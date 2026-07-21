@@ -26,7 +26,12 @@ from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToT
 from utils import label_utils
 from utils.focal_loss import FocalLoss
 from utils.metrics import overall_classification_report
-from utils.train_utils import AverageMeter, bool_flag, to_cuda
+from utils.train_utils import (
+    AverageMeter,
+    bool_flag,
+    progress_bar_disabled,
+    to_cuda,
+)
 
 
 
@@ -106,7 +111,14 @@ def main(config):
         state_dict = torch.load(best_model_path, weights_only=False)['state_dict']
         model.load_state_dict(state_dict)
 
-        test_metrics = evaluation(model, test_loader, device, config.classes, mode='test')
+        test_metrics = evaluation(
+            model,
+            test_loader,
+            device,
+            config.classes,
+            mode='test',
+            progress_bar=getattr(config, "progress_bar", "auto"),
+        )
 
         print(f"Test result for {config.experiment_name}: accuracy={test_metrics['accuracy']:.4f}, f1={test_metrics['macro_f1']:.4f}")
         print(test_metrics['classification_report'])
@@ -288,7 +300,14 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
         model.train()
         loss_meter = AverageMeter()
 
-        progress_bar = tqdm(enumerate(data_loader), total=len(data_loader), desc=f'Epoch {epoch + 1}/{config.epochs}')
+        progress_bar = tqdm(
+            enumerate(data_loader),
+            total=len(data_loader),
+            desc=f'Epoch {epoch + 1}/{config.epochs}',
+            disable=progress_bar_disabled(
+                getattr(config, "progress_bar", "auto")
+            ),
+        )
         global_step = epoch * len(data_loader)
         for step, sample in progress_bar:
             targets = sample['label'].cuda(device=device, non_blocking=True)
@@ -425,6 +444,15 @@ if __name__ == '__main__':
         default=True,
         type=bool_flag,
         help='use source-defined closed-set protocol',
+    )
+    parser.add_argument(
+        '--progress_bar',
+        default='auto',
+        choices=['auto', 'on', 'off'],
+        help=(
+            'tqdm mode: auto enables progress bars only on an interactive '
+            'stderr; on always enables; off always disables'
+        ),
     )
 
     # Training configuration
