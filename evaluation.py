@@ -5,11 +5,20 @@ import torch.backends.cudnn
 import torch.nn.functional as F
 from tqdm import tqdm
 import sklearn.metrics
-from utils.train_utils import AverageMeter, to_cuda
+from utils.train_utils import AverageMeter, progress_bar_disabled, to_cuda
 
 
 def validation(best_f1, best_model_path, config, criterion, device, epoch, model, val_loader, writer, temporal_shift=None):
-    val_metrics = evaluation(model, val_loader, device, config.classes, criterion, mode='val', temporal_shift=temporal_shift)
+    val_metrics = evaluation(
+        model,
+        val_loader,
+        device,
+        config.classes,
+        criterion,
+        mode='val',
+        temporal_shift=temporal_shift,
+        progress_bar=getattr(config, "progress_bar", "auto"),
+    )
     val_loss, val_acc, val_f1, val_kappa = val_metrics['loss'], val_metrics['accuracy'], val_metrics['macro_f1'], val_metrics['kappa']
     writer.add_scalar('val/loss', val_loss, global_step=epoch)
     writer.add_scalar('val/accuracy', val_acc, global_step=epoch)
@@ -28,13 +37,26 @@ def validation(best_f1, best_model_path, config, criterion, device, epoch, model
 
 
 @torch.no_grad()
-def evaluation(model, data_loader, device, class_names, criterion=None, mode='val', temporal_shift=None):
+def evaluation(
+    model,
+    data_loader,
+    device,
+    class_names,
+    criterion=None,
+    mode='val',
+    temporal_shift=None,
+    progress_bar='auto',
+):
     y_true, y_pred = [], []
 
     loss_meter = AverageMeter()
 
     model.eval()
-    for sample in tqdm(data_loader, desc='Validating' if mode == 'val' else 'Testing'):
+    for sample in tqdm(
+        data_loader,
+        desc='Validating' if mode == 'val' else 'Testing',
+        disable=progress_bar_disabled(progress_bar),
+    ):
         target = sample['label']
         y_true.extend(target.tolist())
         target = target.cuda(device=device, non_blocking=True)

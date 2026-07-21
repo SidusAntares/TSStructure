@@ -1,8 +1,26 @@
-import torch
 import argparse
+import sys
+
+import torch
 
 FALSY_STRINGS = {"off", "false", "0"}
 TRUTHY_STRINGS = {"on", "true", "1"}
+
+
+def progress_bar_disabled(mode="auto"):
+    if mode == "off":
+        return True
+
+    if mode == "on":
+        return False
+
+    if mode == "auto":
+        return not sys.stderr.isatty()
+
+    raise ValueError(
+        f"Unknown progress bar mode: {mode!r}. "
+        "Expected one of: auto, on, off."
+    )
 
 
 def to_cuda(sample, device, non_blocking=True):

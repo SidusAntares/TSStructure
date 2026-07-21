@@ -21,7 +21,12 @@ from transforms import (
     Identity,
 )
 from utils.focal_loss import FocalLoss
-from utils.train_utils import AverageMeter, to_cuda, cycle
+from utils.train_utils import (
+    AverageMeter,
+    cycle,
+    progress_bar_disabled,
+    to_cuda,
+)
 
 
 def _check_temporal_index_range(model, positions, applied_shift, tag):
@@ -80,19 +85,41 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
     # estimate an initial guess for shift using Inception Score
     if config.estimate_shift:
         shift_estimator = 'IS' if config.shift_estimator == 'AM' else config.shift_estimator
-        target_to_source_shift = estimate_temporal_shift(teacher, target_loader_no_aug, device, min_shift=min_shift, max_shift=max_shift, sample_size=config.sample_size, shift_estimator=shift_estimator)
+        target_to_source_shift = estimate_temporal_shift(
+            teacher,
+            target_loader_no_aug,
+            device,
+            min_shift=min_shift,
+            max_shift=max_shift,
+            sample_size=config.sample_size,
+            shift_estimator=shift_estimator,
+            progress_bar=getattr(config, "progress_bar", "auto"),
+        )
         if target_to_source_shift >= 0:
             min_shift = 0
         else:
             max_shift = 0
 
         # Use estimated shift to get initial pseudo labels
-        pseudo_softmaxes = get_pseudo_labels(teacher, target_loader_no_aug, device, target_to_source_shift, n=None)
+        pseudo_softmaxes = get_pseudo_labels(
+            teacher,
+            target_loader_no_aug,
+            device,
+            target_to_source_shift,
+            n=None,
+            progress_bar=getattr(config, "progress_bar", "auto"),
+        )
         all_pseudo_labels = torch.max(pseudo_softmaxes, dim=1)[1]
 
     source_to_target_shift = 0
     for epoch in range(config.epochs):
-        progress_bar = tqdm(range(steps_per_epoch), desc=f"TimeMatch Epoch {epoch + 1}/{config.epochs}")
+        progress_bar = tqdm(
+            range(steps_per_epoch),
+            desc=f"TimeMatch Epoch {epoch + 1}/{config.epochs}",
+            disable=progress_bar_disabled(
+                getattr(config, "progress_bar", "auto")
+            ),
+        )
         loss_meter = AverageMeter()
 
         if config.estimate_shift:
@@ -101,7 +128,8 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             target_to_source_shift = estimate_temporal_shift(teacher,
                     target_loader_no_aug, device, estimated_class_distr,
                     min_shift=min_shift, max_shift=max_shift, sample_size=config.sample_size,
-                    shift_estimator=config.shift_estimator)
+                    shift_estimator=config.shift_estimator,
+                    progress_bar=getattr(config, "progress_bar", "auto"))
             if epoch == 0:
                 if config.shift_source:
                     source_to_target_shift = -target_to_source_shift
@@ -337,7 +365,17 @@ class TupleDataset(data.Dataset):
 
 
 @torch.no_grad()
-def estimate_temporal_shift(model, target_loader, device, class_distribution=None, min_shift=-60, max_shift=60, sample_size=100, shift_estimator='IS'):
+def estimate_temporal_shift(
+    model,
+    target_loader,
+    device,
+    class_distribution=None,
+    min_shift=-60,
+    max_shift=60,
+    sample_size=100,
+    shift_estimator='IS',
+    progress_bar='auto',
+):
     shifts = list(range(min_shift, max_shift + 1))
     model.eval()
     if sample_size is None:
@@ -345,7 +383,11 @@ def estimate_temporal_shift(model, target_loader, device, class_distribution=Non
 
     target_iter = iter(target_loader)
     shift_softmaxes, labels = [], []
-    for _ in tqdm(range(sample_size), desc=f'Estimating shift between [{min_shift}, {max_shift}]'):
+    for _ in tqdm(
+        range(sample_size),
+        desc=f'Estimating shift between [{min_shift}, {max_shift}]',
+        disable=progress_bar_disabled(progress_bar),
+    ):
         sample = next(target_iter)
         labels.extend(sample['label'].tolist())
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
@@ -413,11 +455,24 @@ def estimate_temporal_shift(model, target_loader, device, class_distribution=Non
 
 
 @torch.no_grad()
-def get_pseudo_labels(model, data_loader, device, best_shift, n=500):
+def get_pseudo_labels(
+    model,
+    data_loader,
+    device,
+    best_shift,
+    n=500,
+    progress_bar='auto',
+):
     model.eval()
     pseudo_softmaxes = []
     indices = []
-    for i, sample in enumerate(tqdm(data_loader, "computing pseudo labels")):
+    for i, sample in enumerate(
+        tqdm(
+            data_loader,
+            desc="Computing pseudo labels",
+            disable=progress_bar_disabled(progress_bar),
+        )
+    ):
         if n is not None and i == n:
             break
         indices.extend(sample["index"].tolist())
