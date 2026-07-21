@@ -10,7 +10,16 @@ from transforms import Identity, RandomTemporalShift, RandomSampleTimeSteps
 
 
 class _Dataset:
-    def __init__(self, data_root, dataset_name, classes, transform=None, indices=None):
+    def __init__(
+        self,
+        data_root,
+        dataset_name,
+        classes,
+        transform=None,
+        indices=None,
+        closed_set=False,
+        combine_spring_and_winter=False,
+    ):
         self.transform = transform
         self.labels = np.array([0, 1])
 
@@ -44,6 +53,8 @@ def _strong_transform(monkeypatch, with_shift_aug):
         shift_aug_p=1.0,
         num_workers=0,
         batch_size=2,
+        closed_set=False,
+        combine_spring_and_winter=False,
     )
     splits = {
         "source": {"train": [0, 1]},

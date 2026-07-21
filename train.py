@@ -36,18 +36,14 @@ def main(config):
     torch.manual_seed(config.seed)
     device = torch.device(config.device)
 
-    # Select classes that appear at least 200 times source
-    source_classes = label_utils.get_classes(cfg.source.split('/')[0], combine_spring_and_winter=cfg.combine_spring_and_winter)
-    source_data = PixelSetData(cfg.data_root, cfg.source, source_classes)
-    labels, counts = np.unique(source_data.get_labels(), return_counts=True)
-    source_classes = [source_classes[i] for i in labels[counts >= 200]]
-    print('Using classes:', source_classes)
-    cfg.classes = source_classes
-    cfg.num_classes = len(source_classes)
-
-    # Randomly assign parcels to train/val/test
-    indices = {config.source: len(source_data), config.target: len(PixelSetData(config.data_root, config.target, source_classes))}
-    folds = create_train_val_test_folds([config.source, config.target], config.num_folds, indices, config.val_ratio, config.test_ratio)
+    indices, _ = prepare_data_protocol(config)
+    folds = create_train_val_test_folds(
+        [config.source, config.target],
+        config.num_folds,
+        indices,
+        config.val_ratio,
+        config.test_ratio,
+    )
 
     if config.overall:
         overall_performance(config)
@@ -55,6 +51,9 @@ def main(config):
 
     for fold_num, splits in enumerate(folds):
         print(f'Starting fold {fold_num}...')
+
+        if config.closed_set:
+            print_closed_set_counts(config, indices, splits)
 
         config.fold_dir = os.path.join(config.output_dir, f'fold_{fold_num}')
         config.fold_num = fold_num
@@ -117,6 +116,133 @@ def main(config):
     overall_performance(config)
 
 
+def prepare_data_protocol(config):
+    candidate_classes = label_utils.get_classes(
+        config.source.split('/')[0],
+        combine_spring_and_winter=config.combine_spring_and_winter,
+    )
+
+    if not config.closed_set:
+        source_data = PixelSetData(
+            config.data_root,
+            config.source,
+            candidate_classes,
+            combine_spring_and_winter=config.combine_spring_and_winter,
+        )
+        labels, counts = np.unique(source_data.get_labels(), return_counts=True)
+        source_classes = [
+            candidate_classes[int(label)]
+            for label, count in zip(labels, counts)
+            if count >= 200
+        ]
+        print('Using classes:', source_classes)
+        config.classes = source_classes
+        config.num_classes = len(source_classes)
+        target_data = PixelSetData(
+            config.data_root,
+            config.target,
+            source_classes,
+            combine_spring_and_winter=config.combine_spring_and_winter,
+        )
+        return {
+            config.source: len(source_data),
+            config.target: len(target_data),
+        }, None
+
+    candidate_classes = [
+        class_name
+        for class_name in candidate_classes
+        if class_name != "unknown"
+    ]
+    candidate_source_dataset = PixelSetData(
+        config.data_root,
+        config.source,
+        candidate_classes,
+        closed_set=True,
+        combine_spring_and_winter=config.combine_spring_and_winter,
+    )
+    labels, counts = np.unique(
+        candidate_source_dataset.get_labels(), return_counts=True
+    )
+    source_classes = [
+        candidate_classes[int(label)]
+        for label, count in zip(labels, counts)
+        if count >= 200
+    ]
+    if not source_classes:
+        raise ValueError(
+            f"No source classes in {config.source} have at least 200 samples"
+        )
+
+    source_count_by_class = {
+        candidate_classes[int(label)]: int(count)
+        for label, count in zip(labels, counts)
+        if count >= 200
+    }
+    config.classes = source_classes
+    config.num_classes = len(source_classes)
+
+    source_protocol_dataset = PixelSetData(
+        config.data_root,
+        config.source,
+        config.classes,
+        closed_set=True,
+        combine_spring_and_winter=config.combine_spring_and_winter,
+    )
+    target_protocol_dataset = PixelSetData(
+        config.data_root,
+        config.target,
+        config.classes,
+        closed_set=True,
+        combine_spring_and_winter=config.combine_spring_and_winter,
+    )
+    eligible_indices = {
+        config.source: source_protocol_dataset.get_parcel_indices().tolist(),
+        config.target: target_protocol_dataset.get_parcel_indices().tolist(),
+    }
+    protocol = {
+        "closed_set": True,
+        "source": config.source,
+        "target": config.target,
+        "min_source_samples_per_class": 200,
+        "combine_spring_and_winter": config.combine_spring_and_winter,
+        "classes": config.classes,
+        "class_to_idx": {
+            class_name: index for index, class_name in enumerate(config.classes)
+        },
+        "source_class_counts": source_count_by_class,
+        "eligible_source_samples": len(eligible_indices[config.source]),
+        "eligible_target_samples": len(eligible_indices[config.target]),
+        "seed": config.seed,
+        "val_ratio": config.val_ratio,
+        "test_ratio": config.test_ratio,
+    }
+
+    print(
+        "CLOSED_SET_PROTOCOL|"
+        f"source={config.source}|target={config.target}|"
+        f"num_classes={config.num_classes}|classes={','.join(config.classes)}"
+    )
+    with open(os.path.join(config.output_dir, "closed_set_protocol.json"), "w") as f:
+        json.dump(protocol, f, indent=4)
+
+    return eligible_indices, protocol
+
+
+def print_closed_set_counts(config, eligible_indices, splits):
+    print(
+        "CLOSED_SET_COUNTS|"
+        f"source_total={len(eligible_indices[config.source])}|"
+        f"target_total={len(eligible_indices[config.target])}|"
+        f"source_train={len(splits[config.source]['train'])}|"
+        f"source_val={len(splits[config.source]['val'])}|"
+        f"source_test={len(splits[config.source]['test'])}|"
+        f"target_train={len(splits[config.target]['train'])}|"
+        f"target_val={len(splits[config.target]['val'])}|"
+        f"target_test={len(splits[config.target]['test'])}"
+    )
+
+
 def get_num_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -141,7 +267,15 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
     if config.train_on_target:
         dataset_name = config.target
 
-    dataset = PixelSetData(config.data_root, dataset_name, config.classes, train_transform, splits[dataset_name]['train'])
+    dataset = PixelSetData(
+        config.data_root,
+        dataset_name,
+        config.classes,
+        train_transform,
+        indices=splits[dataset_name]['train'],
+        closed_set=config.closed_set,
+        combine_spring_and_winter=config.combine_spring_and_winter,
+    )
     data_loader = create_train_loader(dataset, config.batch_size, config.num_workers)
     print(f'training dataset: {dataset_name}, n={len(dataset)}, batches={len(data_loader)}')
 
@@ -187,10 +321,14 @@ def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1,
     for _ in range(num_folds):
         splits = {}
         for dataset in datasets:
-            if type(num_indices) == dict:
-                indices = list(range(num_indices[dataset]))
+            if isinstance(num_indices, dict):
+                index_spec = num_indices[dataset]
             else:
-                indices = list(range(num_indices))
+                index_spec = num_indices
+            if isinstance(index_spec, (int, np.integer)):
+                indices = list(range(int(index_spec)))
+            else:
+                indices = list(index_spec)
             n = len(indices)
             n_test = int(test_ratio * n)
             n_val = int(val_ratio * n)
@@ -200,9 +338,11 @@ def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1,
 
             train_indices = set(indices[:n_train])
             val_indices = set(indices[n_train:n_train + n_val])
-            test_indices = set(indices[-n_test:])
-            assert set.intersection(train_indices, val_indices, test_indices) == set()
-            assert len(train_indices) + len(val_indices) + len(test_indices) == n
+            test_indices = set(indices[n_train + n_val:])
+            assert train_indices.isdisjoint(val_indices)
+            assert train_indices.isdisjoint(test_indices)
+            assert val_indices.isdisjoint(test_indices)
+            assert train_indices | val_indices | test_indices == set(indices)
 
             splits[dataset] = {'train': train_indices, 'val': val_indices, 'test': test_indices}
         folds.append(splits)
@@ -280,6 +420,12 @@ if __name__ == '__main__':
     parser.add_argument('--eval', action='store_true', help='run only evaluation')
     parser.add_argument('--overall', action='store_true', help='print overall results, if exists')
     parser.add_argument('--combine_spring_and_winter', default=False, type=bool_flag)
+    parser.add_argument(
+        '--closed_set',
+        default=True,
+        type=bool_flag,
+        help='use source-defined closed-set protocol',
+    )
 
     # Training configuration
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs per fold')

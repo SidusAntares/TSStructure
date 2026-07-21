@@ -30,6 +30,8 @@ class PixelSetData(data.Dataset):
         transform=None,
         indices=None,
         with_extra=False,
+        closed_set=False,
+        combine_spring_and_winter=False,
     ):
         super(PixelSetData, self).__init__()
 
@@ -41,6 +43,8 @@ class PixelSetData(data.Dataset):
         self.meta_folder = os.path.join(self.folder, "meta")
         self.transform = transform
         self.with_extra = with_extra
+        self.closed_set = closed_set
+        self.combine_spring_and_winter = combine_spring_and_winter
 
         self.classes = classes
         self.class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
@@ -61,6 +65,9 @@ class PixelSetData(data.Dataset):
 
     def get_labels(self):
         return np.array([x[2] for x in self.samples])
+
+    def get_parcel_indices(self):
+        return np.array([sample[1] for sample in self.samples], dtype=np.int64)
 
     def __len__(self):
         return len(self.samples)
@@ -91,7 +98,9 @@ class PixelSetData(data.Dataset):
         instances = []
         new_parcel_metadata = []
 
-        code_to_class_name = label_utils.get_code_to_class(country)
+        code_to_class_name = label_utils.get_code_to_class(
+            country, self.combine_spring_and_winter
+        )
 
         unknown_crop_codes = set()
 
@@ -106,7 +115,15 @@ class PixelSetData(data.Dataset):
             if crop_code not in code_to_class_name:
                 unknown_crop_codes.add(crop_code)
             class_name = code_to_class_name.get(crop_code, "unknown")
-            class_index = class_to_idx.get(class_name, class_to_idx["unknown"])
+            if self.closed_set:
+                if class_name not in class_to_idx:
+                    continue
+                class_index = class_to_idx[class_name]
+            else:
+                if class_name in class_to_idx:
+                    class_index = class_to_idx[class_name]
+                else:
+                    class_index = class_to_idx["unknown"]
             extra = parcel['geometric_features']
 
             item = (parcel_path, parcel_idx, class_index, extra)
@@ -219,6 +236,10 @@ def create_evaluation_loaders(dataset_name, splits, config, sample_pixels_val=Fa
         config.classes,
         val_transform,
         indices=splits[dataset_name]["val"],
+        closed_set=getattr(config, "closed_set", False),
+        combine_spring_and_winter=getattr(
+            config, "combine_spring_and_winter", False
+        ),
     )
     val_loader = data.DataLoader(
         val_dataset,
@@ -242,6 +263,10 @@ def create_evaluation_loaders(dataset_name, splits, config, sample_pixels_val=Fa
         config.classes,
         test_transform,
         indices=splits[dataset_name]["test"],
+        closed_set=getattr(config, "closed_set", False),
+        combine_spring_and_winter=getattr(
+            config, "combine_spring_and_winter", False
+        ),
     )
     test_loader = data.DataLoader(
         test_dataset,
