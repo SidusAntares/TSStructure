@@ -257,7 +257,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # Setup parameters
-    parser.add_argument('--data_root', default='/data/user/DBL/timematch_data', type=str,
+    parser.add_argument('--data_root', default='/data/user/dataset/timematch_data', type=str,
                         help='Path to datasets root directory')
     parser.add_argument('--num_blocks', default=100, type=int, help='Number of geographical blocks in dataset for splitting. Default 100.')
 
