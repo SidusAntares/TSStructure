@@ -25,6 +25,9 @@ from utils.train_utils import AverageMeter, to_cuda, cycle
 
 
 def _check_temporal_index_range(model, positions, applied_shift, tag):
+    if positions.numel() == 0:
+        return
+
     temporal_encoder = model.temporal_encoder
     min_pos = int(positions.min().item())
     max_pos = int(positions.max().item())
@@ -120,6 +123,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                 teacher_preds = F.softmax(teacher.forward(pixels_t_weak, mask_t_weak, position_t_weak + target_to_source_shift, extra_t_weak), dim=1)
             pseudo_conf, pseudo_targets = torch.max(teacher_preds, dim=1)
             pseudo_mask = pseudo_conf > config.pseudo_threshold
+            num_pseudo = int(pseudo_mask.sum().item())
 
             # Update student on shifted source data and pseudo-labeled target data
             pixels_s, mask_s, position_s, extra_s = to_cuda(sample_source, device)
@@ -130,18 +134,39 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             if config.domain_specific_bn:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
                 logits_source = student.forward(pixels_s, mask_s, position_s + source_to_target_shift, extra_s)
-                if len(torch.nonzero(pseudo_mask)) >= 2:  # at least 2 examples required for BN
+                if num_pseudo >= 2:  # at least 2 examples required for BN
                     _check_temporal_index_range(student, position_t[pseudo_mask], 0, "target")
                     logits_target = student.forward(pixels_t[pseudo_mask], mask_t[pseudo_mask], position_t[pseudo_mask], extra_t[pseudo_mask])
             else:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
-                _check_temporal_index_range(student, position_t[pseudo_mask], 0, "target")
-                pixels = torch.cat([pixels_s, pixels_t[pseudo_mask]])
-                mask = torch.cat([mask_s, mask_t[pseudo_mask]])
-                position = torch.cat([position_s + source_to_target_shift, position_t[pseudo_mask]])
-                extra = torch.cat([extra_s, extra_t[pseudo_mask]])
-                logits = student.forward(pixels, mask, position, extra)
-                logits_source, logits_target = logits[:config.batch_size], logits[config.batch_size:]
+                if num_pseudo > 0:
+                    selected_pixels_t = pixels_t[pseudo_mask]
+                    selected_mask_t = mask_t[pseudo_mask]
+                    selected_position_t = position_t[pseudo_mask]
+                    selected_extra_t = extra_t[pseudo_mask]
+
+                    _check_temporal_index_range(student, selected_position_t, 0, "target")
+
+                    pixels = torch.cat([pixels_s, selected_pixels_t], dim=0)
+                    mask = torch.cat([mask_s, selected_mask_t], dim=0)
+                    position = torch.cat(
+                        [position_s + source_to_target_shift, selected_position_t],
+                        dim=0,
+                    )
+                    extra = torch.cat([extra_s, selected_extra_t], dim=0)
+
+                    logits = student.forward(pixels, mask, position, extra)
+                    source_batch_size = pixels_s.shape[0]
+                    logits_source = logits[:source_batch_size]
+                    logits_target = logits[source_batch_size:]
+                else:
+                    logits_source = student.forward(
+                        pixels_s,
+                        mask_s,
+                        position_s + source_to_target_shift,
+                        extra_s,
+                    )
+                    logits_target = None
 
             loss_source = criterion(logits_source, source_labels)
             if logits_target is not None:
@@ -219,6 +244,10 @@ def get_data_loaders(splits, config, balance_source=True):
     strong_aug = transforms.Compose([
             RandomSamplePixels(config.num_pixels),
             RandomSampleTimeSteps(config.seq_length),
+            RandomTemporalShift(
+                max_shift=config.max_shift_aug,
+                p=config.shift_aug_p,
+            ) if config.with_shift_aug else Identity(),
             Normalize(),
             ToTensor(),
     ])
