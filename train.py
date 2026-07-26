@@ -10,18 +10,12 @@ import random
 import numpy as np
 import torch
 import torch.backends.cudnn
-from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import transforms
 from tqdm import tqdm
 
-from competitors.dann.dann import train_dann
-from competitors.jumbot.jumbot import train_jumbot
-from competitors.mmd.train_mmd import train_mmd
-from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
 from models.stclassifier import PseLTae, PseTae, PseTempCNN, PseGru
-from timematch import train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
 from utils import label_utils
 from utils.focal_loss import FocalLoss
@@ -63,7 +57,7 @@ def main(config):
         config.fold_dir = os.path.join(config.output_dir, f'fold_{fold_num}')
         config.fold_num = fold_num
 
-        sample_pixels_val = config.sample_pixels_val or (config.eval and config.temporal_shift)
+        sample_pixels_val = config.sample_pixels_val
         val_loader, test_loader = create_evaluation_loaders(config.target, splits, config, sample_pixels_val)
 
         if config.model == 'pseltae':
@@ -82,6 +76,8 @@ def main(config):
         best_model_path = os.path.join(config.fold_dir, 'model.pt')
 
         if not config.eval:
+            from torch.utils.tensorboard import SummaryWriter
+
             print(model)
             print('Number of trainable parameters:', get_num_trainable_params(model))
 
@@ -93,18 +89,7 @@ def main(config):
             #         continue
 
             writer = SummaryWriter(log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0)
-            if config.method == 'timematch':
-                train_timematch(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
-            elif config.method == 'dann':
-                train_dann(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
-            elif config.method == 'mmd':
-                train_mmd(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
-            elif config.method == 'jumbot':
-                train_jumbot(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
-            elif config.method == 'alda':
-                train_alda(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
-            else:
-                train_supervised(model, config, writer, splits, val_loader, device, best_model_path)
+            train_supervised(model, config, writer, splits, val_loader, device, best_model_path)
 
         print('Restoring best model weights for testing...')
 
@@ -426,9 +411,9 @@ if __name__ == '__main__':
     parser.add_argument('--target', default='france/30TXT/2017', help='target dataset', choices=available_tiles)
     parser.add_argument('--num_folds', default=1, type=int, help='Number of train/test folds for cross validation')
     parser.add_argument("--val_ratio", default=0.1, type=float,
-                        help='Ratio of training data to use for validation. Default 10%.')
+                        help='Ratio of training data to use for validation. Default 0.1.')
     parser.add_argument("--test_ratio", default=0.2, type=float,
-                        help='Ratio of training data to use for testing. Default 20%.')
+                        help='Ratio of training data to use for testing. Default 0.2.')
     parser.add_argument('--sample_pixels_val', type=bool_flag, default=True, help='speed up validation at the cost of randomness')
     parser.add_argument('--output_dir', default='outputs', help='Path to the folder where the results should be stored')
     parser.add_argument('-e', '--experiment_name', default=None, help='Name of the experiment')
@@ -472,70 +457,6 @@ if __name__ == '__main__':
     parser.add_argument('--with_shift_aug', default=False, type=bool_flag, help='whether to apply random temporal shift augmentation')
     parser.add_argument('--shift_aug_p', default=1.0, type=float, help='probability to apply temporal shift augmentation')
     parser.add_argument('--max_shift_aug', default=60, type=int, help='highest shift to apply for temporal shift augmentation')
-
-    # Specific parameters for each training method
-    subparsers = parser.add_subparsers(dest='method')
-
-    # DANN + CDAN
-    dann = subparsers.add_parser('dann')
-    dann.add_argument('--adv_loss', type=str, default='DANN', choices=['DANN', 'CDAN', 'CDAN+E'])
-    dann.add_argument('--use_default_optim', type=bool_flag, default=True, help="whether to use default optimizer")
-    dann.add_argument('--weights', type=str, help='path to source trained model weights')
-    dann.add_argument("--steps_per_epoch", type=int, default=500, help='n steps per epoch')
-    dann.add_argument('--epochs', default=20, type=int, help='Number of epochs per fold')
-    dann.add_argument("--trade_off", default=1.0, type=float, help='weight of adversarial loss')
-    dann.add_argument('--lr', default=0.001, type=float, help='Learning rate')
-
-    # MMD loss (DAN)
-    mmd = subparsers.add_parser('mmd')
-    mmd.add_argument('--use_default_optim', type=bool_flag, default=True, help="whether to use default optimizer")
-    mmd.add_argument('--weights', type=str, help='path to source trained model weights')
-    mmd.add_argument("--steps_per_epoch", type=int, default=500, help='n steps per epoch')
-    mmd.add_argument('--epochs', default=20, type=int, help='Number of epochs per fold')
-    mmd.add_argument("--trade_off", default=1.0, type=float, help='weight of adversarial loss')
-    mmd.add_argument('--lr', default=0.001, type=float, help='Learning rate')
-
-    # JUMBOT
-    jumbot = subparsers.add_parser('jumbot')
-    jumbot.add_argument('--weights', type=str, help='path to source trained model weights')
-    jumbot.add_argument("--steps_per_epoch", type=int, default=500, help='n steps per epoch')
-    jumbot.add_argument('--epochs', default=20, type=int, help='Number of epochs per fold')
-    jumbot.add_argument('--lr', default=0.001, type=float, help='Learning rate')
-    jumbot.add_argument('--eta1', default=0.01, type=float, help='feature comparison coefficient')
-    jumbot.add_argument('--eta2', default=1.0, type=float, help='label comparison coefficient')
-    jumbot.add_argument('--epsilon', default=0.01, type=float, help='marginal coefficient')
-    jumbot.add_argument('--tau', default=0.5, type=float, help='entropic regularization')
-
-    # ALDA
-    alda = subparsers.add_parser('alda')
-    alda.add_argument('--use_default_optim', type=bool_flag, default=True, help="whether to use default optimizer")
-    alda.add_argument('--weights', type=str, help='path to source trained model weights')
-    alda.add_argument("--steps_per_epoch", type=int, default=500, help='n steps per epoch')
-    alda.add_argument('--epochs', default=20, type=int, help='Number of epochs per fold')
-    alda.add_argument('--lr', default=0.001, type=float, help='Learning rate')
-    alda.add_argument("--trade_off", default=1.0, type=float, help='weight of adversarial loss')
-    alda.add_argument("--pseudo_threshold", default=0.7, type=float, help='confidence threshold for assigning pseudo labels')
-
-
-    # TimeMatch
-    timematch = subparsers.add_parser('timematch')
-    timematch.add_argument('--weights', type=str, help='path to source trained model weights')
-    timematch.add_argument('--lr', default=0.0001, type=float, help='Learning rate')
-    timematch.add_argument("--pseudo_threshold", default=0.9, type=float, help='confidence threshold for assigning pseudo labels')
-    timematch.add_argument("--ema_decay", default=0.9999, type=float, help='decay rate for mean teacher')
-    timematch.add_argument("--trade_off", type=float, default=2.0, help='weight for unsupervised loss')
-    timematch.add_argument("--estimate_shift", type=bool_flag, default=True, help='whether to account for temporal shift')
-    timematch.add_argument('--epochs', default=20, type=int, help='Number of epochs per fold')
-    timematch.add_argument("--steps_per_epoch", type=int, default=500, help='n steps per epoch')
-    timematch.add_argument("--balance_source", type=bool_flag, default=True, help='class balanced batches for source')
-    timematch.add_argument("--use_focal_loss", type=bool_flag, default=True, help='use focal loss or cross entropy')
-    timematch.add_argument("--shift_source", type=bool_flag, default=True, help='whether to apply temporal shift to source data')
-    timematch.add_argument("--sample_size", type=int, default=100, help='number of batches to sample for estimating shift')
-    timematch.add_argument("--max_temporal_shift", type=int, default=60, help='maximum temporal shift to consider')
-    timematch.add_argument("--domain_specific_bn", type=bool_flag, default=True, help='whether to use domain specific batch normalization')
-    timematch.add_argument("--shift_estimator", type=str, default='AM', choices=['AM', 'IS', 'ACC', 'ENT'])
-    timematch.add_argument('--run_validation', default=True, action='store_true', help='whether to run validation each epoch')
-    timematch.add_argument("--output_student", type=bool_flag, default=True, help='output student or teacher')
 
     cfg = parser.parse_args()
 

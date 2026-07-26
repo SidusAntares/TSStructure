@@ -1,7 +1,6 @@
 import inspect
 import io
 import sys
-import types
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,22 +9,7 @@ import torch
 from tqdm import tqdm
 
 import evaluation
-import timematch
 from utils import train_utils
-
-tensorboard_stub = types.ModuleType("torch.utils.tensorboard")
-tensorboard_stub.SummaryWriter = object
-sys.modules.setdefault("torch.utils.tensorboard", tensorboard_stub)
-
-for module_name, function_name in (
-    ("competitors.dann.dann", "train_dann"),
-    ("competitors.jumbot.jumbot", "train_jumbot"),
-    ("competitors.mmd.train_mmd", "train_mmd"),
-    ("competitors.alda.train_alda", "train_alda"),
-):
-    module_stub = types.ModuleType(module_name)
-    setattr(module_stub, function_name, lambda *args, **kwargs: None)
-    sys.modules.setdefault(module_name, module_stub)
 
 import train
 
@@ -68,18 +52,10 @@ def test_disabled_tqdm_writes_no_dynamic_output():
     assert stream.getvalue() == ""
 
 
-@pytest.mark.parametrize(
-    ("function", "parameter"),
-    [
-        (evaluation.evaluation, "progress_bar"),
-        (timematch.estimate_temporal_shift, "progress_bar"),
-        (timematch.get_pseudo_labels, "progress_bar"),
-    ],
-)
-def test_progress_bar_parameters_remain_optional(function, parameter):
-    signature = inspect.signature(function)
+def test_evaluation_progress_bar_parameter_remains_optional():
+    signature = inspect.signature(evaluation.evaluation)
 
-    assert signature.parameters[parameter].default == "auto"
+    assert signature.parameters["progress_bar"].default == "auto"
 
 
 class _EmptyProgress:

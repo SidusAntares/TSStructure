@@ -1,7 +1,5 @@
 import json
 import pickle
-import sys
-import types
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,21 +7,6 @@ import pytest
 import torch
 
 import dataset
-import timematch
-
-tensorboard_stub = types.ModuleType("torch.utils.tensorboard")
-tensorboard_stub.SummaryWriter = object
-sys.modules.setdefault("torch.utils.tensorboard", tensorboard_stub)
-
-for module_name, function_name in (
-    ("competitors.dann.dann", "train_dann"),
-    ("competitors.jumbot.jumbot", "train_jumbot"),
-    ("competitors.mmd.train_mmd", "train_mmd"),
-    ("competitors.alda.train_alda", "train_alda"),
-):
-    module_stub = types.ModuleType(module_name)
-    setattr(module_stub, function_name, lambda *args, **kwargs: None)
-    sys.modules.setdefault(module_name, module_stub)
 
 import train
 
@@ -336,7 +319,7 @@ class _Loader:
         return 1
 
 
-def test_closed_set_is_propagated_to_supervised_evaluation_and_timematch_loaders(
+def test_closed_set_is_propagated_to_supervised_and_evaluation_loaders(
     monkeypatch
 ):
     config = SimpleNamespace(
@@ -380,10 +363,4 @@ def test_closed_set_is_propagated_to_supervised_evaluation_and_timematch_loaders
     monkeypatch.setattr(dataset.data, "DataLoader", _Loader)
     monkeypatch.setattr(dataset, "GroupByShapesBatchSampler", lambda *args, **kwargs: [])
     dataset.create_evaluation_loaders("target", splits, config)
-    assert _LoaderDataset.calls == [(True, True), (True, True)]
-
-    _LoaderDataset.calls = []
-    monkeypatch.setattr(timematch, "PixelSetData", _LoaderDataset)
-    monkeypatch.setattr(timematch.data, "DataLoader", _Loader)
-    timematch.get_data_loaders(splits, config, balance_source=False)
     assert _LoaderDataset.calls == [(True, True), (True, True)]
