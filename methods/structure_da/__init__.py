@@ -1,5 +1,13 @@
 """Building blocks for structure-aware domain adaptation."""
 
+from .adaptation import (
+    JointStructuralOutput,
+    JointStructuralSpaceBuilder,
+    SDADiscriminator,
+    StructuralAdversarialAdapter,
+    StructuralAdversarialOutput,
+    gradient_reverse,
+)
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
 from .model import (
     ComponentLTAEInputs,
@@ -19,7 +27,12 @@ from .quality import (
     StructuralQualityPerception,
     TransferabilityScorer,
 )
-from .schedules import apply_quality_warmup, quality_gate_progress
+from .schedules import (
+    apply_quality_warmup,
+    grl_coefficient,
+    grl_progress,
+    quality_gate_progress,
+)
 from .structure_ops import (
     ChannelRelationOperator,
     StructureOutput,
@@ -39,8 +52,13 @@ __all__ = [
     "DiscriminabilityScorer",
     "DiversityScorer",
     "EffectiveQualityGates",
+    "JointStructuralOutput",
+    "JointStructuralSpaceBuilder",
     "QualityScores",
     "StructureOutput",
+    "SDADiscriminator",
+    "StructuralAdversarialAdapter",
+    "StructuralAdversarialOutput",
     "StructuralQualityOutput",
     "StructuralQualityPerception",
     "StructuralQualityBundle",
@@ -48,6 +66,9 @@ __all__ = [
     "TemporalRelationOperator",
     "TransferabilityScorer",
     "apply_quality_warmup",
+    "grl_coefficient",
+    "grl_progress",
+    "gradient_reverse",
     "quality_gate_progress",
     "vectorize_channel_statistic",
 ]

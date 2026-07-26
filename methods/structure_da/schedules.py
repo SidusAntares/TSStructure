@@ -42,3 +42,27 @@ def apply_quality_warmup(
     if not 0 <= progress <= 1:
         raise ValueError("progress must be in [0, 1]")
     return 1.0 - progress + progress * raw_gate.detach()
+
+
+def grl_progress(step: float, warmup_steps: float) -> float:
+    """Return the clipped linear progress used only by the GRL schedule."""
+
+    step = _finite_float("step", step)
+    warmup_steps = _finite_float("warmup_steps", warmup_steps)
+    if step < 0:
+        raise ValueError("step must be greater than or equal to zero")
+    if warmup_steps <= 0:
+        raise ValueError("warmup_steps must be greater than zero")
+    return float(min(1.0, step / warmup_steps))
+
+
+def grl_coefficient(
+    step: float, warmup_steps: float, gamma: float = 10.0
+) -> float:
+    """Return the logistic gradient-reversal coefficient for one step."""
+
+    gamma = _finite_float("gamma", gamma)
+    if gamma <= 0:
+        raise ValueError("gamma must be greater than zero")
+    progress = grl_progress(step, warmup_steps)
+    return float(2.0 / (1.0 + math.exp(-gamma * progress)) - 1.0)

@@ -1,9 +1,16 @@
 """Tests for detached quality-gate warm-up utilities."""
 
+import math
+
 import pytest
 import torch
 
-from methods.structure_da import apply_quality_warmup, quality_gate_progress
+from methods.structure_da import (
+    apply_quality_warmup,
+    grl_coefficient,
+    grl_progress,
+    quality_gate_progress,
+)
 
 
 def test_quality_gate_progress_starts_at_zero():
@@ -97,3 +104,65 @@ def test_apply_quality_warmup_rejects_non_tensor_or_non_floating_gate():
         apply_quality_warmup([0.5], 0.5)
     with pytest.raises(ValueError, match="floating"):
         apply_quality_warmup(torch.tensor([1], dtype=torch.long), 0.5)
+
+
+def test_grl_progress_starts_at_zero_and_is_a_python_float():
+    progress = grl_progress(step=0, warmup_steps=10)
+
+    assert isinstance(progress, float)
+    assert progress == 0.0
+
+
+def test_grl_progress_is_linear_at_midpoint():
+    assert grl_progress(step=5, warmup_steps=10) == 0.5
+
+
+@pytest.mark.parametrize("step", [10, 11, 100])
+def test_grl_progress_saturates_after_warmup(step):
+    assert grl_progress(step=step, warmup_steps=10) == 1.0
+
+
+@pytest.mark.parametrize(
+    "step, warmup_steps",
+    [
+        (-1, 10),
+        (0, 0),
+        (0, -1),
+        (float("nan"), 10),
+        (0, float("inf")),
+        (True, 10),
+        (0, False),
+    ],
+)
+def test_grl_progress_rejects_invalid_arguments(step, warmup_steps):
+    with pytest.raises(ValueError):
+        grl_progress(step=step, warmup_steps=warmup_steps)
+
+
+def test_grl_coefficient_starts_at_zero():
+    assert grl_coefficient(step=0, warmup_steps=10) == 0.0
+
+
+def test_grl_coefficient_matches_logistic_formula_at_midpoint_and_completion():
+    midpoint = grl_coefficient(step=5, warmup_steps=10, gamma=10.0)
+    completed = grl_coefficient(step=10, warmup_steps=10, gamma=10.0)
+
+    assert midpoint == pytest.approx(2 / (1 + math.exp(-5.0)) - 1)
+    assert completed == pytest.approx(2 / (1 + math.exp(-10.0)) - 1)
+    assert 0 < midpoint < completed < 1
+
+
+def test_grl_coefficient_is_monotonic_and_finite():
+    values = [
+        grl_coefficient(step=step, warmup_steps=10, gamma=3.0)
+        for step in range(11)
+    ]
+
+    assert values == sorted(values)
+    assert all(math.isfinite(value) and 0 <= value <= 1 for value in values)
+
+
+@pytest.mark.parametrize("gamma", [0, -1, float("nan"), float("inf"), True])
+def test_grl_coefficient_rejects_invalid_gamma(gamma):
+    with pytest.raises(ValueError, match="gamma"):
+        grl_coefficient(step=1, warmup_steps=10, gamma=gamma)
