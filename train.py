@@ -54,7 +54,18 @@ def main(config):
         config.fold_num = fold_num
 
         sample_pixels_val = config.sample_pixels_val
-        val_loader, test_loader = create_evaluation_loaders(config.target, splits, config, sample_pixels_val)
+        if config.eval:
+            _, target_test_loader = create_evaluation_loaders(
+                config.target, splits, config, sample_pixels_val
+            )
+            source_val_loader = None
+        else:
+            source_val_loader, _ = create_evaluation_loaders(
+                config.source, splits, config, sample_pixels_val
+            )
+            _, target_test_loader = create_evaluation_loaders(
+                config.target, splits, config, sample_pixels_val
+            )
 
         model = StructureDAModel(
             num_classes=config.num_classes,
@@ -108,7 +119,7 @@ def main(config):
                 classes=tuple(config.classes),
             )
             train_structure_da(
-                model, source_loader, target_loader, val_loader,
+                model, source_loader, target_loader, source_val_loader,
                 training_config, writer, device, best_model_path,
             )
 
@@ -119,7 +130,7 @@ def main(config):
 
         test_metrics = evaluation(
             model,
-            test_loader,
+            target_test_loader,
             device,
             config.classes,
             mode='test',
