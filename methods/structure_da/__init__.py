@@ -9,6 +9,16 @@ from .adaptation import (
     gradient_reverse,
 )
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
+from .losses import (
+    LossWeights,
+    StructureDALosses,
+    classification_loss,
+    component_diversity_loss,
+    compose_total_loss,
+    quality_classification_loss,
+    quality_domain_loss,
+    structural_adversarial_loss,
+)
 from .model import (
     ComponentLTAEInputs,
     ComponentQualityBundle,
@@ -54,8 +64,10 @@ __all__ = [
     "EffectiveQualityGates",
     "JointStructuralOutput",
     "JointStructuralSpaceBuilder",
+    "LossWeights",
     "QualityScores",
     "StructureOutput",
+    "StructureDALosses",
     "SDADiscriminator",
     "StructuralAdversarialAdapter",
     "StructuralAdversarialOutput",
@@ -66,9 +78,15 @@ __all__ = [
     "TemporalRelationOperator",
     "TransferabilityScorer",
     "apply_quality_warmup",
+    "classification_loss",
+    "component_diversity_loss",
+    "compose_total_loss",
     "grl_coefficient",
     "grl_progress",
     "gradient_reverse",
     "quality_gate_progress",
+    "quality_classification_loss",
+    "quality_domain_loss",
+    "structural_adversarial_loss",
     "vectorize_channel_statistic",
 ]
