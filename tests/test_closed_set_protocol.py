@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import dataset
+from methods.structure_da import trainer as structure_da_trainer
 
 import train
 
@@ -319,7 +320,7 @@ class _Loader:
         return 1
 
 
-def test_closed_set_is_propagated_to_supervised_and_evaluation_loaders(
+def test_closed_set_is_propagated_to_structure_da_and_evaluation_loaders(
     monkeypatch
 ):
     config = SimpleNamespace(
@@ -340,6 +341,7 @@ def test_closed_set_is_propagated_to_supervised_and_evaluation_loaders(
         weight_decay=0.0,
         train_on_target=False,
         combine_spring_and_winter=True,
+        with_extra=False,
     )
     splits = {
         "source": {"train": {1}, "val": {2}, "test": {3}},
@@ -347,16 +349,15 @@ def test_closed_set_is_propagated_to_supervised_and_evaluation_loaders(
     }
 
     _LoaderDataset.calls = []
-    monkeypatch.setattr(train, "PixelSetData", _LoaderDataset)
+    monkeypatch.setattr(structure_da_trainer, "PixelSetData", _LoaderDataset)
     monkeypatch.setattr(
-        train,
+        structure_da_trainer,
         "create_train_loader",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")),
     )
-    model = torch.nn.Linear(1, 1)
     with pytest.raises(RuntimeError, match="stop"):
-        train.train_supervised(model, config, None, splits, None, "cpu", "unused")
-    assert _LoaderDataset.calls == [(True, True)]
+        structure_da_trainer.create_structure_da_train_loaders(config, splits)
+    assert _LoaderDataset.calls == [(True, True), (True, True)]
 
     _LoaderDataset.calls = []
     monkeypatch.setattr(dataset, "PixelSetData", _LoaderDataset)

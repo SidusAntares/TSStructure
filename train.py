@@ -10,22 +10,18 @@ import random
 import numpy as np
 import torch
 import torch.backends.cudnn
-from torchvision.transforms import transforms
-from tqdm import tqdm
-
-from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
-from evaluation import evaluation, validation
-from models.stclassifier import PseLTae, PseTae, PseTempCNN, PseGru
-from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
-from utils import label_utils
-from utils.focal_loss import FocalLoss
-from utils.metrics import overall_classification_report
-from utils.train_utils import (
-    AverageMeter,
-    bool_flag,
-    progress_bar_disabled,
-    to_cuda,
+from dataset import PixelSetData, create_evaluation_loaders
+from evaluation import evaluation
+from methods.structure_da import (
+    LossWeights,
+    StructureDAModel,
+    StructureDATrainingConfig,
+    create_structure_da_train_loaders,
+    train_structure_da,
 )
+from utils import label_utils
+from utils.metrics import overall_classification_report
+from utils.train_utils import bool_flag
 
 
 
@@ -60,16 +56,19 @@ def main(config):
         sample_pixels_val = config.sample_pixels_val
         val_loader, test_loader = create_evaluation_loaders(config.target, splits, config, sample_pixels_val)
 
-        if config.model == 'pseltae':
-            model = PseLTae(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psetae':
-            model = PseTae(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psetcnn':
-            model = PseTempCNN(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psegru':
-            model = PseGru(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        else:
-            raise NotImplementedError()
+        model = StructureDAModel(
+            num_classes=config.num_classes,
+            input_dim=config.input_dim,
+            with_extra=config.with_extra,
+            time_scale=config.time_scale,
+            tau_fast_init=config.tau_fast_init,
+            tau_slow_init=config.tau_slow_init,
+            tau_min=config.tau_min,
+            delta_tau_min=config.delta_tau_min,
+            quality_hidden_cap=config.quality_hidden_cap,
+            quality_eta=config.quality_eta,
+            sda_hidden_dim=config.sda_hidden_dim,
+        )
         
         model.to(config.device)
 
@@ -89,7 +88,29 @@ def main(config):
             #         continue
 
             writer = SummaryWriter(log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0)
-            train_supervised(model, config, writer, splits, val_loader, device, best_model_path)
+            source_loader, target_loader = create_structure_da_train_loaders(config, splits)
+            training_config = StructureDATrainingConfig(
+                epochs=config.epochs,
+                steps_per_epoch=config.steps_per_epoch,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                quality_warmup_steps=config.quality_warmup_steps,
+                grl_warmup_steps=config.grl_warmup_steps,
+                grl_gamma=config.grl_gamma,
+                loss_weights=LossWeights(
+                    qdom=config.lambda_qdom,
+                    qcls=config.lambda_qcls,
+                    diversity=config.lambda_div,
+                    sda=config.lambda_sda,
+                ),
+                log_step=config.log_step,
+                progress_bar=config.progress_bar,
+                classes=tuple(config.classes),
+            )
+            train_structure_da(
+                model, source_loader, target_loader, val_loader,
+                training_config, writer, device, best_model_path,
+            )
 
         print('Restoring best model weights for testing...')
 
@@ -247,79 +268,6 @@ def get_dataset_size(data_root, dataset):
     dir = os.path.join(data_root, dataset)
     return len([name for name in os.listdir(os.path.join(dir, 'data')) if name.endswith('.zarr')])
 
-def train_supervised(model, config, writer, splits, val_loader, device, best_model_path):
-    model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-
-    best_f1 = 0
-
-    train_transform = transforms.Compose([
-        RandomSamplePixels(config.num_pixels),
-        RandomSampleTimeSteps(config.seq_length),
-        RandomTemporalShift(max_shift=config.max_shift_aug, p=config.shift_aug_p) if config.with_shift_aug else Identity(),
-        Normalize(),
-        ToTensor(),
-    ])
-    dataset_name = config.source
-    if config.train_on_target:
-        dataset_name = config.target
-
-    dataset = PixelSetData(
-        config.data_root,
-        dataset_name,
-        config.classes,
-        train_transform,
-        indices=splits[dataset_name]['train'],
-        closed_set=config.closed_set,
-        combine_spring_and_winter=config.combine_spring_and_winter,
-    )
-    data_loader = create_train_loader(dataset, config.batch_size, config.num_workers)
-    print(f'training dataset: {dataset_name}, n={len(dataset)}, batches={len(data_loader)}')
-
-    criterion = FocalLoss(gamma=config.focal_loss_gamma)
-    steps_per_epoch = len(data_loader)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs * steps_per_epoch, eta_min=0)
-
-    best_f1 = 0
-    for epoch in range(config.epochs):
-        model.train()
-        loss_meter = AverageMeter()
-
-        progress_bar = tqdm(
-            enumerate(data_loader),
-            total=len(data_loader),
-            desc=f'Epoch {epoch + 1}/{config.epochs}',
-            disable=progress_bar_disabled(
-                getattr(config, "progress_bar", "auto")
-            ),
-        )
-        global_step = epoch * len(data_loader)
-        for step, sample in progress_bar:
-            targets = sample['label'].cuda(device=device, non_blocking=True)
-
-            pixels, mask, positions, extra = to_cuda(sample, device)
-            outputs = model.forward(pixels, mask, positions, extra)
-            loss = criterion(outputs, targets)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            loss_meter.update(loss.item(), n=config.batch_size)
-
-            if step % config.log_step == 0:
-                lr = optimizer.param_groups[0]["lr"]
-                progress_bar.set_postfix(lr=f'{lr:.1E}', loss=f"{loss_meter.avg:.3f}")
-                writer.add_scalar("train/loss", loss_meter.val, global_step + step)
-                writer.add_scalar("train/lr", lr, global_step + step)
-
-        progress_bar.close()
-
-        model.eval()
-        best_f1 = validation(best_f1, best_model_path, config, criterion, device, epoch, model, val_loader, writer)
-
-
 def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1, test_ratio=0.2):
     folds = []
     for _ in range(num_folds):
@@ -445,18 +393,29 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', default=128, type=int, help='Batch size')
     parser.add_argument('--lr', default=1e-3, type=float, help='Learning rate')
     parser.add_argument('--weight_decay', default=1e-4, type=float, help='Weight decay rate')
-    parser.add_argument('--focal_loss_gamma', default=1.0, type=float, help='gamma value for focal loss')
     parser.add_argument('--num_pixels', default=64, type=int, help='Number of pixels to sample from the input sample')
-    parser.add_argument('--seq_length', default=30, type=int, help='Number of time steps to sample from the input sample')
-    parser.add_argument('--model', default='pseltae', choices=['psetae', 'pseltae', 'psetcnn', 'psegru'])
+    parser.set_defaults(model='structure_da')
     parser.add_argument('--input_dim', default=10, type=int, help='Number of channels of input sample')
     parser.add_argument('--with_extra', default=False, type=bool_flag, help='whether to input extra geometric features to the PSE')
     parser.add_argument('--tensorboard_log_dir', default='runs')
-    parser.add_argument('--train_on_target', default=False, action='store_true', help='supervised training on target for upper bound comparison')
-
-    parser.add_argument('--with_shift_aug', default=False, type=bool_flag, help='whether to apply random temporal shift augmentation')
-    parser.add_argument('--shift_aug_p', default=1.0, type=float, help='probability to apply temporal shift augmentation')
-    parser.add_argument('--max_shift_aug', default=60, type=int, help='highest shift to apply for temporal shift augmentation')
+    parser.add_argument('--steps_per_epoch', default=None, type=int)
+    parser.add_argument('--quality_warmup_steps', default=None, type=int,
+                        help='quality warm-up steps; default None means one resolved training epoch')
+    parser.add_argument('--grl_warmup_steps', default=None, type=int,
+                        help='GRL warm-up steps; default None means one resolved training epoch')
+    parser.add_argument('--grl_gamma', default=10.0, type=float)
+    parser.add_argument('--lambda_qdom', default=1.0, type=float)
+    parser.add_argument('--lambda_qcls', default=1.0, type=float)
+    parser.add_argument('--lambda_div', default=1.0, type=float)
+    parser.add_argument('--lambda_sda', default=1.0, type=float)
+    parser.add_argument('--time_scale', default=365.0, type=float)
+    parser.add_argument('--tau_fast_init', default=0.05, type=float)
+    parser.add_argument('--tau_slow_init', default=0.20, type=float)
+    parser.add_argument('--tau_min', default=1e-4, type=float)
+    parser.add_argument('--delta_tau_min', default=1e-4, type=float)
+    parser.add_argument('--quality_hidden_cap', default=128, type=int)
+    parser.add_argument('--quality_eta', default=0.1, type=float)
+    parser.add_argument('--sda_hidden_dim', default=128, type=int)
 
     cfg = parser.parse_args()
 

@@ -71,55 +71,14 @@ class _EmptyDataset:
         return 0
 
 
-def test_supervised_training_defaults_missing_progress_bar_to_auto(
-    monkeypatch,
-):
-    captured = []
-    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
-    monkeypatch.setattr(
-        train, "PixelSetData", lambda *args, **kwargs: _EmptyDataset()
-    )
-    monkeypatch.setattr(train, "create_train_loader", lambda *args, **kwargs: [])
-    monkeypatch.setattr(train, "validation", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(
-        train,
-        "tqdm",
-        lambda *args, **kwargs: (
-            captured.append(kwargs["disable"]) or _EmptyProgress()
-        ),
-    )
-    config = SimpleNamespace(
-        lr=0.001,
-        weight_decay=0.0,
-        num_pixels=2,
-        seq_length=3,
-        max_shift_aug=5,
-        shift_aug_p=1.0,
-        with_shift_aug=False,
-        source="source",
-        target="target",
-        train_on_target=False,
-        data_root="data",
-        classes=["crop"],
-        closed_set=True,
-        combine_spring_and_winter=False,
-        batch_size=2,
-        num_workers=0,
-        focal_loss_gamma=1.0,
-        epochs=1,
+def test_structure_da_training_config_defaults_progress_bar_to_auto():
+    config = train.StructureDATrainingConfig(
+        epochs=1, steps_per_epoch=1, lr=0.001, weight_decay=0.0,
+        quality_warmup_steps=None, grl_warmup_steps=None, grl_gamma=10.0,
+        loss_weights=train.LossWeights(), log_step=1,
     )
 
-    train.train_supervised(
-        torch.nn.Linear(1, 1),
-        config,
-        writer=None,
-        splits={"source": {"train": {1}}},
-        val_loader=None,
-        device="cpu",
-        best_model_path="unused.pt",
-    )
-
-    assert captured == [True]
+    assert config.progress_bar == "auto"
 
 
 def test_final_evaluation_defaults_missing_progress_bar_to_auto(monkeypatch):
@@ -135,7 +94,7 @@ def test_final_evaluation_defaults_missing_progress_bar_to_auto(monkeypatch):
     monkeypatch.setattr(train, "prepare_data_protocol", lambda config: ({}, None))
     monkeypatch.setattr(train, "create_train_val_test_folds", lambda *args: [{}])
     monkeypatch.setattr(train, "create_evaluation_loaders", lambda *args: ([], []))
-    monkeypatch.setattr(train, "PseLTae", lambda **kwargs: Model())
+    monkeypatch.setattr(train, "StructureDAModel", lambda **kwargs: Model())
     monkeypatch.setattr(train.torch, "load", lambda *args, **kwargs: {"state_dict": {}})
     monkeypatch.setattr(
         train,
@@ -166,12 +125,20 @@ def test_final_evaluation_defaults_missing_progress_bar_to_auto(monkeypatch):
         sample_pixels_val=False,
         eval=True,
         temporal_shift=False,
-        model="pseltae",
+        model="structure_da",
         input_dim=10,
         num_classes=1,
         with_extra=False,
         classes=["crop"],
         experiment_name="test",
+        time_scale=365.0,
+        tau_fast_init=0.05,
+        tau_slow_init=0.2,
+        tau_min=1e-4,
+        delta_tau_min=1e-4,
+        quality_hidden_cap=128,
+        quality_eta=0.1,
+        sda_hidden_dim=128,
     )
 
     train.main(config)

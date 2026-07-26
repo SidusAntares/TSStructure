@@ -50,6 +50,15 @@ from .structure_ops import (
     TemporalRelationOperator,
     vectorize_channel_statistic,
 )
+from .trainer import (
+    ResolvedStructureDATraining,
+    StructureDATrainingConfig,
+    StructureDATrainStepOutput,
+    create_structure_da_train_loaders,
+    resolve_structure_da_training,
+    structure_da_train_step,
+    train_structure_da,
+)
 
 __all__ = [
     "ChannelRelationOperator",
@@ -71,6 +80,9 @@ __all__ = [
     "StructureDALosses",
     "StructureDAForwardOutput",
     "StructureDAModel",
+    "ResolvedStructureDATraining",
+    "StructureDATrainingConfig",
+    "StructureDATrainStepOutput",
     "SDADiscriminator",
     "StructuralAdversarialAdapter",
     "StructuralAdversarialOutput",
@@ -92,4 +104,8 @@ __all__ = [
     "quality_domain_loss",
     "structural_adversarial_loss",
     "vectorize_channel_statistic",
+    "create_structure_da_train_loaders",
+    "resolve_structure_da_training",
+    "structure_da_train_step",
+    "train_structure_da",
 ]
