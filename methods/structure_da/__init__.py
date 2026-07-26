@@ -19,6 +19,7 @@ from .losses import (
     quality_domain_loss,
     structural_adversarial_loss,
 )
+from .method import StructureDAForwardOutput, StructureDAModel
 from .model import (
     ComponentLTAEInputs,
     ComponentQualityBundle,
@@ -68,6 +69,8 @@ __all__ = [
     "QualityScores",
     "StructureOutput",
     "StructureDALosses",
+    "StructureDAForwardOutput",
+    "StructureDAModel",
     "SDADiscriminator",
     "StructuralAdversarialAdapter",
     "StructuralAdversarialOutput",
