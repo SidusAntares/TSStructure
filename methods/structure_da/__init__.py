@@ -3,8 +3,11 @@
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
 from .model import (
     ComponentLTAEInputs,
+    ComponentQualityBundle,
     ComponentStructureClassifier,
     ComponentStructureOutput,
+    EffectiveQualityGates,
+    StructuralQualityBundle,
 )
 from .quality import (
     ComponentQualityOutput,
@@ -27,6 +30,7 @@ from .structure_ops import (
 __all__ = [
     "ChannelRelationOperator",
     "ComponentLTAEInputs",
+    "ComponentQualityBundle",
     "ComponentQualityOutput",
     "ComponentQualityPerception",
     "ComponentStructureClassifier",
@@ -34,10 +38,12 @@ __all__ = [
     "DecompositionOutput",
     "DiscriminabilityScorer",
     "DiversityScorer",
+    "EffectiveQualityGates",
     "QualityScores",
     "StructureOutput",
     "StructuralQualityOutput",
     "StructuralQualityPerception",
+    "StructuralQualityBundle",
     "SymmetricTimeKernelDecomposition",
     "TemporalRelationOperator",
     "TransferabilityScorer",

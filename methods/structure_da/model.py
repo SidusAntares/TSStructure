@@ -11,10 +11,18 @@ from models.decoder import get_decoder
 from models.ltae import LTAE
 
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
+from .quality import (
+    ComponentQualityOutput,
+    ComponentQualityPerception,
+    StructuralQualityOutput,
+    StructuralQualityPerception,
+)
+from .schedules import apply_quality_warmup
 from .structure_ops import (
     ChannelRelationOperator,
     StructureOutput,
     TemporalRelationOperator,
+    vectorize_channel_statistic,
 )
 
 
@@ -25,6 +33,36 @@ class ComponentLTAEInputs:
     trend: torch.Tensor
     dynamics: torch.Tensor
     residual: torch.Tensor
+
+
+@dataclass(frozen=True)
+class StructuralQualityBundle:
+    """Quality measurements for the three explicit structural branches."""
+
+    trend_temporal: StructuralQualityOutput
+    dynamics_temporal: StructuralQualityOutput
+    dynamics_channel: StructuralQualityOutput
+
+
+@dataclass(frozen=True)
+class ComponentQualityBundle:
+    """Quality measurements for the three component embeddings."""
+
+    trend: ComponentQualityOutput
+    dynamics: ComponentQualityOutput
+    residual: ComponentQualityOutput
+
+
+@dataclass(frozen=True)
+class EffectiveQualityGates:
+    """Detached structural and component gates after warm-up."""
+
+    beta_trend_temporal: torch.Tensor
+    beta_dynamics_temporal: torch.Tensor
+    beta_dynamics_channel: torch.Tensor
+    q_trend: torch.Tensor
+    q_dynamics: torch.Tensor
+    q_residual: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -41,6 +79,9 @@ class ComponentStructureOutput:
     dynamics_temporal: StructureOutput
     dynamics_channel: StructureOutput
     ltae_inputs: ComponentLTAEInputs
+    structural_quality: StructuralQualityBundle
+    component_quality: ComponentQualityBundle
+    effective_gates: EffectiveQualityGates
 
 
 def _positive_integer(name: str, value: int) -> int:
@@ -89,10 +130,14 @@ class ComponentStructureClassifier(nn.Module):
         max_position: int = 365,
         max_temporal_shift: int = 100,
         classifier_hidden: Sequence[int] = (64, 32),
+        quality_hidden_cap: int = 128,
+        quality_eta: float = 0.1,
     ) -> None:
         super().__init__()
 
         self.feature_dim = _positive_integer("feature_dim", feature_dim)
+        if self.feature_dim < 2:
+            raise ValueError("feature_dim must be greater than or equal to two")
         self.num_classes = _positive_integer("num_classes", num_classes)
         if self.num_classes <= 1:
             raise ValueError("num_classes must be greater than one")
@@ -109,6 +154,9 @@ class ComponentStructureClassifier(nn.Module):
             raise ValueError("ltae_mlp[0] must equal d_model")
         classifier_hidden = _integer_sequence(
             "classifier_hidden", classifier_hidden
+        )
+        quality_hidden_cap = _positive_integer(
+            "quality_hidden_cap", quality_hidden_cap
         )
 
         positional_period = _positive_integer(
@@ -142,6 +190,19 @@ class ComponentStructureClassifier(nn.Module):
         )
         self.temporal_operator = TemporalRelationOperator(time_scale=time_scale)
         self.channel_operator = ChannelRelationOperator(time_scale=time_scale)
+        temporal_statistic_dim = 4 * self.feature_dim
+        channel_statistic_dim = (
+            self.feature_dim * (self.feature_dim - 1) // 2
+        )
+        self.trend_temporal_quality = StructuralQualityPerception(
+            temporal_statistic_dim, self.num_classes, quality_hidden_cap
+        )
+        self.dynamics_temporal_quality = StructuralQualityPerception(
+            temporal_statistic_dim, self.num_classes, quality_hidden_cap
+        )
+        self.dynamics_channel_quality = StructuralQualityPerception(
+            channel_statistic_dim, self.num_classes, quality_hidden_cap
+        )
 
         self.content_norm = nn.LayerNorm(
             self.feature_dim, elementwise_affine=False
@@ -165,6 +226,27 @@ class ComponentStructureClassifier(nn.Module):
             max_position=self.max_position,
         )
         embedding_dim = ltae_mlp[-1]
+        self.trend_component_quality = ComponentQualityPerception(
+            embedding_dim,
+            self.num_classes,
+            eta=quality_eta,
+            hidden_cap=quality_hidden_cap,
+        )
+        self.dynamics_component_quality = ComponentQualityPerception(
+            embedding_dim,
+            self.num_classes,
+            eta=quality_eta,
+            hidden_cap=quality_hidden_cap,
+        )
+        self.residual_component_quality = ComponentQualityPerception(
+            embedding_dim,
+            self.num_classes,
+            eta=quality_eta,
+            hidden_cap=quality_hidden_cap,
+        )
+        self.component_embedding_norm = nn.LayerNorm(
+            embedding_dim, elementwise_affine=False
+        )
         self.classifier = get_decoder(
             [3 * embedding_dim, *classifier_hidden], self.num_classes
         )
@@ -174,6 +256,7 @@ class ComponentStructureClassifier(nn.Module):
         H: torch.Tensor,
         positions: torch.Tensor,
         time_mask: Optional[torch.Tensor] = None,
+        quality_progress: float = 1.0,
     ) -> ComponentStructureOutput:
         """Classify PSE features with component-specific structural inputs."""
 
@@ -202,6 +285,27 @@ class ComponentStructureClassifier(nn.Module):
             decomposition.dynamics, positions, time_mask
         )
 
+        structural_quality = StructuralQualityBundle(
+            trend_temporal=self.trend_temporal_quality(
+                trend_temporal.statistic
+            ),
+            dynamics_temporal=self.dynamics_temporal_quality(
+                dynamics_temporal.statistic
+            ),
+            dynamics_channel=self.dynamics_channel_quality(
+                vectorize_channel_statistic(dynamics_channel.statistic)
+            ),
+        )
+        beta_trend_temporal = apply_quality_warmup(
+            structural_quality.trend_temporal.raw_gate, quality_progress
+        )
+        beta_dynamics_temporal = apply_quality_warmup(
+            structural_quality.dynamics_temporal.raw_gate, quality_progress
+        )
+        beta_dynamics_channel = apply_quality_warmup(
+            structural_quality.dynamics_channel.raw_gate, quality_progress
+        )
+
         zero_channel = torch.zeros_like(decomposition.trend)
         zero_temporal = H.new_zeros(
             H.shape[0], H.shape[1], 2 * self.feature_dim
@@ -210,7 +314,8 @@ class ComponentStructureClassifier(nn.Module):
             trend=torch.cat(
                 [
                     self.content_norm(decomposition.trend),
-                    self.temporal_norm(trend_temporal.local),
+                    beta_trend_temporal[:, None, None]
+                    * self.temporal_norm(trend_temporal.local),
                     zero_channel,
                 ],
                 dim=-1,
@@ -218,8 +323,10 @@ class ComponentStructureClassifier(nn.Module):
             dynamics=torch.cat(
                 [
                     self.content_norm(decomposition.dynamics),
-                    self.temporal_norm(dynamics_temporal.local),
-                    self.channel_norm(dynamics_channel.local),
+                    beta_dynamics_temporal[:, None, None]
+                    * self.temporal_norm(dynamics_temporal.local),
+                    beta_dynamics_channel[:, None, None]
+                    * self.channel_norm(dynamics_channel.local),
                 ],
                 dim=-1,
             ),
@@ -240,8 +347,39 @@ class ComponentStructureClassifier(nn.Module):
         residual_embedding = self.shared_ltae(
             ltae_inputs.residual, ltae_positions
         )
+
+        component_quality = ComponentQualityBundle(
+            trend=self.trend_component_quality(trend_embedding),
+            dynamics=self.dynamics_component_quality(dynamics_embedding),
+            residual=self.residual_component_quality(residual_embedding),
+        )
+        q_trend = apply_quality_warmup(
+            component_quality.trend.raw_gate, quality_progress
+        )
+        q_dynamics = apply_quality_warmup(
+            component_quality.dynamics.raw_gate, quality_progress
+        )
+        q_residual = apply_quality_warmup(
+            component_quality.residual.raw_gate, quality_progress
+        )
+        effective_gates = EffectiveQualityGates(
+            beta_trend_temporal=beta_trend_temporal,
+            beta_dynamics_temporal=beta_dynamics_temporal,
+            beta_dynamics_channel=beta_dynamics_channel,
+            q_trend=q_trend,
+            q_dynamics=q_dynamics,
+            q_residual=q_residual,
+        )
         fused_embedding = torch.cat(
-            [trend_embedding, dynamics_embedding, residual_embedding], dim=-1
+            [
+                q_trend[:, None]
+                * self.component_embedding_norm(trend_embedding),
+                q_dynamics[:, None]
+                * self.component_embedding_norm(dynamics_embedding),
+                q_residual[:, None]
+                * self.component_embedding_norm(residual_embedding),
+            ],
+            dim=-1,
         )
         logits = self.classifier(fused_embedding)
 
@@ -256,6 +394,9 @@ class ComponentStructureClassifier(nn.Module):
             dynamics_temporal=dynamics_temporal,
             dynamics_channel=dynamics_channel,
             ltae_inputs=ltae_inputs,
+            structural_quality=structural_quality,
+            component_quality=component_quality,
+            effective_gates=effective_gates,
         )
 
     def _validate_features(self, H: torch.Tensor) -> None:
