@@ -7,3 +7,4 @@ data/
 .vim/
 .ipynb_checkpoints
 .vscode/
+/sync_to_server.sh
