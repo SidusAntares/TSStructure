@@ -1,6 +1,11 @@
 """Building blocks for structure-aware domain adaptation."""
 
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
+from .model import (
+    ComponentLTAEInputs,
+    ComponentStructureClassifier,
+    ComponentStructureOutput,
+)
 from .structure_ops import (
     ChannelRelationOperator,
     StructureOutput,
@@ -10,6 +15,9 @@ from .structure_ops import (
 
 __all__ = [
     "ChannelRelationOperator",
+    "ComponentLTAEInputs",
+    "ComponentStructureClassifier",
+    "ComponentStructureOutput",
     "DecompositionOutput",
     "StructureOutput",
     "SymmetricTimeKernelDecomposition",
