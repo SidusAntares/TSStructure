@@ -8,7 +8,7 @@ CONDA_ENV="time"
 cd "$REPO_ROOT"
 
 pwd
-git branch --show-current
+git rev-parse --abbrev-ref HEAD
 git rev-parse HEAD
 git status --short
 
