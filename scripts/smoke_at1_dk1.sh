@@ -48,7 +48,7 @@ echo "GPU_ID=$GPU_ID"
 nvidia-smi -i "$GPU_ID"
 
 conda run -n "$CONDA_ENV" --no-capture-output \
-    python train.py \
+    python -u train.py \
     --data_root "$DATA_ROOT" \
     --source "austria/33UVP/2017" \
     --target "denmark/32VNH/2017" \
@@ -68,7 +68,7 @@ conda run -n "$CONDA_ENV" --no-capture-output \
     --lambda_qcls 1 \
     --lambda_div 1 \
     --lambda_sda 1 \
-    --progress_bar off \
+    --progress_bar auto \
     --log_step 1 \
     --output_dir outputs \
     --tensorboard_log_dir runs \

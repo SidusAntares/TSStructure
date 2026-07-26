@@ -1,6 +1,7 @@
 """Regression tests for the formal Structure DA training integration."""
 
 from types import SimpleNamespace
+import sys
 
 import pytest
 import torch
@@ -259,7 +260,7 @@ def test_trainer_auto_progress_falls_back_for_redirected_stderr(monkeypatch):
     captured = []
     model = torch.nn.Linear(1, 1)
     losses = trainer.StructureDALosses(*(torch.tensor(1.0) for _ in range(6)))
-    training_config = config(epochs=1, progress_bar="auto")
+    training_config = config(epochs=2, progress_bar="auto")
     monkeypatch.setattr(
         trainer, "progress_bar_disabled",
         lambda mode: captured.append(mode) or True,
@@ -273,7 +274,109 @@ def test_trainer_auto_progress_falls_back_for_redirected_stderr(monkeypatch):
     )
     monkeypatch.setattr(trainer, "validation", lambda *args: 0)
     trainer.train_structure_da(model, Loader(1), Loader(1), None, training_config, Writer(), "cpu", None)
-    assert captured == ["auto"]
+    assert captured == ["auto", "auto"]
+
+
+class RecordingWriter:
+    def __init__(self):
+        self.scalars = []
+
+    def add_scalar(self, *args):
+        self.scalars.append(args)
+
+
+def _run_text_logging_loop(monkeypatch, progress_bar, writer=None):
+    model = torch.nn.Linear(1, 1)
+    loss_values = (
+        (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+        (3.0, 4.0, 5.0, 6.0, 7.0, 10.0),
+    )
+
+    def fake_step(model, source, target, optimizer, device, global_step, *args):
+        values = loss_values[global_step % len(loss_values)]
+        losses = trainer.StructureDALosses(
+            classification=torch.tensor(values[0]),
+            quality_domain=torch.tensor(values[1]),
+            quality_classification=torch.tensor(values[2]),
+            diversity=torch.tensor(values[3]),
+            structural_adversarial=torch.tensor(values[4]),
+            total=torch.tensor(values[5]),
+        )
+        optimizer.step()
+        return trainer.StructureDATrainStepOutput(
+            losses, 0.25 * (global_step + 1),
+            0.25 * (global_step + 2), 1, 1,
+        )
+
+    monkeypatch.setattr(
+        trainer,
+        "structure_da_train_step",
+        fake_step,
+    )
+    validations = []
+    monkeypatch.setattr(
+        trainer, "validation", lambda *args: validations.append(args) or 0
+    )
+    trainer.train_structure_da(
+        model,
+        Loader(2),
+        Loader(2),
+        None,
+        config(epochs=2, steps_per_epoch=2, progress_bar=progress_bar),
+        writer,
+        "cpu",
+        None,
+    )
+    return validations
+
+
+@pytest.mark.parametrize("progress_bar", ["off", "auto"])
+def test_disabled_progress_emits_compact_train_line(
+    monkeypatch, capsys, progress_bar
+):
+    if progress_bar == "auto":
+        monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+
+    _run_text_logging_loop(monkeypatch, progress_bar)
+
+    output = capsys.readouterr().out
+    train_lines = [
+        line for line in output.splitlines()
+        if line.startswith("TRAIN_EPOCH|")
+    ]
+    assert len(train_lines) == 2
+    line = train_lines[0]
+    for field in (
+        "epoch=1/2", "steps=2", "total=8.0000", "cls=2.0000",
+        "qdom=3.0000", "qcls=4.0000", "div=5.0000", "sda=6.0000",
+        "rho=0.500", "grl=0.750", "lr=",
+    ):
+        assert field in line
+    assert "total=10.0000" not in line
+
+
+def test_enabled_progress_does_not_emit_compact_train_line(monkeypatch, capsys):
+    _run_text_logging_loop(monkeypatch, "on")
+
+    assert "TRAIN_EPOCH|" not in capsys.readouterr().out
+
+
+def test_epoch_text_logging_keeps_validation_once_per_epoch(monkeypatch, capsys):
+    validations = _run_text_logging_loop(monkeypatch, "off")
+
+    capsys.readouterr()
+    assert len(validations) == 2
+
+
+def test_epoch_text_logging_keeps_tensorboard_step_logging(monkeypatch, capsys):
+    writer = RecordingWriter()
+    _run_text_logging_loop(monkeypatch, "off", writer)
+
+    capsys.readouterr()
+    total_events = [event for event in writer.scalars if event[0] == "train/loss_total"]
+    assert [(event[1], event[2]) for event in total_events] == [
+        (6.0, 0), (10.0, 1), (6.0, 2), (10.0, 3),
+    ]
 
 
 def test_target_label_values_do_not_change_loss(monkeypatch):

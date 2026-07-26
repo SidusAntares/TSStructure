@@ -213,12 +213,13 @@ def train_structure_da(
     names = ("total", "classification", "quality_domain", "quality_classification", "diversity", "structural_adversarial")
 
     for epoch in range(training_config.epochs):
+        progress_disabled = progress_bar_disabled(training_config.progress_bar)
         model.train()
         meters = {name: AverageMeter() for name in names}
         source_iter, target_iter = cycle(source_loader), cycle(target_loader)
         bar = tqdm(
             range(resolved.steps_per_epoch),
-            disable=progress_bar_disabled(training_config.progress_bar),
+            disable=progress_disabled,
         )
         for local_step in bar:
             global_step = epoch * resolved.steps_per_epoch + local_step
@@ -242,12 +243,27 @@ def train_structure_da(
                 writer.add_scalar("train/quality_progress", result.quality_progress, global_step)
                 writer.add_scalar("train/grl_coefficient", result.grl_coefficient, global_step)
                 writer.add_scalar("train/lr", lr, global_step)
-            bar.set_postfix(
-                lr=f"{lr:.2e}", total=f"{meters['total'].avg:.3f}",
-                cls=f"{meters['classification'].avg:.3f}",
-                sda=f"{meters['structural_adversarial'].avg:.3f}",
-                rho=f"{result.quality_progress:.2f}",
-                grl=f"{result.grl_coefficient:.2f}",
+            if not progress_disabled:
+                bar.set_postfix(
+                    lr=f"{lr:.2e}", total=f"{meters['total'].avg:.3f}",
+                    cls=f"{meters['classification'].avg:.3f}",
+                    sda=f"{meters['structural_adversarial'].avg:.3f}",
+                    rho=f"{result.quality_progress:.2f}",
+                    grl=f"{result.grl_coefficient:.2f}",
+                )
+        if progress_disabled:
+            print(
+                f"TRAIN_EPOCH|epoch={epoch + 1}/{training_config.epochs}"
+                f"|steps={resolved.steps_per_epoch}"
+                f"|total={meters['total'].avg:.4f}"
+                f"|cls={meters['classification'].avg:.4f}"
+                f"|qdom={meters['quality_domain'].avg:.4f}"
+                f"|qcls={meters['quality_classification'].avg:.4f}"
+                f"|div={meters['diversity'].avg:.4f}"
+                f"|sda={meters['structural_adversarial'].avg:.4f}"
+                f"|rho={result.quality_progress:.3f}"
+                f"|grl={result.grl_coefficient:.3f}"
+                f"|lr={lr:.2e}"
             )
         model.eval()
         best_f1 = validation(
