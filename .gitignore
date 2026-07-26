@@ -4,6 +4,7 @@ __pycache__/*
 data/
 /outputs/
 /runs/
+/logs/
 .vim/
 .ipynb_checkpoints
 .vscode/
