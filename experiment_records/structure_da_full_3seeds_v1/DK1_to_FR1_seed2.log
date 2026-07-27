@@ -1,0 +1,545 @@
+TASK_START|gpu=0|source=DK1|target=FR1|seed=2|run=DK1_to_FR1_seed2
+DATE_START|2026-07-27T07:20:22+08:00
+GIT_HEAD|fc59a2e8f2510dfcbc38396b330ad7d7ebdda17a
+Namespace(data_root='/data/user/dataset/timematch_data', num_blocks=100, source='denmark/32VNH/2017', target='france/31TCJ/2017', num_folds=1, val_ratio=0.1, test_ratio=0.2, sample_pixels_val=True, output_dir='outputs/structure_da_full_3seeds_v1/DK1_to_FR1_seed2', experiment_name='DK1_to_FR1_seed2', num_workers=8, seed=2, device='cuda', log_step=10, eval=False, overall=False, combine_spring_and_winter=False, closed_set=True, progress_bar='auto', epochs=100, batch_size=128, lr=0.001, weight_decay=0.0001, num_pixels=64, input_dim=10, with_extra=False, tensorboard_log_dir='runs/structure_da_full_3seeds_v1/DK1_to_FR1_seed2', steps_per_epoch=None, quality_warmup_steps=None, grl_warmup_steps=None, grl_gamma=10.0, lambda_qdom=1.0, lambda_qcls=1.0, lambda_div=1.0, lambda_sda=1.0, time_scale=365.0, tau_fast_init=0.05, tau_slow_init=0.2, tau_min=0.0001, delta_tau_min=0.0001, quality_hidden_cap=128, quality_eta=0.1, sda_hidden_dim=128, model='structure_da')
+CLOSED_SET_PROTOCOL|source=denmark/32VNH/2017|target=france/31TCJ/2017|num_classes=12|classes=corn,horsebeans,meadow,spring_barley,spring_oat,spring_peas,spring_wheat,winter_barley,winter_rapeseed,winter_rye,winter_triticale,winter_wheat
+Starting fold 0...
+CLOSED_SET_COUNTS|source_total=53823|target_total=57128|source_train=37677|source_val=5382|source_test=10764|target_train=39991|target_val=5712|target_test=11425
+evaluation dataset: denmark/32VNH/2017
+val target data: 5382 (43 batches)
+test taget data: 10764 (1746 batches)
+evaluation dataset: france/31TCJ/2017
+val target data: 5712 (45 batches)
+test taget data: 11425 (1453 batches)
+StructureDAModel(
+  (spatial_encoder): PixelSetEncoder(
+    (mlp1): Sequential(
+      (0): LinearLayer(
+        (linear): Linear(in_features=10, out_features=32, bias=False)
+        (norm): BatchNorm1d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+      (1): LinearLayer(
+        (linear): Linear(in_features=32, out_features=64, bias=False)
+        (norm): BatchNorm1d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+    )
+    (mlp2): Sequential(
+      (0): LinearLayer(
+        (linear): Linear(in_features=128, out_features=128, bias=False)
+        (norm): BatchNorm1d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+    )
+  )
+  (component_classifier): ComponentStructureClassifier(
+    (decomposition): SymmetricTimeKernelDecomposition()
+    (temporal_operator): TemporalRelationOperator()
+    (channel_operator): ChannelRelationOperator()
+    (trend_temporal_quality): StructuralQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=512, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=512, out_features=12, bias=True)
+      )
+    )
+    (dynamics_temporal_quality): StructuralQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=512, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=512, out_features=12, bias=True)
+      )
+    )
+    (dynamics_channel_quality): StructuralQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((8128,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=8128, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((8128,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=8128, out_features=12, bias=True)
+      )
+    )
+    (content_norm): LayerNorm((128,), eps=1e-05, elementwise_affine=False)
+    (temporal_norm): LayerNorm((256,), eps=1e-05, elementwise_affine=False)
+    (channel_norm): LayerNorm((128,), eps=1e-05, elementwise_affine=False)
+    (shared_ltae): LTAE(
+      (inconv): LinearLayer(
+        (linear): Linear(in_features=512, out_features=256, bias=False)
+        (norm): BatchNorm1d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+      (positional_enc): Embedding(565, 256)
+      (attention_heads): MultiHeadAttention(
+        (key): Linear(in_features=256, out_features=128, bias=True)
+        (dropout): Dropout(p=0.1, inplace=False)
+        (softmax): Softmax(dim=-1)
+      )
+      (mlp): Sequential(
+        (0): LinearLayer(
+          (linear): Linear(in_features=256, out_features=128, bias=False)
+          (norm): BatchNorm1d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (activation): ReLU()
+        )
+      )
+      (dropout): Dropout(p=0.2, inplace=False)
+    )
+    (trend_component_quality): ComponentQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=128, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=128, out_features=12, bias=True)
+      )
+      (diversity): DiversityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (diversity_head): Linear(in_features=128, out_features=1, bias=True)
+        (activation): Sigmoid()
+      )
+    )
+    (dynamics_component_quality): ComponentQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=128, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=128, out_features=12, bias=True)
+      )
+      (diversity): DiversityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (diversity_head): Linear(in_features=128, out_features=1, bias=True)
+        (activation): Sigmoid()
+      )
+    )
+    (residual_component_quality): ComponentQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=128, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=128, out_features=12, bias=True)
+      )
+      (diversity): DiversityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (diversity_head): Linear(in_features=128, out_features=1, bias=True)
+        (activation): Sigmoid()
+      )
+    )
+    (component_embedding_norm): LayerNorm((128,), eps=1e-05, elementwise_affine=False)
+    (classifier): Sequential(
+      (0): LinearLayer(
+        (linear): Linear(in_features=384, out_features=64, bias=False)
+        (norm): BatchNorm1d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+      (1): LinearLayer(
+        (linear): Linear(in_features=64, out_features=32, bias=False)
+        (norm): BatchNorm1d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+      (2): Linear(in_features=32, out_features=12, bias=True)
+    )
+  )
+  (joint_builder): JointStructuralSpaceBuilder(
+    (trend_temporal_norm): LayerNorm((512,), eps=1e-05, elementwise_affine=False)
+    (dynamics_temporal_norm): LayerNorm((512,), eps=1e-05, elementwise_affine=False)
+    (dynamics_channel_norm): LayerNorm((8128,), eps=1e-05, elementwise_affine=False)
+  )
+  (adversarial_adapter): StructuralAdversarialAdapter(
+    (discriminator): SDADiscriminator(
+      (hidden): Linear(in_features=9152, out_features=128, bias=True)
+      (activation): ReLU()
+      (output): Linear(in_features=128, out_features=1, bias=True)
+    )
+  )
+)
+Number of trainable parameters: 2792486
+TRAIN_EPOCH|epoch=1/100|steps=312|total=9.2580|cls=0.7494|qdom=4.2398|qcls=7.2453|div=-3.8687|sda=0.8922|rho=0.997|grl=1.000|lr=1.00e-03
+Validation result: loss=1.7857, acc=0.51, f1=0.2814
+Validation F1 improved from -inf to 0.2814!
+Saving best model to outputs/structure_da_full_3seeds_v1/DK1_to_FR1_seed2/fold_0/model.pt
+TRAIN_EPOCH|epoch=2/100|steps=312|total=3.0953|cls=0.4469|qdom=3.4683|qcls=6.4041|div=-8.0976|sda=0.8735|rho=1.000|grl=1.000|lr=9.99e-04
+Validation result: loss=0.6919, acc=0.80, f1=0.4905
+Validation F1 improved from 0.2814 to 0.4905!
+Saving best model to outputs/structure_da_full_3seeds_v1/DK1_to_FR1_seed2/fold_0/model.pt
+TRAIN_EPOCH|epoch=3/100|steps=312|total=2.1206|cls=0.4043|qdom=3.5140|qcls=5.8751|div=-8.7061|sda=1.0332|rho=1.000|grl=1.000|lr=9.98e-04
+Validation result: loss=0.5172, acc=0.85, f1=0.5755
+Validation F1 improved from 0.4905 to 0.5755!
+Saving best model to outputs/structure_da_full_3seeds_v1/DK1_to_FR1_seed2/fold_0/model.pt
+TRAIN_EPOCH|epoch=4/100|steps=312|total=2.0398|cls=0.3864|qdom=3.2935|qcls=5.9254|div=-8.6802|sda=1.1147|rho=1.000|grl=1.000|lr=9.96e-04
+Validation result: loss=0.4886, acc=0.86, f1=0.5623
+Validation F1 did not improve from 0.5755.
+TRAIN_EPOCH|epoch=5/100|steps=312|total=1.9667|cls=0.3814|qdom=3.3229|qcls=5.8974|div=-8.7893|sda=1.1543|rho=1.000|grl=1.000|lr=9.94e-04
+Validation result: loss=0.6843, acc=0.80, f1=0.5536
+Validation F1 did not improve from 0.5755.
+TRAIN_EPOCH|epoch=6/100|steps=312|total=2.1345|cls=0.3679|qdom=3.2244|qcls=6.1514|div=-8.7101|sda=1.1009|rho=1.000|grl=1.000|lr=9.91e-04
+Validation result: loss=0.6306, acc=0.83, f1=0.5053
+Validation F1 did not improve from 0.5755.
+TRAIN_EPOCH|epoch=7/100|steps=312|total=1.4770|cls=0.3334|qdom=3.2169|qcls=5.6834|div=-8.8784|sda=1.1217|rho=1.000|grl=1.000|lr=9.88e-04
+Validation result: loss=0.5137, acc=0.85, f1=0.6231
+Validation F1 improved from 0.5755 to 0.6231!
+Saving best model to outputs/structure_da_full_3seeds_v1/DK1_to_FR1_seed2/fold_0/model.pt
+TRAIN_EPOCH|epoch=8/100|steps=312|total=1.1087|cls=0.3147|qdom=3.1640|qcls=5.4750|div=-8.9321|sda=1.0872|rho=1.000|grl=1.000|lr=9.84e-04
+Validation result: loss=0.4743, acc=0.87, f1=0.6384
+Validation F1 improved from 0.6231 to 0.6384!
+Saving best model to outputs/structure_da_full_3seeds_v1/DK1_to_FR1_seed2/fold_0/model.pt
+TRAIN_EPOCH|epoch=9/100|steps=312|total=2.0036|cls=0.3359|qdom=3.4077|qcls=5.9715|div=-8.8007|sda=1.0893|rho=1.000|grl=1.000|lr=9.80e-04
+Validation result: loss=0.6558, acc=0.82, f1=0.5433
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=10/100|steps=312|total=1.4480|cls=0.3017|qdom=3.2097|qcls=5.7167|div=-8.8949|sda=1.1148|rho=1.000|grl=1.000|lr=9.76e-04
+Validation result: loss=0.5061, acc=0.86, f1=0.6060
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=11/100|steps=312|total=1.5708|cls=0.3175|qdom=3.2577|qcls=5.7907|div=-8.9016|sda=1.1064|rho=1.000|grl=1.000|lr=9.70e-04
+Validation result: loss=0.5316, acc=0.85, f1=0.6244
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=12/100|steps=312|total=1.9649|cls=0.3178|qdom=3.3823|qcls=6.0448|div=-8.8939|sda=1.1139|rho=1.000|grl=1.000|lr=9.65e-04
+Validation result: loss=0.7591, acc=0.80, f1=0.4653
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=13/100|steps=312|total=1.4976|cls=0.3014|qdom=3.1942|qcls=5.8352|div=-8.9465|sda=1.1133|rho=1.000|grl=1.000|lr=9.59e-04
+Validation result: loss=0.6229, acc=0.82, f1=0.6000
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=14/100|steps=312|total=1.5168|cls=0.2935|qdom=3.2566|qcls=5.7673|div=-8.9803|sda=1.1798|rho=1.000|grl=1.000|lr=9.52e-04
+Validation result: loss=0.5594, acc=0.82, f1=0.6177
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=15/100|steps=312|total=1.1617|cls=0.2891|qdom=3.3096|qcls=5.3330|div=-8.9285|sda=1.1585|rho=1.000|grl=1.000|lr=9.46e-04
+Validation result: loss=0.8491, acc=0.77, f1=0.5733
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=16/100|steps=312|total=1.0805|cls=0.2749|qdom=3.1860|qcls=5.3988|div=-8.9696|sda=1.1906|rho=1.000|grl=1.000|lr=9.38e-04
+Validation result: loss=0.6276, acc=0.83, f1=0.6199
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=17/100|steps=312|total=0.8891|cls=0.2687|qdom=3.1236|qcls=5.3045|div=-8.9758|sda=1.1681|rho=1.000|grl=1.000|lr=9.30e-04
+Validation result: loss=0.6211, acc=0.84, f1=0.6329
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=18/100|steps=312|total=1.3610|cls=0.2743|qdom=3.2742|qcls=5.5435|div=-8.9868|sda=1.2558|rho=1.000|grl=1.000|lr=9.22e-04
+Validation result: loss=0.6301, acc=0.80, f1=0.6186
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=19/100|steps=312|total=0.9786|cls=0.2551|qdom=3.2025|qcls=5.2524|div=-8.9730|sda=1.2416|rho=1.000|grl=1.000|lr=9.14e-04
+Validation result: loss=0.7107, acc=0.79, f1=0.6098
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=20/100|steps=312|total=1.2130|cls=0.2568|qdom=3.3157|qcls=5.3941|div=-8.9985|sda=1.2450|rho=1.000|grl=1.000|lr=9.05e-04
+Validation result: loss=0.7570, acc=0.74, f1=0.6053
+Validation F1 did not improve from 0.6384.
+TRAIN_EPOCH|epoch=21/100|steps=312|total=0.9806|cls=0.2542|qdom=3.3103|qcls=5.1820|div=-9.0196|sda=1.2536|rho=1.000|grl=1.000|lr=8.95e-04
+Validation result: loss=0.4148, acc=0.88, f1=0.7190
+Validation F1 improved from 0.6384 to 0.7190!
+Saving best model to outputs/structure_da_full_3seeds_v1/DK1_to_FR1_seed2/fold_0/model.pt
+TRAIN_EPOCH|epoch=22/100|steps=312|total=0.4745|cls=0.2466|qdom=3.1688|qcls=4.8063|div=-8.9949|sda=1.2478|rho=1.000|grl=1.000|lr=8.85e-04
+Validation result: loss=0.6196, acc=0.81, f1=0.6343
+Validation F1 did not improve from 0.7190.
+TRAIN_EPOCH|epoch=23/100|steps=312|total=0.6270|cls=0.2425|qdom=3.1980|qcls=4.9584|div=-9.0089|sda=1.2370|rho=1.000|grl=1.000|lr=8.75e-04
+Validation result: loss=0.3546, acc=0.89, f1=0.7557
+Validation F1 improved from 0.7190 to 0.7557!
+Saving best model to outputs/structure_da_full_3seeds_v1/DK1_to_FR1_seed2/fold_0/model.pt
+TRAIN_EPOCH|epoch=24/100|steps=312|total=0.5690|cls=0.2402|qdom=3.2194|qcls=4.8390|div=-8.9818|sda=1.2522|rho=1.000|grl=1.000|lr=8.64e-04
+Validation result: loss=0.5166, acc=0.84, f1=0.6659
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=25/100|steps=312|total=0.1969|cls=0.2318|qdom=3.0590|qcls=4.7081|div=-9.0286|sda=1.2265|rho=1.000|grl=1.000|lr=8.54e-04
+Validation result: loss=0.7389, acc=0.76, f1=0.5990
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=26/100|steps=312|total=0.5319|cls=0.2303|qdom=3.2865|qcls=4.8175|div=-9.0132|sda=1.2108|rho=1.000|grl=1.000|lr=8.42e-04
+Validation result: loss=0.4522, acc=0.87, f1=0.7286
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=27/100|steps=312|total=0.6662|cls=0.2313|qdom=3.1903|qcls=5.0280|div=-9.0280|sda=1.2446|rho=1.000|grl=1.000|lr=8.31e-04
+Validation result: loss=0.3654, acc=0.90, f1=0.7443
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=28/100|steps=312|total=0.7995|cls=0.2255|qdom=3.0802|qcls=5.1804|div=-8.9761|sda=1.2895|rho=1.000|grl=1.000|lr=8.19e-04
+Validation result: loss=0.6300, acc=0.81, f1=0.6356
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=29/100|steps=312|total=0.5073|cls=0.2245|qdom=3.0858|qcls=4.9497|div=-9.0022|sda=1.2495|rho=1.000|grl=1.000|lr=8.06e-04
+Validation result: loss=0.3716, acc=0.89, f1=0.7178
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=30/100|steps=312|total=0.2617|cls=0.2129|qdom=2.9793|qcls=4.8110|div=-8.9738|sda=1.2324|rho=1.000|grl=1.000|lr=7.94e-04
+Validation result: loss=0.3785, acc=0.89, f1=0.7002
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=31/100|steps=312|total=0.7066|cls=0.2166|qdom=3.3081|qcls=4.9389|div=-8.9918|sda=1.2348|rho=1.000|grl=1.000|lr=7.81e-04
+Validation result: loss=0.4911, acc=0.85, f1=0.6671
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=32/100|steps=312|total=0.7423|cls=0.2210|qdom=3.1859|qcls=5.0608|div=-9.0039|sda=1.2784|rho=1.000|grl=1.000|lr=7.68e-04
+Validation result: loss=0.5471, acc=0.84, f1=0.6411
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=33/100|steps=312|total=1.1452|cls=0.2110|qdom=3.4025|qcls=5.2753|div=-9.0148|sda=1.2712|rho=1.000|grl=1.000|lr=7.55e-04
+Validation result: loss=0.6243, acc=0.82, f1=0.6105
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=34/100|steps=312|total=1.1127|cls=0.2097|qdom=3.5225|qcls=5.0846|div=-8.9715|sda=1.2675|rho=1.000|grl=1.000|lr=7.41e-04
+Validation result: loss=0.3688, acc=0.90, f1=0.7136
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=35/100|steps=312|total=1.0340|cls=0.2034|qdom=3.4751|qcls=5.0876|div=-9.0028|sda=1.2706|rho=1.000|grl=1.000|lr=7.27e-04
+Validation result: loss=0.2713, acc=0.93, f1=0.7557
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=36/100|steps=312|total=1.0345|cls=0.1933|qdom=3.4628|qcls=5.1158|div=-9.0196|sda=1.2821|rho=1.000|grl=1.000|lr=7.13e-04
+Validation result: loss=0.4842, acc=0.86, f1=0.6468
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=37/100|steps=312|total=1.0754|cls=0.1898|qdom=3.4009|qcls=5.1780|div=-8.9941|sda=1.3009|rho=1.000|grl=1.000|lr=6.99e-04
+Validation result: loss=0.4108, acc=0.88, f1=0.6859
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=38/100|steps=312|total=1.2842|cls=0.1908|qdom=3.5450|qcls=5.2305|div=-9.0009|sda=1.3188|rho=1.000|grl=1.000|lr=6.84e-04
+Validation result: loss=0.3916, acc=0.89, f1=0.7469
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=39/100|steps=312|total=0.7917|cls=0.2065|qdom=3.2559|qcls=5.0921|div=-9.0182|sda=1.2555|rho=1.000|grl=1.000|lr=6.69e-04
+Validation result: loss=0.5358, acc=0.84, f1=0.6610
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=40/100|steps=312|total=1.0375|cls=0.2008|qdom=3.4318|qcls=5.1548|div=-9.0183|sda=1.2684|rho=1.000|grl=1.000|lr=6.55e-04
+Validation result: loss=0.4209, acc=0.88, f1=0.6952
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=41/100|steps=312|total=0.7699|cls=0.1850|qdom=3.3765|qcls=4.9761|div=-9.0068|sda=1.2392|rho=1.000|grl=1.000|lr=6.39e-04
+Validation result: loss=0.4921, acc=0.86, f1=0.6573
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=42/100|steps=312|total=0.8793|cls=0.1929|qdom=3.5876|qcls=4.9124|div=-9.0420|sda=1.2285|rho=1.000|grl=1.000|lr=6.24e-04
+Validation result: loss=0.4586, acc=0.87, f1=0.6787
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=43/100|steps=312|total=0.8219|cls=0.1892|qdom=3.5171|qcls=4.8791|div=-9.0376|sda=1.2741|rho=1.000|grl=1.000|lr=6.09e-04
+Validation result: loss=0.3796, acc=0.90, f1=0.7116
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=44/100|steps=312|total=0.5515|cls=0.1778|qdom=3.3734|qcls=4.7633|div=-9.0319|sda=1.2688|rho=1.000|grl=1.000|lr=5.94e-04
+Validation result: loss=0.3820, acc=0.90, f1=0.6990
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=45/100|steps=312|total=0.8174|cls=0.1743|qdom=3.5523|qcls=4.8262|div=-9.0200|sda=1.2846|rho=1.000|grl=1.000|lr=5.78e-04
+Validation result: loss=0.4752, acc=0.86, f1=0.6776
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=46/100|steps=312|total=1.0059|cls=0.1724|qdom=3.6047|qcls=4.9324|div=-8.9890|sda=1.2856|rho=1.000|grl=1.000|lr=5.63e-04
+Validation result: loss=0.4288, acc=0.88, f1=0.6915
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=47/100|steps=312|total=0.9649|cls=0.1726|qdom=3.6106|qcls=4.9033|div=-9.0196|sda=1.2981|rho=1.000|grl=1.000|lr=5.47e-04
+Validation result: loss=0.5495, acc=0.85, f1=0.6214
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=48/100|steps=312|total=0.8492|cls=0.1652|qdom=3.5689|qcls=4.8516|div=-9.0298|sda=1.2933|rho=1.000|grl=1.000|lr=5.31e-04
+Validation result: loss=0.4520, acc=0.88, f1=0.6713
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=49/100|steps=312|total=0.7991|cls=0.1673|qdom=3.5381|qcls=4.8000|div=-9.0002|sda=1.2939|rho=1.000|grl=1.000|lr=5.16e-04
+Validation result: loss=0.5654, acc=0.84, f1=0.6340
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=50/100|steps=312|total=0.9536|cls=0.1671|qdom=3.6075|qcls=4.8941|div=-9.0032|sda=1.2882|rho=1.000|grl=1.000|lr=5.00e-04
+Validation result: loss=0.4666, acc=0.87, f1=0.6595
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=51/100|steps=312|total=0.8525|cls=0.1592|qdom=3.6103|qcls=4.8256|div=-9.0243|sda=1.2818|rho=1.000|grl=1.000|lr=4.84e-04
+Validation result: loss=0.4435, acc=0.87, f1=0.6814
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=52/100|steps=312|total=0.6035|cls=0.1545|qdom=3.4701|qcls=4.7101|div=-9.0164|sda=1.2853|rho=1.000|grl=1.000|lr=4.69e-04
+Validation result: loss=0.4808, acc=0.87, f1=0.6493
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=53/100|steps=312|total=0.6564|cls=0.1546|qdom=3.4633|qcls=4.7439|div=-9.0108|sda=1.3053|rho=1.000|grl=1.000|lr=4.53e-04
+Validation result: loss=0.3948, acc=0.89, f1=0.7091
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=54/100|steps=312|total=0.6085|cls=0.1473|qdom=3.4427|qcls=4.7685|div=-9.0341|sda=1.2841|rho=1.000|grl=1.000|lr=4.37e-04
+Validation result: loss=0.4255, acc=0.88, f1=0.6853
+Validation F1 did not improve from 0.7557.
+TRAIN_EPOCH|epoch=55/100|steps=312|total=0.7264|cls=0.1465|qdom=3.4740|qcls=4.7965|div=-8.9909|sda=1.3003|rho=1.000|grl=1.000|lr=4.22e-04
+Validation result: loss=0.3118, acc=0.91, f1=0.7664
+Validation F1 improved from 0.7557 to 0.7664!
+Saving best model to outputs/structure_da_full_3seeds_v1/DK1_to_FR1_seed2/fold_0/model.pt
+TRAIN_EPOCH|epoch=56/100|steps=312|total=0.5259|cls=0.1412|qdom=3.4191|qcls=4.7220|div=-9.0380|sda=1.2816|rho=1.000|grl=1.000|lr=4.06e-04
+Validation result: loss=0.3548, acc=0.90, f1=0.7351
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=57/100|steps=312|total=0.4670|cls=0.1392|qdom=3.3452|qcls=4.7396|div=-9.0308|sda=1.2738|rho=1.000|grl=1.000|lr=3.91e-04
+Validation result: loss=0.3944, acc=0.89, f1=0.6963
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=58/100|steps=312|total=0.4417|cls=0.1362|qdom=3.3340|qcls=4.7038|div=-9.0070|sda=1.2748|rho=1.000|grl=1.000|lr=3.76e-04
+Validation result: loss=0.4286, acc=0.89, f1=0.7165
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=59/100|steps=312|total=0.2118|cls=0.1350|qdom=3.2091|qcls=4.6118|div=-9.0159|sda=1.2718|rho=1.000|grl=1.000|lr=3.61e-04
+Validation result: loss=0.4453, acc=0.89, f1=0.6935
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=60/100|steps=312|total=0.4254|cls=0.1325|qdom=3.4032|qcls=4.6465|div=-9.0445|sda=1.2876|rho=1.000|grl=1.000|lr=3.45e-04
+Validation result: loss=0.3820, acc=0.90, f1=0.7313
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=61/100|steps=312|total=0.3270|cls=0.1291|qdom=3.3276|qcls=4.5749|div=-8.9952|sda=1.2906|rho=1.000|grl=1.000|lr=3.31e-04
+Validation result: loss=0.4269, acc=0.88, f1=0.7253
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=62/100|steps=312|total=0.3544|cls=0.1233|qdom=3.3462|qcls=4.6032|div=-9.0118|sda=1.2934|rho=1.000|grl=1.000|lr=3.16e-04
+Validation result: loss=0.4385, acc=0.89, f1=0.7419
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=63/100|steps=312|total=0.4101|cls=0.1237|qdom=3.4239|qcls=4.6098|div=-9.0337|sda=1.2863|rho=1.000|grl=1.000|lr=3.01e-04
+Validation result: loss=0.3841, acc=0.89, f1=0.7292
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=64/100|steps=312|total=0.2934|cls=0.1222|qdom=3.3017|qcls=4.5683|div=-8.9856|sda=1.2868|rho=1.000|grl=1.000|lr=2.87e-04
+Validation result: loss=0.3522, acc=0.91, f1=0.7572
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=65/100|steps=312|total=0.2879|cls=0.1174|qdom=3.3041|qcls=4.6026|div=-9.0257|sda=1.2895|rho=1.000|grl=1.000|lr=2.73e-04
+Validation result: loss=0.3885, acc=0.89, f1=0.7300
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=66/100|steps=312|total=0.2840|cls=0.1185|qdom=3.3359|qcls=4.5744|div=-9.0409|sda=1.2962|rho=1.000|grl=1.000|lr=2.59e-04
+Validation result: loss=0.4486, acc=0.88, f1=0.7235
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=67/100|steps=312|total=0.0989|cls=0.1125|qdom=3.2895|qcls=4.4563|div=-9.0329|sda=1.2734|rho=1.000|grl=1.000|lr=2.45e-04
+Validation result: loss=0.4522, acc=0.88, f1=0.7276
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=68/100|steps=312|total=0.1619|cls=0.1083|qdom=3.2808|qcls=4.5151|div=-9.0378|sda=1.2954|rho=1.000|grl=1.000|lr=2.32e-04
+Validation result: loss=0.3662, acc=0.91, f1=0.7256
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=69/100|steps=312|total=0.2591|cls=0.1125|qdom=3.3706|qcls=4.5178|div=-9.0315|sda=1.2897|rho=1.000|grl=1.000|lr=2.19e-04
+Validation result: loss=0.4078, acc=0.90, f1=0.7348
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=70/100|steps=312|total=0.3010|cls=0.1109|qdom=3.3641|qcls=4.5790|div=-9.0345|sda=1.2815|rho=1.000|grl=1.000|lr=2.06e-04
+Validation result: loss=0.4053, acc=0.89, f1=0.7370
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=71/100|steps=312|total=0.2735|cls=0.1058|qdom=3.3816|qcls=4.5537|div=-9.0502|sda=1.2826|rho=1.000|grl=1.000|lr=1.94e-04
+Validation result: loss=0.4100, acc=0.90, f1=0.7551
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=72/100|steps=312|total=0.4608|cls=0.1064|qdom=3.4568|qcls=4.6246|div=-9.0138|sda=1.2867|rho=1.000|grl=1.000|lr=1.81e-04
+Validation result: loss=0.3660, acc=0.91, f1=0.7490
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=73/100|steps=312|total=0.3529|cls=0.1046|qdom=3.4232|qcls=4.5631|div=-9.0163|sda=1.2783|rho=1.000|grl=1.000|lr=1.69e-04
+Validation result: loss=0.3658, acc=0.91, f1=0.7658
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=74/100|steps=312|total=0.2524|cls=0.1000|qdom=3.3197|qcls=4.5737|div=-9.0145|sda=1.2734|rho=1.000|grl=1.000|lr=1.58e-04
+Validation result: loss=0.3713, acc=0.91, f1=0.7657
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=75/100|steps=312|total=0.2583|cls=0.0988|qdom=3.3353|qcls=4.5792|div=-9.0237|sda=1.2686|rho=1.000|grl=1.000|lr=1.46e-04
+Validation result: loss=0.3652, acc=0.91, f1=0.7547
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=76/100|steps=312|total=0.0845|cls=0.0972|qdom=3.2331|qcls=4.5171|div=-9.0257|sda=1.2627|rho=1.000|grl=1.000|lr=1.36e-04
+Validation result: loss=0.3814, acc=0.91, f1=0.7548
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=77/100|steps=312|total=-0.0025|cls=0.0956|qdom=3.1620|qcls=4.5053|div=-9.0243|sda=1.2589|rho=1.000|grl=1.000|lr=1.25e-04
+Validation result: loss=0.3885, acc=0.90, f1=0.7503
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=78/100|steps=312|total=0.0664|cls=0.0928|qdom=3.2236|qcls=4.4881|div=-8.9974|sda=1.2593|rho=1.000|grl=1.000|lr=1.15e-04
+Validation result: loss=0.4099, acc=0.90, f1=0.7394
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=79/100|steps=312|total=0.0793|cls=0.0922|qdom=3.2327|qcls=4.5032|div=-9.0099|sda=1.2612|rho=1.000|grl=1.000|lr=1.05e-04
+Validation result: loss=0.3980, acc=0.90, f1=0.7525
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=80/100|steps=312|total=0.0696|cls=0.0893|qdom=3.2603|qcls=4.4877|div=-9.0241|sda=1.2564|rho=1.000|grl=1.000|lr=9.55e-05
+Validation result: loss=0.3888, acc=0.90, f1=0.7535
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=81/100|steps=312|total=0.0345|cls=0.0913|qdom=3.2813|qcls=4.4657|div=-9.0595|sda=1.2557|rho=1.000|grl=1.000|lr=8.65e-05
+Validation result: loss=0.4086, acc=0.90, f1=0.7545
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=82/100|steps=312|total=0.1000|cls=0.0868|qdom=3.3014|qcls=4.4783|div=-9.0274|sda=1.2609|rho=1.000|grl=1.000|lr=7.78e-05
+Validation result: loss=0.4151, acc=0.90, f1=0.7460
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=83/100|steps=312|total=0.0385|cls=0.0842|qdom=3.2808|qcls=4.4672|div=-9.0490|sda=1.2552|rho=1.000|grl=1.000|lr=6.96e-05
+Validation result: loss=0.4370, acc=0.89, f1=0.7601
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=84/100|steps=312|total=0.0897|cls=0.0881|qdom=3.2514|qcls=4.4937|div=-8.9889|sda=1.2454|rho=1.000|grl=1.000|lr=6.18e-05
+Validation result: loss=0.4016, acc=0.90, f1=0.7602
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=85/100|steps=312|total=0.0503|cls=0.0837|qdom=3.2483|qcls=4.4873|div=-9.0064|sda=1.2375|rho=1.000|grl=1.000|lr=5.45e-05
+Validation result: loss=0.4097, acc=0.90, f1=0.7545
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=86/100|steps=312|total=0.0334|cls=0.0847|qdom=3.2425|qcls=4.4590|div=-8.9906|sda=1.2377|rho=1.000|grl=1.000|lr=4.76e-05
+Validation result: loss=0.4208, acc=0.90, f1=0.7558
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=87/100|steps=312|total=-0.0090|cls=0.0870|qdom=3.2494|qcls=4.4434|div=-9.0268|sda=1.2379|rho=1.000|grl=1.000|lr=4.11e-05
+Validation result: loss=0.4025, acc=0.90, f1=0.7461
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=88/100|steps=312|total=0.0292|cls=0.0850|qdom=3.2771|qcls=4.4685|div=-9.0411|sda=1.2397|rho=1.000|grl=1.000|lr=3.51e-05
+Validation result: loss=0.4248, acc=0.89, f1=0.7482
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=89/100|steps=312|total=0.0425|cls=0.0838|qdom=3.2723|qcls=4.4552|div=-9.0038|sda=1.2350|rho=1.000|grl=1.000|lr=2.96e-05
+Validation result: loss=0.4332, acc=0.89, f1=0.7337
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=90/100|steps=312|total=0.0248|cls=0.0838|qdom=3.2711|qcls=4.4521|div=-9.0130|sda=1.2309|rho=1.000|grl=1.000|lr=2.45e-05
+Validation result: loss=0.4237, acc=0.89, f1=0.7473
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=91/100|steps=312|total=0.0007|cls=0.0837|qdom=3.2612|qcls=4.4529|div=-9.0254|sda=1.2283|rho=1.000|grl=1.000|lr=1.99e-05
+Validation result: loss=0.4200, acc=0.90, f1=0.7536
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=92/100|steps=312|total=0.0141|cls=0.0815|qdom=3.2641|qcls=4.4501|div=-9.0089|sda=1.2273|rho=1.000|grl=1.000|lr=1.57e-05
+Validation result: loss=0.4406, acc=0.89, f1=0.7299
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=93/100|steps=312|total=0.0213|cls=0.0830|qdom=3.2618|qcls=4.4676|div=-9.0154|sda=1.2244|rho=1.000|grl=1.000|lr=1.20e-05
+Validation result: loss=0.4393, acc=0.89, f1=0.7378
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=94/100|steps=312|total=0.0185|cls=0.0808|qdom=3.2577|qcls=4.4672|div=-9.0112|sda=1.2241|rho=1.000|grl=1.000|lr=8.86e-06
+Validation result: loss=0.4288, acc=0.89, f1=0.7396
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=95/100|steps=312|total=-0.0368|cls=0.0811|qdom=3.2476|qcls=4.4604|div=-9.0472|sda=1.2214|rho=1.000|grl=1.000|lr=6.16e-06
+Validation result: loss=0.4247, acc=0.90, f1=0.7359
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=96/100|steps=312|total=-0.0670|cls=0.0801|qdom=3.2537|qcls=4.4418|div=-9.0618|sda=1.2191|rho=1.000|grl=1.000|lr=3.94e-06
+Validation result: loss=0.4231, acc=0.90, f1=0.7469
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=97/100|steps=312|total=-0.0088|cls=0.0815|qdom=3.2414|qcls=4.4599|div=-9.0097|sda=1.2182|rho=1.000|grl=1.000|lr=2.22e-06
+Validation result: loss=0.4292, acc=0.89, f1=0.7407
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=98/100|steps=312|total=-0.0445|cls=0.0771|qdom=3.2457|qcls=4.4514|div=-9.0373|sda=1.2185|rho=1.000|grl=1.000|lr=9.87e-07
+Validation result: loss=0.4175, acc=0.90, f1=0.7495
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=99/100|steps=312|total=-0.0408|cls=0.0800|qdom=3.2440|qcls=4.4451|div=-9.0274|sda=1.2174|rho=1.000|grl=1.000|lr=2.47e-07
+Validation result: loss=0.4130, acc=0.90, f1=0.7536
+Validation F1 did not improve from 0.7664.
+TRAIN_EPOCH|epoch=100/100|steps=312|total=-0.0056|cls=0.0800|qdom=3.2433|qcls=4.4480|div=-8.9934|sda=1.2166|rho=1.000|grl=1.000|lr=0.00e+00
+Validation result: loss=0.4237, acc=0.90, f1=0.7428
+Validation F1 did not improve from 0.7664.
+Restoring best model weights for testing...
+Test result for DK1_to_FR1_seed2: accuracy=0.4921, f1=0.2307
+                  precision    recall  f1-score   support
+
+            corn       0.90      0.77      0.83      1310
+      horsebeans       0.40      0.01      0.03       140
+          meadow       0.80      0.69      0.74      3076
+   spring_barley       0.00      0.09      0.01        47
+      spring_oat       0.00      0.00      0.00         7
+     spring_peas       0.00      0.00      0.00        77
+    spring_wheat       0.00      0.00      0.00        10
+   winter_barley       0.06      0.20      0.09       806
+ winter_rapeseed       0.50      0.37      0.42       492
+      winter_rye       0.00      0.00      0.00         6
+winter_triticale       0.07      0.13      0.09       174
+    winter_wheat       0.89      0.40      0.55      5280
+
+        accuracy                           0.49     11425
+       macro avg       0.30      0.22      0.23     11425
+    weighted avg       0.76      0.49      0.58     11425
+
+corn [1014    0   18   89  137    0   49    0    0    0    0    3]
+horsebeans [ 7  2 13 22  1  0  0 11  6 40 11 27]
+meadow [  23    3 2136  534    8   14    7   55   68  102   44   82]
+spring_barley [ 1  0 13  4  0  0  0 10  0  6  6  7]
+spring_oat [0 0 1 1 0 0 0 3 1 0 1 0]
+spring_peas [ 3  0  3 14  0  0  0  2 45  0  0 10]
+spring_wheat [0 0 1 0 0 0 0 3 0 1 2 3]
+winter_barley [  6   0 244  86   2   0   1 162  55 106  36 108]
+winter_rapeseed [ 11   0  23 216   0  10   0  26 180  13   4   9]
+winter_rye [0 0 0 0 0 0 0 6 0 0 0 0]
+winter_triticale [ 2  0 17  8  0  0  1 90  2 13 22 19]
+winter_wheat [  60    0  213   21    1    1    0 2263    6  445  168 2102]
+Overall result across 1 folds:
+|                  | precision   | recall   | f1-score   | support     |
+|:-----------------|:------------|:---------|:-----------|:------------|
+| corn             | 90.0±0.0    | 77.4±0.0 | 83.2±0.0   | 1310.0±0.0  |
+| horsebeans       | 40.0±0.0    | 1.4±0.0  | 2.8±0.0    | 140.0±0.0   |
+| meadow           | 79.6±0.0    | 69.4±0.0 | 74.2±0.0   | 3076.0±0.0  |
+| spring_barley    | 0.4±0.0     | 8.5±0.0  | 0.8±0.0    | 47.0±0.0    |
+| spring_oat       | 0.0±0.0     | 0.0±0.0  | 0.0±0.0    | 7.0±0.0     |
+| spring_peas      | 0.0±0.0     | 0.0±0.0  | 0.0±0.0    | 77.0±0.0    |
+| spring_wheat     | 0.0±0.0     | 0.0±0.0  | 0.0±0.0    | 10.0±0.0    |
+| winter_barley    | 6.2±0.0     | 20.1±0.0 | 9.4±0.0    | 806.0±0.0   |
+| winter_rapeseed  | 49.6±0.0    | 36.6±0.0 | 42.1±0.0   | 492.0±0.0   |
+| winter_rye       | 0.0±0.0     | 0.0±0.0  | 0.0±0.0    | 6.0±0.0     |
+| winter_triticale | 7.5±0.0     | 12.6±0.0 | 9.4±0.0    | 174.0±0.0   |
+| winter_wheat     | 88.7±0.0    | 39.8±0.0 | 55.0±0.0   | 5280.0±0.0  |
+|                  |             |          |            |             |
+| accuracy         |             |          |            | 49.2±0.0    |
+| macro avg        | 30.2±0.0    | 22.2±0.0 | 23.1±0.0   | 11425.0±0.0 |
+accuracy: 49.2±0.0
+loss: 0.0±0.0
+macro_f1: 23.1±0.0
+weighted_f1: 57.6±0.0
+kappa: 37.4±0.0
+TASK_DONE|gpu=0|source=DK1|target=FR1|seed=2
+DATE_END|2026-07-27T08:22:16+08:00
