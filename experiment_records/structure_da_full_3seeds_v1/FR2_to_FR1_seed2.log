@@ -477,3 +477,70 @@ Validation F1 did not improve from 0.8661.
 TRAIN_EPOCH|epoch=96/100|steps=579|total=-1.1325|cls=0.0299|qdom=2.9698|qcls=2.7548|div=-8.0690|sda=1.1821|rho=1.000|grl=1.000|lr=3.94e-06
 Validation result: loss=0.1719, acc=0.96, f1=0.8205
 Validation F1 did not improve from 0.8661.
+TRAIN_EPOCH|epoch=97/100|steps=579|total=-1.1280|cls=0.0288|qdom=2.9661|qcls=2.7489|div=-8.0546|sda=1.1827|rho=1.000|grl=1.000|lr=2.22e-06
+Validation result: loss=0.1788, acc=0.95, f1=0.8091
+Validation F1 did not improve from 0.8661.
+TRAIN_EPOCH|epoch=98/100|steps=579|total=-1.1378|cls=0.0298|qdom=2.9766|qcls=2.7449|div=-8.0725|sda=1.1833|rho=1.000|grl=1.000|lr=9.87e-07
+Validation result: loss=0.1799, acc=0.95, f1=0.8112
+Validation F1 did not improve from 0.8661.
+TRAIN_EPOCH|epoch=99/100|steps=579|total=-1.1281|cls=0.0293|qdom=2.9685|qcls=2.7420|div=-8.0500|sda=1.1821|rho=1.000|grl=1.000|lr=2.47e-07
+Validation result: loss=0.1665, acc=0.96, f1=0.8155
+Validation F1 did not improve from 0.8661.
+TRAIN_EPOCH|epoch=100/100|steps=579|total=-1.1358|cls=0.0293|qdom=2.9639|qcls=2.7371|div=-8.0489|sda=1.1829|rho=1.000|grl=1.000|lr=0.00e+00
+Validation result: loss=0.1737, acc=0.95, f1=0.8151
+Validation F1 did not improve from 0.8661.
+Restoring best model weights for testing...
+Test result for FR2_to_FR1_seed2: accuracy=0.8175, f1=0.4517
+                  precision    recall  f1-score   support
+
+            corn       0.72      0.98      0.83      1361
+      horsebeans       0.33      0.10      0.15       121
+          meadow       0.61      0.99      0.76      3089
+   spring_barley       0.23      0.06      0.09        52
+     spring_peas       0.42      0.06      0.10        84
+      sunflowers       1.00      0.82      0.90      3247
+   winter_barley       0.89      0.19      0.31       783
+      winter_oat       0.50      0.02      0.04        55
+ winter_rapeseed       0.95      0.59      0.73       545
+winter_triticale       0.43      0.09      0.15       163
+    winter_wheat       0.97      0.86      0.91      5198
+
+        accuracy                           0.82     14698
+       macro avg       0.64      0.43      0.45     14698
+    weighted avg       0.85      0.82      0.80     14698
+
+corn [1330    0   28    0    0    2    0    0    0    0    1]
+horsebeans [11 12 95  0  0  1  0  0  0  0  2]
+meadow [  30    1 3050    0    0    2    1    0    0    0    5]
+spring_barley [ 4  0 33  3  0  0  0  0  0  0 12]
+spring_peas [ 2  6 53  2  5  0  3  0 13  0  0]
+sunflowers [ 308    0  259    3    7 2657    0    0    2    0   11]
+winter_barley [ 74   4 523   1   0   0 148   0   0   3  30]
+winter_oat [ 1  0 31  0  0  0  2  1  0  1 19]
+winter_rapeseed [ 16   6 203   0   0   0   0   0 320   0   0]
+winter_triticale [22  3 70  1  0  0  1  0  1 15 50]
+winter_wheat [  62    4  618    3    0    8   12    1    0   16 4474]
+Overall result across 1 folds:
+|                  | precision   | recall   | f1-score   | support     |
+|:-----------------|:------------|:---------|:-----------|:------------|
+| corn             | 71.5±0.0    | 97.7±0.0 | 82.6±0.0   | 1361.0±0.0  |
+| horsebeans       | 33.3±0.0    | 9.9±0.0  | 15.3±0.0   | 121.0±0.0   |
+| meadow           | 61.5±0.0    | 98.7±0.0 | 75.8±0.0   | 3089.0±0.0  |
+| spring_barley    | 23.1±0.0    | 5.8±0.0  | 9.2±0.0    | 52.0±0.0    |
+| spring_peas      | 41.7±0.0    | 6.0±0.0  | 10.4±0.0   | 84.0±0.0    |
+| sunflowers       | 99.5±0.0    | 81.8±0.0 | 89.8±0.0   | 3247.0±0.0  |
+| winter_barley    | 88.6±0.0    | 18.9±0.0 | 31.2±0.0   | 783.0±0.0   |
+| winter_oat       | 50.0±0.0    | 1.8±0.0  | 3.5±0.0    | 55.0±0.0    |
+| winter_rapeseed  | 95.2±0.0    | 58.7±0.0 | 72.6±0.0   | 545.0±0.0   |
+| winter_triticale | 42.9±0.0    | 9.2±0.0  | 15.2±0.0   | 163.0±0.0   |
+| winter_wheat     | 97.2±0.0    | 86.1±0.0 | 91.3±0.0   | 5198.0±0.0  |
+|                  |             |          |            |             |
+| accuracy         |             |          |            | 81.7±0.0    |
+| macro avg        | 64.0±0.0    | 43.1±0.0 | 45.2±0.0   | 14698.0±0.0 |
+accuracy: 81.7±0.0
+loss: 0.0±0.0
+macro_f1: 45.2±0.0
+weighted_f1: 80.4±0.0
+kappa: 76.1±0.0
+TASK_DONE|gpu=1|source=FR2|target=FR1|seed=2
+DATE_END|2026-07-27T11:43:34+08:00

@@ -1,0 +1,200 @@
+TASK_START|gpu=2|source=FR1|target=AT1|seed=3|run=FR1_to_AT1_seed3
+DATE_START|2026-07-27T13:41:41+08:00
+GIT_HEAD|fc59a2e8f2510dfcbc38396b330ad7d7ebdda17a
+Namespace(data_root='/data/user/dataset/timematch_data', num_blocks=100, source='france/31TCJ/2017', target='austria/33UVP/2017', num_folds=1, val_ratio=0.1, test_ratio=0.2, sample_pixels_val=True, output_dir='outputs/structure_da_full_3seeds_v1/FR1_to_AT1_seed3', experiment_name='FR1_to_AT1_seed3', num_workers=8, seed=3, device='cuda', log_step=10, eval=False, overall=False, combine_spring_and_winter=False, closed_set=True, progress_bar='auto', epochs=100, batch_size=128, lr=0.001, weight_decay=0.0001, num_pixels=64, input_dim=10, with_extra=False, tensorboard_log_dir='runs/structure_da_full_3seeds_v1/FR1_to_AT1_seed3', steps_per_epoch=None, quality_warmup_steps=None, grl_warmup_steps=None, grl_gamma=10.0, lambda_qdom=1.0, lambda_qcls=1.0, lambda_div=1.0, lambda_sda=1.0, time_scale=365.0, tau_fast_init=0.05, tau_slow_init=0.2, tau_min=0.0001, delta_tau_min=0.0001, quality_hidden_cap=128, quality_eta=0.1, sda_hidden_dim=128, model='structure_da')
+CLOSED_SET_PROTOCOL|source=france/31TCJ/2017|target=austria/33UVP/2017|num_classes=12|classes=corn,horsebeans,meadow,spring_barley,spring_peas,sunflowers,winter_barley,winter_oat,winter_peas,winter_rapeseed,winter_triticale,winter_wheat
+Starting fold 0...
+CLOSED_SET_COUNTS|source_total=74156|target_total=42731|source_train=51910|source_val=7415|source_test=14831|target_train=29912|target_val=4273|target_test=8546
+evaluation dataset: france/31TCJ/2017
+val target data: 7415 (58 batches)
+test taget data: 14831 (1574 batches)
+evaluation dataset: austria/33UVP/2017
+val target data: 4273 (34 batches)
+test taget data: 8546 (722 batches)
+StructureDAModel(
+  (spatial_encoder): PixelSetEncoder(
+    (mlp1): Sequential(
+      (0): LinearLayer(
+        (linear): Linear(in_features=10, out_features=32, bias=False)
+        (norm): BatchNorm1d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+      (1): LinearLayer(
+        (linear): Linear(in_features=32, out_features=64, bias=False)
+        (norm): BatchNorm1d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+    )
+    (mlp2): Sequential(
+      (0): LinearLayer(
+        (linear): Linear(in_features=128, out_features=128, bias=False)
+        (norm): BatchNorm1d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+    )
+  )
+  (component_classifier): ComponentStructureClassifier(
+    (decomposition): SymmetricTimeKernelDecomposition()
+    (temporal_operator): TemporalRelationOperator()
+    (channel_operator): ChannelRelationOperator()
+    (trend_temporal_quality): StructuralQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=512, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=512, out_features=12, bias=True)
+      )
+    )
+    (dynamics_temporal_quality): StructuralQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=512, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=512, out_features=12, bias=True)
+      )
+    )
+    (dynamics_channel_quality): StructuralQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((8128,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=8128, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((8128,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=8128, out_features=12, bias=True)
+      )
+    )
+    (content_norm): LayerNorm((128,), eps=1e-05, elementwise_affine=False)
+    (temporal_norm): LayerNorm((256,), eps=1e-05, elementwise_affine=False)
+    (channel_norm): LayerNorm((128,), eps=1e-05, elementwise_affine=False)
+    (shared_ltae): LTAE(
+      (inconv): LinearLayer(
+        (linear): Linear(in_features=512, out_features=256, bias=False)
+        (norm): BatchNorm1d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+      (positional_enc): Embedding(565, 256)
+      (attention_heads): MultiHeadAttention(
+        (key): Linear(in_features=256, out_features=128, bias=True)
+        (dropout): Dropout(p=0.1, inplace=False)
+        (softmax): Softmax(dim=-1)
+      )
+      (mlp): Sequential(
+        (0): LinearLayer(
+          (linear): Linear(in_features=256, out_features=128, bias=False)
+          (norm): BatchNorm1d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+          (activation): ReLU()
+        )
+      )
+      (dropout): Dropout(p=0.2, inplace=False)
+    )
+    (trend_component_quality): ComponentQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=128, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=128, out_features=12, bias=True)
+      )
+      (diversity): DiversityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (diversity_head): Linear(in_features=128, out_features=1, bias=True)
+        (activation): Sigmoid()
+      )
+    )
+    (dynamics_component_quality): ComponentQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=128, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=128, out_features=12, bias=True)
+      )
+      (diversity): DiversityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (diversity_head): Linear(in_features=128, out_features=1, bias=True)
+        (activation): Sigmoid()
+      )
+    )
+    (residual_component_quality): ComponentQualityPerception(
+      (transferability): TransferabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (hidden): Linear(in_features=128, out_features=128, bias=True)
+        (activation): ReLU()
+        (domain_head): Linear(in_features=128, out_features=2, bias=True)
+      )
+      (discriminability): DiscriminabilityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (class_head): Linear(in_features=128, out_features=12, bias=True)
+      )
+      (diversity): DiversityScorer(
+        (normalization): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+        (diversity_head): Linear(in_features=128, out_features=1, bias=True)
+        (activation): Sigmoid()
+      )
+    )
+    (component_embedding_norm): LayerNorm((128,), eps=1e-05, elementwise_affine=False)
+    (classifier): Sequential(
+      (0): LinearLayer(
+        (linear): Linear(in_features=384, out_features=64, bias=False)
+        (norm): BatchNorm1d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+      (1): LinearLayer(
+        (linear): Linear(in_features=64, out_features=32, bias=False)
+        (norm): BatchNorm1d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
+        (activation): ReLU()
+      )
+      (2): Linear(in_features=32, out_features=12, bias=True)
+    )
+  )
+  (joint_builder): JointStructuralSpaceBuilder(
+    (trend_temporal_norm): LayerNorm((512,), eps=1e-05, elementwise_affine=False)
+    (dynamics_temporal_norm): LayerNorm((512,), eps=1e-05, elementwise_affine=False)
+    (dynamics_channel_norm): LayerNorm((8128,), eps=1e-05, elementwise_affine=False)
+  )
+  (adversarial_adapter): StructuralAdversarialAdapter(
+    (discriminator): SDADiscriminator(
+      (hidden): Linear(in_features=9152, out_features=128, bias=True)
+      (activation): ReLU()
+      (output): Linear(in_features=128, out_features=1, bias=True)
+    )
+  )
+)
+Number of trainable parameters: 2792486
+TRAIN_EPOCH|epoch=1/100|steps=405|total=4.1468|cls=0.4696|qdom=3.7043|qcls=4.7098|div=-5.3225|sda=0.5856|rho=0.998|grl=1.000|lr=1.00e-03
+Validation result: loss=0.8663, acc=0.76, f1=0.3686
+Validation F1 improved from -inf to 0.3686!
+Saving best model to outputs/structure_da_full_3seeds_v1/FR1_to_AT1_seed3/fold_0/model.pt
+TRAIN_EPOCH|epoch=2/100|steps=405|total=1.1316|cls=0.2689|qdom=3.6093|qcls=4.4670|div=-8.2064|sda=0.9928|rho=1.000|grl=1.000|lr=9.99e-04
+Validation result: loss=0.3468, acc=0.90, f1=0.5360
+Validation F1 improved from 0.3686 to 0.5360!
+Saving best model to outputs/structure_da_full_3seeds_v1/FR1_to_AT1_seed3/fold_0/model.pt
+TRAIN_EPOCH|epoch=3/100|steps=405|total=0.1256|cls=0.2492|qdom=3.2324|qcls=4.1274|div=-8.4436|sda=0.9602|rho=1.000|grl=1.000|lr=9.98e-04
+Validation result: loss=0.2763, acc=0.93, f1=0.5844
+Validation F1 improved from 0.5360 to 0.5844!
+Saving best model to outputs/structure_da_full_3seeds_v1/FR1_to_AT1_seed3/fold_0/model.pt
+TRAIN_EPOCH|epoch=4/100|steps=405|total=-0.4756|cls=0.2360|qdom=2.9303|qcls=3.8853|div=-8.5022|sda=0.9750|rho=1.000|grl=1.000|lr=9.96e-04
+Validation result: loss=0.3828, acc=0.89, f1=0.5493
+Validation F1 did not improve from 0.5844.
+TRAIN_EPOCH|epoch=5/100|steps=405|total=-0.6075|cls=0.2243|qdom=2.7569|qcls=3.8707|div=-8.5097|sda=1.0502|rho=1.000|grl=1.000|lr=9.94e-04
+Validation result: loss=0.2730, acc=0.93, f1=0.5755
+Validation F1 did not improve from 0.5844.
+TRAIN_EPOCH|epoch=6/100|steps=405|total=-0.2057|cls=0.2330|qdom=2.9733|qcls=4.0709|div=-8.5413|sda=1.0584|rho=1.000|grl=1.000|lr=9.91e-04
+Validation result: loss=0.3135, acc=0.92, f1=0.5689
+Validation F1 did not improve from 0.5844.

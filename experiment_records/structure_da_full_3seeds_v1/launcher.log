@@ -54,3 +54,14 @@ OUTPUT_ROOT|outputs/structure_da_full_3seeds_v1
 [START][GPU 3] AT1_to_FR2_seed3
 [DONE][GPU 0] DK1_to_FR2_seed3
 [START][GPU 0] DK1_to_FR1_seed3
+[DONE][GPU 1] FR2_to_FR1_seed2
+[START][GPU 1] FR2_to_AT1_seed2
+[DONE][GPU 2] FR1_to_DK1_seed3
+[START][GPU 2] FR1_to_FR2_seed3
+[DONE][GPU 0] DK1_to_FR1_seed3
+[START][GPU 0] DK1_to_AT1_seed3
+[DONE][GPU 3] AT1_to_FR2_seed3
+[START][GPU 3] AT1_to_FR1_seed3
+[DONE][GPU 0] DK1_to_AT1_seed3
+[DONE][GPU 2] FR1_to_FR2_seed3
+[START][GPU 2] FR1_to_AT1_seed3
