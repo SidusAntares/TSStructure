@@ -5,6 +5,7 @@ data/
 /outputs/
 /runs/
 /logs/
+/analysis_outputs/
 .vim/
 .ipynb_checkpoints
 .vscode/

@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Unified CLI for read-only Structure DA post-hoc diagnostics."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT_DIR = Path("analysis_outputs/structure_da_full_3seeds_v1")
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    logs = commands.add_parser("logs", help="parse archived task logs")
+    logs.add_argument("--experiment-dir", type=Path, required=True)
+    logs.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+
+    raw = commands.add_parser("raw", help="analyze raw four-domain time series")
+    raw.add_argument("--data-root", type=Path, required=True)
+    raw.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+
+    checkpoint = commands.add_parser("checkpoint", help="diagnose an existing checkpoint without training")
+    checkpoint.add_argument("--task-log", type=Path, required=True)
+    checkpoint.add_argument("--checkpoint", type=Path, required=True)
+    checkpoint.add_argument("--data-root", type=Path, required=True)
+    checkpoint.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    checkpoint.add_argument("--samples-per-class", type=int, default=200)
+    checkpoint.add_argument("--diagnostic-seed", type=int, default=0)
+    checkpoint.add_argument("--device", default="cuda")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.command == "logs":
+        from analysis.structure_da.log_analysis import analyze_logs
+
+        result = analyze_logs(args.experiment_dir, args.output_dir)
+        manifest = result["manifest"]
+        print(
+            "LOG_ANALYSIS|"
+            f"logs={len(manifest['task_logs_used'])}|completed={manifest['completed']}|"
+            f"incomplete={manifest['incomplete']}|failed={manifest['failed']}|"
+            f"missing={manifest['missing']}"
+        )
+    elif args.command == "raw":
+        from analysis.structure_da.raw_timeseries import run_raw_analysis
+
+        result = run_raw_analysis(args.data_root, args.output_dir)
+        print(
+            f"RAW_ANALYSIS|groups={len(result['aggregates'])}|"
+            f"classes_union={len(result['classes_union'])}|"
+            f"classes_intersection={len(result['classes_intersection'])}"
+        )
+    else:
+        if args.samples_per_class <= 0:
+            raise ValueError("samples-per-class must be positive")
+        from analysis.structure_da.checkpoint_analysis import run_checkpoint_analysis
+
+        run_checkpoint_analysis(
+            args.task_log, args.checkpoint, args.data_root, args.output_dir,
+            samples_per_class=args.samples_per_class, device=args.device,
+            diagnostic_seed=args.diagnostic_seed,
+        )
+
+
+if __name__ == "__main__":
+    main()
