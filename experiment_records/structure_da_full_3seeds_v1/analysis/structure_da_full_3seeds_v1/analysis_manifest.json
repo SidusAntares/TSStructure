@@ -1,0 +1,13 @@
+{
+  "command": "raw",
+  "timestamp": "2026-07-27T04:54:15.059611+00:00",
+  "input_experiment_dir": null,
+  "data_root": "/data/user/dataset/timematch_data",
+  "task_logs_used": [],
+  "completed": null,
+  "incomplete": null,
+  "failed": null,
+  "diagnostic_sampling_seed": null,
+  "samples_per_class": null,
+  "checkpoint_path": null
+}
