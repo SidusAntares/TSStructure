@@ -26,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
     raw.add_argument("--data-root", type=Path, required=True)
     raw.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
 
+    decomposition = commands.add_parser(
+        "ndvi-decomposition", help="decompose existing class-domain mean NDVI curves"
+    )
+    decomposition.add_argument("--ndvi-csv", type=Path, required=True)
+    decomposition.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+
     checkpoint = commands.add_parser("checkpoint", help="diagnose an existing checkpoint without training")
     checkpoint.add_argument("--task-log", type=Path, required=True)
     checkpoint.add_argument("--checkpoint", type=Path, required=True)
@@ -58,6 +64,18 @@ def main() -> None:
             f"RAW_ANALYSIS|groups={len(result['aggregates'])}|"
             f"classes_union={len(result['classes_union'])}|"
             f"classes_intersection={len(result['classes_intersection'])}"
+        )
+    elif args.command == "ndvi-decomposition":
+        from analysis.structure_da.decomposition_diagnostics import (
+            run_ndvi_decomposition,
+        )
+
+        result = run_ndvi_decomposition(args.ndvi_csv, args.output_dir)
+        print(
+            "NDVI_DECOMPOSITION|"
+            f"classes={len(result['classes'])}|"
+            f"groups={len(result['reconstruction'])}|"
+            f"max_reconstruction_error={result['max_reconstruction_error']:.3e}"
         )
     else:
         if args.samples_per_class <= 0:

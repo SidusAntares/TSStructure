@@ -1,6 +1,8 @@
 import datetime as dt
+import importlib
 
 import numpy as np
+import pandas as pd
 
 from analysis.structure_da import raw_timeseries as raw
 from analysis.structure_da.raw_timeseries import (
@@ -134,3 +136,81 @@ def test_repository_band_mapping_identifies_red_and_nir():
     assert raw.NDVI_RED_INDEX == 2
     assert raw.NDVI_NIR_BAND == "B08"
     assert raw.NDVI_NIR_INDEX == 3
+
+
+def _decomposition_diagnostics():
+    return importlib.import_module("analysis.structure_da.decomposition_diagnostics")
+
+
+def test_ndvi_decomposition_reuses_real_operator_and_reconstructs_irregular_series():
+    diagnostics = _decomposition_diagnostics()
+    from methods.structure_da.decomposition import SymmetricTimeKernelDecomposition
+
+    rng = np.random.default_rng(11)
+    doys = [10, 23, 41, 78, 121]
+    frame = pd.DataFrame({
+        "class_name": "corn", "domain": "FR1",
+        "date": [f"2017-01-{index + 1:02d}" for index in range(len(doys))],
+        "day_of_year": doys, "ndvi_mean": rng.normal(size=len(doys)),
+        "n_parcels": 7,
+    })
+
+    components, reconstruction = diagnostics.decompose_ndvi_frame(frame)
+
+    assert diagnostics.SymmetricTimeKernelDecomposition is SymmetricTimeKernelDecomposition
+    assert reconstruction.iloc[0]["max_abs_reconstruction_error"] < 1e-5
+    reconstructed = components.pivot(
+        index="day_of_year", columns="component", values="value"
+    ).sum(axis=1)
+    assert np.allclose(reconstructed.to_numpy(), frame["ndvi_mean"], atol=1e-5)
+
+
+def test_ndvi_decomposition_sorts_rows_and_does_not_invent_missing_domains():
+    diagnostics = _decomposition_diagnostics()
+    frame = pd.DataFrame([
+        {"class_name": "wheat", "domain": "FR2", "date": "2017-03-01", "day_of_year": 60, "ndvi_mean": 0.3, "n_parcels": 4},
+        {"class_name": "corn", "domain": "FR1", "date": "2017-02-01", "day_of_year": 32, "ndvi_mean": 0.2, "n_parcels": 3},
+        {"class_name": "wheat", "domain": "FR1", "date": "2017-01-10", "day_of_year": 10, "ndvi_mean": 0.1, "n_parcels": 5},
+        {"class_name": "wheat", "domain": "FR2", "date": "2017-01-20", "day_of_year": 20, "ndvi_mean": 0.2, "n_parcels": 4},
+        {"class_name": "corn", "domain": "FR1", "date": "2017-01-05", "day_of_year": 5, "ndvi_mean": 0.1, "n_parcels": 3},
+    ])
+
+    components, reconstruction = diagnostics.decompose_ndvi_frame(frame)
+    keys = list(components[["class_name", "domain", "day_of_year", "component"]].itertuples(index=False, name=None))
+    component_order = {"trend": 0, "dynamics": 1, "residual": 2}
+
+    assert keys == sorted(keys, key=lambda row: (row[0], row[1], row[2], component_order[row[3]]))
+    assert set(zip(reconstruction["class_name"], reconstruction["domain"])) == {
+        ("corn", "FR1"), ("wheat", "FR1"), ("wheat", "FR2")
+    }
+
+
+def test_ndvi_decomposition_writes_tables_and_missing_domain_figure(tmp_path):
+    diagnostics = _decomposition_diagnostics()
+    csv_path = tmp_path / "ndvi.csv"
+    output_dir = tmp_path / "output"
+    pd.DataFrame({
+        "class_name": ["corn"] * 4,
+        "domain": ["FR1", "FR1", "FR2", "FR2"],
+        "date": ["2017-01-10", "2017-03-01", "2017-01-20", "2017-04-01"],
+        "day_of_year": [10, 60, 20, 91],
+        "ndvi_mean": [0.1, 0.5, 0.2, 0.6],
+        "n_parcels": [3, 3, 4, 4],
+    }).to_csv(csv_path, index=False)
+
+    result = diagnostics.run_ndvi_decomposition(csv_path, output_dir)
+
+    assert (output_dir / "tables/ndvi_decomposition/ndvi_decomposition_long.csv").is_file()
+    assert (output_dir / "tables/ndvi_decomposition/reconstruction_check.csv").is_file()
+    assert (output_dir / "figures/raw_timeseries/ndvi_decomposition/corn.png").is_file()
+    assert set(result["components"]["domain"]) == {"FR1", "FR2"}
+
+
+def test_cli_accepts_ndvi_decomposition_subcommand():
+    from scripts.analyze_structure_da import build_parser
+
+    args = build_parser().parse_args([
+        "ndvi-decomposition", "--ndvi-csv", "ndvi.csv", "--output-dir", "out",
+    ])
+
+    assert args.command == "ndvi-decomposition"
