@@ -40,6 +40,30 @@ def component_similarities(trend: np.ndarray, dynamics: np.ndarray, residual: np
     return result
 
 
+def combine_domain_component_metrics(
+    source: Mapping[str, np.ndarray], target: Mapping[str, np.ndarray],
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Compute temporal diagnostics per domain, then merge sample-level results."""
+
+    source_ratios = component_energy_ratios(
+        source["trend"], source["dynamics"], source["residual"]
+    )
+    target_ratios = component_energy_ratios(
+        target["trend"], target["dynamics"], target["residual"]
+    )
+    source_similarity = component_similarities(
+        source["trend"], source["dynamics"], source["residual"]
+    )
+    target_similarity = component_similarities(
+        target["trend"], target["dynamics"], target["residual"]
+    )
+    similarities = {
+        name: np.concatenate([source_similarity[name], target_similarity[name]], axis=0)
+        for name in source_similarity
+    }
+    return np.concatenate([source_ratios, target_ratios], axis=0), similarities
+
+
 def fit_pca_2d(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Fit deterministic two-dimensional PCA on the supplied joint features."""
 
@@ -364,12 +388,12 @@ def run_checkpoint_analysis(task_log: Path | str, checkpoint: Path | str, data_r
     checkpoint_table_dir.mkdir(parents=True, exist_ok=True)
     figure_dir.mkdir(parents=True, exist_ok=True)
 
-    components = {name: np.concatenate([source["components"][name], target["components"][name]]) for name in ("trend", "dynamics", "residual")}
-    ratios = component_energy_ratios(components["trend"], components["dynamics"], components["residual"])
+    ratios, similarities = combine_domain_component_metrics(
+        source["components"], target["components"]
+    )
     ratio_frame = pd.DataFrame({"domain": domains, "class": class_labels, "trend_ratio": ratios[:, 0], "dynamics_ratio": ratios[:, 1], "residual_ratio": ratios[:, 2]})
     energy_table = _aggregate_numeric(ratio_frame, ("trend_ratio", "dynamics_ratio", "residual_ratio"), ("domain", "class"))
     energy_table.to_csv(table_dir / f"checkpoint_{run.run_name}_component_energy.csv", index=False)
-    similarities = component_similarities(components["trend"], components["dynamics"], components["residual"])
     similarity_frame = pd.DataFrame({"domain": domains, "class": class_labels, **similarities})
     similarity_table = _aggregate_numeric(similarity_frame, tuple(similarities), ("domain", "class"))
     similarity_table.to_csv(checkpoint_table_dir / "component_similarity.csv", index=False)

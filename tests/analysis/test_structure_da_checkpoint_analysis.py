@@ -1,5 +1,6 @@
 import numpy as np
 
+from analysis.structure_da import checkpoint_analysis
 from analysis.structure_da.checkpoint_analysis import (
     _sample_pixels,
     component_energy_ratios,
@@ -64,3 +65,26 @@ def test_extra_features_use_training_normalization_constants():
     extra = np.array([40000.0, 1e8, 40000.0, 1.0], dtype=np.float32)
 
     assert np.array_equal(normalize_extra_features(extra), np.ones(4, dtype=np.float32))
+
+
+def test_domain_component_metrics_support_unequal_temporal_lengths():
+    source = {
+        "trend": np.ones((2, 7, 3)),
+        "dynamics": np.full((2, 7, 3), 2.0),
+        "residual": np.full((2, 7, 3), 3.0),
+    }
+    target = {
+        "trend": np.ones((3, 11, 3)),
+        "dynamics": np.full((3, 11, 3), 2.0),
+        "residual": np.full((3, 11, 3), 3.0),
+    }
+
+    ratios, similarities = checkpoint_analysis.combine_domain_component_metrics(
+        source, target
+    )
+
+    assert ratios.shape == (5, 3)
+    assert np.allclose(ratios, np.tile([1 / 14, 4 / 14, 9 / 14], (5, 1)))
+    assert set(similarities) == {"T_D", "T_R", "D_R"}
+    assert all(values.shape == (5,) for values in similarities.values())
+    assert all(np.allclose(values, 1.0) for values in similarities.values())
