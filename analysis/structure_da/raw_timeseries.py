@@ -71,14 +71,18 @@ def normalize_parcel_pixels(pixels: np.ndarray) -> np.ndarray:
 
 
 def compute_parcel_ndvi(pixels: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """Compute NDVI after training-compatible scaling and parcel pixel averaging."""
+    """Compute pixel-level NDVI, then average equally over a parcel's pixels."""
 
-    parcel_curve = normalize_parcel_pixels(pixels)
-    if parcel_curve.shape[1] <= max(NDVI_RED_INDEX, NDVI_NIR_INDEX):
+    pixels = np.asarray(pixels)
+    if pixels.ndim != 3:
+        raise ValueError("pixels must have shape [T,C,S]")
+    if pixels.shape[1] <= max(NDVI_RED_INDEX, NDVI_NIR_INDEX):
         raise ValueError("pixels do not contain the repository-defined RED/NIR channels")
-    red = parcel_curve[:, NDVI_RED_INDEX]
-    nir = parcel_curve[:, NDVI_NIR_INDEX]
-    return (nir - red) / (nir + red + eps)
+    scaled = np.clip(pixels, 0, 65535).astype(np.float64) / 65535.0
+    red = scaled[:, NDVI_RED_INDEX, :]
+    nir = scaled[:, NDVI_NIR_INDEX, :]
+    pixel_ndvi = (nir - red) / (nir + red + eps)
+    return pixel_ndvi.mean(axis=-1)
 
 
 def day_of_years(dates: Iterable[dt.date]) -> tuple[int, ...]:

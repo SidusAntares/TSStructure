@@ -38,16 +38,23 @@ def test_dates_are_real_calendar_dates_and_missing_groups_are_absent():
     assert ("DK1", "wheat") not in groups
 
 
-def test_parcel_ndvi_uses_normalized_red_and_nir_parcel_means():
-    pixels = np.zeros((2, 10, 3), dtype=np.float32)
-    pixels[:, 2, :] = 10000
-    pixels[:, 3, :] = 30000
+def test_parcel_ndvi_averages_pixel_level_ndvi():
+    pixels = np.zeros((1, 10, 2), dtype=np.float32)
+    pixels[0, 2, :] = [10000, 30000]
+    pixels[0, 3, :] = [30000, 40000]
 
     ndvi = raw.compute_parcel_ndvi(pixels)
-    red = 10000 / 65535
-    nir = 30000 / 65535
+    scaled_red = np.array([10000, 30000], dtype=np.float64) / 65535
+    scaled_nir = np.array([30000, 40000], dtype=np.float64) / 65535
+    pixel_ndvi = (scaled_nir - scaled_red) / (scaled_nir + scaled_red + 1e-8)
+    expected = pixel_ndvi.mean()
+    ratio_of_means = (
+        (scaled_nir.mean() - scaled_red.mean())
+        / (scaled_nir.mean() + scaled_red.mean() + 1e-8)
+    )
 
-    assert np.allclose(ndvi, (nir - red) / (nir + red + 1e-8))
+    assert np.allclose(ndvi, [expected])
+    assert not np.isclose(ndvi[0], ratio_of_means)
 
 
 def test_ndvi_aggregation_keeps_parcels_equally_weighted():
