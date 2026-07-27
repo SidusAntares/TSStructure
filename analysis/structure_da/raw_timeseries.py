@@ -23,6 +23,15 @@ DOMAIN_DATASETS = {
     "FR1": "france/31TCJ/2017",
     "AT1": "austria/33UVP/2017",
 }
+DOMAIN_COLORS = {"DK1": "C0", "FR2": "C1", "FR1": "C2", "AT1": "C3"}
+
+# Stored channel order follows preprocessing.read_s2_image(): 10 m bands first,
+# followed by the resampled 20 m bands.
+SENTINEL2_CHANNELS = ("B02", "B03", "B04", "B08", "B05", "B06", "B07", "B8A", "B11", "B12")
+NDVI_RED_BAND = "B04"
+NDVI_RED_INDEX = SENTINEL2_CHANNELS.index(NDVI_RED_BAND)
+NDVI_NIR_BAND = "B08"
+NDVI_NIR_INDEX = SENTINEL2_CHANNELS.index(NDVI_NIR_BAND)
 
 
 @dataclass(frozen=True)
@@ -61,6 +70,23 @@ def normalize_parcel_pixels(pixels: np.ndarray) -> np.ndarray:
     return np.clip(pixels, 0, 65535).astype(np.float64).mean(axis=-1) / 65535.0
 
 
+def compute_parcel_ndvi(pixels: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Compute NDVI after training-compatible scaling and parcel pixel averaging."""
+
+    parcel_curve = normalize_parcel_pixels(pixels)
+    if parcel_curve.shape[1] <= max(NDVI_RED_INDEX, NDVI_NIR_INDEX):
+        raise ValueError("pixels do not contain the repository-defined RED/NIR channels")
+    red = parcel_curve[:, NDVI_RED_INDEX]
+    nir = parcel_curve[:, NDVI_NIR_INDEX]
+    return (nir - red) / (nir + red + eps)
+
+
+def day_of_years(dates: Iterable[dt.date]) -> tuple[int, ...]:
+    """Derive DOY from parsed real acquisition dates."""
+
+    return tuple(date.timetuple().tm_yday for date in dates)
+
+
 def aggregate_parcel_curves(parcels: Iterable[ParcelCurve]) -> dict[tuple[str, str], RawAggregate]:
     """Aggregate parcel curves with equal weight per parcel."""
 
@@ -80,6 +106,46 @@ def aggregate_parcel_curves(parcels: Iterable[ParcelCurve]) -> dict[tuple[str, s
             sem=std / np.sqrt(len(values)), n_parcels=len(values),
         )
     return result
+
+
+def build_ndvi_tables(
+    aggregates: dict[tuple[str, str], RawAggregate],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build NDVI observations, parcel support, and temporal descriptors."""
+
+    mapping = {
+        "red_band": NDVI_RED_BAND, "red_index": NDVI_RED_INDEX,
+        "nir_band": NDVI_NIR_BAND, "nir_index": NDVI_NIR_INDEX,
+    }
+    long_rows, support_rows, descriptor_rows = [], [], []
+    for aggregate in aggregates.values():
+        doys = day_of_years(aggregate.dates)
+        for date, doy, mean, std, sem in zip(
+            aggregate.dates, doys, aggregate.mean, aggregate.std, aggregate.sem
+        ):
+            long_rows.append({
+                "class_name": aggregate.class_name, "domain": aggregate.domain,
+                "date": date.isoformat(), "day_of_year": doy,
+                "ndvi_mean": mean, "ndvi_std": std, "ndvi_sem": sem,
+                "n_parcels": aggregate.n_parcels, **mapping,
+            })
+        support_rows.append({
+            "class_name": aggregate.class_name, "domain": aggregate.domain,
+            "n_parcels": aggregate.n_parcels, **mapping,
+        })
+        peak = int(np.argmax(aggregate.mean))
+        minimum = int(np.argmin(aggregate.mean))
+        descriptor_rows.append({
+            "class_name": aggregate.class_name, "domain": aggregate.domain,
+            "n_parcels": aggregate.n_parcels,
+            "ndvi_mean_over_time": aggregate.mean.mean(),
+            "ndvi_std_over_time": aggregate.mean.std(ddof=0),
+            "ndvi_range": np.ptp(aggregate.mean),
+            "ndvi_peak_value": aggregate.mean[peak], "ndvi_peak_doy": doys[peak],
+            "ndvi_min_value": aggregate.mean[minimum], "ndvi_min_doy": doys[minimum],
+            **mapping,
+        })
+    return pd.DataFrame(long_rows), pd.DataFrame(support_rows), pd.DataFrame(descriptor_rows)
 
 
 def _save(fig: plt.Figure, path: Path) -> None:
@@ -143,6 +209,80 @@ def _plot_class_curves(class_name: str, aggregates: dict[tuple[str, str], RawAgg
     _save(fig, path)
 
 
+def _draw_ndvi_class(
+    axis: plt.Axes, class_name: str,
+    aggregates: dict[tuple[str, str], RawAggregate], shape_normalized: bool,
+) -> None:
+    for domain in DOMAIN_DATASETS:
+        aggregate = aggregates.get((domain, class_name))
+        if aggregate is None:
+            continue
+        mean = aggregate.mean
+        sem = aggregate.sem
+        if shape_normalized:
+            # Diagnostic visualization only; this transform is never used for training.
+            denominator = mean.std(ddof=0) + 1e-8
+            mean = (mean - mean.mean()) / denominator
+            sem = sem / denominator
+        doys = np.asarray(day_of_years(aggregate.dates))
+        color = DOMAIN_COLORS[domain]
+        axis.plot(
+            doys, mean, marker="o", markersize=3.5, linewidth=1.4,
+            color=color, label=domain,
+        )
+        axis.fill_between(doys, mean - sem, mean + sem, color=color, alpha=0.10)
+    axis.set_xlim(1, 366)
+    axis.grid(alpha=0.2)
+
+
+def plot_ndvi_class_curves(
+    class_name: str, aggregates: dict[tuple[str, str], RawAggregate],
+    path: Path, shape_normalized: bool = False,
+) -> None:
+    """Plot one class on each domain's unmodified real-observation DOY points."""
+
+    fig, axis = plt.subplots(figsize=(8, 5))
+    _draw_ndvi_class(axis, class_name, aggregates, shape_normalized)
+    axis.set_xlabel("Day of year (DOY)")
+    axis.set_ylabel("Shape-normalized NDVI" if shape_normalized else "NDVI")
+    qualifier = (
+        "Shape-normalized mean NDVI (diagnostic only)"
+        if shape_normalized else "Parcel-mean NDVI by domain"
+    )
+    axis.set_title(
+        f"{class_name}: {qualifier}\n"
+        f"RED={NDVI_RED_BAND}[{NDVI_RED_INDEX}], NIR={NDVI_NIR_BAND}[{NDVI_NIR_INDEX}]"
+    )
+    handles, _ = axis.get_legend_handles_labels()
+    if handles:
+        axis.legend()
+    _save(fig, path)
+
+
+def _plot_ndvi_overview(
+    classes: list[str], aggregates: dict[tuple[str, str], RawAggregate], path: Path,
+) -> None:
+    ncols = min(4, max(1, len(classes)))
+    nrows = int(np.ceil(len(classes) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.3 * ncols, 3.2 * nrows), squeeze=False)
+    for axis, class_name in zip(axes.flat, classes):
+        _draw_ndvi_class(axis, class_name, aggregates, False)
+        axis.set_title(class_name, fontsize=9)
+        axis.set_xlabel("DOY")
+        axis.set_ylabel("NDVI")
+    for axis in axes.flat[len(classes):]:
+        axis.set_visible(False)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=4)
+    fig.suptitle(
+        "Parcel-mean NDVI by domain | "
+        f"RED={NDVI_RED_BAND}[{NDVI_RED_INDEX}], NIR={NDVI_NIR_BAND}[{NDVI_NIR_INDEX}]",
+        y=1.01,
+    )
+    _save(fig, path)
+
+
 def run_raw_analysis(data_root: Path | str, output_dir: Path | str) -> dict[str, object]:
     """Analyze all four raw domains without interpolation or data mutation."""
 
@@ -175,18 +315,23 @@ def run_raw_analysis(data_root: Path | str, output_dir: Path | str) -> dict[str,
             class_name = all_classes[int(sample["label"])]
             counts[class_name] = counts.get(class_name, 0) + 1
             curve = normalize_parcel_pixels(sample["pixels"])
+            ndvi = compute_parcel_ndvi(sample["pixels"])
             accumulator = accumulators.setdefault(
                 (domain, class_name),
                 {"dates": dates, "sum": np.zeros_like(curve),
-                 "sum_sq": np.zeros_like(curve), "count": 0},
+                 "sum_sq": np.zeros_like(curve),
+                 "ndvi_sum": np.zeros_like(ndvi),
+                 "ndvi_sum_sq": np.zeros_like(ndvi), "count": 0},
             )
             accumulator["sum"] += curve
             accumulator["sum_sq"] += np.square(curve)
+            accumulator["ndvi_sum"] += ndvi
+            accumulator["ndvi_sum_sq"] += np.square(ndvi)
             accumulator["count"] += 1
         class_sets[domain] = set(counts)
         support_rows.extend({"class_name": name, "domain": domain, "parcel_count": count} for name, count in counts.items())
 
-    aggregates = {}
+    aggregates, ndvi_aggregates = {}, {}
     for (domain, class_name), accumulator in accumulators.items():
         count = int(accumulator["count"])
         mean = accumulator["sum"] / count
@@ -195,6 +340,15 @@ def run_raw_analysis(data_root: Path | str, output_dir: Path | str) -> dict[str,
         aggregates[domain, class_name] = RawAggregate(
             domain, class_name, accumulator["dates"], mean, std,
             std / np.sqrt(count), count,
+        )
+        ndvi_mean = accumulator["ndvi_sum"] / count
+        ndvi_variance = np.maximum(
+            accumulator["ndvi_sum_sq"] / count - np.square(ndvi_mean), 0
+        )
+        ndvi_std = np.sqrt(ndvi_variance)
+        ndvi_aggregates[domain, class_name] = RawAggregate(
+            domain, class_name, accumulator["dates"], ndvi_mean, ndvi_std,
+            ndvi_std / np.sqrt(count), count,
         )
     tables = output_dir / "tables"
     figures = output_dir / "figures" / "raw_timeseries"
@@ -223,12 +377,27 @@ def run_raw_analysis(data_root: Path | str, output_dir: Path | str) -> dict[str,
                 "n_parcels": aggregate.n_parcels,
             })
     pd.DataFrame(descriptors).to_csv(tables / "raw_temporal_descriptors.csv", index=False)
+    ndvi_tables = tables / "ndvi_doy"
+    ndvi_tables.mkdir(parents=True, exist_ok=True)
+    ndvi_long, ndvi_support, ndvi_descriptors = build_ndvi_tables(ndvi_aggregates)
+    ndvi_long.to_csv(ndvi_tables / "ndvi_doy_long.csv", index=False)
+    ndvi_support.to_csv(ndvi_tables / "ndvi_domain_class_support.csv", index=False)
+    ndvi_descriptors.to_csv(ndvi_tables / "ndvi_temporal_descriptors.csv", index=False)
     _plot_schedule(schedule, figures / "domain_observation_schedule.png")
     _plot_support(support, figures / "class_support.png")
     for class_name in union:
         safe_name = class_name.replace("/", "_")
         _plot_class_curves(class_name, aggregates, figures / "absolute" / f"{safe_name}.png", False)
         _plot_class_curves(class_name, aggregates, figures / "shape_normalized" / f"{safe_name}.png", True)
+        plot_ndvi_class_curves(
+            class_name, ndvi_aggregates, figures / "ndvi_doy" / f"{safe_name}.png"
+        )
+        plot_ndvi_class_curves(
+            class_name, ndvi_aggregates,
+            figures / "ndvi_doy_shape_normalized" / f"{safe_name}.png",
+            shape_normalized=True,
+        )
+    _plot_ndvi_overview(union, ndvi_aggregates, figures / "ndvi_doy_overview.png")
 
     manifest = {
         "command": "raw", "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -236,7 +405,16 @@ def run_raw_analysis(data_root: Path | str, output_dir: Path | str) -> dict[str,
         "task_logs_used": [], "completed": None, "incomplete": None,
         "failed": None, "diagnostic_sampling_seed": None,
         "samples_per_class": None, "checkpoint_path": None,
+        "ndvi_band_mapping": {
+            "red_band": NDVI_RED_BAND, "red_index": NDVI_RED_INDEX,
+            "nir_band": NDVI_NIR_BAND, "nir_index": NDVI_NIR_INDEX,
+            "stored_channel_order": SENTINEL2_CHANNELS,
+        },
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "analysis_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return {"aggregates": aggregates, "manifest": manifest, "classes_union": union, "classes_intersection": intersection}
+    return {
+        "aggregates": aggregates, "ndvi_aggregates": ndvi_aggregates,
+        "manifest": manifest, "classes_union": union,
+        "classes_intersection": intersection,
+    }
