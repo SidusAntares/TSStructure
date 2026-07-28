@@ -1,4 +1,4 @@
-"""Deterministic three-component decomposition over real timestamps."""
+"""Three-component decomposition of 3D or channel-preserving temporal features."""
 
 from dataclasses import dataclass
 import math
@@ -31,7 +31,11 @@ class SymmetricTimeKernelDecomposition(nn.Module):
 
     The two kernel scales are learned, while the decomposition itself contains
     no projections or task-specific logic. Timestamps are divided by a fixed
-    global ``time_scale`` so spacing remains comparable between samples.
+    global ``time_scale`` so spacing remains comparable between samples. Legacy
+    features may have shape ``[B,L,D]``. Channel-preserving features may have
+    shape ``[B,L,C,P]``, where ``C`` is the original-variable axis and ``P`` is
+    each variable's internal feature dimension. Decomposition acts only along
+    ``L`` and never mixes ``C`` or ``P``.
     """
 
     def __init__(
@@ -123,7 +127,11 @@ class SymmetricTimeKernelDecomposition(nn.Module):
         """Return the trend, dynamics, and residual of ``H``.
 
         Args:
-            H: Floating-point temporal features with shape ``[B, L, D]``.
+            H: Floating-point temporal features with shape ``[B,L,D]`` or
+                ``[B,L,C,P]``. The legacy 3D form remains available to existing
+                models and scalar diagnostics. In the 4D form, decomposition
+                acts only along ``L``; the original-variable axis ``C`` and
+                internal attribute axis ``P`` are preserved without mixing.
             positions: Real timestamps with shape ``[B, L]`` or ``[L]``.
             time_mask: Optional boolean or 0/1 validity mask with shape
                 ``[B, L]`` or ``[L]``. Masked outputs are zero and masked
@@ -132,21 +140,25 @@ class SymmetricTimeKernelDecomposition(nn.Module):
 
         if not isinstance(H, torch.Tensor):
             raise ValueError("H must be a torch.Tensor")
-        if H.ndim != 3:
-            raise ValueError("H must have shape [B, L, D]")
-        if H.shape[1] < 1:
-            raise ValueError("H must contain at least one time point")
+        if H.ndim not in (3, 4):
+            raise ValueError("H must have shape [B, L, D] or [B, L, C, P]")
+        if H.shape[1] < 1 or any(size < 1 for size in H.shape[2:]):
+            raise ValueError("H feature dimensions must be non-empty")
         if not H.is_floating_point():
             raise ValueError("H must use a floating-point dtype")
 
-        batch_size, sequence_length, _ = H.shape
+        batch_size, sequence_length = H.shape[:2]
         positions = self._prepare_positions(
             positions, batch_size, sequence_length, H
         )
         mask = self._prepare_mask(time_mask, batch_size, sequence_length, H.device)
         mask_values = mask.to(dtype=H.dtype)
 
-        mask_expanded = mask.unsqueeze(-1)
+        mask_expanded = mask.reshape(
+            batch_size,
+            sequence_length,
+            *([1] * (H.ndim - 2)),
+        )
         H_valid = torch.where(mask_expanded, H, torch.zeros_like(H))
         if not torch.isfinite(H_valid[mask]).all().item():
             raise ValueError("valid H values must be finite")
@@ -249,4 +261,14 @@ class SymmetricTimeKernelDecomposition(nn.Module):
             mask.unsqueeze(-1).bool(), normalizer, torch.ones_like(normalizer)
         )
         weights = kernel / normalizer
-        return torch.bmm(weights, H_valid) * mask.unsqueeze(-1)
+        original_shape = H_valid.shape
+        batch_size, sequence_length = original_shape[:2]
+        flat_features = H_valid.reshape(batch_size, sequence_length, -1)
+        smoothed = torch.bmm(weights, flat_features)
+        smoothed = smoothed.reshape(original_shape)
+        query_mask = mask.reshape(
+            batch_size,
+            sequence_length,
+            *([1] * (H_valid.ndim - 2)),
+        )
+        return smoothed * query_mask
