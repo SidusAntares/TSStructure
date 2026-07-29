@@ -116,11 +116,10 @@ def test_batch_items_are_independent():
     assert not any(isinstance(module, nn.Dropout) for module in encoder.modules())
 
 
-def test_channel_identity_shape_matches_output_features():
+def test_channel_identity_embedding_is_absent():
     encoder = _make_encoder(num_channels=4)
 
-    assert encoder.channel_embedding.num_embeddings == 4
-    assert encoder.channel_embedding.embedding_dim == encoder.channel_feature_dim
+    assert not hasattr(encoder, "channel_embedding")
 
 
 def test_selected_channel_output_depends_only_on_its_own_values():
@@ -147,39 +146,18 @@ def test_changing_another_channel_does_not_change_selected_token():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_shared_pixel_encoder_matches_channels_when_identifiers_are_zero():
-    encoder = _make_encoder(num_channels=4).eval()
-    common_values = torch.randn(2, 3, 1, 5)
+def test_shared_pixel_encoder_matches_channels_for_identical_inputs():
+    encoder = _make_encoder(num_channels=4).double().eval()
+    common_values = torch.randn(2, 3, 1, 5, dtype=torch.float64)
     pixels = common_values.expand(-1, -1, 4, -1).clone()
     valid_pixels = torch.ones(2, 3, 5, dtype=torch.bool)
-    with torch.no_grad():
-        encoder.channel_embedding.weight.zero_()
 
     output = encoder(pixels, valid_pixels)
 
     for channel in range(1, 4):
-        torch.testing.assert_close(output[:, :, channel], output[:, :, 0])
-
-
-def test_channel_identifier_is_added_exactly_after_pooling():
-    encoder = _make_encoder(num_channels=3).eval()
-    pixels = torch.randn(2, 3, 3, 5)
-    valid_pixels = torch.ones(2, 3, 5, dtype=torch.bool)
-    delta = torch.linspace(-0.3, 0.4, encoder.channel_feature_dim)
-    with torch.no_grad():
-        encoder.channel_embedding.weight.zero_()
-    base_output = encoder(pixels, valid_pixels)
-    with torch.no_grad():
-        encoder.channel_embedding.weight[1].copy_(delta)
-
-    identified_output = encoder(pixels, valid_pixels)
-
-    torch.testing.assert_close(
-        identified_output[:, :, 1] - base_output[:, :, 1],
-        delta.reshape(1, 1, -1).expand(2, 3, -1),
-    )
-    torch.testing.assert_close(identified_output[:, :, 0], base_output[:, :, 0])
-    torch.testing.assert_close(identified_output[:, :, 2], base_output[:, :, 2])
+        torch.testing.assert_close(
+            output[:, :, channel], output[:, :, 0], rtol=0, atol=1e-12
+        )
 
 
 def test_obsolete_multivariate_context_modules_are_absent():

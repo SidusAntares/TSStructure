@@ -137,14 +137,16 @@ class ChannelPreservingPixelSetEncoder(nn.Module):
     """Encode each physical variable's parcel pixel set independently.
 
     Inputs are pixel values with shape ``[B,L,C,S]`` and a valid-pixel mask
-    with shape ``[B,L,S]``. The output token ``Z[b,t,c,:]`` is the sum of a
-    shared Pixel-Set Encoder applied only to variable ``c`` and the learnable
-    identity vector for variable ``c``. The output has shape ``[B,L,C,p]``:
-    ``C`` remains the fixed original-variable axis, while ``p`` is each
-    variable's internal feature dimension. Pooling acts only over the unordered
-    within-parcel pixel-set axis ``S``; pixels are not independent samples.
-    Cross-variable relations are left to later explicit channel-structure
-    operators, and this encoder performs no channel mixing.
+    with shape ``[B,L,S]``. The output token ``Z[b,t,c,:]`` is produced only
+    from variable ``c`` by a shared pointwise encoder, masked mean and unbiased
+    sample standard deviation over ``S``, and a shared post-pooling encoder.
+    The output has shape ``[B,L,C,p]``: ``C`` remains the fixed original-variable
+    axis, while ``p`` is each variable's internal feature dimension. Tokens do
+    not contain other variables' observations, channel identity embeddings,
+    channel mixing or relations, or temporal position encodings. Channel
+    identity and cross-variable relations are left to later explicit structure
+    modules; pixels remain unordered elements of their parcel rather than
+    independent samples.
     """
 
     def __init__(
@@ -175,10 +177,6 @@ class ChannelPreservingPixelSetEncoder(nn.Module):
         self.post_pool_encoder = _TokenMLP(
             2 * pixel_hidden_dim, self.channel_feature_dim
         )
-        self.channel_embedding = nn.Embedding(
-            self.num_channels, self.channel_feature_dim
-        )
-        nn.init.normal_(self.channel_embedding.weight, mean=0.0, std=0.02)
 
     def _validate_inputs(self, pixels, valid_pixels):
         if pixels.ndim != 4:
@@ -224,7 +222,6 @@ class ChannelPreservingPixelSetEncoder(nn.Module):
         """Return channel-preserving parcel tokens with shape ``[B,L,C,p]``."""
 
         mask_bool, mask = self._validate_inputs(pixels, valid_pixels)
-        channels = pixels.shape[2]
         values = pixels.permute(0, 1, 3, 2).unsqueeze(-1)
         if not torch.isfinite(values[mask_bool]).all().item():
             raise ValueError("valid pixel values must be finite")
@@ -236,12 +233,7 @@ class ChannelPreservingPixelSetEncoder(nn.Module):
 
         pixel_features = self.pixel_value_encoder(values)
         mean, std = _masked_mean_and_sample_std(pixel_features, mask, self.eps)
-        base_tokens = self.post_pool_encoder(torch.cat([mean, std], dim=-1))
-        channel_indices = torch.arange(channels, device=pixels.device)
-        channel_identity = self.channel_embedding(channel_indices).reshape(
-            1, 1, channels, self.channel_feature_dim
-        )
-        return base_tokens + channel_identity
+        return self.post_pool_encoder(torch.cat([mean, std], dim=-1))
 
 
 def masked_mean(x, mask):
