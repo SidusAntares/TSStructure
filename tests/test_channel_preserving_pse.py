@@ -14,10 +14,7 @@ def _make_encoder(num_channels=10, channel_feature_dim=12):
     return ChannelPreservingPixelSetEncoder(
         num_channels=num_channels,
         channel_feature_dim=channel_feature_dim,
-        self_hidden_dim=7,
-        context_hidden_dim=11,
-        channel_embedding_dim=5,
-        pixel_token_dim=9,
+        pixel_hidden_dim=9,
     )
 
 
@@ -116,22 +113,17 @@ def test_batch_items_are_independent():
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert not any(isinstance(module, nn.BatchNorm1d) for module in encoder.modules())
+    assert not any(isinstance(module, nn.Dropout) for module in encoder.modules())
 
 
-def test_channel_identity_uses_distinct_embedding_rows():
+def test_channel_identity_shape_matches_output_features():
     encoder = _make_encoder(num_channels=4)
 
     assert encoder.channel_embedding.num_embeddings == 4
-    assert encoder.channel_embedding.embedding_dim == 5
-    row_stride = encoder.channel_embedding.weight.stride(0)
-    assert row_stride > 0
-    assert (
-        encoder.channel_embedding.weight[0].data_ptr()
-        != encoder.channel_embedding.weight[1].data_ptr()
-    )
+    assert encoder.channel_embedding.embedding_dim == encoder.channel_feature_dim
 
 
-def test_selected_channel_output_has_gradient_to_its_own_values():
+def test_selected_channel_output_depends_only_on_its_own_values():
     encoder = _make_encoder(num_channels=3)
     pixels = torch.randn(1, 2, 3, 4, requires_grad=True)
     valid_pixels = torch.ones(1, 2, 4, dtype=torch.bool)
@@ -139,17 +131,62 @@ def test_selected_channel_output_has_gradient_to_its_own_values():
     encoder(pixels, valid_pixels)[0, 1, 2].sum().backward()
 
     assert torch.count_nonzero(pixels.grad[0, 1, 2]).item() > 0
+    assert torch.count_nonzero(pixels.grad[0, 1, :2]).item() == 0
 
 
-def test_selected_channel_output_has_gradient_to_same_pixel_context():
+def test_changing_another_channel_does_not_change_selected_token():
+    encoder = _make_encoder(num_channels=3).eval()
+    pixels = torch.randn(2, 3, 3, 4)
+    valid_pixels = torch.ones(2, 3, 4, dtype=torch.bool)
+    expected = encoder(pixels, valid_pixels)[:, :, 1].clone()
+    changed = pixels.clone()
+    changed[:, :, 2] = torch.randn_like(changed[:, :, 2]) * 1e6
+
+    actual = encoder(changed, valid_pixels)[:, :, 1]
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_shared_pixel_encoder_matches_channels_when_identifiers_are_zero():
+    encoder = _make_encoder(num_channels=4).eval()
+    common_values = torch.randn(2, 3, 1, 5)
+    pixels = common_values.expand(-1, -1, 4, -1).clone()
+    valid_pixels = torch.ones(2, 3, 5, dtype=torch.bool)
+    with torch.no_grad():
+        encoder.channel_embedding.weight.zero_()
+
+    output = encoder(pixels, valid_pixels)
+
+    for channel in range(1, 4):
+        torch.testing.assert_close(output[:, :, channel], output[:, :, 0])
+
+
+def test_channel_identifier_is_added_exactly_after_pooling():
+    encoder = _make_encoder(num_channels=3).eval()
+    pixels = torch.randn(2, 3, 3, 5)
+    valid_pixels = torch.ones(2, 3, 5, dtype=torch.bool)
+    delta = torch.linspace(-0.3, 0.4, encoder.channel_feature_dim)
+    with torch.no_grad():
+        encoder.channel_embedding.weight.zero_()
+    base_output = encoder(pixels, valid_pixels)
+    with torch.no_grad():
+        encoder.channel_embedding.weight[1].copy_(delta)
+
+    identified_output = encoder(pixels, valid_pixels)
+
+    torch.testing.assert_close(
+        identified_output[:, :, 1] - base_output[:, :, 1],
+        delta.reshape(1, 1, -1).expand(2, 3, -1),
+    )
+    torch.testing.assert_close(identified_output[:, :, 0], base_output[:, :, 0])
+    torch.testing.assert_close(identified_output[:, :, 2], base_output[:, :, 2])
+
+
+def test_obsolete_multivariate_context_modules_are_absent():
     encoder = _make_encoder(num_channels=3)
-    pixels = torch.randn(1, 2, 3, 4, requires_grad=True)
-    valid_pixels = torch.ones(1, 2, 4, dtype=torch.bool)
 
-    encoder(pixels, valid_pixels)[0, 1, 2].sum().backward()
-
-    cross_channel_grad = pixels.grad[0, 1, :2]
-    assert torch.count_nonzero(cross_channel_grad).item() > 0
+    assert not hasattr(encoder, "spectral_context_encoder")
+    assert not hasattr(encoder, "pixel_token_encoder")
 
 
 def test_legacy_pixel_set_encoder_output_shape_is_unchanged():
@@ -194,3 +231,41 @@ def test_input_validation_rejects_invalid_shapes_and_dtypes(
 
     with pytest.raises((TypeError, ValueError), match=message):
         encoder(pixels, valid_pixels)
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf")])
+def test_nonfinite_valid_pixel_value_raises_value_error(nonfinite):
+    encoder = _make_encoder(num_channels=3)
+    pixels = torch.randn(1, 2, 3, 4)
+    valid_pixels = torch.ones(1, 2, 4, dtype=torch.bool)
+    pixels[0, 1, 2, 3] = nonfinite
+
+    with pytest.raises(ValueError, match="valid pixel values must be finite"):
+        encoder(pixels, valid_pixels)
+
+
+@pytest.mark.parametrize(
+    "invalid_mask_value",
+    [0.5, 2.0, -1.0, float("nan"), float("inf")],
+)
+def test_float_mask_must_contain_only_finite_binary_values(invalid_mask_value):
+    encoder = _make_encoder(num_channels=3)
+    pixels = torch.randn(1, 2, 3, 4)
+    valid_pixels = torch.ones(1, 2, 4)
+    valid_pixels[0, 1, 2] = invalid_mask_value
+
+    with pytest.raises(ValueError, match="finite 0/1 values"):
+        encoder(pixels, valid_pixels)
+
+
+def test_bool_and_equivalent_float_masks_match():
+    encoder = _make_encoder(num_channels=3).eval()
+    pixels = torch.randn(1, 2, 3, 4)
+    bool_mask = torch.tensor(
+        [[[True, False, True, True], [False, True, True, False]]]
+    )
+
+    bool_output = encoder(pixels, bool_mask)
+    float_output = encoder(pixels, bool_mask.float())
+
+    torch.testing.assert_close(float_output, bool_output, rtol=0, atol=0)

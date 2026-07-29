@@ -134,23 +134,24 @@ def _masked_mean_and_sample_std(tokens, valid_pixels, eps=1e-8):
 
 
 class ChannelPreservingPixelSetEncoder(nn.Module):
-    """Encode parcel pixel sets without eliminating raw-variable identity.
+    """Encode each physical variable's parcel pixel set independently.
 
     Inputs are pixel values with shape ``[B,L,C,S]`` and a valid-pixel mask
-    with shape ``[B,L,S]``. The output has shape ``[B,L,C,p]``: ``C`` remains
-    the original variable axis, while ``p`` is the internal feature dimension
-    of each variable token. Pooling acts only over the unordered within-parcel
-    pixel-set axis ``S``; pixels are not treated as independent samples.
+    with shape ``[B,L,S]``. The output token ``Z[b,t,c,:]`` is the sum of a
+    shared Pixel-Set Encoder applied only to variable ``c`` and the learnable
+    identity vector for variable ``c``. The output has shape ``[B,L,C,p]``:
+    ``C`` remains the fixed original-variable axis, while ``p`` is each
+    variable's internal feature dimension. Pooling acts only over the unordered
+    within-parcel pixel-set axis ``S``; pixels are not independent samples.
+    Cross-variable relations are left to later explicit channel-structure
+    operators, and this encoder performs no channel mixing.
     """
 
     def __init__(
         self,
         num_channels: int,
         channel_feature_dim: int = 16,
-        self_hidden_dim: int = 16,
-        context_hidden_dim: int = 32,
-        channel_embedding_dim: int = 8,
-        pixel_token_dim: int = 16,
+        pixel_hidden_dim: int = 16,
         eps: float = 1e-8,
     ):
         super().__init__()
@@ -158,10 +159,7 @@ class ChannelPreservingPixelSetEncoder(nn.Module):
             raise ValueError("num_channels must be positive")
         for name, value in (
             ("channel_feature_dim", channel_feature_dim),
-            ("self_hidden_dim", self_hidden_dim),
-            ("context_hidden_dim", context_hidden_dim),
-            ("channel_embedding_dim", channel_embedding_dim),
-            ("pixel_token_dim", pixel_token_dim),
+            ("pixel_hidden_dim", pixel_hidden_dim),
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -173,20 +171,14 @@ class ChannelPreservingPixelSetEncoder(nn.Module):
         self.output_dim = channel_feature_dim
         self.eps = eps
 
-        self.self_value_encoder = _TokenMLP(1, self_hidden_dim)
-        self.spectral_context_encoder = _TokenMLP(
-            self.num_channels, context_hidden_dim
+        self.pixel_value_encoder = _TokenMLP(1, pixel_hidden_dim)
+        self.post_pool_encoder = _TokenMLP(
+            2 * pixel_hidden_dim, self.channel_feature_dim
         )
         self.channel_embedding = nn.Embedding(
-            self.num_channels, channel_embedding_dim
+            self.num_channels, self.channel_feature_dim
         )
-        combined_dim = (
-            self_hidden_dim + context_hidden_dim + channel_embedding_dim
-        )
-        self.pixel_token_encoder = _TokenMLP(combined_dim, pixel_token_dim)
-        self.post_pool_encoder = _TokenMLP(
-            2 * pixel_token_dim, self.channel_feature_dim
-        )
+        nn.init.normal_(self.channel_embedding.weight, mean=0.0, std=0.02)
 
     def _validate_inputs(self, pixels, valid_pixels):
         if pixels.ndim != 4:
@@ -210,10 +202,19 @@ class ChannelPreservingPixelSetEncoder(nn.Module):
                 f"pixels channel dimension must equal num_channels={self.num_channels}"
             )
 
-        mask = valid_pixels.to(dtype=pixels.dtype)
-        if torch.any(mask.sum(dim=-1) == 0):
+        if valid_pixels.dtype == torch.bool:
+            mask_bool = valid_pixels
+        else:
+            if not torch.isfinite(valid_pixels).all().item() or not torch.all(
+                (valid_pixels == 0) | (valid_pixels == 1)
+            ).item():
+                raise ValueError("valid_pixels must contain only finite 0/1 values")
+            mask_bool = valid_pixels != 0
+
+        mask_bool = mask_bool.to(device=pixels.device)
+        if torch.any(mask_bool.sum(dim=-1) == 0):
             raise ValueError("each [B,L] date must contain at least one valid pixel")
-        return mask
+        return mask_bool, mask_bool.to(dtype=pixels.dtype)
 
     def forward(
         self,
@@ -222,35 +223,25 @@ class ChannelPreservingPixelSetEncoder(nn.Module):
     ) -> torch.Tensor:
         """Return channel-preserving parcel tokens with shape ``[B,L,C,p]``."""
 
-        mask = self._validate_inputs(pixels, valid_pixels)
-        batch, time, channels, num_pixels = pixels.shape
-        spectra = pixels.permute(0, 1, 3, 2)
-        spectra = torch.where(
-            mask.unsqueeze(-1) != 0,
-            spectra,
-            torch.zeros_like(spectra),
+        mask_bool, mask = self._validate_inputs(pixels, valid_pixels)
+        channels = pixels.shape[2]
+        values = pixels.permute(0, 1, 3, 2).unsqueeze(-1)
+        if not torch.isfinite(values[mask_bool]).all().item():
+            raise ValueError("valid pixel values must be finite")
+        values = torch.where(
+            mask_bool.unsqueeze(-1).unsqueeze(-1),
+            values,
+            torch.zeros_like(values),
         )
 
-        self_feature = self.self_value_encoder(spectra.unsqueeze(-1))
-        context_feature = self.spectral_context_encoder(spectra)
-        context_feature = context_feature.unsqueeze(-2).expand(
-            batch, time, num_pixels, channels, -1
-        )
-
+        pixel_features = self.pixel_value_encoder(values)
+        mean, std = _masked_mean_and_sample_std(pixel_features, mask, self.eps)
+        base_tokens = self.post_pool_encoder(torch.cat([mean, std], dim=-1))
         channel_indices = torch.arange(channels, device=pixels.device)
-        channel_identity = self.channel_embedding(channel_indices)
-        channel_identity = channel_identity.reshape(1, 1, 1, channels, -1).expand(
-            batch, time, num_pixels, channels, -1
+        channel_identity = self.channel_embedding(channel_indices).reshape(
+            1, 1, channels, self.channel_feature_dim
         )
-
-        pixel_tokens = self.pixel_token_encoder(
-            torch.cat(
-                [self_feature, context_feature, channel_identity],
-                dim=-1,
-            )
-        )
-        mean, std = _masked_mean_and_sample_std(pixel_tokens, mask, self.eps)
-        return self.post_pool_encoder(torch.cat([mean, std], dim=-1))
+        return base_tokens + channel_identity
 
 
 def masked_mean(x, mask):
