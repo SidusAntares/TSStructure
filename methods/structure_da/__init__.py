@@ -59,6 +59,14 @@ from .temporal_functional import (
     TemporalFunctionalLift,
     TemporalFunctionalOutput,
 )
+from .temporal_registration import (
+    MonotoneWarpEstimator,
+    MonotoneWarpOutput,
+    SourceRunningSRVFTemplate,
+    SourceSRVFTemplateOutput,
+    TemporalRegistrationOutput,
+    TemporalSRVFRegistration,
+)
 from .temporal_srvf import (
     SourceRunningSupportScale,
     TemporalSRVFExtractor,
@@ -89,6 +97,8 @@ __all__ = [
     "JointStructuralOutput",
     "JointStructuralSpaceBuilder",
     "LossWeights",
+    "MonotoneWarpEstimator",
+    "MonotoneWarpOutput",
     "QualityScores",
     "StructureOutput",
     "StructureDALosses",
@@ -102,6 +112,8 @@ __all__ = [
     "SDADiscriminator",
     "SourceRunningStandardizer",
     "SourceRunningSupportScale",
+    "SourceRunningSRVFTemplate",
+    "SourceSRVFTemplateOutput",
     "StructuralAdversarialAdapter",
     "StructuralAdversarialOutput",
     "StructuralQualityOutput",
@@ -110,8 +122,10 @@ __all__ = [
     "SymmetricTimeKernelDecomposition",
     "TemporalFunctionalLift",
     "TemporalFunctionalOutput",
+    "TemporalRegistrationOutput",
     "TemporalSRVFExtractor",
     "TemporalSRVFOutput",
+    "TemporalSRVFRegistration",
     "TemporalRelationOperator",
     "TransferabilityScorer",
     "apply_quality_warmup",
