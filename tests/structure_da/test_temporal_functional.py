@@ -178,6 +178,7 @@ def test_output_shapes_and_dtype(dtype: torch.dtype) -> None:
     assert output.coefficients.shape == (2, 8, 12)
     assert output.function.shape == (2, 24, 12)
     assert output.derivative.shape == (2, 24, 12)
+    assert output.information_variance.shape == (2, 24)
     assert output.time_mask.shape == (2, 7)
     assert output.time_mask.dtype == torch.bool
     assert output.solve_valid.shape == (2,)
@@ -187,12 +188,59 @@ def test_output_shapes_and_dtype(dtype: torch.dtype) -> None:
         output.coefficients,
         output.function,
         output.derivative,
+        output.information_variance,
         output.time_span,
         output.max_internal_gap,
     ):
         assert value.dtype == dtype
     assert output.num_valid_observations.shape == (2,)
     assert output.num_distinct_observations.shape == (2,)
+    assert torch.isfinite(output.information_variance).all()
+    assert torch.all(output.information_variance >= 0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_information_variance_matches_batched_cholesky_reference(
+    dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(45)
+    lift = _make_lift(smoothing_weight=2e-3, eps=1e-7)
+    tokens = torch.randn(2, 6, 3, 4, dtype=dtype)
+    positions = torch.tensor(
+        [[0.0, 41.0, 97.0, 153.0, 242.0, 340.0],
+         [13.0, 62.0, 118.0, 191.0, 280.0, 355.0]],
+        dtype=dtype,
+    )
+    time_mask = torch.tensor(
+        [[True, True, True, True, True, True],
+         [True, True, False, True, False, True]]
+    )
+
+    output = lift(tokens, positions, time_mask)
+
+    fitting_positions = torch.where(
+        time_mask, output.normalized_positions, torch.zeros_like(positions)
+    )
+    basis, _, _ = _evaluate_cubic_bspline(fitting_positions, lift.knots)
+    weighted_basis = basis * time_mask.unsqueeze(-1).to(dtype=dtype)
+    gram = basis.transpose(1, 2) @ weighted_basis
+    roughness = lift.roughness_matrix.to(dtype=dtype)
+    identity = torch.eye(lift.num_basis, dtype=dtype)
+    gram = gram + lift.smoothing_weight * roughness + lift.eps * identity
+    cholesky = torch.linalg.cholesky(gram)
+    canonical_basis = lift.canonical_basis.to(dtype=dtype)
+    canonical_rhs = canonical_basis.T.unsqueeze(0).expand(2, -1, -1)
+    solved_basis = torch.cholesky_solve(canonical_rhs, cholesky)
+    expected = (
+        canonical_basis.T.unsqueeze(0) * solved_basis
+    ).sum(dim=1).clamp_min(0.0)
+
+    torch.testing.assert_close(
+        output.information_variance,
+        expected,
+        atol=2e-5 if dtype == torch.float32 else 1e-10,
+        rtol=2e-5 if dtype == torch.float32 else 1e-10,
+    )
 
 
 def test_spline_reconstructs_smooth_polynomial_on_canonical_grid() -> None:
@@ -360,6 +408,10 @@ def test_solve_valid_requires_at_least_two_distinct_observations() -> None:
     assert output.num_distinct_observations.tolist() == [4, 1, 0]
     for value in (output.coefficients, output.function, output.derivative):
         torch.testing.assert_close(value[1:], torch.zeros_like(value[1:]))
+    torch.testing.assert_close(
+        output.information_variance[1:],
+        torch.zeros_like(output.information_variance[1:]),
+    )
 
 
 def test_duplicate_valid_positions_raise_clear_error() -> None:

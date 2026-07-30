@@ -19,6 +19,7 @@ class TemporalFunctionalOutput:
     coefficients: Tensor
     function: Tensor
     derivative: Tensor
+    information_variance: Tensor
 
     time_mask: Tensor
     solve_valid: Tensor
@@ -560,6 +561,15 @@ class TemporalFunctionalLift(nn.Module):
         )
         function = canonical_basis.unsqueeze(0) @ coefficients
         derivative = canonical_derivative.unsqueeze(0) @ coefficients
+        canonical_rhs = canonical_basis.T.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        solved_basis = torch.cholesky_solve(
+            canonical_rhs, safe_cholesky
+        )
+        information_variance = (
+            canonical_basis.T.unsqueeze(0) * solved_basis
+        ).sum(dim=1).clamp_min(0.0)
         finite_valid = (
             torch.isfinite(coefficients).reshape(batch_size, -1).all(dim=1)
             & torch.isfinite(function).reshape(batch_size, -1).all(dim=1)
@@ -575,12 +585,18 @@ class TemporalFunctionalLift(nn.Module):
         derivative = torch.where(
             solve_mask, derivative, torch.zeros_like(derivative)
         )
+        information_variance = torch.where(
+            solve_valid.unsqueeze(-1),
+            information_variance,
+            torch.zeros_like(information_variance),
+        )
         return TemporalFunctionalOutput(
             standardized_tokens=standardized_tokens,
             normalized_positions=normalized_positions,
             coefficients=coefficients,
             function=function,
             derivative=derivative,
+            information_variance=information_variance,
             time_mask=resolved_time_mask,
             solve_valid=solve_valid,
             num_valid_observations=num_valid_observations,

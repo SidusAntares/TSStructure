@@ -59,6 +59,11 @@ from .temporal_functional import (
     TemporalFunctionalLift,
     TemporalFunctionalOutput,
 )
+from .temporal_srvf import (
+    SourceRunningSupportScale,
+    TemporalSRVFExtractor,
+    TemporalSRVFOutput,
+)
 from .trainer import (
     ResolvedStructureDATraining,
     StructureDATrainingConfig,
@@ -96,6 +101,7 @@ __all__ = [
     "StructureDATrainStepOutput",
     "SDADiscriminator",
     "SourceRunningStandardizer",
+    "SourceRunningSupportScale",
     "StructuralAdversarialAdapter",
     "StructuralAdversarialOutput",
     "StructuralQualityOutput",
@@ -104,6 +110,8 @@ __all__ = [
     "SymmetricTimeKernelDecomposition",
     "TemporalFunctionalLift",
     "TemporalFunctionalOutput",
+    "TemporalSRVFExtractor",
+    "TemporalSRVFOutput",
     "TemporalRelationOperator",
     "TransferabilityScorer",
     "apply_quality_warmup",
