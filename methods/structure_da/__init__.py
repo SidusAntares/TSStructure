@@ -54,6 +54,11 @@ from .structure_ops import (
     TemporalRelationOperator,
     vectorize_channel_statistic,
 )
+from .temporal_functional import (
+    SourceRunningStandardizer,
+    TemporalFunctionalLift,
+    TemporalFunctionalOutput,
+)
 from .trainer import (
     ResolvedStructureDATraining,
     StructureDATrainingConfig,
@@ -90,12 +95,15 @@ __all__ = [
     "StructureDATrainingConfig",
     "StructureDATrainStepOutput",
     "SDADiscriminator",
+    "SourceRunningStandardizer",
     "StructuralAdversarialAdapter",
     "StructuralAdversarialOutput",
     "StructuralQualityOutput",
     "StructuralQualityPerception",
     "StructuralQualityBundle",
     "SymmetricTimeKernelDecomposition",
+    "TemporalFunctionalLift",
+    "TemporalFunctionalOutput",
     "TemporalRelationOperator",
     "TransferabilityScorer",
     "apply_quality_warmup",
