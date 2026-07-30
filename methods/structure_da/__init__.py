@@ -54,6 +54,10 @@ from .structure_ops import (
     TemporalRelationOperator,
     vectorize_channel_statistic,
 )
+from .temporal_coordinates import (
+    TemporalCoordinateOutput,
+    TemporalShapePhaseCoordinates,
+)
 from .temporal_functional import (
     SourceRunningStandardizer,
     TemporalFunctionalLift,
@@ -127,6 +131,7 @@ __all__ = [
     "StructuralQualityPerception",
     "StructuralQualityBundle",
     "SymmetricTimeKernelDecomposition",
+    "TemporalCoordinateOutput",
     "TemporalFunctionalLift",
     "TemporalFunctionalOutput",
     "TemporalGeometryLossOutput",
@@ -135,6 +140,7 @@ __all__ = [
     "TemporalSRVFExtractor",
     "TemporalSRVFOutput",
     "TemporalSRVFRegistration",
+    "TemporalShapePhaseCoordinates",
     "TemporalRelationOperator",
     "TransferabilityScorer",
     "apply_quality_warmup",
