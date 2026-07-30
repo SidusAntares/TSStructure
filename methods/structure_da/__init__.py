@@ -8,6 +8,10 @@ from .adaptation import (
     StructuralAdversarialOutput,
     gradient_reverse,
 )
+from .backbone import (
+    StructureBackbone,
+    StructureBackboneOutput,
+)
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
 from .losses import (
     LossWeights,
@@ -78,6 +82,8 @@ __all__ = [
     "QualityScores",
     "StructureOutput",
     "StructureDALosses",
+    "StructureBackbone",
+    "StructureBackboneOutput",
     "StructureDAForwardOutput",
     "StructureDAModel",
     "ResolvedStructureDATraining",
