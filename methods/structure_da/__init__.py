@@ -59,6 +59,12 @@ from .temporal_functional import (
     TemporalFunctionalLift,
     TemporalFunctionalOutput,
 )
+from .temporal_geometry import (
+    PhaseTangentOutput,
+    TemporalGeometryLossOutput,
+    TemporalGeometryObjective,
+    warp_to_identity_tangent,
+)
 from .temporal_registration import (
     MonotoneWarpEstimator,
     MonotoneWarpOutput,
@@ -99,6 +105,7 @@ __all__ = [
     "LossWeights",
     "MonotoneWarpEstimator",
     "MonotoneWarpOutput",
+    "PhaseTangentOutput",
     "QualityScores",
     "StructureOutput",
     "StructureDALosses",
@@ -122,6 +129,8 @@ __all__ = [
     "SymmetricTimeKernelDecomposition",
     "TemporalFunctionalLift",
     "TemporalFunctionalOutput",
+    "TemporalGeometryLossOutput",
+    "TemporalGeometryObjective",
     "TemporalRegistrationOutput",
     "TemporalSRVFExtractor",
     "TemporalSRVFOutput",
@@ -144,4 +153,5 @@ __all__ = [
     "resolve_structure_da_training",
     "structure_da_train_step",
     "train_structure_da",
+    "warp_to_identity_tangent",
 ]
