@@ -375,12 +375,15 @@ def joint_structure_da_train_step(
     model,
     source_sample,
     target_sample,
-    optimizer,
+    task_optimizer,
+    geometry_optimizer,
     quality_objective,
     training_config,
     device,
     *,
     domain_score_weight: float = 1.0,
+    task_scheduler=None,
+    geometry_scheduler=None,
 ) -> JointStructureDATrainStepOutput:
     if not isinstance(model, StructureAwareDomainAdaptationModel):
         raise ValueError("model must be StructureAwareDomainAdaptationModel")
@@ -389,7 +392,8 @@ def joint_structure_da_train_step(
     source_labels = source_sample["label"].to(device=device, dtype=torch.long)
     source_tensors = _sample_to_device(source_sample, device)
     target_tensors = _sample_to_device(target_sample, device)
-    optimizer.zero_grad(set_to_none=True)
+    task_optimizer.zero_grad(set_to_none=True)
+    geometry_optimizer.zero_grad(set_to_none=True)
     source_backbone = model.forward_backbone(*source_tensors)
     target_backbone = model.forward_backbone(*target_tensors)
     model.update_source_state_from_backbone(
@@ -465,8 +469,20 @@ def joint_structure_da_train_step(
         geometry,
         alignment,
     )
-    total_loss.backward()
-    optimizer.step()
+    weighted_geometry_loss = training_config.geometry_weight * geometry_loss
+    task_total_loss = (
+        training_config.task_weight * task_loss
+        + quality_loss.total_loss
+        + training_config.alignment_weight * alignment_loss
+    )
+    weighted_geometry_loss.backward()
+    geometry_optimizer.step()
+    if geometry_scheduler is not None:
+        geometry_scheduler.step()
+    task_total_loss.backward()
+    task_optimizer.step()
+    if task_scheduler is not None:
+        task_scheduler.step()
     quality = merged_quality
     return JointStructureDATrainStepOutput(
         losses=loss_output,
@@ -571,13 +587,23 @@ def train_joint_structure_da(
 ):
     steps_per_epoch = _resolve_steps(training_config, source_loader, target_loader)
     model.to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
+    task_optimizer = torch.optim.Adam(
+        model.task_parameters(),
         lr=training_config.lr,
         weight_decay=training_config.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
+    geometry_optimizer = torch.optim.Adam(
+        model.geometry_parameters(),
+        lr=training_config.lr,
+        weight_decay=training_config.weight_decay,
+    )
+    task_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        task_optimizer,
+        T_max=training_config.epochs * steps_per_epoch,
+        eta_min=0,
+    )
+    geometry_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        geometry_optimizer,
         T_max=training_config.epochs * steps_per_epoch,
         eta_min=0,
     )
@@ -613,13 +639,15 @@ def train_joint_structure_da(
                 model,
                 next(source_iterator),
                 next(target_iterator),
-                optimizer,
+                task_optimizer,
+                geometry_optimizer,
                 quality_objective,
                 training_config,
                 device,
                 domain_score_weight=domain_score_weight,
+                task_scheduler=task_scheduler,
+                geometry_scheduler=geometry_scheduler,
             )
-            scheduler.step()
             losses = result.losses
             values = {
                 "total": losses.total_loss,
@@ -638,7 +666,7 @@ def train_joint_structure_da(
                 diagnostic_meters.setdefault(name, AverageMeter()).update(
                     value.item()
                 )
-            lr = optimizer.param_groups[0]["lr"]
+            lr = task_optimizer.param_groups[0]["lr"]
             lr_meter.update(lr)
             diagnostics = result.diagnostics.scalars
             if (

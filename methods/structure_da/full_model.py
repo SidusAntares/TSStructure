@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from collections.abc import Iterator
 from typing import Any
 
 import torch
@@ -143,6 +144,41 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             grl_max_iters=grl_max_iters,
             grl_weight=grl_weight,
         )
+
+    def _parameter_partition(
+        self,
+    ) -> tuple[tuple[nn.Parameter, ...], tuple[nn.Parameter, ...]]:
+        geometry = tuple(
+            parameter
+            for parameter in self.temporal_operator.extractor.warp_parameters()
+            if parameter.requires_grad
+        )
+        geometry_ids = {id(parameter) for parameter in geometry}
+        trainable = tuple(
+            parameter for parameter in self.parameters() if parameter.requires_grad
+        )
+        task = tuple(
+            parameter
+            for parameter in trainable
+            if id(parameter) not in geometry_ids
+        )
+        task_ids = {id(parameter) for parameter in task}
+        trainable_ids = {id(parameter) for parameter in trainable}
+        if geometry_ids & task_ids or geometry_ids | task_ids != trainable_ids:
+            raise RuntimeError(
+                "geometry and task parameters must be disjoint and exhaustive"
+            )
+        return geometry, task
+
+    def geometry_parameters(self) -> Iterator[nn.Parameter]:
+        """Yield exactly the trainable temporal warp-estimator parameters."""
+
+        yield from self._parameter_partition()[0]
+
+    def task_parameters(self) -> Iterator[nn.Parameter]:
+        """Yield every trainable parameter not owned by temporal geometry."""
+
+        yield from self._parameter_partition()[1]
 
     def _resolve_channel_mask(
         self,

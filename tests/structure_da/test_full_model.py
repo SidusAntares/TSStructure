@@ -102,6 +102,24 @@ def test_model_contains_exactly_one_shared_module_of_each_kind() -> None:
     ) == 1
 
 
+def test_geometry_and_task_parameter_sets_are_disjoint_and_exhaustive() -> None:
+    model = _model()
+    geometry = list(model.geometry_parameters())
+    task = list(model.task_parameters())
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    warp = list(model.temporal_operator.extractor.registration.warp_estimator.parameters())
+
+    assert {id(parameter) for parameter in geometry} == {
+        id(parameter) for parameter in warp if parameter.requires_grad
+    }
+    assert {id(parameter) for parameter in geometry}.isdisjoint(
+        {id(parameter) for parameter in task}
+    )
+    assert {id(parameter) for parameter in (*geometry, *task)} == {
+        id(parameter) for parameter in trainable
+    }
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_forward_details_shapes_extra_compatibility_and_read_only_state(dtype) -> None:
     model = _model(dtype).eval()
@@ -169,6 +187,10 @@ def test_source_geometry_reuses_backbone_and_routes_only_geometry_to_warp() -> N
     model.zero_grad(set_to_none=True)
     geometry.total_loss.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in warp_parameters)
+    assert all(
+        parameter.grad is None
+        for parameter in model.task_parameters()
+    )
 
 
 def test_cached_backbone_path_matches_wrapper_and_preserves_task_gradients() -> None:

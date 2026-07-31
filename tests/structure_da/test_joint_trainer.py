@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from methods.structure_da.joint_trainer import (
     JointStructureDATrainingConfig,
@@ -12,7 +13,10 @@ from methods.structure_da.joint_trainer import (
     train_joint_structure_da,
 )
 from methods.structure_da import joint_trainer as joint_trainer_module
-from methods.structure_da.quality_fusion import HierarchicalQualityObjective
+from methods.structure_da.quality_fusion import (
+    HierarchicalQualityObjective,
+    concatenate_hierarchical_quality_outputs,
+)
 from tests.structure_da.test_full_model import _model
 
 
@@ -58,6 +62,13 @@ def _objective(config):
     )
 
 
+def _optimizers(model, config):
+    return (
+        torch.optim.Adam(model.task_parameters(), lr=config.lr),
+        torch.optim.Adam(model.geometry_parameters(), lr=config.lr),
+    )
+
+
 def _counts(model):
     temporal = model.temporal_operator.extractor.registration
     channel = model.channel_operator.extractor
@@ -68,6 +79,92 @@ def _counts(model):
         int(channel.attribute_standardizer.num_updates.item()),
         int(channel.energy_scale.num_updates.item()),
     )
+
+
+def _isolated_losses(model, config):
+    model.alignment.grl.iteration.fill_(3)
+    source = _sample(2, 5)
+    target = _sample(2, 7, labels=False)
+    source_tensors = (
+        source["pixels"], source["valid_pixels"], source["positions"]
+    )
+    target_tensors = (
+        target["pixels"], target["valid_pixels"], target["positions"]
+    )
+    source_backbone = model.forward_backbone(*source_tensors)
+    target_backbone = model.forward_backbone(*target_tensors)
+    model.update_source_state_from_backbone(
+        model.detach_backbone_for_state(source_backbone), source_tensors[2]
+    )
+    source_output = model.forward_from_backbone(source_backbone, source_tensors[2])
+    target_output = model.forward_from_backbone(target_backbone, target_tensors[2])
+    merged_quality = concatenate_hierarchical_quality_outputs(
+        source_output.representation.quality,
+        target_output.representation.quality,
+    )
+    source_labels = source["label"]
+    domain_labels = torch.tensor([1, 1, 0, 0])
+    class_labels = torch.cat([source_labels, torch.zeros(2, dtype=torch.long)])
+    return {
+        "geometry": model.forward_source_geometry(
+            source_output, source_tensors[2]
+        ).total_loss,
+        "task": F.cross_entropy(source_output.representation.logits, source_labels),
+        "quality": _objective(config)(
+            merged_quality,
+            class_labels,
+            domain_labels,
+            domain_labels == 1,
+        ).total_loss,
+        "alignment": model.align(source_output, target_output).loss,
+    }
+
+
+def _has_gradient(parameters) -> bool:
+    return any(
+        parameter.grad is not None
+        and torch.isfinite(parameter.grad).all()
+        and parameter.grad.abs().sum() > 0
+        for parameter in parameters
+    )
+
+
+@pytest.mark.parametrize(
+    "loss_name,expected",
+    [
+        ("geometry", (True, False, False, False, False)),
+        ("task", (False, True, False, True, False)),
+        ("quality", (False, False, True, False, False)),
+        ("alignment", (False, True, False, False, True)),
+    ],
+)
+def test_each_loss_has_the_intended_gradient_route(loss_name, expected) -> None:
+    model = _model()
+    config = _config()
+    losses = _isolated_losses(model, config)
+
+    model.zero_grad(set_to_none=True)
+    losses[loss_name].backward()
+
+    actual = (
+        _has_gradient(model.geometry_parameters()),
+        _has_gradient(
+            parameter
+            for module in (
+                model.backbone,
+                model.temporal_operator.extractor,
+                model.channel_operator,
+                model.representation.component_ltae,
+            )
+            for parameter in module.parameters()
+            if id(parameter)
+            not in {id(warp) for warp in model.geometry_parameters()}
+        ),
+        _has_gradient(model.representation.quality_fusion.parameters()),
+        _has_gradient(model.representation.classifier.parameters()),
+        _has_gradient(model.alignment.discriminator.parameters()),
+    )
+    assert actual == expected
 
 
 def test_training_config_rejects_invalid_values_and_has_no_legacy_fields() -> None:
@@ -107,7 +204,7 @@ def test_resolve_domain_score_weight(
 def test_joint_step_explicitly_forwards_domain_score_weight(monkeypatch) -> None:
     model = _model()
     config = _config()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    task_optimizer, geometry_optimizer = _optimizers(model, config)
     received = []
     original = model.forward_from_backbone
 
@@ -120,7 +217,8 @@ def test_joint_step_explicitly_forwards_domain_score_weight(monkeypatch) -> None
         model,
         _sample(2, 5),
         _sample(2, 7, labels=False),
-        optimizer,
+        task_optimizer,
+        geometry_optimizer,
         _objective(config),
         config,
         torch.device("cpu"),
@@ -134,21 +232,22 @@ def test_joint_step_supports_unequal_lengths_and_never_reads_target_label() -> N
     model = _model()
     model.alignment.grl.iteration.fill_(2)
     config = _config()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    task_optimizer, geometry_optimizer = _optimizers(model, config)
     step_calls = 0
-    original_step = optimizer.step
+    original_step = task_optimizer.step
 
     def counted_step(*args, **kwargs):
         nonlocal step_calls
         step_calls += 1
         return original_step(*args, **kwargs)
 
-    optimizer.step = counted_step
+    task_optimizer.step = counted_step
     result = joint_structure_da_train_step(
         model,
         _sample(2, 5),
         _sample(3, 7, labels=False),
-        optimizer,
+        task_optimizer,
+        geometry_optimizer,
         _objective(config),
         config,
         torch.device("cpu"),
@@ -193,12 +292,57 @@ def test_joint_step_supports_unequal_lengths_and_never_reads_target_label() -> N
     )
 
 
+def test_joint_step_uses_separate_optimizers_and_schedulers() -> None:
+    model = _model()
+    config = _config()
+    task_optimizer = torch.optim.Adam(model.task_parameters(), lr=config.lr)
+    geometry_optimizer = torch.optim.Adam(
+        model.geometry_parameters(), lr=config.lr
+    )
+    task_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        task_optimizer, T_max=2
+    )
+    geometry_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        geometry_optimizer, T_max=2
+    )
+    counts = {"task": 0, "geometry": 0}
+    original_task_step = task_optimizer.step
+    original_geometry_step = geometry_optimizer.step
+
+    def task_step(*args, **kwargs):
+        counts["task"] += 1
+        return original_task_step(*args, **kwargs)
+
+    def geometry_step(*args, **kwargs):
+        counts["geometry"] += 1
+        return original_geometry_step(*args, **kwargs)
+
+    task_optimizer.step = task_step
+    geometry_optimizer.step = geometry_step
+    joint_structure_da_train_step(
+        model,
+        _sample(2, 5),
+        _sample(2, 7, labels=False),
+        task_optimizer,
+        geometry_optimizer,
+        _objective(config),
+        config,
+        torch.device("cpu"),
+        task_scheduler=task_scheduler,
+        geometry_scheduler=geometry_scheduler,
+    )
+
+    assert counts == {"task": 1, "geometry": 1}
+    assert task_scheduler.last_epoch == 1
+    assert geometry_scheduler.last_epoch == 1
+
+
 def test_joint_step_runs_each_domain_backbone_once_and_updates_only_source_state(
     monkeypatch,
 ) -> None:
     model = _model()
     config = _config()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    task_optimizer, geometry_optimizer = _optimizers(model, config)
     backbone_calls = []
     state_inputs = []
     original_backbone = model.forward_backbone
@@ -219,7 +363,8 @@ def test_joint_step_runs_each_domain_backbone_once_and_updates_only_source_state
         model,
         _sample(2, 5),
         _sample(3, 7, labels=False),
-        optimizer,
+        task_optimizer,
+        geometry_optimizer,
         _objective(config),
         config,
         torch.device("cpu"),
@@ -234,7 +379,7 @@ def test_joint_step_runs_each_domain_backbone_once_and_updates_only_source_state
 def test_joint_step_exposes_finite_source_target_diagnostics(monkeypatch) -> None:
     model = _model()
     config = _config()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    task_optimizer, geometry_optimizer = _optimizers(model, config)
     recorded_outputs = []
     original_forward = model.forward_from_backbone
 
@@ -248,7 +393,8 @@ def test_joint_step_exposes_finite_source_target_diagnostics(monkeypatch) -> Non
         model,
         _sample(2, 5),
         _sample(3, 7, labels=False),
-        optimizer,
+        task_optimizer,
+        geometry_optimizer,
         _objective(config),
         config,
         torch.device("cpu"),
@@ -332,7 +478,7 @@ def test_nonfinite_loss_raises_before_optimizer_step(monkeypatch) -> None:
 
     model = _model()
     config = _config()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    task_optimizer, geometry_optimizer = _optimizers(model, config)
     original_cross_entropy = module.F.cross_entropy
     call_count = 0
 
@@ -344,16 +490,18 @@ def test_nonfinite_loss_raises_before_optimizer_step(monkeypatch) -> None:
         return original_cross_entropy(*args, **kwargs)
 
     monkeypatch.setattr(module.F, "cross_entropy", first_nan_cross_entropy)
-    monkeypatch.setattr(
-        optimizer,
-        "step",
-        lambda *args, **kwargs: pytest.fail("optimizer.step must not run"),
-    )
+    for optimizer in (task_optimizer, geometry_optimizer):
+        monkeypatch.setattr(
+            optimizer,
+            "step",
+            lambda *args, **kwargs: pytest.fail("optimizer.step must not run"),
+        )
 
     with pytest.raises(FloatingPointError) as error:
         joint_structure_da_train_step(
-            model, _sample(2, 5), _sample(2, 7, labels=False), optimizer,
-            _objective(config), config, torch.device("cpu"),
+            model, _sample(2, 5), _sample(2, 7, labels=False),
+            task_optimizer, geometry_optimizer, _objective(config), config,
+            torch.device("cpu"),
         )
 
     message = str(error.value)
@@ -370,7 +518,7 @@ def test_invalid_quality_coefficient_raises_before_optimizer_step(
 ) -> None:
     model = _model()
     config = _config()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    task_optimizer, geometry_optimizer = _optimizers(model, config)
     original_forward = model.forward_from_backbone
 
     def invalid_forward(*args, **kwargs):
@@ -385,23 +533,25 @@ def test_invalid_quality_coefficient_raises_before_optimizer_step(
         )
 
     monkeypatch.setattr(model, "forward_from_backbone", invalid_forward)
-    monkeypatch.setattr(
-        optimizer,
-        "step",
-        lambda *args, **kwargs: pytest.fail("optimizer.step must not run"),
-    )
+    for optimizer in (task_optimizer, geometry_optimizer):
+        monkeypatch.setattr(
+            optimizer,
+            "step",
+            lambda *args, **kwargs: pytest.fail("optimizer.step must not run"),
+        )
 
     with pytest.raises(FloatingPointError, match=field):
         joint_structure_da_train_step(
-            model, _sample(2, 5), _sample(2, 7, labels=False), optimizer,
-            _objective(config), config, torch.device("cpu"),
+            model, _sample(2, 5), _sample(2, 7, labels=False),
+            task_optimizer, geometry_optimizer, _objective(config), config,
+            torch.device("cpu"),
         )
 
 
 def test_invalid_grl_coefficient_raises_before_optimizer_step(monkeypatch) -> None:
     model = _model()
     config = _config()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    task_optimizer, geometry_optimizer = _optimizers(model, config)
     original_align = model.align
 
     def invalid_align(*args, **kwargs):
@@ -409,16 +559,18 @@ def test_invalid_grl_coefficient_raises_before_optimizer_step(monkeypatch) -> No
         return replace(output, coefficient=output.coefficient.new_tensor(1.1))
 
     monkeypatch.setattr(model, "align", invalid_align)
-    monkeypatch.setattr(
-        optimizer,
-        "step",
-        lambda *args, **kwargs: pytest.fail("optimizer.step must not run"),
-    )
+    for optimizer in (task_optimizer, geometry_optimizer):
+        monkeypatch.setattr(
+            optimizer,
+            "step",
+            lambda *args, **kwargs: pytest.fail("optimizer.step must not run"),
+        )
 
     with pytest.raises(FloatingPointError, match="GRL coefficient"):
         joint_structure_da_train_step(
-            model, _sample(2, 5), _sample(2, 7, labels=False), optimizer,
-            _objective(config), config, torch.device("cpu"),
+            model, _sample(2, 5), _sample(2, 7, labels=False),
+            task_optimizer, geometry_optimizer, _objective(config), config,
+            torch.device("cpu"),
         )
 
 

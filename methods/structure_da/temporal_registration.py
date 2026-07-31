@@ -611,10 +611,10 @@ class TemporalSRVFRegistration(nn.Module):
             & (template_mean_support >= self.min_template_mean_support)
         )
         warp_output = self.warp_estimator(
-            srvf_output.srvf,
-            template_srvf,
-            srvf_output.support_confidence,
-            template_support,
+            srvf_output.srvf.detach(),
+            template_srvf.detach(),
+            srvf_output.support_confidence.detach(),
+            template_support.detach(),
             registration_valid,
         )
         registered_srvf = _apply_srvf_group_action(

@@ -117,6 +117,19 @@ def _split_batched_dataclass(value, batch_size: int):
     return value, value
 
 
+def _detach_dataclass(value):
+    if isinstance(value, Tensor):
+        return value.detach()
+    if is_dataclass(value):
+        return type(value)(
+            **{
+                field.name: _detach_dataclass(getattr(value, field.name))
+                for field in fields(value)
+            }
+        )
+    return value
+
+
 class TemporalStructureExtractor(nn.Module):
     """Compose registration, coordinates, encoding, and geometry for one component."""
 
@@ -285,6 +298,41 @@ class TemporalStructureExtractor(nn.Module):
             registration_valid=registration.registration_valid,
         )
 
+    def _make_geometry_registration(
+        self,
+        registration: TemporalRegistrationOutput,
+    ) -> TemporalRegistrationOutput:
+        if not isinstance(registration, TemporalRegistrationOutput):
+            raise ValueError(
+                "registration must be a TemporalRegistrationOutput"
+            )
+        geometry_srvf = registration.srvf_output.srvf.detach()
+        geometry_support = registration.srvf_output.support_confidence.detach()
+        registered_srvf = _apply_srvf_group_action(
+            geometry_srvf,
+            registration.warp,
+            registration.warp_derivative,
+            self.registration.eps,
+        )
+        registered_support = _warp_sequence(
+            geometry_support.unsqueeze(-1),
+            registration.warp,
+        ).squeeze(-1)
+        return TemporalRegistrationOutput(
+            srvf_output=_detach_dataclass(registration.srvf_output),
+            template_srvf=registration.template_srvf.detach(),
+            template_support=registration.template_support.detach(),
+            template_initialized=registration.template_initialized,
+            template_mean_support=registration.template_mean_support.detach(),
+            interval_logits=registration.interval_logits,
+            interval_widths=registration.interval_widths,
+            warp=registration.warp,
+            warp_derivative=registration.warp_derivative,
+            registered_srvf=registered_srvf,
+            registered_support=registered_support,
+            registration_valid=registration.registration_valid,
+        )
+
     def forward_task(
         self,
         component_tokens: Tensor,
@@ -295,7 +343,10 @@ class TemporalStructureExtractor(nn.Module):
             component_tokens, positions, time_mask
         )
         task_registration = self._make_task_registration(registration)
-        return self._encode_registration(task_registration, registration)
+        geometry_registration = self._make_geometry_registration(registration)
+        return self._encode_registration(
+            task_registration, geometry_registration
+        )
 
     def forward_task_pair(
         self,
@@ -312,15 +363,16 @@ class TemporalStructureExtractor(nn.Module):
             combined_tokens, combined_positions, combined_mask
         )
         task_registration = self._make_task_registration(registration)
-        first_registration, second_registration = _split_batched_dataclass(
-            registration, batch_size
+        geometry_registration = self._make_geometry_registration(registration)
+        first_geometry, second_geometry = _split_batched_dataclass(
+            geometry_registration, batch_size
         )
         first_task, second_task = _split_batched_dataclass(
             task_registration, batch_size
         )
         return (
-            self._encode_registration(first_task, first_registration),
-            self._encode_registration(second_task, second_registration),
+            self._encode_registration(first_task, first_geometry),
+            self._encode_registration(second_task, second_geometry),
         )
 
     def forward(
