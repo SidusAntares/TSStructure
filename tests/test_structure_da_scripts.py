@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import subprocess
 
 import pytest
@@ -8,11 +9,35 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SMOKE_SCRIPT = REPO_ROOT / "scripts" / "smoke_at1_dk1.sh"
 FORMAL_SCRIPT = REPO_ROOT / "scripts" / "run_structure_da_12tasks_4gpu_3seeds.sh"
 PILOT_SCRIPT = REPO_ROOT / "scripts" / "run_structure_da_pilot4_4gpu.sh"
+ENV_CHECK_SCRIPT = REPO_ROOT / "scripts" / "check_server_env.sh"
+SERVER_SCRIPTS = [SMOKE_SCRIPT, FORMAL_SCRIPT, PILOT_SCRIPT, ENV_CHECK_SCRIPT]
 
 
-@pytest.mark.parametrize("script", [SMOKE_SCRIPT, FORMAL_SCRIPT, PILOT_SCRIPT])
+def _git_command_lines(source: str) -> list[str]:
+    command_pattern = re.compile(r"(?<![A-Za-z0-9_])git(?=\s)")
+    return [line for line in source.splitlines() if command_pattern.search(line)]
+
+
+@pytest.mark.parametrize("script", SERVER_SCRIPTS)
 def test_structure_da_shell_script_has_valid_bash_syntax(script: Path) -> None:
-    subprocess.run(["bash", "-n", str(script)], check=True)
+    relative_script = script.relative_to(REPO_ROOT).as_posix()
+    subprocess.run(["bash", "-n", relative_script], cwd=REPO_ROOT, check=True)
+
+
+@pytest.mark.parametrize("script", SERVER_SCRIPTS)
+def test_server_script_does_not_execute_git_commands(script: Path) -> None:
+    source = script.read_text(encoding="utf-8")
+    assert _git_command_lines(source) == []
+    for obsolete_marker in (
+        "origin/main", "dirty_worktree", "head_mismatch", "GIT_HEAD",
+    ):
+        assert obsolete_marker not in source
+
+
+def test_server_environment_check_does_not_access_github() -> None:
+    source = ENV_CHECK_SCRIPT.read_text(encoding="utf-8")
+    assert "github.com" not in source.casefold()
+    assert "origin" not in source.casefold()
 
 
 def test_smoke_script_uses_default_data_root_and_no_legacy_arguments() -> None:
@@ -66,7 +91,7 @@ def test_pilot_script_maps_exactly_four_tasks_to_four_gpus() -> None:
     assert "france/31TCJ/2017" not in source
 
 
-def test_pilot_script_has_fixed_parameters_and_safety_guards() -> None:
+def test_pilot_script_has_fixed_parameters_and_runtime_guards() -> None:
     source = PILOT_SCRIPT.read_text(encoding="utf-8")
     for fragment in (
         "--epochs 20", "--steps_per_epoch 500", "--batch_size 8",
@@ -88,8 +113,27 @@ def test_pilot_script_has_fixed_parameters_and_safety_guards() -> None:
     for forbidden in ("--data_root", "DATA_ROOT=", "nohup"):
         assert forbidden not in source
     for guard in (
-        "git status --porcelain", "git rev-parse HEAD",
-        "git rev-parse origin/main", "TASK_START|", "TASK_DONE|",
-        "TASK_FAILED|", "EXPERIMENT_SUMMARY|",
+        "TASK_START|", "TASK_DONE|", "TASK_FAILED|",
+        "EXPERIMENT_SUMMARY|", "completion_file", ".previous_",
+        'pids+=("$!")', 'wait "$pid"',
     ):
         assert guard in source
+
+
+def test_formal_script_keeps_twelve_domain_tasks_and_three_seeds() -> None:
+    source = FORMAL_SCRIPT.read_text(encoding="utf-8")
+    for dataset in (
+        '"denmark/32VNH/2017"',
+        '"france/30TXT/2017"',
+        '"france/31TCJ/2017"',
+        '"austria/33UVP/2017"',
+    ):
+        assert dataset in source
+    assert "SEEDS=(1 2 3)" in source
+    assert 'if [[ "$target_index" -eq "$source_index" ]]' in source
+    assert "--progress_bar off" in source
+    for runtime_behavior in (
+        "COMPLETION_FILE", ".previous_", "TASK_FAILED|",
+        "EXPERIMENT_SUMMARY|", 'wait "$pid"',
+    ):
+        assert runtime_behavior in source

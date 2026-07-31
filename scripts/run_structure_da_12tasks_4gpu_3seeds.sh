@@ -23,8 +23,6 @@ RUN_ROOT="runs/$EXPERIMENT_GROUP"
 STATUS_DIR="$LOG_DIR/.launcher_status"
 mkdir -p "$LOG_DIR" "$OUTPUT_ROOT" "$RUN_ROOT" "$STATUS_DIR"
 
-GIT_HEAD="$(git rev-parse HEAD)"
-
 echo "EXPERIMENT_GROUP|$EXPERIMENT_GROUP"
 echo "LOG_DIR|$LOG_DIR"
 echo "OUTPUT_ROOT|$OUTPUT_ROOT"
@@ -72,7 +70,6 @@ run_source_tasks() {
             {
                 echo "TASK_START|gpu=$gpu_id|source=$SOURCE_SHORT|target=$TARGET_SHORT|seed=$seed|run=$RUN_NAME"
                 echo "DATE_START|$(date --iso-8601=seconds)"
-                echo "GIT_HEAD|$GIT_HEAD"
             } > "$TASK_LOG"
 
             echo "[START][GPU $gpu_id] $RUN_NAME"
@@ -108,7 +105,7 @@ run_source_tasks() {
                     --tau_slow_init 0.20 \
                     --tau_min 0.0001 \
                     --delta_tau_min 0.0001 \
-                    --progress_bar auto \
+                    --progress_bar off \
                     --output_dir "$OUTPUT_ROOT" \
                     --tensorboard_log_dir "$RUN_ROOT" \
                     --experiment_name "$RUN_NAME" \

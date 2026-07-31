@@ -8,9 +8,6 @@ CONDA_ENV="time"
 cd "$REPO_ROOT"
 
 pwd
-git rev-parse --abbrev-ref HEAD
-git rev-parse HEAD
-git status --short
 
 command -v conda
 

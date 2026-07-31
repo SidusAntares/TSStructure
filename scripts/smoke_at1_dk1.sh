@@ -42,7 +42,6 @@ if not torch.cuda.is_available():
 
 echo "SMOKE_START"
 date
-git rev-parse HEAD
 echo "GPU_ID=$GPU_ID"
 nvidia-smi -i "$GPU_ID"
 

@@ -14,20 +14,6 @@ TASKS=(
 
 cd "$REPO_ROOT"
 
-if [[ -n "$(git status --porcelain)" ]]; then
-    echo "ERROR|dirty_worktree"
-    git status --short
-    exit 1
-fi
-
-git fetch origin
-GIT_HEAD="$(git rev-parse HEAD)"
-ORIGIN_HEAD="$(git rev-parse origin/main)"
-if [[ "$GIT_HEAD" != "$ORIGIN_HEAD" ]]; then
-    echo "ERROR|head_mismatch|head=$GIT_HEAD|origin_main=$ORIGIN_HEAD"
-    exit 1
-fi
-
 LOG_DIR="logs/$EXPERIMENT_GROUP"
 OUTPUT_ROOT="outputs/$EXPERIMENT_GROUP"
 RUN_ROOT="runs/$EXPERIMENT_GROUP"
@@ -35,7 +21,6 @@ STATUS_DIR="$LOG_DIR/.launcher_status"
 mkdir -p "$LOG_DIR" "$OUTPUT_ROOT" "$RUN_ROOT" "$STATUS_DIR"
 
 echo "EXPERIMENT_GROUP|$EXPERIMENT_GROUP"
-echo "GIT_HEAD|$GIT_HEAD"
 echo "LOG_DIR|$LOG_DIR"
 echo "OUTPUT_ROOT|$OUTPUT_ROOT"
 
@@ -68,7 +53,6 @@ run_task() {
     {
         echo "TASK_START|gpu=$gpu_id|source=$source_short|target=$target_short|seed=$seed|run=$run_name"
         echo "DATE_START|$(date --iso-8601=seconds)"
-        echo "GIT_HEAD|$GIT_HEAD"
     } > "$task_log"
 
     echo "[START][GPU $gpu_id] $run_name"
