@@ -76,6 +76,14 @@ from .temporal_head import (
     TemporalStructureFeatureOutput,
     TemporalStructureOutputHead,
 )
+from .temporal_module import (
+    SharedTemporalStructureOperator,
+    TemporalGeometryForwardOutput,
+    TemporalGeometryPairOutput,
+    TemporalStructureExtractor,
+    TemporalStructureOutput,
+    TemporalStructurePairOutput,
+)
 from .temporal_registration import (
     MonotoneWarpEstimator,
     MonotoneWarpOutput,
@@ -129,6 +137,7 @@ __all__ = [
     "StructureDATrainingConfig",
     "StructureDATrainStepOutput",
     "SDADiscriminator",
+    "SharedTemporalStructureOperator",
     "SourceRunningStandardizer",
     "SourceRunningSupportScale",
     "SourceRunningSRVFTemplate",
@@ -145,9 +154,14 @@ __all__ = [
     "TemporalFunctionalOutput",
     "TemporalGeometryLossOutput",
     "TemporalGeometryObjective",
+    "TemporalGeometryForwardOutput",
+    "TemporalGeometryPairOutput",
     "TemporalStructureEncoder",
+    "TemporalStructureExtractor",
     "TemporalStructureFeatureOutput",
     "TemporalStructureOutputHead",
+    "TemporalStructureOutput",
+    "TemporalStructurePairOutput",
     "TemporalRegistrationOutput",
     "TemporalSRVFExtractor",
     "TemporalSRVFOutput",
