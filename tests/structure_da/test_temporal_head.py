@@ -400,6 +400,47 @@ def test_dtype_is_preserved(dtype: torch.dtype) -> None:
         assert parameter.dtype == dtype
 
 
+def test_cpu_bfloat16_autocast_supports_fp32_master_parameters() -> None:
+    encoder = _encoder(dropout=0.0)
+    coordinates = _coordinate_output(requires_grad=True)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = encoder(coordinates)
+        loss = (
+            output.feature.square().mean()
+            + output.shape_embedding.square().mean()
+            + output.phase_embedding.square().mean()
+        )
+    loss.backward()
+
+    for tensor in (
+        output.feature,
+        output.shape_embedding,
+        output.phase_embedding,
+        output.joint_embedding,
+    ):
+        assert torch.isfinite(tensor).all()
+    for module in (
+        encoder.shape_encoder,
+        encoder.phase_encoder,
+        encoder.output_head,
+    ):
+        for parameter in module.parameters():
+            assert parameter.dtype == torch.float32
+            assert parameter.grad is not None
+            assert torch.isfinite(parameter.grad).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mixed_precision_input_is_rejected_without_autocast(
+    dtype: torch.dtype,
+) -> None:
+    coordinates = _coordinate_output(dtype=dtype)
+
+    with pytest.raises(ValueError, match="autocast is disabled"):
+        _encoder()(coordinates)
+
+
 @pytest.mark.parametrize(
     "factory,kwargs,match",
     [

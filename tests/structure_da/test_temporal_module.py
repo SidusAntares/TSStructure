@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 
 import pytest
 import torch
+
+import methods.structure_da.temporal_module as temporal_module
 
 from methods.structure_da import (
     SharedTemporalStructureOperator,
@@ -475,6 +478,105 @@ def test_cpu_dtype_is_preserved(dtype: torch.dtype) -> None:
     assert output.coordinates.phase_coordinates.dtype == dtype
     assert output.encoded.feature.dtype == dtype
     assert all(parameter.dtype == dtype for parameter in extractor.parameters())
+
+
+@dataclass(frozen=True)
+class _NestedFloatingValues:
+    half: torch.Tensor
+    bfloat: torch.Tensor
+    single: torch.Tensor
+    double: torch.Tensor
+    integer: torch.Tensor
+    boolean: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _FloatingValues:
+    nested: _NestedFloatingValues
+    label: str
+
+
+def test_floating_dataclass_conversion_is_recursive_and_differentiable() -> None:
+    half = torch.randn(3, dtype=torch.float16, requires_grad=True)
+    bfloat = torch.randn(3, dtype=torch.bfloat16, requires_grad=True)
+    single = torch.randn(3, dtype=torch.float32, requires_grad=True)
+    double = torch.randn(3, dtype=torch.float64, requires_grad=True)
+    integer = torch.arange(3)
+    boolean = torch.tensor([True, False, True])
+    original = _FloatingValues(
+        nested=_NestedFloatingValues(
+            half=half,
+            bfloat=bfloat,
+            single=single,
+            double=double,
+            integer=integer,
+            boolean=boolean,
+        ),
+        label="registration",
+    )
+
+    converted = temporal_module._floating_dataclass_to_float32(original)
+
+    assert converted is not original
+    assert converted.nested is not original.nested
+    assert converted.nested.half.dtype == torch.float32
+    assert converted.nested.bfloat.dtype == torch.float32
+    assert converted.nested.single is single
+    assert converted.nested.double is double
+    assert converted.nested.integer is integer
+    assert converted.nested.boolean is boolean
+    assert converted.label == original.label
+    assert original.nested.half.dtype == torch.float16
+    assert original.nested.bfloat.dtype == torch.bfloat16
+
+    (converted.nested.half.sum() + converted.nested.bfloat.sum()).backward()
+    assert half.grad is not None and torch.isfinite(half.grad).all()
+    assert bfloat.grad is not None and torch.isfinite(bfloat.grad).all()
+
+
+def test_coordinate_construction_stays_float32_inside_cpu_autocast() -> None:
+    extractor = _extractor()
+    tokens, positions, time_mask = _inputs()
+    _initialize(extractor, tokens, positions, time_mask)
+    tokens = tokens.clone().requires_grad_()
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = extractor.forward_task(tokens, positions, time_mask)
+        loss = output.encoded.feature.square().mean()
+    loss.backward()
+
+    assert output.coordinates.shape_coordinates.dtype == torch.float32
+    assert output.coordinates.phase_coordinates.dtype == torch.float32
+    assert torch.isfinite(output.encoded.feature).all()
+    projection = extractor.coordinates.attribute_projection.weight
+    assert projection.grad is not None and torch.isfinite(projection.grad).all()
+    for parameter in extractor.encoder.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_cuda_float16_autocast_temporal_pipeline_is_finite() -> None:
+    extractor = _extractor().cuda()
+    tokens, positions, time_mask = _inputs()
+    tokens = tokens.cuda()
+    positions = positions.cuda()
+    time_mask = time_mask.cuda()
+    _initialize(extractor, tokens, positions, time_mask)
+    tokens = tokens.clone().requires_grad_()
+
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        output = extractor.forward_task(tokens, positions, time_mask)
+        loss = output.encoded.feature.square().mean()
+    loss.backward()
+
+    assert output.coordinates.shape_coordinates.dtype == torch.float32
+    assert output.coordinates.phase_coordinates.dtype == torch.float32
+    assert torch.isfinite(output.encoded.feature).all()
+    assert tokens.grad is not None and torch.isfinite(tokens.grad).all()
+    for parameter in extractor.encoder.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
 
 
 def test_shared_operator_rejects_wrong_extractor_type() -> None:

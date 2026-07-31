@@ -47,6 +47,14 @@ def _validate_valid_mask(
         raise ValueError("valid device must match coordinate device")
 
 
+def _autocast_enabled_for(device: torch.device) -> bool:
+    if device.type == "cuda":
+        return torch.is_autocast_enabled()
+    if device.type == "cpu":
+        return torch.is_autocast_cpu_enabled()
+    return False
+
+
 def _validate_floating_tensor(
     name: str,
     tensor: Tensor,
@@ -66,7 +74,22 @@ def _validate_floating_tensor(
     if tensor.device != parameter.device:
         raise ValueError(f"{name} device must match module parameter device")
     if tensor.dtype != parameter.dtype:
-        raise ValueError(f"{name} dtype must match module parameter dtype")
+        if not _autocast_enabled_for(tensor.device):
+            raise ValueError(
+                f"{name} dtype must match module parameter dtype when "
+                "autocast is disabled"
+            )
+        if parameter.dtype != torch.float32:
+            raise ValueError(
+                f"{name} mixed-precision input requires float32 master "
+                "parameters"
+            )
+        if tensor.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError(f"{name} uses an unsupported autocast dtype")
     if not torch.isfinite(tensor).all().item():
         raise ValueError(f"{name} must contain only finite values")
 
@@ -323,6 +346,10 @@ class TemporalStructureEncoder(nn.Module):
 
         shape_embedding = self.shape_encoder(shape_coordinates, valid)
         phase_embedding = self.phase_encoder(phase_coordinates, valid)
+        if shape_embedding.dtype != phase_embedding.dtype:
+            raise RuntimeError(
+                "shape and phase embeddings must use the same dtype"
+            )
         joint_embedding = torch.cat(
             [shape_embedding, phase_embedding], dim=-1
         )

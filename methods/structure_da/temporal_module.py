@@ -130,6 +130,25 @@ def _detach_dataclass(value):
     return value
 
 
+def _floating_dataclass_to_float32(value):
+    """Copy a dataclass tree while promoting low-precision tensors."""
+
+    if isinstance(value, Tensor):
+        if value.dtype in (torch.float16, torch.bfloat16):
+            return value.float()
+        return value
+    if is_dataclass(value):
+        return type(value)(
+            **{
+                field.name: _floating_dataclass_to_float32(
+                    getattr(value, field.name)
+                )
+                for field in fields(value)
+            }
+        )
+    return value
+
+
 class TemporalStructureExtractor(nn.Module):
     """Compose registration, coordinates, encoding, and geometry for one component."""
 
@@ -252,7 +271,10 @@ class TemporalStructureExtractor(nn.Module):
         registration: TemporalRegistrationOutput,
         geometry_registration: TemporalRegistrationOutput | None = None,
     ) -> TemporalStructureOutput:
-        coordinates = self.coordinates(registration)
+        device_type = registration.registered_srvf.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            float_registration = _floating_dataclass_to_float32(registration)
+            coordinates = self.coordinates(float_registration)
         encoded = self.encoder(coordinates)
         return TemporalStructureOutput(
             registration=registration,
