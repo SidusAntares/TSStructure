@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="/data/user/TSStructure"
 CONDA_ENV="time"
-EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-structure_eden_pilot4_v1}"
+EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-structure_eden_pilot4_100ep_v1}"
 
 TASKS=(
     "0|AT1|austria/33UVP/2017|DK1|denmark/32VNH/2017|1"
@@ -63,7 +63,7 @@ run_task() {
             --target "$target" \
             --seed "$seed" \
             --device cuda \
-            --epochs 20 \
+            --epochs 100 \
             --steps_per_epoch 500 \
             --batch_size 8 \
             --eval_batch_size 128 \
@@ -75,7 +75,7 @@ run_task() {
             --pixel_hidden_dim 16 \
             --structure_dim 128 \
             --domain_hidden_dim 128 \
-            --grl_warmup_max_iters 2500 \
+            --grl_warmup_max_iters 10000 \
             --lambda_task 1 \
             --lambda_geometry 0.1 \
             --lambda_alignment 1 \

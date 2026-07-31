@@ -79,7 +79,11 @@ def test_formal_script_has_new_group_and_explicit_current_arguments() -> None:
 
 def test_pilot_script_maps_exactly_four_tasks_to_four_gpus() -> None:
     source = PILOT_SCRIPT.read_text(encoding="utf-8")
-    assert 'EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-structure_eden_pilot4_v1}"' in source
+    assert (
+        'EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-structure_eden_pilot4_100ep_v1}"'
+        in source
+    )
+    assert "structure_eden_pilot4_v1" not in source
     for fragment in (
         '"0|AT1|austria/33UVP/2017|DK1|denmark/32VNH/2017|1"',
         '"1|AT1|austria/33UVP/2017|DK1|denmark/32VNH/2017|2"',
@@ -94,12 +98,12 @@ def test_pilot_script_maps_exactly_four_tasks_to_four_gpus() -> None:
 def test_pilot_script_has_fixed_parameters_and_runtime_guards() -> None:
     source = PILOT_SCRIPT.read_text(encoding="utf-8")
     for fragment in (
-        "--epochs 20", "--steps_per_epoch 500", "--batch_size 8",
+        "--epochs 100", "--steps_per_epoch 500", "--batch_size 8",
         "--eval_batch_size 128", "--num_pixels 64", "--num_workers 8",
         "--lr 0.001", "--weight_decay 0.0001",
         "--channel_feature_dim 16", "--pixel_hidden_dim 16",
         "--structure_dim 128", "--domain_hidden_dim 128",
-        "--grl_warmup_max_iters 2500", "--lambda_task 1",
+        "--grl_warmup_max_iters 10000", "--lambda_task 1",
         "--lambda_geometry 0.1", "--lambda_alignment 1",
         "--lambda_structural_cls 0.25", "--lambda_structural_domain 0.25",
         "--lambda_component_cls 0.25", "--lambda_component_domain 0.25",
@@ -112,6 +116,10 @@ def test_pilot_script_has_fixed_parameters_and_runtime_guards() -> None:
         assert fragment in source
     for forbidden in ("--data_root", "DATA_ROOT=", "nohup"):
         assert forbidden not in source
+    for obsolete_parameter in (
+        "--epochs 20", "--grl_warmup_max_iters 2500",
+    ):
+        assert obsolete_parameter not in source
     for guard in (
         "TASK_START|", "TASK_DONE|", "TASK_FAILED|",
         "EXPERIMENT_SUMMARY|", "completion_file", ".previous_",
