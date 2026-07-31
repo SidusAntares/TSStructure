@@ -271,7 +271,7 @@ def test_all_invalid_sample_has_zero_embeddings_alpha_and_fused_feature() -> Non
     assert torch.count_nonzero(output.fused_feature[2]) == 0
 
 
-def test_task_loss_updates_ltae_classifier_quality_and_all_feature_inputs() -> None:
+def test_task_loss_updates_features_and_classifier_but_not_quality_probes() -> None:
     model = _classifier()
     decomposition, temporal, channel, positions, mask = _inputs()
     components = [
@@ -299,12 +299,17 @@ def test_task_loss_updates_ltae_classifier_quality_and_all_feature_inputs() -> N
     for tensor in (*components, *structure_tensors):
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
         assert tensor.grad.abs().sum() > 0
-    for group in (model.component_ltae, model.quality_fusion, model.classifier):
+    for group in (model.component_ltae, model.classifier):
         assert all(
             parameter.grad is not None
             for parameter in group.parameters()
             if parameter.requires_grad
         )
+    assert all(
+        parameter.grad is None
+        for parameter in model.quality_fusion.parameters()
+        if parameter.requires_grad
+    )
 
 
 def test_residual_branch_has_no_structure_interface_or_slot_values() -> None:
@@ -466,7 +471,11 @@ def test_real_backbone_structure_operators_and_classifier_integrate_end_to_end()
         parameter.grad is not None and parameter.grad.abs().sum() > 0
         for parameter in classifier.component_ltae.parameters()
     )
-    assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in classifier.quality_fusion.parameters())
+    assert all(
+        parameter.grad is None
+        for parameter in classifier.quality_fusion.parameters()
+        if parameter.requires_grad
+    )
     assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in classifier.classifier.parameters())
     assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in channel_extractor.parameters())
     for parameter in temporal_extractor.registration.warp_estimator.parameters():

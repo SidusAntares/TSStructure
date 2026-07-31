@@ -244,17 +244,42 @@ def test_invalid_only_zeros_final_coefficient() -> None:
         torch.testing.assert_close(getattr(masked, field), getattr(unmasked, field))
 
 
-def test_quality_scorer_gradients_reach_feature_and_both_heads() -> None:
+def test_quality_scorer_detaches_probe_features_but_trains_both_heads() -> None:
     scorer = _scorer()
     feature = torch.randn(5, 4, requires_grad=True)
 
     output = scorer(feature)
-    (output.coefficient.sum() + output.class_logits.square().mean() + output.domain_logits.square().mean()).backward()
+    (output.class_logits.square().mean() + output.domain_logits.square().mean()).backward()
 
-    assert feature.grad is not None and feature.grad.abs().sum() > 0
+    assert feature.grad is None
     for parameter in scorer.parameters():
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()
+
+
+@pytest.mark.parametrize("domain_score_weight", [0.0, 0.25, 1.0])
+def test_quality_score_weight_uses_normalized_formula(
+    domain_score_weight: float,
+) -> None:
+    scorer = _scorer()
+    output = scorer(torch.randn(5, 4), domain_score_weight=domain_score_weight)
+    expected = (
+        0.50 * domain_score_weight * output.domain_invariance
+        + 0.25 * output.entropy_score
+        + 0.25 * output.confidence_score
+    ) / (0.50 * domain_score_weight + 0.50)
+
+    torch.testing.assert_close(output.coefficient, expected.clamp(0.0, 1.0))
+    assert not output.coefficient.requires_grad
+    for diagnostic in (
+        output.domain_invariance,
+        output.entropy_score,
+        output.confidence_score,
+        output.discriminability,
+    ):
+        assert not diagnostic.requires_grad
+    assert output.class_logits.requires_grad
+    assert output.domain_logits.requires_grad
 
 
 def test_hierarchical_scorer_sharing_and_independence_are_exact() -> None:
@@ -286,7 +311,13 @@ class _FixedScorer(nn.Module):
         self.coefficient = coefficient
         self.num_classes = num_classes
 
-    def forward(self, feature: torch.Tensor, valid: torch.Tensor | None = None):
+    def forward(
+        self,
+        feature: torch.Tensor,
+        valid: torch.Tensor | None = None,
+        domain_score_weight: float = 1.0,
+    ):
+        del domain_score_weight
         batch = feature.shape[0]
         if valid is None:
             valid = torch.ones(batch, dtype=torch.bool, device=feature.device)
@@ -512,7 +543,7 @@ def test_source_mask_must_match_domain_labels() -> None:
         HierarchicalQualityObjective()(quality, labels, domains, torch.ones(4, dtype=torch.bool))
 
 
-def test_task_fusion_gradients_reach_all_inputs_and_quality_scorers() -> None:
+def test_task_fusion_gradients_reach_inputs_but_not_quality_scorers() -> None:
     fusion = _fusion()
     inputs = list(_fusion_inputs())
     for index in range(7):
@@ -526,10 +557,10 @@ def test_task_fusion_gradients_reach_all_inputs_and_quality_scorers() -> None:
     for tensor in inputs[:7]:
         assert tensor.grad is not None and tensor.grad.abs().sum() > 0
     for parameter in fusion.parameters():
-        assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        assert parameter.grad is None
 
 
-def test_quality_auxiliary_losses_update_heads_and_feature_inputs() -> None:
+def test_quality_auxiliary_losses_update_heads_but_not_feature_inputs() -> None:
     fusion = _fusion()
     inputs = list(_fusion_inputs())
     for index in range(7):
@@ -548,9 +579,7 @@ def test_quality_auxiliary_losses_update_heads_and_feature_inputs() -> None:
     losses.total_loss.backward()
 
     for tensor in inputs[:7]:
-        assert tensor.grad is not None
-        assert torch.isfinite(tensor.grad).all()
-        assert tensor.grad.abs().sum() > 0
+        assert tensor.grad is None
     for parameter in fusion.parameters():
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()

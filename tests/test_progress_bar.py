@@ -257,6 +257,7 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
         lambda_task=1.0, lambda_geometry=1.0, lambda_alignment=1.0,
         lambda_structural_cls=1.0, lambda_structural_domain=1.0,
         lambda_component_cls=1.0, lambda_component_domain=1.0,
+        quality_domain_score_warmup_epochs=5,
         log_step=1, progress_bar="off",
     )
 
@@ -294,7 +295,7 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         "--domain_hidden_dim", "--grl_warmup_max_iters", "--lambda_task",
         "--lambda_geometry", "--lambda_alignment", "--lambda_structural_cls",
         "--lambda_structural_domain", "--lambda_component_cls",
-        "--lambda_component_domain",
+        "--lambda_component_domain", "--quality_domain_score_warmup_epochs",
         "--eval_batch_size",
     ):
         assert option in result.stdout

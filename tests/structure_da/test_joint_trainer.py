@@ -11,6 +11,7 @@ from methods.structure_da.joint_trainer import (
     joint_structure_da_train_step,
     train_joint_structure_da,
 )
+from methods.structure_da import joint_trainer as joint_trainer_module
 from methods.structure_da.quality_fusion import HierarchicalQualityObjective
 from tests.structure_da.test_full_model import _model
 
@@ -71,6 +72,7 @@ def _counts(model):
 
 def test_training_config_rejects_invalid_values_and_has_no_legacy_fields() -> None:
     config = _config()
+    assert config.quality_domain_score_warmup_epochs == 5
     for field in (
         "task_weight", "geometry_weight", "alignment_weight",
         "structural_classification_weight", "structural_domain_weight",
@@ -78,6 +80,54 @@ def test_training_config_rejects_invalid_values_and_has_no_legacy_fields() -> No
     ):
         with pytest.raises(ValueError):
             _config(**{field: -1.0})
+    for invalid in (-1, 1.5, True):
+        with pytest.raises(ValueError, match="quality_domain_score_warmup_epochs"):
+            _config(quality_domain_score_warmup_epochs=invalid)
+
+
+@pytest.mark.parametrize(
+    "warmup_epochs,expected",
+    [
+        (0, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+        (1, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+        (5, [0.0, 0.25, 0.5, 0.75, 1.0, 1.0]),
+    ],
+)
+def test_resolve_domain_score_weight(
+    warmup_epochs: int, expected: list[float]
+) -> None:
+    actual = [
+        joint_trainer_module.resolve_domain_score_weight(epoch, warmup_epochs)
+        for epoch in range(6)
+    ]
+
+    assert actual == expected
+
+
+def test_joint_step_explicitly_forwards_domain_score_weight(monkeypatch) -> None:
+    model = _model()
+    config = _config()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    received = []
+    original = model.forward_from_backbone
+
+    def recording_forward(*args, **kwargs):
+        received.append(kwargs.get("domain_score_weight"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model, "forward_from_backbone", recording_forward)
+    joint_structure_da_train_step(
+        model,
+        _sample(2, 5),
+        _sample(2, 7, labels=False),
+        optimizer,
+        _objective(config),
+        config,
+        torch.device("cpu"),
+        domain_score_weight=0.25,
+    )
+
+    assert received == [0.25, 0.25]
 
 
 def test_joint_step_supports_unequal_lengths_and_never_reads_target_label() -> None:
@@ -480,7 +530,7 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
     )
     for name in (
         "total", "task", "q_total", "geometry", "alignment",
-        "train_acc", "domain_acc", "grl", "lr",
+        "train_acc", "domain_acc", "grl", "q_dom_w", "lr",
     ):
         assert f"|{name}=" in train_step
     train_epoch = next(
@@ -489,7 +539,7 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
     for name in (
         "total", "task", "q_total", "q_struct_cls", "q_struct_dom",
         "q_comp_cls", "q_comp_dom", "geometry", "alignment",
-        "train_acc", "domain_acc", "grl", "lr",
+        "train_acc", "domain_acc", "grl", "q_dom_w", "lr",
     ):
         assert f"|{name}=" in train_epoch
     structure_epoch = next(
@@ -510,6 +560,7 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
         "alpha_T_s", "alpha_T_t", "alpha_D_s", "alpha_D_t",
         "alpha_R_s", "alpha_R_t", "beta_T_temporal_s",
         "beta_T_temporal_t", "beta_D_channel_s", "beta_D_channel_t",
+        "domain_score_weight",
     ):
         assert f"|{name}=" in quality_epoch
     geometry_epoch = next(
@@ -529,6 +580,7 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
         "train/alpha_residual", "train/beta_trend_temporal",
         "train/beta_dynamics_temporal", "train/beta_trend_channel",
         "train/beta_dynamics_channel", "train/lr",
+        "train/quality/domain_score_weight",
         "train/source/energy_fraction_trend",
         "train/target/energy_fraction_trend",
         "train/source/temporal_valid_trend",

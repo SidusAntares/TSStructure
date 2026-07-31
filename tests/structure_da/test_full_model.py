@@ -190,6 +190,24 @@ def test_cached_backbone_path_matches_wrapper_and_preserves_task_gradients() -> 
     )
 
 
+def test_forward_from_backbone_threads_domain_score_weight() -> None:
+    model = _model().eval()
+    pixels, valid, positions = _inputs()
+    backbone = model.forward_backbone(pixels, valid, positions)
+
+    without_domain = model.forward_from_backbone(
+        backbone, positions, domain_score_weight=0.0
+    )
+    with_domain = model.forward_from_backbone(
+        backbone, positions, domain_score_weight=1.0
+    )
+
+    assert not torch.allclose(
+        without_domain.representation.quality.alpha_trend,
+        with_domain.representation.quality.alpha_trend,
+    )
+
+
 def test_cached_source_state_update_does_not_run_backbone_or_keep_gradients() -> None:
     model = _model()
     pixels, valid, positions = _inputs()

@@ -117,6 +117,9 @@ def main(config):
                 structural_domain_weight=config.lambda_structural_domain,
                 component_classification_weight=config.lambda_component_cls,
                 component_domain_weight=config.lambda_component_domain,
+                quality_domain_score_warmup_epochs=(
+                    config.quality_domain_score_warmup_epochs
+                ),
                 log_step=config.log_step,
                 progress_bar=config.progress_bar,
                 classes=tuple(config.classes),
@@ -432,6 +435,11 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_structural_domain', default=1.0, type=float)
     parser.add_argument('--lambda_component_cls', default=1.0, type=float)
     parser.add_argument('--lambda_component_domain', default=1.0, type=float)
+    parser.add_argument(
+        '--quality_domain_score_warmup_epochs',
+        default=5,
+        type=int,
+    )
     parser.add_argument('--time_scale', default=366.0, type=float)
     parser.add_argument('--tau_fast_init', default=0.05, type=float)
     parser.add_argument('--tau_slow_init', default=0.20, type=float)

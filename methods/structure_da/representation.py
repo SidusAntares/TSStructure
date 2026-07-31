@@ -327,6 +327,7 @@ class QualityAwareComponentClassifier(nn.Module):
         channel_features: PairedStructureFeatures,
         positions: Tensor,
         time_mask: Tensor | None = None,
+        domain_score_weight: float = 1.0,
     ) -> QualityAwareClassifierOutput:
         if not isinstance(decomposition, DecompositionOutput):
             raise ValueError("decomposition must be a DecompositionOutput")
@@ -377,6 +378,7 @@ class QualityAwareComponentClassifier(nn.Module):
             temporal_features.dynamics_valid,
             channel_features.trend_valid,
             channel_features.dynamics_valid,
+            domain_score_weight,
         )
         logits = self.classifier(quality.fused_feature)
         return QualityAwareClassifierOutput(

@@ -28,6 +28,7 @@ from .joint_trainer import (
     JointStructureDATrainingConfig,
     create_joint_structure_da_train_loaders,
     joint_structure_da_train_step,
+    resolve_domain_score_weight,
     train_joint_structure_da,
 )
 from .quality_fusion import (
@@ -154,6 +155,7 @@ __all__ = [
     "concatenate_hierarchical_quality_outputs",
     "create_joint_structure_da_train_loaders",
     "joint_structure_da_train_step",
+    "resolve_domain_score_weight",
     "train_joint_structure_da",
     "warp_to_identity_tangent",
 ]

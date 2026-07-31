@@ -157,6 +157,16 @@ def _positive_float(name: str, value: float) -> float:
     return converted
 
 
+def _unit_interval_float(name: str, value: float) -> float:
+    try:
+        converted = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must lie in [0, 1]") from error
+    if not math.isfinite(converted) or not 0.0 <= converted <= 1.0:
+        raise ValueError(f"{name} must lie in [0, 1]")
+    return converted
+
+
 def _resolve_valid(valid: Tensor | None, batch_size: int, device: torch.device) -> Tensor:
     if valid is None:
         return torch.ones(batch_size, dtype=torch.bool, device=device)
@@ -196,7 +206,10 @@ class QualityScorer(nn.Module):
         )
 
     def forward(
-        self, feature: Tensor, valid: Tensor | None = None
+        self,
+        feature: Tensor,
+        valid: Tensor | None = None,
+        domain_score_weight: float = 1.0,
     ) -> QualityScoreOutput:
         if not isinstance(feature, Tensor) or feature.ndim != 2:
             raise ValueError("feature must have shape [B, input_dim]")
@@ -208,9 +221,13 @@ class QualityScorer(nn.Module):
         if not torch.isfinite(feature).all().item():
             raise ValueError("feature must contain only finite values")
         resolved_valid = _resolve_valid(valid, feature.shape[0], feature.device)
+        domain_score_weight = _unit_interval_float(
+            "domain_score_weight", domain_score_weight
+        )
 
-        class_logits = self.class_classifier(feature)
-        domain_logits = self.domain_classifier(feature)
+        probe_feature = feature.detach()
+        class_logits = self.class_classifier(probe_feature)
+        domain_logits = self.domain_classifier(probe_feature)
         class_probability = torch.softmax(class_logits, dim=-1)
         source_probability = torch.softmax(domain_logits, dim=-1)[..., 1]
         domain_invariance = (
@@ -231,20 +248,25 @@ class QualityScorer(nn.Module):
         discriminability = (
             0.5 * (entropy_score + confidence_score)
         ).clamp(0.0, 1.0)
-        coefficient = (
-            0.50 * domain_invariance
+        domain_weight = 0.50 * domain_score_weight
+        classification_weight = 0.50
+        raw_coefficient = (
+            domain_weight * domain_invariance
             + 0.25 * entropy_score
             + 0.25 * confidence_score
-        ).clamp(0.0, 1.0)
-        coefficient = torch.where(
-            resolved_valid, coefficient, torch.zeros_like(coefficient)
+        ) / (domain_weight + classification_weight)
+        raw_coefficient = raw_coefficient.clamp(0.0, 1.0)
+        raw_coefficient = torch.where(
+            resolved_valid,
+            raw_coefficient,
+            torch.zeros_like(raw_coefficient),
         )
         return QualityScoreOutput(
-            coefficient=coefficient,
-            domain_invariance=domain_invariance,
-            entropy_score=entropy_score,
-            confidence_score=confidence_score,
-            discriminability=discriminability,
+            coefficient=raw_coefficient.detach(),
+            domain_invariance=domain_invariance.detach(),
+            entropy_score=entropy_score.detach(),
+            confidence_score=confidence_score.detach(),
+            discriminability=discriminability.detach(),
             domain_logits=domain_logits,
             class_logits=class_logits,
             valid=resolved_valid,
@@ -341,6 +363,7 @@ class HierarchicalQualityFusion(nn.Module):
         dynamics_temporal_valid: Tensor,
         trend_channel_valid: Tensor,
         dynamics_channel_valid: Tensor,
+        domain_score_weight: float = 1.0,
     ) -> HierarchicalQualityOutput:
         components = (trend_embedding, dynamics_embedding, residual_embedding)
         structures = (
@@ -360,16 +383,16 @@ class HierarchicalQualityFusion(nn.Module):
 
         structural = StructuralQualityBundle(
             trend_temporal=self.temporal_quality(
-                trend_temporal, trend_temporal_valid
+                trend_temporal, trend_temporal_valid, domain_score_weight
             ),
             dynamics_temporal=self.temporal_quality(
-                dynamics_temporal, dynamics_temporal_valid
+                dynamics_temporal, dynamics_temporal_valid, domain_score_weight
             ),
             trend_channel=self.channel_quality(
-                trend_channel, trend_channel_valid
+                trend_channel, trend_channel_valid, domain_score_weight
             ),
             dynamics_channel=self.channel_quality(
-                dynamics_channel, dynamics_channel_valid
+                dynamics_channel, dynamics_channel_valid, domain_score_weight
             ),
         )
         beta_trend_temporal = structural.trend_temporal.coefficient
@@ -412,13 +435,13 @@ class HierarchicalQualityFusion(nn.Module):
         )
         component = ComponentQualityBundle(
             trend=self.component_quality["trend"](
-                trend_component_input, component_valid
+                trend_component_input, component_valid, domain_score_weight
             ),
             dynamics=self.component_quality["dynamics"](
-                dynamics_component_input, component_valid
+                dynamics_component_input, component_valid, domain_score_weight
             ),
             residual=self.component_quality["residual"](
-                residual_component_input, component_valid
+                residual_component_input, component_valid, domain_score_weight
             ),
         )
         alpha_trend = component.trend.coefficient

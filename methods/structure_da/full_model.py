@@ -222,6 +222,7 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         extra: Tensor | None = None,
         *,
         channel_mask: Tensor | None = None,
+        domain_score_weight: float = 1.0,
     ) -> StructureAwareForwardOutput:
         del extra
         if not isinstance(backbone, StructureBackboneOutput):
@@ -248,6 +249,7 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             PairedStructureFeatures.from_channel(channel),
             positions,
             backbone.time_mask,
+            domain_score_weight=domain_score_weight,
         )
         return StructureAwareForwardOutput(
             backbone=backbone,
@@ -265,6 +267,7 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         *,
         time_mask: Tensor | None = None,
         channel_mask: Tensor | None = None,
+        domain_score_weight: float = 1.0,
     ) -> StructureAwareForwardOutput:
         backbone = self.forward_backbone(
             pixels,
@@ -277,6 +280,7 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             backbone,
             positions,
             channel_mask=channel_mask,
+            domain_score_weight=domain_score_weight,
         )
 
     def forward(
@@ -288,6 +292,7 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         *,
         time_mask: Tensor | None = None,
         channel_mask: Tensor | None = None,
+        domain_score_weight: float = 1.0,
     ) -> Tensor:
         return self.forward_details(
             pixels,
@@ -296,6 +301,7 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             extra,
             time_mask=time_mask,
             channel_mask=channel_mask,
+            domain_score_weight=domain_score_weight,
         ).representation.logits
 
     @torch.no_grad()

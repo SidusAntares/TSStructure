@@ -45,6 +45,18 @@ def _finite_nonnegative(name: str, value: float, *, positive: bool = False) -> f
     return converted
 
 
+def resolve_domain_score_weight(epoch_index: int, warmup_epochs: int) -> float:
+    """Resolve the normalized domain-score contribution for a zero-based epoch."""
+
+    if isinstance(epoch_index, bool) or not isinstance(epoch_index, int) or epoch_index < 0:
+        raise ValueError("epoch_index must be a nonnegative integer")
+    if isinstance(warmup_epochs, bool) or not isinstance(warmup_epochs, int) or warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be a nonnegative integer")
+    if warmup_epochs <= 1:
+        return 1.0
+    return min(1.0, max(0.0, epoch_index / float(warmup_epochs - 1)))
+
+
 @dataclass(frozen=True)
 class JointStructureDALossOutput:
     total_loss: Tensor
@@ -104,6 +116,7 @@ class JointStructureDATrainingConfig:
     structural_domain_weight: float = 1.0
     component_classification_weight: float = 1.0
     component_domain_weight: float = 1.0
+    quality_domain_score_warmup_epochs: int = 5
     log_step: int = 10
     progress_bar: str = "auto"
     classes: Sequence[str] = ()
@@ -112,6 +125,14 @@ class JointStructureDATrainingConfig:
         _positive_int("epochs", self.epochs)
         _positive_int("steps_per_epoch", self.steps_per_epoch, optional=True)
         _positive_int("log_step", self.log_step)
+        if (
+            isinstance(self.quality_domain_score_warmup_epochs, bool)
+            or not isinstance(self.quality_domain_score_warmup_epochs, int)
+            or self.quality_domain_score_warmup_epochs < 0
+        ):
+            raise ValueError(
+                "quality_domain_score_warmup_epochs must be a nonnegative integer"
+            )
         object.__setattr__(self, "lr", _finite_nonnegative("lr", self.lr, positive=True))
         object.__setattr__(self, "weight_decay", _finite_nonnegative("weight_decay", self.weight_decay))
         for name in (
@@ -358,6 +379,8 @@ def joint_structure_da_train_step(
     quality_objective,
     training_config,
     device,
+    *,
+    domain_score_weight: float = 1.0,
 ) -> JointStructureDATrainStepOutput:
     if not isinstance(model, StructureAwareDomainAdaptationModel):
         raise ValueError("model must be StructureAwareDomainAdaptationModel")
@@ -373,10 +396,14 @@ def joint_structure_da_train_step(
         model.detach_backbone_for_state(source_backbone), source_tensors[2]
     )
     source_output = model.forward_from_backbone(
-        source_backbone, source_tensors[2]
+        source_backbone,
+        source_tensors[2],
+        domain_score_weight=domain_score_weight,
     )
     target_output = model.forward_from_backbone(
-        target_backbone, target_tensors[2]
+        target_backbone,
+        target_tensors[2],
+        domain_score_weight=domain_score_weight,
     )
 
     task_loss = F.cross_entropy(
@@ -568,6 +595,9 @@ def train_joint_structure_da(
         "quality_component_domain", "geometry", "alignment",
     )
     for epoch in range(training_config.epochs):
+        domain_score_weight = resolve_domain_score_weight(
+            epoch, training_config.quality_domain_score_warmup_epochs
+        )
         progress_disabled = progress_bar_disabled(training_config.progress_bar)
         model.train()
         meters = {name: AverageMeter() for name in meter_names}
@@ -587,6 +617,7 @@ def train_joint_structure_da(
                 quality_objective,
                 training_config,
                 device,
+                domain_score_weight=domain_score_weight,
             )
             scheduler.step()
             losses = result.losses
@@ -625,6 +656,7 @@ def train_joint_structure_da(
                     f"|train_acc={diagnostics['source_train_accuracy'].item():.4f}"
                     f"|domain_acc={diagnostics['domain_accuracy'].item():.4f}"
                     f"|grl={diagnostics['grl_coefficient'].item():.3f}"
+                    f"|q_dom_w={domain_score_weight:.3f}"
                     f"|lr={lr:.2e}"
                 )
             if global_step % training_config.log_step == 0 and writer is not None:
@@ -643,6 +675,11 @@ def train_joint_structure_da(
                     writer.add_scalar(tag, meters[name].val, global_step)
                 writer.add_scalar("train/domain_accuracy", result.alignment.accuracy.detach().item(), global_step)
                 writer.add_scalar("train/grl_coefficient", result.alignment.coefficient.detach().item(), global_step)
+                writer.add_scalar(
+                    "train/quality/domain_score_weight",
+                    domain_score_weight,
+                    global_step,
+                )
                 for tag, value in (
                     ("train/alpha_trend", result.mean_alpha_trend),
                     ("train/alpha_dynamics", result.mean_alpha_dynamics),
@@ -685,6 +722,7 @@ def train_joint_structure_da(
                 f"|train_acc={diagnostic_average['source_train_accuracy']:.4f}"
                 f"|domain_acc={diagnostic_average['domain_accuracy']:.4f}"
                 f"|grl={diagnostic_average['grl_coefficient']:.3f}"
+                f"|q_dom_w={domain_score_weight:.3f}"
                 f"|lr={lr_meter.avg:.2e}"
             )
             print(
@@ -721,6 +759,7 @@ def train_joint_structure_da(
             )
             print(
                 f"QUALITY_EPOCH|epoch={epoch + 1}"
+                f"|domain_score_weight={domain_score_weight:.3f}"
                 f"|alpha_T_s={diagnostic_average['source_alpha_T_mean']:.4f}"
                 f"|alpha_T_t={diagnostic_average['target_alpha_T_mean']:.4f}"
                 f"|alpha_D_s={diagnostic_average['source_alpha_D_mean']:.4f}"
