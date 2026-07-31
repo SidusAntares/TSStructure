@@ -38,8 +38,15 @@ def build_analysis_tables(runs: Iterable[ParsedRun]) -> dict[str, pd.DataFrame]:
             epoch_rows.append({
                 "run_name": run.run_name, "source": run.source, "target": run.target,
                 "seed": run.seed, "epoch": epoch.epoch, "total": epoch.total,
-                "cls": epoch.cls, "qdom": epoch.qdom, "qcls": epoch.qcls,
-                "div": epoch.div, "sda": epoch.sda, "rho": epoch.rho,
+                "task": epoch.task, "quality": epoch.quality,
+                "geometry": epoch.geometry, "alignment": epoch.alignment,
+                "domain_accuracy": epoch.domain_accuracy,
+                "alpha_T": epoch.alpha_T, "alpha_D": epoch.alpha_D,
+                "alpha_R": epoch.alpha_R,
+                "beta_T_temp": epoch.beta_T_temp,
+                "beta_D_temp": epoch.beta_D_temp,
+                "beta_T_channel": epoch.beta_T_channel,
+                "beta_D_channel": epoch.beta_D_channel,
                 "grl": epoch.grl, "lr": epoch.lr, "val_loss": epoch.val_loss,
                 "val_accuracy": epoch.val_accuracy, "val_macro_f1": epoch.val_macro_f1,
             })
@@ -60,7 +67,14 @@ def build_analysis_tables(runs: Iterable[ParsedRun]) -> dict[str, pd.DataFrame]:
                 "steps_per_epoch": run.epochs[0].steps if run.epochs else run.config.get("steps_per_epoch"),
             })
             if run.epochs:
-                values = {name: np.asarray([getattr(epoch, name) for epoch in run.epochs]) for name in ("cls", "qdom", "qcls", "div", "sda")}
+                values = {
+                    name: np.asarray([
+                        getattr(epoch, name) for epoch in run.epochs
+                    ])
+                    for name in (
+                        "task", "quality", "geometry", "alignment",
+                    )
+                }
                 loss_row = {"run_name": run.run_name}
                 for name, array in values.items():
                     loss_row.update({f"{name}_epoch1": array[0], f"{name}_final": array[-1], f"{name}_min": array.min()})

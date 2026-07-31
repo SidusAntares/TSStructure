@@ -32,14 +32,6 @@ def build_parser() -> argparse.ArgumentParser:
     decomposition.add_argument("--ndvi-csv", type=Path, required=True)
     decomposition.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
 
-    checkpoint = commands.add_parser("checkpoint", help="diagnose an existing checkpoint without training")
-    checkpoint.add_argument("--task-log", type=Path, required=True)
-    checkpoint.add_argument("--checkpoint", type=Path, required=True)
-    checkpoint.add_argument("--data-root", type=Path, required=True)
-    checkpoint.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    checkpoint.add_argument("--samples-per-class", type=int, default=200)
-    checkpoint.add_argument("--diagnostic-seed", type=int, default=0)
-    checkpoint.add_argument("--device", default="cuda")
     return parser
 
 
@@ -76,16 +68,6 @@ def main() -> None:
             f"classes={len(result['classes'])}|"
             f"groups={len(result['reconstruction'])}|"
             f"max_reconstruction_error={result['max_reconstruction_error']:.3e}"
-        )
-    else:
-        if args.samples_per_class <= 0:
-            raise ValueError("samples-per-class must be positive")
-        from analysis.structure_da.checkpoint_analysis import run_checkpoint_analysis
-
-        run_checkpoint_analysis(
-            args.task_log, args.checkpoint, args.data_root, args.output_dir,
-            samples_per_class=args.samples_per_class, device=args.device,
-            diagnostic_seed=args.diagnostic_seed,
         )
 
 

@@ -2,7 +2,6 @@
 set -euo pipefail
 
 REPO_ROOT="/data/user/TSStructure"
-DATA_ROOT="/data/user/dataset/timematch_data"
 CONDA_ENV="time"
 GPU_ID="${1:-0}"
 EXP_NAME="smoke_at1_dk1_seed1"
@@ -49,7 +48,6 @@ nvidia-smi -i "$GPU_ID"
 
 conda run -n "$CONDA_ENV" --no-capture-output \
     python -u train.py \
-    --data_root "$DATA_ROOT" \
     --source "austria/33UVP/2017" \
     --target "denmark/32VNH/2017" \
     --closed_set True \
@@ -61,13 +59,18 @@ conda run -n "$CONDA_ENV" --no-capture-output \
     --batch_size 4 \
     --num_pixels 16 \
     --num_workers 0 \
-    --quality_warmup_steps 5 \
-    --grl_warmup_steps 5 \
-    --grl_gamma 10 \
-    --lambda_qdom 1 \
-    --lambda_qcls 1 \
-    --lambda_div 1 \
-    --lambda_sda 1 \
+    --channel_feature_dim 16 \
+    --pixel_hidden_dim 16 \
+    --structure_dim 128 \
+    --domain_hidden_dim 128 \
+    --grl_warmup_max_iters 250 \
+    --lambda_task 1 \
+    --lambda_geometry 1 \
+    --lambda_alignment 1 \
+    --lambda_structural_cls 1 \
+    --lambda_structural_domain 1 \
+    --lambda_component_cls 1 \
+    --lambda_component_domain 1 \
     --progress_bar auto \
     --log_step 1 \
     --output_dir outputs \

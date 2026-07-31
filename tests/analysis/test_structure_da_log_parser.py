@@ -32,13 +32,13 @@ Test result for DK1_to_FR2_seed1: accuracy=0.6000, f1=0.5000
     return f"""TASK_START|gpu=0|source=DK1|target=FR2|seed=1|run=DK1_to_FR2_seed1
 DATE_START|2026-07-27T00:00:00+08:00
 GIT_HEAD|abc123
-Namespace(source='denmark/32VNH/2017', target='france/30TXT/2017', seed=1, epochs=2, batch_size=128, lr=0.001, weight_decay=0.0001, num_pixels=64, steps_per_epoch=None, quality_warmup_steps=None, grl_warmup_steps=None, lambda_qdom=1.0, lambda_qcls=1.0, lambda_div=1.0, lambda_sda=1.0, time_scale=365.0, tau_fast_init=0.05, tau_slow_init=0.2, tau_min=0.0001, delta_tau_min=0.0001, quality_hidden_cap=128, quality_eta=0.1, sda_hidden_dim=128, input_dim=10, with_extra=False)
+Namespace(source='denmark/32VNH/2017', target='france/30TXT/2017', seed=1, epochs=2, batch_size=128, lr=0.001, weight_decay=0.0001, num_pixels=64, steps_per_epoch=None, grl_warmup_max_iters=250, lambda_task=1.0, lambda_geometry=1.0, lambda_alignment=1.0, lambda_structural_cls=1.0, lambda_structural_domain=1.0, lambda_component_cls=1.0, lambda_component_domain=1.0, time_scale=366.0, tau_fast_init=0.05, tau_slow_init=0.2, tau_min=0.0001, delta_tau_min=0.0001, channel_feature_dim=16, pixel_hidden_dim=16, structure_dim=128, domain_hidden_dim=128, input_dim=10, with_extra=False)
 CLOSED_SET_PROTOCOL|source=denmark/32VNH/2017|target=france/30TXT/2017|num_classes={num_classes}|classes={','.join(classes)}
 CLOSED_SET_COUNTS|source_total=10|target_total=20
-TRAIN_EPOCH|epoch=1/2|steps=3|total=5.0000|cls=2.0000|qdom=8.0000|qcls=10.0000|div=-8.0000|sda=1.3000|rho=1.000|grl=1.000|lr=1.00e-03
+TRAIN_EPOCH|epoch=1/2|steps=3|total=5.0000|task=2.0000|quality=1.0000|geometry=0.7000|alignment=1.3000|domain_accuracy=0.5000|alpha_T=0.6000|alpha_D=0.3000|alpha_R=0.1000|beta_T_temp=0.7000|beta_D_temp=0.6000|beta_T_channel=0.3000|beta_D_channel=0.4000|grl=1.000|lr=1.00e-03
 Validation result: loss=0.6000, acc=0.70, f1=0.4000
 Validation F1 improved from -inf to 0.4000!
-TRAIN_EPOCH|epoch=2/2|steps=3|total=4.0000|cls=1.0000|qdom=7.0000|qcls=9.0000|div=-9.0000|sda=1.2000|rho=1.000|grl=1.000|lr=0.00e+00
+TRAIN_EPOCH|epoch=2/2|steps=3|total=4.0000|task=1.0000|quality=1.1000|geometry=0.7000|alignment=1.2000|domain_accuracy=0.5500|alpha_T=0.5500|alpha_D=0.3500|alpha_R=0.1000|beta_T_temp=0.6500|beta_D_temp=0.5500|beta_T_channel=0.3500|beta_D_channel=0.4500|grl=1.000|lr=0.00e+00
 Validation result: loss=0.5000, acc=0.80, f1=0.6000
 Validation F1 improved from 0.4000 to 0.6000!
 {test_section}

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 import dataset
-from methods.structure_da import trainer as structure_da_trainer
+from methods.structure_da import joint_trainer as structure_da_trainer
 
 import train
 
@@ -356,7 +356,7 @@ def test_closed_set_is_propagated_to_structure_da_and_evaluation_loaders(
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")),
     )
     with pytest.raises(RuntimeError, match="stop"):
-        structure_da_trainer.create_structure_da_train_loaders(config, splits)
+        structure_da_trainer.create_joint_structure_da_train_loaders(config, splits)
     assert _LoaderDataset.calls == [(True, True), (True, True)]
 
     _LoaderDataset.calls = []

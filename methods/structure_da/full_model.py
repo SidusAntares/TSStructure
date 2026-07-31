@@ -73,6 +73,10 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         pixel_hidden_dim: int = 16,
         structure_dim: int = 128,
         time_scale: float = 366.0,
+        tau_fast_init: float = 0.05,
+        tau_slow_init: float = 0.20,
+        tau_min: float = 1e-4,
+        delta_tau_min: float = 1e-4,
         temporal_options: Mapping[str, Any] | None = None,
         channel_options: Mapping[str, Any] | None = None,
         representation_options: Mapping[str, Any] | None = None,
@@ -92,6 +96,10 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             num_channels=num_channels,
             channel_feature_dim=channel_feature_dim,
             pixel_hidden_dim=pixel_hidden_dim,
+            tau_fast_init=tau_fast_init,
+            tau_slow_init=tau_slow_init,
+            tau_min=tau_min,
+            delta_tau_min=delta_tau_min,
             time_scale=time_scale,
         )
         temporal_kwargs = _options_with_fixed(

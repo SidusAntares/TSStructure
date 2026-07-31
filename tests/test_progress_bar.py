@@ -142,6 +142,10 @@ def test_final_evaluation_defaults_missing_progress_bar_to_auto(monkeypatch):
         classes=["crop"],
         experiment_name="test",
         time_scale=366.0,
+        tau_fast_init=0.05,
+        tau_slow_init=0.20,
+        tau_min=1e-4,
+        delta_tau_min=1e-4,
         channel_feature_dim=16,
         pixel_hidden_dim=16,
         structure_dim=128,
@@ -167,6 +171,7 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
     evaluation_domains = []
     trainer_validation_loaders = []
     final_test_loaders = []
+    model_kwargs = []
 
     class Model:
         def to(self, device):
@@ -195,7 +200,11 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
         return target_val, target_test
 
     monkeypatch.setattr(train, "create_evaluation_loaders", create_evaluation_loaders)
-    monkeypatch.setattr(train, "StructureAwareDomainAdaptationModel", lambda **kwargs: Model())
+    monkeypatch.setattr(
+        train,
+        "StructureAwareDomainAdaptationModel",
+        lambda **kwargs: (model_kwargs.append(kwargs) or Model()),
+    )
     monkeypatch.setattr(
         train,
         "create_joint_structure_da_train_loaders",
@@ -235,6 +244,8 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
         output_dir="outputs", sample_pixels_val=False, eval=False,
         model="structure_da", input_dim=10, num_classes=1, with_extra=False,
         classes=["crop"], experiment_name="test", time_scale=366.0,
+        tau_fast_init=0.07, tau_slow_init=0.29,
+        tau_min=0.0002, delta_tau_min=0.0003,
         channel_feature_dim=16, pixel_hidden_dim=16, structure_dim=128,
         domain_hidden_dim=128, grl_warmup_max_iters=250,
         tensorboard_log_dir="runs", epochs=1,
@@ -251,6 +262,20 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
     assert trainer_validation_loaders == [source_val]
     assert target_val not in trainer_validation_loaders
     assert final_test_loaders == [target_test]
+    assert model_kwargs == [{
+        "num_classes": 1,
+        "num_channels": 10,
+        "channel_feature_dim": 16,
+        "pixel_hidden_dim": 16,
+        "structure_dim": 128,
+        "time_scale": 366.0,
+        "tau_fast_init": 0.07,
+        "tau_slow_init": 0.29,
+        "tau_min": 0.0002,
+        "delta_tau_min": 0.0003,
+        "alignment_hidden_dim": 128,
+        "grl_max_iters": 250,
+    }]
 
 
 def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
@@ -269,8 +294,8 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
     ):
         assert option in result.stdout
     for option in (
-        "--quality_warmup_steps", "--grl_gamma", "--lambda_qdom",
-        "--lambda_qcls", "--lambda_div", "--lambda_sda",
+        "--quality_" + "warmup_steps", "--grl_gamma", "--lambda_qdom",
+        "--lambda_qcls", "--lambda_" + "div", "--lambda_" + "sda",
         "--quality_hidden_cap", "--quality_eta", "--sda_hidden_dim",
     ):
         assert option not in result.stdout

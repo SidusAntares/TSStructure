@@ -19,8 +19,8 @@ from methods.structure_da.temporal_module import (
 from models.ltae import LTAE
 
 
-def _model(dtype: torch.dtype = torch.float32):
-    return StructureAwareDomainAdaptationModel(
+def _model(dtype: torch.dtype = torch.float32, **overrides):
+    options = dict(
         num_classes=3,
         num_channels=2,
         channel_feature_dim=2,
@@ -64,7 +64,9 @@ def _model(dtype: torch.dtype = torch.float32):
         },
         alignment_hidden_dim=5,
         grl_max_iters=10,
-    ).to(dtype=dtype)
+    )
+    options.update(overrides)
+    return StructureAwareDomainAdaptationModel(**options).to(dtype=dtype)
 
 
 def _inputs(batch: int = 2, length: int = 5, dtype=torch.float32):
@@ -188,3 +190,21 @@ def test_invalid_constructor_and_masks_are_rejected() -> None:
     pixels, valid, positions = _inputs()
     with pytest.raises(ValueError):
         model.forward_details(pixels, valid, positions, channel_mask=torch.ones(2, 5, 2, 1))
+
+
+def test_tau_constructor_values_reach_stkd_initial_scales() -> None:
+    baseline = _model()
+    changed = _model(
+        tau_fast_init=0.08,
+        tau_slow_init=0.31,
+        tau_min=1e-3,
+        delta_tau_min=2e-3,
+    )
+
+    assert baseline.backbone.decomposition.tau_fast.item() == pytest.approx(0.05)
+    assert baseline.backbone.decomposition.tau_slow.item() == pytest.approx(0.20)
+    assert changed.backbone.decomposition.tau_fast.item() == pytest.approx(0.08)
+    assert changed.backbone.decomposition.tau_slow.item() == pytest.approx(0.31)
+    assert changed.backbone.decomposition.tau_fast.item() != pytest.approx(
+        baseline.backbone.decomposition.tau_fast.item()
+    )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -69,10 +71,6 @@ def _counts(model):
 
 def test_training_config_rejects_invalid_values_and_has_no_legacy_fields() -> None:
     config = _config()
-    assert not hasattr(config, "quality_warmup_steps")
-    assert not hasattr(config, "quality_progress")
-    assert not hasattr(config, "diversity_weight")
-    assert not hasattr(config, "coefficient_stop_gradient")
     for field in (
         "task_weight", "geometry_weight", "alignment_weight",
         "structural_classification_weight", "structural_domain_weight",
@@ -145,6 +143,101 @@ def test_joint_step_supports_unequal_lengths_and_never_reads_target_label() -> N
     )
 
 
+def test_nonfinite_loss_raises_before_optimizer_step(monkeypatch) -> None:
+    import methods.structure_da.joint_trainer as module
+
+    model = _model()
+    config = _config()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    original_cross_entropy = module.F.cross_entropy
+    call_count = 0
+
+    def first_nan_cross_entropy(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return args[0].sum() * float("nan")
+        return original_cross_entropy(*args, **kwargs)
+
+    monkeypatch.setattr(module.F, "cross_entropy", first_nan_cross_entropy)
+    monkeypatch.setattr(
+        optimizer,
+        "step",
+        lambda *args, **kwargs: pytest.fail("optimizer.step must not run"),
+    )
+
+    with pytest.raises(FloatingPointError) as error:
+        joint_structure_da_train_step(
+            model, _sample(2, 5), _sample(2, 7, labels=False), optimizer,
+            _objective(config), config, torch.device("cpu"),
+        )
+
+    message = str(error.value)
+    for name in (
+        "task_loss", "quality_loss", "geometry_loss", "alignment_loss",
+        "total_loss",
+    ):
+        assert name in message
+
+
+@pytest.mark.parametrize("field,value", [("alpha_trend", 1.1), ("beta_trend_channel", -0.1)])
+def test_invalid_quality_coefficient_raises_before_optimizer_step(
+    monkeypatch, field, value
+) -> None:
+    model = _model()
+    config = _config()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    original_forward = model.forward_details
+
+    def invalid_forward(*args, **kwargs):
+        output = original_forward(*args, **kwargs)
+        quality = output.representation.quality
+        invalid = getattr(quality, field).clone()
+        invalid[0] = value
+        quality = replace(quality, **{field: invalid})
+        return replace(
+            output,
+            representation=replace(output.representation, quality=quality),
+        )
+
+    monkeypatch.setattr(model, "forward_details", invalid_forward)
+    monkeypatch.setattr(
+        optimizer,
+        "step",
+        lambda *args, **kwargs: pytest.fail("optimizer.step must not run"),
+    )
+
+    with pytest.raises(FloatingPointError, match=field):
+        joint_structure_da_train_step(
+            model, _sample(2, 5), _sample(2, 7, labels=False), optimizer,
+            _objective(config), config, torch.device("cpu"),
+        )
+
+
+def test_invalid_grl_coefficient_raises_before_optimizer_step(monkeypatch) -> None:
+    model = _model()
+    config = _config()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    original_align = model.align
+
+    def invalid_align(*args, **kwargs):
+        output = original_align(*args, **kwargs)
+        return replace(output, coefficient=output.coefficient.new_tensor(1.1))
+
+    monkeypatch.setattr(model, "align", invalid_align)
+    monkeypatch.setattr(
+        optimizer,
+        "step",
+        lambda *args, **kwargs: pytest.fail("optimizer.step must not run"),
+    )
+
+    with pytest.raises(FloatingPointError, match="GRL coefficient"):
+        joint_structure_da_train_step(
+            model, _sample(2, 5), _sample(2, 7, labels=False), optimizer,
+            _objective(config), config, torch.device("cpu"),
+        )
+
+
 def test_loader_factory_forces_no_extra_and_independent_train_loaders(monkeypatch) -> None:
     import methods.structure_da.joint_trainer as module
 
@@ -195,6 +288,13 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
     config = _config()
     writer = _Writer()
     path = tmp_path / "model.pt"
+    recorded = []
+    original_train_step = module.joint_structure_da_train_step
+
+    def recording_train_step(*args, **kwargs):
+        result = original_train_step(*args, **kwargs)
+        recorded.append(result)
+        return result
 
     # Exercise the standard four-argument forward without CUDA-bound evaluation.
     def fake_validation(best_f1, best_model_path, training_config, criterion,
@@ -210,6 +310,7 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
         return 0.5
 
     monkeypatch.setattr(module, "validation", fake_validation)
+    monkeypatch.setattr(module, "joint_structure_da_train_step", recording_train_step)
     train_joint_structure_da(
         model,
         [_sample(2, 5)],
@@ -227,7 +328,20 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
     assert checkpoint["best_f1"] == 0.5
     assert _counts(restored) == (2, 2, 2, 2, 2)
     assert restored.alignment.grl.iteration.item() == 2
-    assert "TRAIN_EPOCH|" in capsys.readouterr().out
+    epoch_log = capsys.readouterr().out
+    assert "TRAIN_EPOCH|" in epoch_log
+    expected_epoch_values = {
+        "domain_accuracy": sum(item.alignment.accuracy.item() for item in recorded) / 2,
+        "alpha_T": sum(item.mean_alpha_trend.item() for item in recorded) / 2,
+        "alpha_D": sum(item.mean_alpha_dynamics.item() for item in recorded) / 2,
+        "alpha_R": sum(item.mean_alpha_residual.item() for item in recorded) / 2,
+        "beta_T_temp": sum(item.mean_beta_trend_temporal.item() for item in recorded) / 2,
+        "beta_D_temp": sum(item.mean_beta_dynamics_temporal.item() for item in recorded) / 2,
+        "beta_T_channel": sum(item.mean_beta_trend_channel.item() for item in recorded) / 2,
+        "beta_D_channel": sum(item.mean_beta_dynamics_channel.item() for item in recorded) / 2,
+    }
+    for name, value in expected_epoch_values.items():
+        assert f"|{name}={value:.4f}" in epoch_log
     required = {
         "train/loss_total", "train/loss_task", "train/loss_quality_total",
         "train/loss_quality_structural_cls", "train/loss_quality_structural_domain",

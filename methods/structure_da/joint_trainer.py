@@ -143,6 +143,66 @@ def _sample_to_device(sample, device):
     )
 
 
+def _scalar_description(value: Tensor) -> str:
+    if not isinstance(value, Tensor):
+        return f"non-tensor({type(value).__name__})"
+    if value.ndim != 0:
+        return f"shape={tuple(value.shape)}"
+    return repr(value.detach().item())
+
+
+def _check_loss_scalars(**losses: Tensor) -> None:
+    invalid = [
+        name
+        for name, value in losses.items()
+        if not isinstance(value, Tensor)
+        or value.ndim != 0
+        or not torch.isfinite(value.detach()).item()
+    ]
+    if invalid:
+        values = ", ".join(
+            f"{name}={_scalar_description(value)}"
+            for name, value in losses.items()
+        )
+        raise FloatingPointError(
+            f"invalid scalar loss before backward ({', '.join(invalid)}): {values}"
+        )
+
+
+def _check_bounded_training_values(model, quality, alignment) -> None:
+    coefficients = {
+        "alpha_trend": quality.alpha_trend,
+        "alpha_dynamics": quality.alpha_dynamics,
+        "alpha_residual": quality.alpha_residual,
+        "beta_trend_temporal": quality.beta_trend_temporal,
+        "beta_dynamics_temporal": quality.beta_dynamics_temporal,
+        "beta_trend_channel": quality.beta_trend_channel,
+        "beta_dynamics_channel": quality.beta_dynamics_channel,
+    }
+    for name, value in coefficients.items():
+        detached = value.detach()
+        if (
+            not torch.isfinite(detached).all().item()
+            or not ((detached >= 0) & (detached <= 1)).all().item()
+        ):
+            raise FloatingPointError(
+                f"{name} must contain only finite values in [0, 1]"
+            )
+
+    grl = alignment.coefficient.detach()
+    grl_low = model.alignment.grl.low
+    grl_high = model.alignment.grl.high
+    if (
+        grl.ndim != 0
+        or not torch.isfinite(grl).item()
+        or not grl_low <= grl.item() <= grl_high
+    ):
+        raise FloatingPointError(
+            "GRL coefficient must be a finite scalar in "
+            f"[{grl_low}, {grl_high}]"
+        )
+
+
 def joint_structure_da_train_step(
     model,
     source_sample,
@@ -199,6 +259,14 @@ def joint_structure_da_train_step(
         + training_config.geometry_weight * geometry_loss
         + training_config.alignment_weight * alignment_loss
     )
+    _check_loss_scalars(
+        task_loss=task_loss,
+        quality_loss=quality_loss.total_loss,
+        geometry_loss=geometry_loss,
+        alignment_loss=alignment_loss,
+        total_loss=total_loss,
+    )
+    _check_bounded_training_values(model, merged_quality, alignment)
     total_loss.backward()
     optimizer.step()
     quality = merged_quality
@@ -264,6 +332,8 @@ def train_joint_structure_da(
         "total", "task", "quality_total", "quality_structural_cls",
         "quality_structural_domain", "quality_component_cls",
         "quality_component_domain", "geometry", "alignment",
+        "domain_accuracy", "alpha_T", "alpha_D", "alpha_R",
+        "beta_T_temp", "beta_D_temp", "beta_T_channel", "beta_D_channel",
     )
     for epoch in range(training_config.epochs):
         progress_disabled = progress_bar_disabled(training_config.progress_bar)
@@ -298,6 +368,23 @@ def train_joint_structure_da(
             }
             for name, value in values.items():
                 meters[name].update(value.detach().item(), n=result.source_batch_size)
+            diagnostic_values = {
+                "domain_accuracy": result.alignment.accuracy,
+                "alpha_T": result.mean_alpha_trend,
+                "alpha_D": result.mean_alpha_dynamics,
+                "alpha_R": result.mean_alpha_residual,
+                "beta_T_temp": result.mean_beta_trend_temporal,
+                "beta_D_temp": result.mean_beta_dynamics_temporal,
+                "beta_T_channel": result.mean_beta_trend_channel,
+                "beta_D_channel": result.mean_beta_dynamics_channel,
+            }
+            diagnostic_batch_size = (
+                result.source_batch_size + result.target_batch_size
+            )
+            for name, value in diagnostic_values.items():
+                meters[name].update(
+                    value.detach().item(), n=diagnostic_batch_size
+                )
             lr = optimizer.param_groups[0]["lr"]
             if global_step % training_config.log_step == 0 and writer is not None:
                 tags = {
@@ -343,6 +430,14 @@ def train_joint_structure_da(
                 f"|quality={meters['quality_total'].avg:.4f}"
                 f"|geometry={meters['geometry'].avg:.4f}"
                 f"|alignment={meters['alignment'].avg:.4f}"
+                f"|domain_accuracy={meters['domain_accuracy'].avg:.4f}"
+                f"|alpha_T={meters['alpha_T'].avg:.4f}"
+                f"|alpha_D={meters['alpha_D'].avg:.4f}"
+                f"|alpha_R={meters['alpha_R'].avg:.4f}"
+                f"|beta_T_temp={meters['beta_T_temp'].avg:.4f}"
+                f"|beta_D_temp={meters['beta_D_temp'].avg:.4f}"
+                f"|beta_T_channel={meters['beta_T_channel'].avg:.4f}"
+                f"|beta_D_channel={meters['beta_D_channel'].avg:.4f}"
                 f"|grl={result.alignment.coefficient.item():.3f}|lr={lr:.2e}"
             )
         model.eval()

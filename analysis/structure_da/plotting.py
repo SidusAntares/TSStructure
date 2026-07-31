@@ -91,8 +91,8 @@ def _training_figures(run: ParsedRun, root: Path) -> None:
     run_dir = root / run.run_name
 
     fig, axes = plt.subplots(2, 1, figsize=(7, 7), sharex=True)
-    axes[0].plot(epochs, [item.cls for item in run.epochs])
-    axes[0].set_ylabel("Classification loss")
+    axes[0].plot(epochs, [item.task for item in run.epochs])
+    axes[0].set_ylabel("Task loss")
     axes[1].plot(epochs, 100 * val)
     axes[1].set_ylabel("Source-val Macro-F1 (%)")
     axes[1].set_xlabel("Epoch")
@@ -100,25 +100,19 @@ def _training_figures(run: ParsedRun, root: Path) -> None:
     _save(fig, run_dir / "classification_and_validation.png")
 
     fig, axis = plt.subplots(figsize=(7, 4.5))
-    axis.plot(epochs, [item.qdom for item in run.epochs], label="qdom")
-    axis.plot(epochs, [item.qcls for item in run.epochs], label="qcls")
-    axis.axhline(12 * np.log(2), linestyle="--", color="C0", alpha=0.6, label="qdom random reference")
-    axis.axhline(6 * np.log(max(run.num_classes, 2)), linestyle="--", color="C1", alpha=0.6, label="qcls random reference")
-    axis.set_xlabel("Epoch"); axis.set_ylabel("Loss"); axis.set_title(f"{run.run_name}: quality losses")
+    axis.plot(epochs, [item.quality for item in run.epochs], label="quality")
+    axis.plot(epochs, [item.geometry for item in run.epochs], label="geometry")
+    axis.plot(epochs, [item.alignment for item in run.epochs], label="alignment")
+    axis.set_xlabel("Epoch"); axis.set_ylabel("Loss"); axis.set_title(f"{run.run_name}: auxiliary losses")
     axis.legend(fontsize=8)
     _save(fig, run_dir / "quality_losses.png")
 
-    for name, reference, filename, title in (
-        ("sda", 2 * np.log(2), "sda_loss.png", "SDA loss"),
-        ("div", None, "diversity_loss.png", "Diversity loss"),
-    ):
-        fig, axis = plt.subplots(figsize=(7, 4.2))
-        axis.plot(epochs, [getattr(item, name) for item in run.epochs])
-        if reference is not None:
-            axis.axhline(reference, linestyle="--", color="black", alpha=0.6, label="random domain reference")
-            axis.legend()
-        axis.set_xlabel("Epoch"); axis.set_ylabel("Loss"); axis.set_title(f"{run.run_name}: {title}")
-        _save(fig, run_dir / filename)
+    fig, axis = plt.subplots(figsize=(7, 4.2))
+    axis.plot(epochs, [item.domain_accuracy for item in run.epochs])
+    axis.axhline(0.5, linestyle="--", color="black", alpha=0.6)
+    axis.set_xlabel("Epoch"); axis.set_ylabel("Accuracy")
+    axis.set_title(f"{run.run_name}: domain accuracy")
+    _save(fig, run_dir / "domain_accuracy.png")
 
     fig, axis = plt.subplots(figsize=(7, 4.2))
     axis.plot(epochs, 100 * val)

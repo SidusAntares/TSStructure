@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="/data/user/TSStructure"
 DATA_ROOT="/data/user/dataset/timematch_data"
 CONDA_ENV="time"
-EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-structure_da_full_3seeds_v1}"
+EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-structure_eden_full_3seeds_v1}"
 
 DATASETS=(
     "denmark/32VNH/2017"
@@ -86,6 +86,28 @@ run_source_tasks() {
                     --device cuda \
                     --closed_set true \
                     --combine_spring_and_winter false \
+                    --epochs 100 \
+                    --batch_size 128 \
+                    --num_pixels 64 \
+                    --lr 1e-3 \
+                    --weight_decay 1e-4 \
+                    --channel_feature_dim 16 \
+                    --pixel_hidden_dim 16 \
+                    --structure_dim 128 \
+                    --domain_hidden_dim 128 \
+                    --grl_warmup_max_iters 250 \
+                    --lambda_task 1 \
+                    --lambda_geometry 1 \
+                    --lambda_alignment 1 \
+                    --lambda_structural_cls 1 \
+                    --lambda_structural_domain 1 \
+                    --lambda_component_cls 1 \
+                    --lambda_component_domain 1 \
+                    --time_scale 366 \
+                    --tau_fast_init 0.05 \
+                    --tau_slow_init 0.20 \
+                    --tau_min 0.0001 \
+                    --delta_tau_min 0.0001 \
                     --progress_bar auto \
                     --output_dir "$OUTPUT_ROOT" \
                     --tensorboard_log_dir "$RUN_ROOT" \

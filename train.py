@@ -78,6 +78,10 @@ def main(config):
             pixel_hidden_dim=config.pixel_hidden_dim,
             structure_dim=config.structure_dim,
             time_scale=config.time_scale,
+            tau_fast_init=config.tau_fast_init,
+            tau_slow_init=config.tau_slow_init,
+            tau_min=config.tau_min,
+            delta_tau_min=config.delta_tau_min,
             alignment_hidden_dim=config.domain_hidden_dim,
             grl_max_iters=config.grl_warmup_max_iters,
         )

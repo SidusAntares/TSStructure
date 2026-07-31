@@ -16,12 +16,18 @@ class EpochRecord:
     epoch: int
     steps: int
     total: float
-    cls: float
-    qdom: float
-    qcls: float
-    div: float
-    sda: float
-    rho: float
+    task: float
+    quality: float
+    geometry: float
+    alignment: float
+    domain_accuracy: float
+    alpha_T: float
+    alpha_D: float
+    alpha_R: float
+    beta_T_temp: float
+    beta_D_temp: float
+    beta_T_channel: float
+    beta_D_channel: float
     grl: float
     lr: float
     val_loss: Optional[float] = None
@@ -199,10 +205,19 @@ def parse_task_log(path: Path | str) -> ParsedRun:
             pending = EpochRecord(
                 epoch=int(str(values["epoch"]).split("/")[0]),
                 steps=int(values["steps"]),
-                total=float(values["total"]), cls=float(values["cls"]),
-                qdom=float(values["qdom"]), qcls=float(values["qcls"]),
-                div=float(values["div"]), sda=float(values["sda"]),
-                rho=float(values["rho"]), grl=float(values["grl"]),
+                total=float(values["total"]), task=float(values["task"]),
+                quality=float(values["quality"]),
+                geometry=float(values["geometry"]),
+                alignment=float(values["alignment"]),
+                domain_accuracy=float(values["domain_accuracy"]),
+                alpha_T=float(values["alpha_T"]),
+                alpha_D=float(values["alpha_D"]),
+                alpha_R=float(values["alpha_R"]),
+                beta_T_temp=float(values["beta_T_temp"]),
+                beta_D_temp=float(values["beta_D_temp"]),
+                beta_T_channel=float(values["beta_T_channel"]),
+                beta_D_channel=float(values["beta_D_channel"]),
+                grl=float(values["grl"]),
                 lr=float(values["lr"]),
             )
             epochs.append(pending)
