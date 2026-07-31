@@ -69,6 +69,13 @@ from .temporal_geometry import (
     TemporalGeometryObjective,
     warp_to_identity_tangent,
 )
+from .temporal_head import (
+    PhaseCoordinateEncoder,
+    ShapeCoordinateEncoder,
+    TemporalStructureEncoder,
+    TemporalStructureFeatureOutput,
+    TemporalStructureOutputHead,
+)
 from .temporal_registration import (
     MonotoneWarpEstimator,
     MonotoneWarpOutput,
@@ -110,6 +117,7 @@ __all__ = [
     "MonotoneWarpEstimator",
     "MonotoneWarpOutput",
     "PhaseTangentOutput",
+    "PhaseCoordinateEncoder",
     "QualityScores",
     "StructureOutput",
     "StructureDALosses",
@@ -129,6 +137,7 @@ __all__ = [
     "StructuralAdversarialOutput",
     "StructuralQualityOutput",
     "StructuralQualityPerception",
+    "ShapeCoordinateEncoder",
     "StructuralQualityBundle",
     "SymmetricTimeKernelDecomposition",
     "TemporalCoordinateOutput",
@@ -136,6 +145,9 @@ __all__ = [
     "TemporalFunctionalOutput",
     "TemporalGeometryLossOutput",
     "TemporalGeometryObjective",
+    "TemporalStructureEncoder",
+    "TemporalStructureFeatureOutput",
+    "TemporalStructureOutputHead",
     "TemporalRegistrationOutput",
     "TemporalSRVFExtractor",
     "TemporalSRVFOutput",
