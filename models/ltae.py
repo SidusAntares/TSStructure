@@ -81,14 +81,34 @@ class LTAE(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, positions, return_att=False):
+    def forward(self, x, positions, return_att=False, time_mask=None):
+        resolved_mask = None
+        if time_mask is not None:
+            resolved_mask = _resolve_time_mask(
+                time_mask,
+                batch_size=x.shape[0],
+                sequence_length=x.shape[1],
+                device=x.device,
+            )
+            x = torch.where(
+                resolved_mask.unsqueeze(-1), x, torch.zeros_like(x)
+            )
         if self.inconv is not None:
             x = self.inconv(x)
         enc_output = x + self.positional_enc(positions + self.max_temporal_shift)
 
-        enc_output, attn = self.attention_heads(enc_output)
+        enc_output, attn = self.attention_heads(
+            enc_output, time_mask=resolved_mask
+        )
 
         enc_output = self.dropout(self.mlp(enc_output))
+        if resolved_mask is not None:
+            sample_valid = resolved_mask.any(dim=-1)
+            enc_output = torch.where(
+                sample_valid.unsqueeze(-1),
+                enc_output,
+                torch.zeros_like(enc_output),
+            )
 
         if return_att:
             return enc_output, attn
@@ -113,7 +133,7 @@ class MultiHeadAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
 
-    def forward(self, x):
+    def forward(self, x, time_mask=None):
         # Slightly more efficient re-implementation of LTAE
         B, T, C = x.size()
         q = self.query.repeat(B, 1, 1, 1).transpose(1, 2)  # (nh, hs) -> (B, nh, 1, d_k)
@@ -121,8 +141,54 @@ class MultiHeadAttention(nn.Module):
         v = x.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         # self-attend; (B, nh, 1, d_k) x (B, nh, d_k, T) -> (B, nh, 1, T)
         att = (q @ k.transpose(-2, -1)) / self.temperature
+        resolved_mask = None
+        sample_valid = None
+        if time_mask is not None:
+            resolved_mask = _resolve_time_mask(
+                time_mask,
+                batch_size=B,
+                sequence_length=T,
+                device=x.device,
+            )
+            sample_valid = resolved_mask.any(dim=-1)
+            safe_mask = resolved_mask.clone()
+            safe_mask[~sample_valid, 0] = True
+            att = att.masked_fill(
+                ~safe_mask[:, None, None, :],
+                torch.finfo(att.dtype).min,
+            )
         att = self.softmax(att)
         att = self.dropout(att)
+        if resolved_mask is not None:
+            att = att * resolved_mask[:, None, None, :].to(dtype=att.dtype)
+            att = att * sample_valid[:, None, None, None].to(dtype=att.dtype)
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, C)
+        if sample_valid is not None:
+            y = torch.where(
+                sample_valid.unsqueeze(-1), y, torch.zeros_like(y)
+            )
         return y, att
+
+
+def _resolve_time_mask(time_mask, batch_size, sequence_length, device):
+    if not isinstance(time_mask, torch.Tensor):
+        raise ValueError("time_mask must be a torch.Tensor or None")
+    if time_mask.ndim == 1:
+        if time_mask.shape != (sequence_length,):
+            raise ValueError("time_mask must have shape [L] or [B, L]")
+        time_mask = time_mask.unsqueeze(0).expand(batch_size, -1)
+    elif time_mask.ndim == 2:
+        if time_mask.shape != (batch_size, sequence_length):
+            raise ValueError("time_mask must have shape [L] or [B, L]")
+    else:
+        raise ValueError("time_mask must have shape [L] or [B, L]")
+    if time_mask.is_complex() or (
+        time_mask.dtype != torch.bool
+        and (
+            not torch.isfinite(time_mask).all().item()
+            or not torch.all((time_mask == 0) | (time_mask == 1)).item()
+        )
+    ):
+        raise ValueError("time_mask must contain only finite 0/1 values")
+    return time_mask.to(device=device, dtype=torch.bool)
