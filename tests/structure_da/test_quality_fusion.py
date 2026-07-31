@@ -16,6 +16,7 @@ from methods.structure_da.quality_fusion import (
     QualityScoreOutput,
     QualityScorer,
     StructuralQualityBundle,
+    concatenate_hierarchical_quality_outputs,
 )
 
 
@@ -46,6 +47,60 @@ def _fusion_inputs(dtype: torch.dtype = torch.float32):
         torch.tensor([False, True, False, True]),
     ]
     return (*embeddings, *structures, component_valid, *structure_valid)
+
+
+def test_concatenate_hierarchical_quality_outputs_preserves_order_and_gradients() -> None:
+    fusion = _fusion()
+    source_inputs = list(_fusion_inputs())
+    target_inputs = list(_fusion_inputs())
+    source_inputs[0] = torch.randn(2, 4, requires_grad=True)
+    target_inputs[0] = torch.randn(3, 4, requires_grad=True)
+    for inputs, batch_size in ((source_inputs, 2), (target_inputs, 3)):
+        for index in range(1, 7):
+            width = 4 if index < 3 else 3
+            inputs[index] = torch.randn(batch_size, width)
+        inputs[7] = torch.ones(batch_size, dtype=torch.bool)
+        for index in range(8, 12):
+            inputs[index] = torch.ones(batch_size, dtype=torch.bool)
+    source = fusion(*source_inputs)
+    target = fusion(*target_inputs)
+
+    merged = concatenate_hierarchical_quality_outputs(source, target)
+
+    for name in (
+        "alpha_trend", "alpha_dynamics", "alpha_residual",
+        "beta_trend_temporal", "beta_dynamics_temporal",
+        "beta_trend_channel", "beta_dynamics_channel", "fused_feature",
+    ):
+        expected = torch.cat([getattr(source, name), getattr(target, name)], dim=0)
+        torch.testing.assert_close(getattr(merged, name), expected)
+    torch.testing.assert_close(
+        merged.structural.trend_temporal.class_logits,
+        torch.cat([
+            source.structural.trend_temporal.class_logits,
+            target.structural.trend_temporal.class_logits,
+        ]),
+    )
+    assert torch.equal(
+        merged.component.residual.valid,
+        torch.cat([source.component.residual.valid, target.component.residual.valid]),
+    )
+    merged.fused_feature.sum().backward()
+    assert source_inputs[0].grad is not None and source_inputs[0].grad.abs().sum() > 0
+    assert target_inputs[0].grad is not None and target_inputs[0].grad.abs().sum() > 0
+
+
+def test_concatenate_hierarchical_quality_outputs_rejects_nonbatch_mismatch() -> None:
+    fusion = _fusion()
+    source = fusion(*_fusion_inputs())
+    other = HierarchicalQualityFusion(4, 5, 3, domain_hidden_dim=5)
+    inputs = list(_fusion_inputs())
+    for index in range(3, 7):
+        inputs[index] = torch.randn(4, 5)
+    target = other(*inputs)
+
+    with pytest.raises(ValueError):
+        concatenate_hierarchical_quality_outputs(source, target)
 
 
 def test_quality_scorer_has_exact_classifier_architecture() -> None:

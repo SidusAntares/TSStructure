@@ -74,6 +74,73 @@ class QualityLossOutput:
     component_domain_count: Tensor
 
 
+def _concatenate_batch_tensors(name: str, source: Tensor, target: Tensor) -> Tensor:
+    if not isinstance(source, Tensor) or not isinstance(target, Tensor):
+        raise ValueError(f"{name} values must be tensors")
+    if source.ndim == 0 or target.ndim == 0 or source.shape[1:] != target.shape[1:]:
+        raise ValueError(f"{name} non-batch dimensions must match")
+    if source.dtype != target.dtype or source.device != target.device:
+        raise ValueError(f"{name} dtype and device must match")
+    return torch.cat([source, target], dim=0)
+
+
+def _concatenate_score(
+    name: str, source: QualityScoreOutput, target: QualityScoreOutput
+) -> QualityScoreOutput:
+    if not isinstance(source, QualityScoreOutput) or not isinstance(target, QualityScoreOutput):
+        raise ValueError(f"{name} values must be QualityScoreOutput")
+    return QualityScoreOutput(
+        coefficient=_concatenate_batch_tensors(f"{name}.coefficient", source.coefficient, target.coefficient),
+        domain_invariance=_concatenate_batch_tensors(f"{name}.domain_invariance", source.domain_invariance, target.domain_invariance),
+        entropy_score=_concatenate_batch_tensors(f"{name}.entropy_score", source.entropy_score, target.entropy_score),
+        confidence_score=_concatenate_batch_tensors(f"{name}.confidence_score", source.confidence_score, target.confidence_score),
+        discriminability=_concatenate_batch_tensors(f"{name}.discriminability", source.discriminability, target.discriminability),
+        domain_logits=_concatenate_batch_tensors(f"{name}.domain_logits", source.domain_logits, target.domain_logits),
+        class_logits=_concatenate_batch_tensors(f"{name}.class_logits", source.class_logits, target.class_logits),
+        valid=_concatenate_batch_tensors(f"{name}.valid", source.valid, target.valid),
+    )
+
+
+def concatenate_hierarchical_quality_outputs(
+    source: HierarchicalQualityOutput,
+    target: HierarchicalQualityOutput,
+) -> HierarchicalQualityOutput:
+    """Concatenate source-first quality outputs without breaking autograd."""
+    if not isinstance(source, HierarchicalQualityOutput) or not isinstance(target, HierarchicalQualityOutput):
+        raise ValueError("source and target must be HierarchicalQualityOutput")
+    return HierarchicalQualityOutput(
+        structural=StructuralQualityBundle(
+            trend_temporal=_concatenate_score("structural.trend_temporal", source.structural.trend_temporal, target.structural.trend_temporal),
+            dynamics_temporal=_concatenate_score("structural.dynamics_temporal", source.structural.dynamics_temporal, target.structural.dynamics_temporal),
+            trend_channel=_concatenate_score("structural.trend_channel", source.structural.trend_channel, target.structural.trend_channel),
+            dynamics_channel=_concatenate_score("structural.dynamics_channel", source.structural.dynamics_channel, target.structural.dynamics_channel),
+        ),
+        component=ComponentQualityBundle(
+            trend=_concatenate_score("component.trend", source.component.trend, target.component.trend),
+            dynamics=_concatenate_score("component.dynamics", source.component.dynamics, target.component.dynamics),
+            residual=_concatenate_score("component.residual", source.component.residual, target.component.residual),
+        ),
+        beta_trend_temporal=_concatenate_batch_tensors("beta_trend_temporal", source.beta_trend_temporal, target.beta_trend_temporal),
+        beta_dynamics_temporal=_concatenate_batch_tensors("beta_dynamics_temporal", source.beta_dynamics_temporal, target.beta_dynamics_temporal),
+        beta_trend_channel=_concatenate_batch_tensors("beta_trend_channel", source.beta_trend_channel, target.beta_trend_channel),
+        beta_dynamics_channel=_concatenate_batch_tensors("beta_dynamics_channel", source.beta_dynamics_channel, target.beta_dynamics_channel),
+        alpha_trend=_concatenate_batch_tensors("alpha_trend", source.alpha_trend, target.alpha_trend),
+        alpha_dynamics=_concatenate_batch_tensors("alpha_dynamics", source.alpha_dynamics, target.alpha_dynamics),
+        alpha_residual=_concatenate_batch_tensors("alpha_residual", source.alpha_residual, target.alpha_residual),
+        weighted_trend_temporal=_concatenate_batch_tensors("weighted_trend_temporal", source.weighted_trend_temporal, target.weighted_trend_temporal),
+        weighted_dynamics_temporal=_concatenate_batch_tensors("weighted_dynamics_temporal", source.weighted_dynamics_temporal, target.weighted_dynamics_temporal),
+        weighted_trend_channel=_concatenate_batch_tensors("weighted_trend_channel", source.weighted_trend_channel, target.weighted_trend_channel),
+        weighted_dynamics_channel=_concatenate_batch_tensors("weighted_dynamics_channel", source.weighted_dynamics_channel, target.weighted_dynamics_channel),
+        trend_component_input=_concatenate_batch_tensors("trend_component_input", source.trend_component_input, target.trend_component_input),
+        dynamics_component_input=_concatenate_batch_tensors("dynamics_component_input", source.dynamics_component_input, target.dynamics_component_input),
+        residual_component_input=_concatenate_batch_tensors("residual_component_input", source.residual_component_input, target.residual_component_input),
+        raw_fusion=_concatenate_batch_tensors("raw_fusion", source.raw_fusion, target.raw_fusion),
+        temporal_fusion=_concatenate_batch_tensors("temporal_fusion", source.temporal_fusion, target.temporal_fusion),
+        channel_fusion=_concatenate_batch_tensors("channel_fusion", source.channel_fusion, target.channel_fusion),
+        fused_feature=_concatenate_batch_tensors("fused_feature", source.fused_feature, target.fused_feature),
+    )
+
+
 def _positive_int(name: str, value: int, minimum: int = 1) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{name} must be at least {minimum}")

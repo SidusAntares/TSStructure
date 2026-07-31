@@ -21,6 +21,25 @@ from .channel_module import (
     SourceRunningRelationEnergyScale,
 )
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
+from .eden_alignment import (
+    EDENDomainAlignmentOutput,
+    EDENDomainDiscriminator,
+    EDENFusedFeatureAlignment,
+    WarmStartGradientReverseLayer,
+)
+from .full_model import (
+    StructureAwareDomainAdaptationModel,
+    StructureAwareForwardOutput,
+    StructureAwareGeometryOutput,
+)
+from .joint_trainer import (
+    JointStructureDALossOutput,
+    JointStructureDATrainStepOutput,
+    JointStructureDATrainingConfig,
+    create_joint_structure_da_train_loaders,
+    joint_structure_da_train_step,
+    train_joint_structure_da,
+)
 from .losses import (
     LossWeights,
     StructureDALosses,
@@ -59,6 +78,7 @@ from .quality_fusion import (
     QualityScoreOutput,
     QualityScorer,
     StructuralQualityBundle,
+    concatenate_hierarchical_quality_outputs,
 )
 from .representation import (
     PairedStructureFeatures,
@@ -144,8 +164,14 @@ __all__ = [
     "DiscriminabilityScorer",
     "DiversityScorer",
     "EffectiveQualityGates",
+    "EDENDomainAlignmentOutput",
+    "EDENDomainDiscriminator",
+    "EDENFusedFeatureAlignment",
     "JointStructuralOutput",
     "JointStructuralSpaceBuilder",
+    "JointStructureDALossOutput",
+    "JointStructureDATrainStepOutput",
+    "JointStructureDATrainingConfig",
     "HierarchicalQualityFusion",
     "HierarchicalQualityObjective",
     "HierarchicalQualityOutput",
@@ -166,6 +192,9 @@ __all__ = [
     "StructureDALosses",
     "StructureBackbone",
     "StructureBackboneOutput",
+    "StructureAwareDomainAdaptationModel",
+    "StructureAwareForwardOutput",
+    "StructureAwareGeometryOutput",
     "StructureDAForwardOutput",
     "StructureDAModel",
     "ResolvedStructureDATraining",
@@ -207,8 +236,10 @@ __all__ = [
     "TemporalShapePhaseCoordinates",
     "TemporalRelationOperator",
     "TransferabilityScorer",
+    "WarmStartGradientReverseLayer",
     "apply_quality_warmup",
     "classification_loss",
+    "concatenate_hierarchical_quality_outputs",
     "component_diversity_loss",
     "compose_total_loss",
     "grl_coefficient",
@@ -220,8 +251,11 @@ __all__ = [
     "structural_adversarial_loss",
     "vectorize_channel_statistic",
     "create_structure_da_train_loaders",
+    "create_joint_structure_da_train_loaders",
+    "joint_structure_da_train_step",
     "resolve_structure_da_training",
     "structure_da_train_step",
     "train_structure_da",
+    "train_joint_structure_da",
     "warp_to_identity_tangent",
 ]

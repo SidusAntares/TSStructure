@@ -13,11 +13,11 @@ import torch.backends.cudnn
 from dataset import PixelSetData, create_evaluation_loaders
 from evaluation import evaluation
 from methods.structure_da import (
-    LossWeights,
-    StructureDAModel,
-    StructureDATrainingConfig,
-    create_structure_da_train_loaders,
-    train_structure_da,
+    HierarchicalQualityObjective,
+    JointStructureDATrainingConfig,
+    StructureAwareDomainAdaptationModel,
+    create_joint_structure_da_train_loaders,
+    train_joint_structure_da,
 )
 from utils import label_utils
 from utils.metrics import overall_classification_report
@@ -26,6 +26,10 @@ from utils.train_utils import bool_flag
 
 
 def main(config):
+    if config.with_extra:
+        raise ValueError(
+            "the channel-preserving structure model does not use geometric extra features"
+        )
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -67,18 +71,15 @@ def main(config):
                 config.target, splits, config, sample_pixels_val
             )
 
-        model = StructureDAModel(
+        model = StructureAwareDomainAdaptationModel(
             num_classes=config.num_classes,
-            input_dim=config.input_dim,
-            with_extra=config.with_extra,
+            num_channels=config.input_dim,
+            channel_feature_dim=config.channel_feature_dim,
+            pixel_hidden_dim=config.pixel_hidden_dim,
+            structure_dim=config.structure_dim,
             time_scale=config.time_scale,
-            tau_fast_init=config.tau_fast_init,
-            tau_slow_init=config.tau_slow_init,
-            tau_min=config.tau_min,
-            delta_tau_min=config.delta_tau_min,
-            quality_hidden_cap=config.quality_hidden_cap,
-            quality_eta=config.quality_eta,
-            sda_hidden_dim=config.sda_hidden_dim,
+            alignment_hidden_dim=config.domain_hidden_dim,
+            grl_max_iters=config.grl_warmup_max_iters,
         )
         
         model.to(config.device)
@@ -99,26 +100,24 @@ def main(config):
             #         continue
 
             writer = SummaryWriter(log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0)
-            source_loader, target_loader = create_structure_da_train_loaders(config, splits)
-            training_config = StructureDATrainingConfig(
+            source_loader, target_loader = create_joint_structure_da_train_loaders(config, splits)
+            training_config = JointStructureDATrainingConfig(
                 epochs=config.epochs,
                 steps_per_epoch=config.steps_per_epoch,
                 lr=config.lr,
                 weight_decay=config.weight_decay,
-                quality_warmup_steps=config.quality_warmup_steps,
-                grl_warmup_steps=config.grl_warmup_steps,
-                grl_gamma=config.grl_gamma,
-                loss_weights=LossWeights(
-                    qdom=config.lambda_qdom,
-                    qcls=config.lambda_qcls,
-                    diversity=config.lambda_div,
-                    sda=config.lambda_sda,
-                ),
+                task_weight=config.lambda_task,
+                geometry_weight=config.lambda_geometry,
+                alignment_weight=config.lambda_alignment,
+                structural_classification_weight=config.lambda_structural_cls,
+                structural_domain_weight=config.lambda_structural_domain,
+                component_classification_weight=config.lambda_component_cls,
+                component_domain_weight=config.lambda_component_domain,
                 log_step=config.log_step,
                 progress_bar=config.progress_bar,
                 classes=tuple(config.classes),
             )
-            train_structure_da(
+            train_joint_structure_da(
                 model, source_loader, target_loader, source_val_loader,
                 training_config, writer, device, best_model_path,
             )
@@ -410,23 +409,23 @@ if __name__ == '__main__':
     parser.add_argument('--with_extra', default=False, type=bool_flag, help='whether to input extra geometric features to the PSE')
     parser.add_argument('--tensorboard_log_dir', default='runs')
     parser.add_argument('--steps_per_epoch', default=None, type=int)
-    parser.add_argument('--quality_warmup_steps', default=None, type=int,
-                        help='quality warm-up steps; default None means one resolved training epoch')
-    parser.add_argument('--grl_warmup_steps', default=None, type=int,
-                        help='GRL warm-up steps; default None means one resolved training epoch')
-    parser.add_argument('--grl_gamma', default=10.0, type=float)
-    parser.add_argument('--lambda_qdom', default=1.0, type=float)
-    parser.add_argument('--lambda_qcls', default=1.0, type=float)
-    parser.add_argument('--lambda_div', default=1.0, type=float)
-    parser.add_argument('--lambda_sda', default=1.0, type=float)
-    parser.add_argument('--time_scale', default=365.0, type=float)
+    parser.add_argument('--channel_feature_dim', default=16, type=int)
+    parser.add_argument('--pixel_hidden_dim', default=16, type=int)
+    parser.add_argument('--structure_dim', default=128, type=int)
+    parser.add_argument('--domain_hidden_dim', default=128, type=int)
+    parser.add_argument('--grl_warmup_max_iters', default=250, type=int)
+    parser.add_argument('--lambda_task', default=1.0, type=float)
+    parser.add_argument('--lambda_geometry', default=1.0, type=float)
+    parser.add_argument('--lambda_alignment', default=1.0, type=float)
+    parser.add_argument('--lambda_structural_cls', default=1.0, type=float)
+    parser.add_argument('--lambda_structural_domain', default=1.0, type=float)
+    parser.add_argument('--lambda_component_cls', default=1.0, type=float)
+    parser.add_argument('--lambda_component_domain', default=1.0, type=float)
+    parser.add_argument('--time_scale', default=366.0, type=float)
     parser.add_argument('--tau_fast_init', default=0.05, type=float)
     parser.add_argument('--tau_slow_init', default=0.20, type=float)
     parser.add_argument('--tau_min', default=1e-4, type=float)
     parser.add_argument('--delta_tau_min', default=1e-4, type=float)
-    parser.add_argument('--quality_hidden_cap', default=128, type=int)
-    parser.add_argument('--quality_eta', default=0.1, type=float)
-    parser.add_argument('--sda_hidden_dim', default=128, type=int)
 
     cfg = parser.parse_args()
 
