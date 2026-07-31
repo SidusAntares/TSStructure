@@ -11,6 +11,7 @@ from methods.structure_da.joint_trainer import (
     create_joint_structure_da_train_loaders,
     joint_structure_da_train_step,
     train_joint_structure_da,
+    validation_structure_contributions,
 )
 from methods.structure_da import joint_trainer as joint_trainer_module
 from methods.structure_da.quality_fusion import (
@@ -752,6 +753,89 @@ class _Writer:
         self.tags.add(tag)
 
 
+def test_counterfactual_validation_reuses_one_backbone_forward_per_batch(
+    monkeypatch,
+) -> None:
+    model = _model()
+    loader = [_sample(2, 5), _sample(1, 7)]
+    backbone_calls = 0
+    classifier_calls = 0
+    original_backbone = model.forward_backbone
+    original_classifier = model.representation.classifier.forward
+
+    def counted_backbone(*args, **kwargs):
+        nonlocal backbone_calls
+        backbone_calls += 1
+        return original_backbone(*args, **kwargs)
+
+    def counted_classifier(*args, **kwargs):
+        nonlocal classifier_calls
+        classifier_calls += 1
+        return original_classifier(*args, **kwargs)
+
+    monkeypatch.setattr(model, "forward_backbone", counted_backbone)
+    monkeypatch.setattr(model.representation.classifier, "forward", counted_classifier)
+
+    metrics = validation_structure_contributions(
+        model,
+        loader,
+        torch.device("cpu"),
+        classes=("a", "b", "c"),
+    )
+
+    assert backbone_calls == len(loader)
+    assert classifier_calls == 4 * len(loader)
+    assert set(metrics) == {
+        "full_loss", "no_temporal_loss", "no_channel_loss", "raw_only_loss",
+        "full_f1", "no_temporal_f1", "no_channel_f1", "raw_only_f1",
+        "delta_temporal", "delta_channel", "delta_structure",
+    }
+    assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+    assert metrics["delta_temporal"] == pytest.approx(
+        metrics["full_f1"] - metrics["no_temporal_f1"]
+    )
+    assert metrics["delta_channel"] == pytest.approx(
+        metrics["full_f1"] - metrics["no_channel_f1"]
+    )
+    assert metrics["delta_structure"] == pytest.approx(
+        metrics["full_f1"] - metrics["raw_only_f1"]
+    )
+
+
+def test_counterfactual_validation_aggregates_metrics_over_the_full_dataset() -> None:
+    model = _model()
+    loader = [_sample(1, 5), _sample(2, 7)]
+
+    metrics = validation_structure_contributions(
+        model,
+        loader,
+        torch.device("cpu"),
+        classes=("a", "b", "c"),
+    )
+
+    with torch.inference_mode():
+        labels = []
+        logits = []
+        for sample in loader:
+            output = model.forward_details(
+                sample["pixels"], sample["valid_pixels"], sample["positions"], None
+            )
+            labels.append(sample["label"])
+            logits.append(model.representation.classifier(output.representation.quality.fused_feature))
+        labels = torch.cat(labels)
+        logits = torch.cat(logits)
+        predictions = logits.argmax(dim=-1)
+        expected_ce = F.cross_entropy(logits, labels).item()
+        from sklearn.metrics import f1_score
+
+        expected_f1 = f1_score(
+            labels.numpy(), predictions.numpy(), average="macro", zero_division=0
+        )
+
+    assert metrics["full_loss"] == pytest.approx(expected_ce)
+    assert metrics["full_f1"] == pytest.approx(expected_f1)
+
+
 def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch, capsys) -> None:
     import methods.structure_da.joint_trainer as module
 
@@ -767,20 +851,6 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
         recorded.append(result)
         return result
 
-    # Exercise the standard four-argument forward without CUDA-bound evaluation.
-    def fake_validation(best_f1, best_model_path, training_config, criterion,
-                        device, epoch, validation_model, val_loader, validation_writer):
-        sample = _sample(2, 5)
-        validation_model(
-            sample["pixels"], sample["valid_pixels"], sample["positions"], None
-        )
-        torch.save(
-            {"epoch": epoch, "state_dict": validation_model.state_dict(), "best_f1": 0.5},
-            best_model_path,
-        )
-        return 0.5
-
-    monkeypatch.setattr(module, "validation", fake_validation)
     monkeypatch.setattr(module, "joint_structure_da_train_step", recording_train_step)
     monkeypatch.setattr(
         module,
@@ -793,7 +863,7 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
         model,
         [_sample(2, 5)],
         [_sample(2, 7, labels=False)],
-        object(),
+        [_sample(2, 5)],
         config,
         writer,
         torch.device("cpu"),
@@ -803,7 +873,7 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
     checkpoint = torch.load(path, weights_only=False)
     restored = _model()
     restored.load_state_dict(checkpoint["state_dict"])
-    assert checkpoint["best_f1"] == 0.5
+    assert torch.isfinite(torch.tensor(checkpoint["best_f1"]))
     assert _counts(restored) == (2, 2, 2, 2, 2)
     assert restored.alignment.grl.iteration.item() == 2
     epoch_log = capsys.readouterr().out
@@ -812,6 +882,9 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
     assert "STRUCTURE_EPOCH|" in epoch_log
     assert "QUALITY_EPOCH|" in epoch_log
     assert "GEOMETRY_EPOCH|" in epoch_log
+    assert epoch_log.count("DECOMP_EPOCH|") == 2
+    assert epoch_log.count("CONTRIBUTION_EPOCH|") == 2
+    assert "VAL_CONTRIBUTION|" in epoch_log
     train_step = next(
         line for line in epoch_log.splitlines() if line.startswith("TRAIN_STEP|")
     )
@@ -880,5 +953,11 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
         "train/target/alpha_trend_std",
         "train/geometry/trend_alignment",
         "train/geometry/dynamics_alignment",
+        "train/diagnostics/source/decomposition/energy_closure_relative_error",
+        "train/diagnostics/target/decomposition/roughness_D",
+        "train/diagnostics/source/contribution/effective_T_temporal_norm",
+        "train/diagnostics/target/contribution/fusion_share_channel",
+        "val/counterfactual/full_f1",
+        "val/counterfactual/delta_structure",
     }
     assert required <= writer.tags

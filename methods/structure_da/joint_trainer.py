@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 from typing import Mapping, Sequence
 
+import sklearn.metrics
 import torch
 from torch import Tensor
 from torch.nn import functional as F
@@ -13,11 +14,20 @@ from torchvision.transforms import transforms
 from tqdm import tqdm
 
 from dataset import PixelSetData, create_train_loader
-from evaluation import validation
 from transforms import Normalize, RandomSamplePixels, ToTensor
 from utils.train_utils import AverageMeter, cycle, progress_bar_disabled, to_cuda
 
 from .eden_alignment import EDENDomainAlignmentOutput
+from .diagnostics import (
+    ContributionDiagnostics,
+    DecompositionDiagnostics,
+    compute_decomposition_diagnostics,
+    compute_structure_contribution_diagnostics,
+    merge_contribution_diagnostics,
+    merge_decomposition_diagnostics,
+    summarize_contribution_diagnostics,
+    summarize_decomposition_diagnostics,
+)
 from .full_model import StructureAwareDomainAdaptationModel
 from .quality_fusion import (
     HierarchicalQualityObjective,
@@ -127,6 +137,10 @@ class JointStructureDATrainStepOutput:
     mean_beta_trend_channel: Tensor
     mean_beta_dynamics_channel: Tensor
     diagnostics: JointStructureDADiagnostics
+    source_decomposition_diagnostics: DecompositionDiagnostics
+    target_decomposition_diagnostics: DecompositionDiagnostics
+    source_contribution_diagnostics: ContributionDiagnostics
+    target_contribution_diagnostics: ContributionDiagnostics
 
 
 @dataclass(frozen=True)
@@ -403,6 +417,46 @@ def _build_diagnostics(
     )
 
 
+def _decomposition_diagnostics(
+    output, positions: Tensor, eps: float
+) -> DecompositionDiagnostics:
+    decomposition = output.backbone.decomposition
+    return compute_decomposition_diagnostics(
+        output.backbone.channel_tokens,
+        decomposition.trend,
+        decomposition.dynamics,
+        decomposition.residual,
+        positions,
+        output.backbone.time_mask,
+        eps=eps,
+    )
+
+
+def _contribution_diagnostics(output) -> ContributionDiagnostics:
+    representation = output.representation
+    quality = representation.quality
+    return compute_structure_contribution_diagnostics(
+        alpha_T=quality.alpha_trend,
+        alpha_D=quality.alpha_dynamics,
+        alpha_R=quality.alpha_residual,
+        beta_T_temporal=quality.beta_trend_temporal,
+        beta_D_temporal=quality.beta_dynamics_temporal,
+        beta_T_channel=quality.beta_trend_channel,
+        beta_D_channel=quality.beta_dynamics_channel,
+        temporal_T=representation.temporal_features.trend,
+        temporal_D=representation.temporal_features.dynamics,
+        channel_T=representation.channel_features.trend,
+        channel_D=representation.channel_features.dynamics,
+        raw_fusion=quality.raw_fusion,
+        temporal_fusion=quality.temporal_fusion,
+        channel_fusion=quality.channel_fusion,
+        temporal_T_valid=representation.temporal_features.trend_valid,
+        temporal_D_valid=representation.temporal_features.dynamics_valid,
+        channel_T_valid=representation.channel_features.trend_valid,
+        channel_D_valid=representation.channel_features.dynamics_valid,
+    )
+
+
 def joint_structure_da_train_step(
     model,
     source_sample,
@@ -510,6 +564,15 @@ def joint_structure_da_train_step(
         geometry,
         alignment,
     )
+    diagnostic_eps = model.backbone.decomposition.eps
+    source_decomposition_diagnostics = _decomposition_diagnostics(
+        source_output, source_tensors[2], diagnostic_eps
+    )
+    target_decomposition_diagnostics = _decomposition_diagnostics(
+        target_output, target_tensors[2], diagnostic_eps
+    )
+    source_contribution_diagnostics = _contribution_diagnostics(source_output)
+    target_contribution_diagnostics = _contribution_diagnostics(target_output)
     weighted_geometry_loss = training_config.geometry_weight * geometry_loss
     task_total_loss = (
         training_config.task_weight * task_loss
@@ -546,6 +609,10 @@ def joint_structure_da_train_step(
         mean_beta_trend_channel=quality.beta_trend_channel.mean(),
         mean_beta_dynamics_channel=quality.beta_dynamics_channel.mean(),
         diagnostics=diagnostics,
+        source_decomposition_diagnostics=source_decomposition_diagnostics,
+        target_decomposition_diagnostics=target_decomposition_diagnostics,
+        source_contribution_diagnostics=source_contribution_diagnostics,
+        target_contribution_diagnostics=target_contribution_diagnostics,
     )
 
 
@@ -628,6 +695,195 @@ def _diagnostic_tensorboard_tag(name: str) -> str | None:
     return None
 
 
+@torch.inference_mode()
+def _collect_validation_structure_contributions(
+    model,
+    val_loader,
+    device,
+    classes: Sequence[str],
+) -> tuple[dict[str, float], Tensor, Tensor]:
+    """Evaluate fusion-block counterfactuals from one detailed pass per batch."""
+
+    if not classes:
+        raise ValueError("classes must be nonempty")
+    mode_logits: dict[str, list[Tensor]] = {
+        "full": [],
+        "no_temporal": [],
+        "no_channel": [],
+        "raw_only": [],
+    }
+    labels: list[Tensor] = []
+    model.eval()
+    for sample in val_loader:
+        target = sample["label"].to(device=device, dtype=torch.long)
+        pixels, valid_pixels, positions, extra = _sample_to_device(sample, device)
+        output = model.forward_details(pixels, valid_pixels, positions, extra)
+        quality = output.representation.quality
+        raw = quality.raw_fusion
+        temporal = quality.temporal_fusion
+        channel = quality.channel_fusion
+        zero_temporal = torch.zeros_like(temporal)
+        zero_channel = torch.zeros_like(channel)
+        mode_logits["full"].append(output.representation.logits.detach().cpu())
+        features = {
+            "no_temporal": torch.cat([raw, zero_temporal, channel], dim=-1),
+            "no_channel": torch.cat([raw, temporal, zero_channel], dim=-1),
+            "raw_only": torch.cat([raw, zero_temporal, zero_channel], dim=-1),
+        }
+        for name, feature in features.items():
+            mode_logits[name].append(
+                model.representation.classifier(feature).detach().cpu()
+            )
+        labels.append(target.detach().cpu())
+    if not labels:
+        raise ValueError("validation loader must be nonempty")
+    all_labels = torch.cat(labels)
+    per_mode: dict[str, dict[str, float]] = {}
+    for name, chunks in mode_logits.items():
+        logits = torch.cat(chunks)
+        predictions = logits.argmax(dim=-1)
+        per_mode[name] = {
+            "macro_f1": float(
+                sklearn.metrics.f1_score(
+                    all_labels.numpy(),
+                    predictions.numpy(),
+                    average="macro",
+                    zero_division=0,
+                )
+            ),
+            "cross_entropy": float(
+                F.cross_entropy(logits, all_labels, reduction="mean").item()
+            ),
+        }
+    metrics = {
+        **{
+            f"{name}_loss": values["cross_entropy"]
+            for name, values in per_mode.items()
+        },
+        **{
+            f"{name}_f1": values["macro_f1"]
+            for name, values in per_mode.items()
+        },
+        "delta_temporal": (
+            per_mode["full"]["macro_f1"]
+            - per_mode["no_temporal"]["macro_f1"]
+        ),
+        "delta_channel": (
+            per_mode["full"]["macro_f1"]
+            - per_mode["no_channel"]["macro_f1"]
+        ),
+        "delta_structure": (
+            per_mode["full"]["macro_f1"]
+            - per_mode["raw_only"]["macro_f1"]
+        ),
+    }
+    return metrics, all_labels, torch.cat(mode_logits["full"]).argmax(dim=-1)
+
+
+@torch.inference_mode()
+def validation_structure_contributions(
+    model,
+    val_loader,
+    device,
+    classes: Sequence[str],
+) -> dict[str, float]:
+    """Return full-dataset counterfactual contribution metrics."""
+
+    return _collect_validation_structure_contributions(
+        model, val_loader, device, classes
+    )[0]
+
+
+def _validation_with_structure_contributions(
+    best_f1,
+    best_model_path,
+    training_config,
+    device,
+    epoch,
+    model,
+    val_loader,
+    writer,
+) -> tuple[float, dict[str, float]]:
+    metrics, labels, predictions = _collect_validation_structure_contributions(
+        model, val_loader, device, training_config.classes
+    )
+    val_loss = metrics["full_loss"]
+    val_f1 = metrics["full_f1"]
+    val_accuracy = float(
+        sklearn.metrics.accuracy_score(labels.numpy(), predictions.numpy())
+    )
+    val_kappa = float(
+        sklearn.metrics.cohen_kappa_score(
+            labels.numpy(),
+            predictions.numpy(),
+            labels=list(range(len(training_config.classes))),
+        )
+    )
+    if writer is not None:
+        writer.add_scalar("val/loss", val_loss, epoch)
+        writer.add_scalar("val/accuracy", val_accuracy, epoch)
+        writer.add_scalar("val/f1", val_f1, epoch)
+        writer.add_scalar("val/kappa", val_kappa, epoch)
+    print(
+        f"Validation result: loss={val_loss:.4f}, "
+        f"acc={val_accuracy:.2f}, f1={val_f1:.4f}"
+    )
+    if val_f1 > best_f1:
+        print(f"Validation F1 improved from {best_f1:.4f} to {val_f1:.4f}!")
+        best_f1 = val_f1
+        if best_model_path is not None:
+            print(f"Saving best model to {best_model_path}")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "state_dict": model.state_dict(),
+                    "best_f1": best_f1,
+                },
+                best_model_path,
+            )
+    else:
+        print(f"Validation F1 did not improve from {best_f1:.4f}.")
+    return best_f1, metrics
+
+
+def _merge_optional(current, update, merge):
+    return update if current is None else merge(current, update)
+
+
+def _format_epoch_diagnostics(
+    prefix: str, epoch: int, domain: str, values: Mapping[str, Tensor]
+) -> str:
+    fields = [f"{prefix}|epoch={epoch}|domain={domain}"]
+    for name, value in values.items():
+        scalar = value.item()
+        fields.append(f"{name}={scalar:.6g}")
+    return "|".join(fields)
+
+
+def _write_epoch_diagnostics(
+    writer,
+    epoch: int,
+    domain: str,
+    category: str,
+    values: Mapping[str, Tensor],
+) -> None:
+    if writer is None:
+        return
+    for name, value in values.items():
+        writer.add_scalar(
+            f"train/diagnostics/{domain}/{category}/{name}", value.item(), epoch
+        )
+
+
+def _log_validation_contributions(writer, epoch: int, metrics) -> None:
+    fields = [f"VAL_CONTRIBUTION|epoch={epoch}"]
+    for name, value in metrics.items():
+        fields.append(f"{name}={value:.6g}")
+        if writer is not None:
+            writer.add_scalar(f"val/counterfactual/{name}", value, epoch - 1)
+    print("|".join(fields))
+
+
 def train_joint_structure_da(
     model,
     source_loader,
@@ -671,7 +927,6 @@ def train_joint_structure_da(
         component_classification_weight=training_config.component_classification_weight,
         component_domain_weight=training_config.component_domain_weight,
     )
-    criterion = torch.nn.CrossEntropyLoss()
     best_f1 = float("-inf")
     meter_names = (
         "total", "task", "quality_total", "quality_structural_cls",
@@ -686,6 +941,8 @@ def train_joint_structure_da(
         model.train()
         meters = {name: AverageMeter() for name in meter_names}
         diagnostic_meters: dict[str, AverageMeter] = {}
+        decomposition_epoch = {"source": None, "target": None}
+        contribution_epoch = {"source": None, "target": None}
         lr_meter = AverageMeter()
         source_iterator = cycle(source_loader)
         target_iterator = cycle(target_loader)
@@ -725,6 +982,26 @@ def train_joint_structure_da(
                 diagnostic_meters.setdefault(name, AverageMeter()).update(
                     value.item()
                 )
+            decomposition_epoch["source"] = _merge_optional(
+                decomposition_epoch["source"],
+                result.source_decomposition_diagnostics,
+                merge_decomposition_diagnostics,
+            )
+            decomposition_epoch["target"] = _merge_optional(
+                decomposition_epoch["target"],
+                result.target_decomposition_diagnostics,
+                merge_decomposition_diagnostics,
+            )
+            contribution_epoch["source"] = _merge_optional(
+                contribution_epoch["source"],
+                result.source_contribution_diagnostics,
+                merge_contribution_diagnostics,
+            )
+            contribution_epoch["target"] = _merge_optional(
+                contribution_epoch["target"],
+                result.target_contribution_diagnostics,
+                merge_contribution_diagnostics,
+            )
             lr = task_optimizer.param_groups[0]["lr"]
             lr_meter.update(lr)
             diagnostics = result.diagnostics.scalars
@@ -873,16 +1150,44 @@ def train_joint_structure_da(
                 f"|D_unsupported={diagnostic_average['geometry_D_unsupported']:.4f}"
                 f"|D_center={diagnostic_average['geometry_D_phase_center']:.4f}"
             )
+        for domain in ("source", "target"):
+            decomposition_summary = summarize_decomposition_diagnostics(
+                decomposition_epoch[domain]
+            )
+            contribution_summary = summarize_contribution_diagnostics(
+                contribution_epoch[domain]
+            )
+            print(
+                _format_epoch_diagnostics(
+                    "DECOMP_EPOCH", epoch + 1, domain, decomposition_summary
+                )
+            )
+            print(
+                _format_epoch_diagnostics(
+                    "CONTRIBUTION_EPOCH",
+                    epoch + 1,
+                    domain,
+                    contribution_summary,
+                )
+            )
+            _write_epoch_diagnostics(
+                writer, epoch, domain, "decomposition", decomposition_summary
+            )
+            _write_epoch_diagnostics(
+                writer, epoch, domain, "contribution", contribution_summary
+            )
         model.eval()
-        best_f1 = validation(
+        best_f1, validation_contributions = _validation_with_structure_contributions(
             best_f1,
             best_model_path,
             training_config,
-            criterion,
             device,
             epoch,
             model,
             val_loader,
             writer,
+        )
+        _log_validation_contributions(
+            writer, epoch + 1, validation_contributions
         )
     return best_f1

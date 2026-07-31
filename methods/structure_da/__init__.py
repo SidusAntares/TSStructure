@@ -10,6 +10,18 @@ from .channel_module import (
     SourceRunningRelationEnergyScale,
 )
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
+from .diagnostics import (
+    ContributionDiagnostics,
+    DecompositionDiagnostics,
+    DiagnosticMoments,
+    DiagnosticStat,
+    compute_decomposition_diagnostics,
+    compute_structure_contribution_diagnostics,
+    merge_contribution_diagnostics,
+    merge_decomposition_diagnostics,
+    summarize_contribution_diagnostics,
+    summarize_decomposition_diagnostics,
+)
 from .eden_alignment import (
     EDENDomainAlignmentOutput,
     EDENDomainDiscriminator,
@@ -32,6 +44,7 @@ from .joint_trainer import (
     resolve_grl_warmup_max_iters,
     resolve_steps_per_epoch,
     train_joint_structure_da,
+    validation_structure_contributions,
 )
 from .quality_fusion import (
     ComponentQualityBundle,
@@ -97,7 +110,11 @@ __all__ = [
     "ChannelStructureOutput",
     "ChannelStructurePairOutput",
     "ComponentQualityBundle",
+    "ContributionDiagnostics",
     "DecompositionOutput",
+    "DecompositionDiagnostics",
+    "DiagnosticMoments",
+    "DiagnosticStat",
     "EDENDomainAlignmentOutput",
     "EDENDomainDiscriminator",
     "EDENFusedFeatureAlignment",
@@ -155,11 +172,18 @@ __all__ = [
     "TemporalStructurePairOutput",
     "WarmStartGradientReverseLayer",
     "concatenate_hierarchical_quality_outputs",
+    "compute_decomposition_diagnostics",
+    "compute_structure_contribution_diagnostics",
     "create_joint_structure_da_train_loaders",
     "joint_structure_da_train_step",
+    "merge_contribution_diagnostics",
+    "merge_decomposition_diagnostics",
     "resolve_domain_score_weight",
     "resolve_grl_warmup_max_iters",
     "resolve_steps_per_epoch",
     "train_joint_structure_da",
+    "summarize_contribution_diagnostics",
+    "summarize_decomposition_diagnostics",
+    "validation_structure_contributions",
     "warp_to_identity_tangent",
 ]
