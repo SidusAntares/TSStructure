@@ -12,6 +12,14 @@ from .backbone import (
     StructureBackbone,
     StructureBackboneOutput,
 )
+from .channel_module import (
+    ChannelStructureOutput,
+    ChannelStructurePairOutput,
+    MultiScaleChannelRelationStructure,
+    SharedChannelStructureOperator,
+    SourceRunningAttributeStandardizer,
+    SourceRunningRelationEnergyScale,
+)
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
 from .losses import (
     LossWeights,
@@ -109,6 +117,8 @@ from .trainer import (
 
 __all__ = [
     "ChannelRelationOperator",
+    "ChannelStructureOutput",
+    "ChannelStructurePairOutput",
     "ComponentLTAEInputs",
     "ComponentQualityBundle",
     "ComponentQualityOutput",
@@ -124,6 +134,7 @@ __all__ = [
     "LossWeights",
     "MonotoneWarpEstimator",
     "MonotoneWarpOutput",
+    "MultiScaleChannelRelationStructure",
     "PhaseTangentOutput",
     "PhaseCoordinateEncoder",
     "QualityScores",
@@ -138,6 +149,9 @@ __all__ = [
     "StructureDATrainStepOutput",
     "SDADiscriminator",
     "SharedTemporalStructureOperator",
+    "SharedChannelStructureOperator",
+    "SourceRunningAttributeStandardizer",
+    "SourceRunningRelationEnergyScale",
     "SourceRunningStandardizer",
     "SourceRunningSupportScale",
     "SourceRunningSRVFTemplate",
