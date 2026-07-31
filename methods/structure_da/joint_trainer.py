@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import torch
 from torch import Tensor
@@ -55,6 +55,27 @@ class JointStructureDALossOutput:
 
 
 @dataclass(frozen=True)
+class JointStructureDADiagnostics:
+    """Detached finite scalar diagnostics from one joint training step."""
+
+    scalars: Mapping[str, Tensor]
+
+    def __post_init__(self) -> None:
+        invalid = [
+            name
+            for name, value in self.scalars.items()
+            if not isinstance(value, Tensor)
+            or value.ndim != 0
+            or not torch.isfinite(value).item()
+        ]
+        if invalid:
+            raise FloatingPointError(
+                "training diagnostics must be finite scalar tensors: "
+                + ", ".join(invalid)
+            )
+
+
+@dataclass(frozen=True)
 class JointStructureDATrainStepOutput:
     losses: JointStructureDALossOutput
     alignment: EDENDomainAlignmentOutput
@@ -67,6 +88,7 @@ class JointStructureDATrainStepOutput:
     mean_beta_dynamics_temporal: Tensor
     mean_beta_trend_channel: Tensor
     mean_beta_dynamics_channel: Tensor
+    diagnostics: JointStructureDADiagnostics
 
 
 @dataclass(frozen=True)
@@ -203,6 +225,131 @@ def _check_bounded_training_values(model, quality, alignment) -> None:
         )
 
 
+def _masked_mean_square(value: Tensor, time_mask: Tensor) -> Tensor:
+    mask = time_mask
+    while mask.ndim < value.ndim:
+        mask = mask.unsqueeze(-1)
+    return value.square().masked_select(mask.expand_as(value)).mean()
+
+
+def _mean_l2_norm(value: Tensor) -> Tensor:
+    return torch.linalg.vector_norm(value, dim=-1).mean()
+
+
+def _domain_diagnostics(prefix: str, output, eps: float) -> dict[str, Tensor]:
+    decomposition = output.backbone.decomposition
+    time_mask = output.backbone.time_mask
+    energies = {
+        "trend": _masked_mean_square(decomposition.trend, time_mask),
+        "dynamics": _masked_mean_square(decomposition.dynamics, time_mask),
+        "residual": _masked_mean_square(decomposition.residual, time_mask),
+    }
+    energy_total = sum(energies.values())
+    reconstruction = (
+        decomposition.trend + decomposition.dynamics + decomposition.residual
+    )
+    reconstruction_error = _masked_mean_square(
+        reconstruction - output.backbone.channel_tokens,
+        time_mask,
+    ) / (
+        _masked_mean_square(output.backbone.channel_tokens, time_mask) + eps
+    )
+    values = {
+        f"{prefix}_{name}_energy_fraction": energy / (energy_total + eps)
+        for name, energy in energies.items()
+    }
+    values[f"{prefix}_reconstruction_relative_error"] = reconstruction_error
+    values.update(
+        {
+            f"{prefix}_temporal_T_valid_rate": output.temporal.trend.encoded.valid.float().mean(),
+            f"{prefix}_temporal_D_valid_rate": output.temporal.dynamics.encoded.valid.float().mean(),
+            f"{prefix}_channel_T_valid_rate": output.channel.trend.valid.float().mean(),
+            f"{prefix}_channel_D_valid_rate": output.channel.dynamics.valid.float().mean(),
+            f"{prefix}_raw_T_norm": _mean_l2_norm(output.representation.trend_embedding),
+            f"{prefix}_raw_D_norm": _mean_l2_norm(output.representation.dynamics_embedding),
+            f"{prefix}_raw_R_norm": _mean_l2_norm(output.representation.residual_embedding),
+            f"{prefix}_temporal_T_norm": _mean_l2_norm(output.representation.temporal_features.trend),
+            f"{prefix}_temporal_D_norm": _mean_l2_norm(output.representation.temporal_features.dynamics),
+            f"{prefix}_channel_T_norm": _mean_l2_norm(output.representation.channel_features.trend),
+            f"{prefix}_channel_D_norm": _mean_l2_norm(output.representation.channel_features.dynamics),
+            f"{prefix}_raw_fusion_norm": _mean_l2_norm(output.representation.quality.raw_fusion),
+            f"{prefix}_temporal_fusion_norm": _mean_l2_norm(output.representation.quality.temporal_fusion),
+            f"{prefix}_channel_fusion_norm": _mean_l2_norm(output.representation.quality.channel_fusion),
+            f"{prefix}_fused_feature_norm": _mean_l2_norm(output.representation.quality.fused_feature),
+        }
+    )
+    for component, channel_output in (
+        ("T", output.channel.trend),
+        ("D", output.channel.dynamics),
+    ):
+        values.update(
+            {
+                f"{prefix}_channel_{component}_relation_mass": channel_output.relation_mass.mean(),
+                f"{prefix}_channel_{component}_state_reliability_mean": channel_output.state_reliability.mean(),
+                f"{prefix}_channel_{component}_evolution_reliability_mean": channel_output.evolution_reliability.mean(),
+            }
+        )
+    quality = output.representation.quality
+    for name, coefficient in (
+        ("alpha_T", quality.alpha_trend),
+        ("alpha_D", quality.alpha_dynamics),
+        ("alpha_R", quality.alpha_residual),
+        ("beta_T_temporal", quality.beta_trend_temporal),
+        ("beta_D_temporal", quality.beta_dynamics_temporal),
+        ("beta_T_channel", quality.beta_trend_channel),
+        ("beta_D_channel", quality.beta_dynamics_channel),
+    ):
+        values[f"{prefix}_{name}_mean"] = coefficient.mean()
+        values[f"{prefix}_{name}_std"] = coefficient.std(unbiased=False)
+    return values
+
+
+def _build_diagnostics(
+    model,
+    source_output,
+    target_output,
+    source_labels,
+    losses,
+    geometry,
+    alignment,
+) -> JointStructureDADiagnostics:
+    trend_geometry = geometry.temporal.trend.geometry
+    dynamics_geometry = geometry.temporal.dynamics.geometry
+    decomposition = model.backbone.decomposition
+    values = {
+        "source_train_accuracy": (
+            source_output.representation.logits.argmax(dim=-1) == source_labels
+        ).float().mean(),
+        "domain_accuracy": alignment.accuracy,
+        "grl_coefficient": alignment.coefficient,
+        "loss_total": losses.total_loss,
+        "loss_task": losses.task_loss,
+        "loss_quality_total": losses.quality_loss.total_loss,
+        "loss_quality_structural_cls": losses.quality_loss.structural_classification_loss,
+        "loss_quality_structural_domain": losses.quality_loss.structural_domain_loss,
+        "loss_quality_component_cls": losses.quality_loss.component_classification_loss,
+        "loss_quality_component_domain": losses.quality_loss.component_domain_loss,
+        "loss_geometry_total": losses.geometry_loss,
+        "loss_alignment": losses.alignment_loss,
+        "geometry_T_alignment": trend_geometry.alignment_loss,
+        "geometry_T_roughness": trend_geometry.roughness_loss,
+        "geometry_T_unsupported": trend_geometry.unsupported_loss,
+        "geometry_T_phase_center": trend_geometry.center_loss,
+        "geometry_D_alignment": dynamics_geometry.alignment_loss,
+        "geometry_D_roughness": dynamics_geometry.roughness_loss,
+        "geometry_D_unsupported": dynamics_geometry.unsupported_loss,
+        "geometry_D_phase_center": dynamics_geometry.center_loss,
+        "tau_fast": decomposition.tau_fast,
+        "tau_slow": decomposition.tau_slow,
+        "tau_gap": decomposition.tau_slow - decomposition.tau_fast,
+    }
+    values.update(_domain_diagnostics("source", source_output, decomposition.eps))
+    values.update(_domain_diagnostics("target", target_output, decomposition.eps))
+    return JointStructureDADiagnostics(
+        scalars={name: value.detach() for name, value in values.items()}
+    )
+
+
 def joint_structure_da_train_step(
     model,
     source_sample,
@@ -267,17 +414,27 @@ def joint_structure_da_train_step(
         total_loss=total_loss,
     )
     _check_bounded_training_values(model, merged_quality, alignment)
+    loss_output = JointStructureDALossOutput(
+        total_loss=total_loss,
+        task_loss=task_loss,
+        quality_loss=quality_loss,
+        geometry_loss=geometry_loss,
+        alignment_loss=alignment_loss,
+    )
+    diagnostics = _build_diagnostics(
+        model,
+        source_output,
+        target_output,
+        source_labels,
+        loss_output,
+        geometry,
+        alignment,
+    )
     total_loss.backward()
     optimizer.step()
     quality = merged_quality
     return JointStructureDATrainStepOutput(
-        losses=JointStructureDALossOutput(
-            total_loss=total_loss,
-            task_loss=task_loss,
-            quality_loss=quality_loss,
-            geometry_loss=geometry_loss,
-            alignment_loss=alignment_loss,
-        ),
+        losses=loss_output,
         alignment=alignment,
         source_batch_size=source_batch_size,
         target_batch_size=target_batch_size,
@@ -288,6 +445,7 @@ def joint_structure_da_train_step(
         mean_beta_dynamics_temporal=quality.beta_dynamics_temporal.mean(),
         mean_beta_trend_channel=quality.beta_trend_channel.mean(),
         mean_beta_dynamics_channel=quality.beta_dynamics_channel.mean(),
+        diagnostics=diagnostics,
     )
 
 
@@ -296,6 +454,74 @@ def _resolve_steps(training_config, source_loader, target_loader) -> int:
     if source_steps == 0 or target_steps == 0:
         raise ValueError("source and target training loaders must be nonempty")
     return training_config.steps_per_epoch or max(source_steps, target_steps)
+
+
+def _diagnostic_tensorboard_tag(name: str) -> str | None:
+    direct = {
+        "source_train_accuracy": "train/source_train_accuracy",
+        "tau_fast": "train/decomposition/tau_fast",
+        "tau_slow": "train/decomposition/tau_slow",
+        "tau_gap": "train/decomposition/tau_gap",
+        "geometry_T_alignment": "train/geometry/trend_alignment",
+        "geometry_T_roughness": "train/geometry/trend_roughness",
+        "geometry_T_unsupported": "train/geometry/trend_unsupported",
+        "geometry_T_phase_center": "train/geometry/trend_phase_center",
+        "geometry_D_alignment": "train/geometry/dynamics_alignment",
+        "geometry_D_roughness": "train/geometry/dynamics_roughness",
+        "geometry_D_unsupported": "train/geometry/dynamics_unsupported",
+        "geometry_D_phase_center": "train/geometry/dynamics_phase_center",
+    }
+    if name in direct:
+        return direct[name]
+    for domain in ("source", "target"):
+        prefix = f"{domain}_"
+        if not name.startswith(prefix):
+            continue
+        suffix = name[len(prefix):]
+        suffix_tags = {
+            "trend_energy_fraction": "energy_fraction_trend",
+            "dynamics_energy_fraction": "energy_fraction_dynamics",
+            "residual_energy_fraction": "energy_fraction_residual",
+            "reconstruction_relative_error": "reconstruction_relative_error",
+            "temporal_T_valid_rate": "temporal_valid_trend",
+            "temporal_D_valid_rate": "temporal_valid_dynamics",
+            "channel_T_valid_rate": "channel_valid_trend",
+            "channel_D_valid_rate": "channel_valid_dynamics",
+            "raw_T_norm": "raw_norm_trend",
+            "raw_D_norm": "raw_norm_dynamics",
+            "raw_R_norm": "raw_norm_residual",
+            "temporal_T_norm": "temporal_norm_trend",
+            "temporal_D_norm": "temporal_norm_dynamics",
+            "channel_T_norm": "channel_norm_trend",
+            "channel_D_norm": "channel_norm_dynamics",
+            "raw_fusion_norm": "fusion_norm_raw",
+            "temporal_fusion_norm": "fusion_norm_temporal",
+            "channel_fusion_norm": "fusion_norm_channel",
+            "fused_feature_norm": "fusion_norm_final",
+            "channel_T_relation_mass": "channel_relation_mass_trend",
+            "channel_D_relation_mass": "channel_relation_mass_dynamics",
+            "channel_T_state_reliability_mean": "channel_state_reliability_trend",
+            "channel_D_state_reliability_mean": "channel_state_reliability_dynamics",
+            "channel_T_evolution_reliability_mean": "channel_evolution_reliability_trend",
+            "channel_D_evolution_reliability_mean": "channel_evolution_reliability_dynamics",
+            "alpha_T_mean": "alpha_trend_mean",
+            "alpha_T_std": "alpha_trend_std",
+            "alpha_D_mean": "alpha_dynamics_mean",
+            "alpha_D_std": "alpha_dynamics_std",
+            "alpha_R_mean": "alpha_residual_mean",
+            "alpha_R_std": "alpha_residual_std",
+            "beta_T_temporal_mean": "beta_trend_temporal_mean",
+            "beta_T_temporal_std": "beta_trend_temporal_std",
+            "beta_D_temporal_mean": "beta_dynamics_temporal_mean",
+            "beta_D_temporal_std": "beta_dynamics_temporal_std",
+            "beta_T_channel_mean": "beta_trend_channel_mean",
+            "beta_T_channel_std": "beta_trend_channel_std",
+            "beta_D_channel_mean": "beta_dynamics_channel_mean",
+            "beta_D_channel_std": "beta_dynamics_channel_std",
+        }
+        if suffix in suffix_tags:
+            return f"train/{domain}/{suffix_tags[suffix]}"
+    return None
 
 
 def train_joint_structure_da(
@@ -332,17 +558,18 @@ def train_joint_structure_da(
         "total", "task", "quality_total", "quality_structural_cls",
         "quality_structural_domain", "quality_component_cls",
         "quality_component_domain", "geometry", "alignment",
-        "domain_accuracy", "alpha_T", "alpha_D", "alpha_R",
-        "beta_T_temp", "beta_D_temp", "beta_T_channel", "beta_D_channel",
     )
     for epoch in range(training_config.epochs):
         progress_disabled = progress_bar_disabled(training_config.progress_bar)
         model.train()
         meters = {name: AverageMeter() for name in meter_names}
+        diagnostic_meters: dict[str, AverageMeter] = {}
+        lr_meter = AverageMeter()
         source_iterator = cycle(source_loader)
         target_iterator = cycle(target_loader)
-        bar = tqdm(range(steps_per_epoch), disable=progress_disabled)
-        for local_step in bar:
+        bar = None if progress_disabled else tqdm(range(steps_per_epoch))
+        step_iterator = range(steps_per_epoch) if bar is None else bar
+        for local_step in step_iterator:
             global_step = epoch * steps_per_epoch + local_step
             result = joint_structure_da_train_step(
                 model,
@@ -368,24 +595,30 @@ def train_joint_structure_da(
             }
             for name, value in values.items():
                 meters[name].update(value.detach().item(), n=result.source_batch_size)
-            diagnostic_values = {
-                "domain_accuracy": result.alignment.accuracy,
-                "alpha_T": result.mean_alpha_trend,
-                "alpha_D": result.mean_alpha_dynamics,
-                "alpha_R": result.mean_alpha_residual,
-                "beta_T_temp": result.mean_beta_trend_temporal,
-                "beta_D_temp": result.mean_beta_dynamics_temporal,
-                "beta_T_channel": result.mean_beta_trend_channel,
-                "beta_D_channel": result.mean_beta_dynamics_channel,
-            }
-            diagnostic_batch_size = (
-                result.source_batch_size + result.target_batch_size
-            )
-            for name, value in diagnostic_values.items():
-                meters[name].update(
-                    value.detach().item(), n=diagnostic_batch_size
+            for name, value in result.diagnostics.scalars.items():
+                diagnostic_meters.setdefault(name, AverageMeter()).update(
+                    value.item()
                 )
             lr = optimizer.param_groups[0]["lr"]
+            lr_meter.update(lr)
+            diagnostics = result.diagnostics.scalars
+            if (
+                progress_disabled
+                and global_step % training_config.log_step == 0
+            ):
+                print(
+                    f"TRAIN_STEP|epoch={epoch + 1}/{training_config.epochs}"
+                    f"|step={local_step + 1}/{steps_per_epoch}"
+                    f"|total={diagnostics['loss_total'].item():.4f}"
+                    f"|task={diagnostics['loss_task'].item():.4f}"
+                    f"|q_total={diagnostics['loss_quality_total'].item():.4f}"
+                    f"|geometry={diagnostics['loss_geometry_total'].item():.4f}"
+                    f"|alignment={diagnostics['loss_alignment'].item():.4f}"
+                    f"|train_acc={diagnostics['source_train_accuracy'].item():.4f}"
+                    f"|domain_acc={diagnostics['domain_accuracy'].item():.4f}"
+                    f"|grl={diagnostics['grl_coefficient'].item():.3f}"
+                    f"|lr={lr:.2e}"
+                )
             if global_step % training_config.log_step == 0 and writer is not None:
                 tags = {
                     "total": "train/loss_total",
@@ -412,8 +645,12 @@ def train_joint_structure_da(
                     ("train/beta_dynamics_channel", result.mean_beta_dynamics_channel),
                 ):
                     writer.add_scalar(tag, value.detach().item(), global_step)
+                for name, value in diagnostics.items():
+                    tag = _diagnostic_tensorboard_tag(name)
+                    if tag is not None:
+                        writer.add_scalar(tag, value.item(), global_step)
                 writer.add_scalar("train/lr", lr, global_step)
-            if not progress_disabled:
+            if bar is not None:
                 bar.set_postfix(
                     total=f"{meters['total'].avg:.3f}",
                     task=f"{meters['task'].avg:.3f}",
@@ -423,22 +660,84 @@ def train_joint_structure_da(
                     lr=f"{lr:.2e}",
                 )
         if progress_disabled:
+            diagnostic_average = {
+                name: meter.avg for name, meter in diagnostic_meters.items()
+            }
             print(
                 f"TRAIN_EPOCH|epoch={epoch + 1}/{training_config.epochs}"
                 f"|steps={steps_per_epoch}|total={meters['total'].avg:.4f}"
                 f"|task={meters['task'].avg:.4f}"
-                f"|quality={meters['quality_total'].avg:.4f}"
+                f"|q_total={meters['quality_total'].avg:.4f}"
+                f"|q_struct_cls={meters['quality_structural_cls'].avg:.4f}"
+                f"|q_struct_dom={meters['quality_structural_domain'].avg:.4f}"
+                f"|q_comp_cls={meters['quality_component_cls'].avg:.4f}"
+                f"|q_comp_dom={meters['quality_component_domain'].avg:.4f}"
                 f"|geometry={meters['geometry'].avg:.4f}"
                 f"|alignment={meters['alignment'].avg:.4f}"
-                f"|domain_accuracy={meters['domain_accuracy'].avg:.4f}"
-                f"|alpha_T={meters['alpha_T'].avg:.4f}"
-                f"|alpha_D={meters['alpha_D'].avg:.4f}"
-                f"|alpha_R={meters['alpha_R'].avg:.4f}"
-                f"|beta_T_temp={meters['beta_T_temp'].avg:.4f}"
-                f"|beta_D_temp={meters['beta_D_temp'].avg:.4f}"
-                f"|beta_T_channel={meters['beta_T_channel'].avg:.4f}"
-                f"|beta_D_channel={meters['beta_D_channel'].avg:.4f}"
-                f"|grl={result.alignment.coefficient.item():.3f}|lr={lr:.2e}"
+                f"|train_acc={diagnostic_average['source_train_accuracy']:.4f}"
+                f"|domain_acc={diagnostic_average['domain_accuracy']:.4f}"
+                f"|grl={diagnostic_average['grl_coefficient']:.3f}"
+                f"|lr={lr_meter.avg:.2e}"
+            )
+            print(
+                f"STRUCTURE_EPOCH|epoch={epoch + 1}"
+                f"|tau_fast={diagnostic_average['tau_fast']:.6f}"
+                f"|tau_slow={diagnostic_average['tau_slow']:.6f}"
+                f"|tau_gap={diagnostic_average['tau_gap']:.6f}"
+                f"|energy_T_s={diagnostic_average['source_trend_energy_fraction']:.4f}"
+                f"|energy_D_s={diagnostic_average['source_dynamics_energy_fraction']:.4f}"
+                f"|energy_R_s={diagnostic_average['source_residual_energy_fraction']:.4f}"
+                f"|energy_T_t={diagnostic_average['target_trend_energy_fraction']:.4f}"
+                f"|energy_D_t={diagnostic_average['target_dynamics_energy_fraction']:.4f}"
+                f"|energy_R_t={diagnostic_average['target_residual_energy_fraction']:.4f}"
+                f"|reconstruction_s={diagnostic_average['source_reconstruction_relative_error']:.3e}"
+                f"|reconstruction_t={diagnostic_average['target_reconstruction_relative_error']:.3e}"
+                f"|temporal_T_valid_s={diagnostic_average['source_temporal_T_valid_rate']:.4f}"
+                f"|temporal_D_valid_s={diagnostic_average['source_temporal_D_valid_rate']:.4f}"
+                f"|temporal_T_valid_t={diagnostic_average['target_temporal_T_valid_rate']:.4f}"
+                f"|temporal_D_valid_t={diagnostic_average['target_temporal_D_valid_rate']:.4f}"
+                f"|channel_T_valid_s={diagnostic_average['source_channel_T_valid_rate']:.4f}"
+                f"|channel_D_valid_s={diagnostic_average['source_channel_D_valid_rate']:.4f}"
+                f"|channel_T_valid_t={diagnostic_average['target_channel_T_valid_rate']:.4f}"
+                f"|channel_D_valid_t={diagnostic_average['target_channel_D_valid_rate']:.4f}"
+                f"|raw_fusion_norm_s={diagnostic_average['source_raw_fusion_norm']:.4f}"
+                f"|raw_fusion_norm_t={diagnostic_average['target_raw_fusion_norm']:.4f}"
+                f"|temporal_fusion_norm_s={diagnostic_average['source_temporal_fusion_norm']:.4f}"
+                f"|temporal_fusion_norm_t={diagnostic_average['target_temporal_fusion_norm']:.4f}"
+                f"|channel_fusion_norm_s={diagnostic_average['source_channel_fusion_norm']:.4f}"
+                f"|channel_fusion_norm_t={diagnostic_average['target_channel_fusion_norm']:.4f}"
+                f"|channel_T_relation_mass_s={diagnostic_average['source_channel_T_relation_mass']:.4f}"
+                f"|channel_D_relation_mass_s={diagnostic_average['source_channel_D_relation_mass']:.4f}"
+                f"|channel_T_relation_mass_t={diagnostic_average['target_channel_T_relation_mass']:.4f}"
+                f"|channel_D_relation_mass_t={diagnostic_average['target_channel_D_relation_mass']:.4f}"
+            )
+            print(
+                f"QUALITY_EPOCH|epoch={epoch + 1}"
+                f"|alpha_T_s={diagnostic_average['source_alpha_T_mean']:.4f}"
+                f"|alpha_T_t={diagnostic_average['target_alpha_T_mean']:.4f}"
+                f"|alpha_D_s={diagnostic_average['source_alpha_D_mean']:.4f}"
+                f"|alpha_D_t={diagnostic_average['target_alpha_D_mean']:.4f}"
+                f"|alpha_R_s={diagnostic_average['source_alpha_R_mean']:.4f}"
+                f"|alpha_R_t={diagnostic_average['target_alpha_R_mean']:.4f}"
+                f"|beta_T_temporal_s={diagnostic_average['source_beta_T_temporal_mean']:.4f}"
+                f"|beta_T_temporal_t={diagnostic_average['target_beta_T_temporal_mean']:.4f}"
+                f"|beta_D_temporal_s={diagnostic_average['source_beta_D_temporal_mean']:.4f}"
+                f"|beta_D_temporal_t={diagnostic_average['target_beta_D_temporal_mean']:.4f}"
+                f"|beta_T_channel_s={diagnostic_average['source_beta_T_channel_mean']:.4f}"
+                f"|beta_T_channel_t={diagnostic_average['target_beta_T_channel_mean']:.4f}"
+                f"|beta_D_channel_s={diagnostic_average['source_beta_D_channel_mean']:.4f}"
+                f"|beta_D_channel_t={diagnostic_average['target_beta_D_channel_mean']:.4f}"
+            )
+            print(
+                f"GEOMETRY_EPOCH|epoch={epoch + 1}"
+                f"|T_align={diagnostic_average['geometry_T_alignment']:.4f}"
+                f"|T_rough={diagnostic_average['geometry_T_roughness']:.4f}"
+                f"|T_unsupported={diagnostic_average['geometry_T_unsupported']:.4f}"
+                f"|T_center={diagnostic_average['geometry_T_phase_center']:.4f}"
+                f"|D_align={diagnostic_average['geometry_D_alignment']:.4f}"
+                f"|D_rough={diagnostic_average['geometry_D_roughness']:.4f}"
+                f"|D_unsupported={diagnostic_average['geometry_D_unsupported']:.4f}"
+                f"|D_center={diagnostic_average['geometry_D_phase_center']:.4f}"
             )
         model.eval()
         best_f1 = validation(

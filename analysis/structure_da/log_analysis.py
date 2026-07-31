@@ -22,6 +22,24 @@ def _population_std(values: pd.Series) -> float:
     return float(values.std(ddof=0)) if len(values) else float("nan")
 
 
+def _diagnostic_rows(
+    runs: Iterable[ParsedRun], attribute: str
+) -> list[dict[str, object]]:
+    rows = []
+    for run in runs:
+        for values in getattr(run, attribute):
+            rows.append(
+                {
+                    "run_name": run.run_name,
+                    "source": run.source,
+                    "target": run.target,
+                    "seed": run.seed,
+                    **values,
+                }
+            )
+    return rows
+
+
 def build_analysis_tables(runs: Iterable[ParsedRun]) -> dict[str, pd.DataFrame]:
     """Build all normalized log tables without reading or plotting files."""
 
@@ -39,7 +57,12 @@ def build_analysis_tables(runs: Iterable[ParsedRun]) -> dict[str, pd.DataFrame]:
                 "run_name": run.run_name, "source": run.source, "target": run.target,
                 "seed": run.seed, "epoch": epoch.epoch, "total": epoch.total,
                 "task": epoch.task, "quality": epoch.quality,
+                "quality_structural_cls": epoch.quality_structural_cls,
+                "quality_structural_domain": epoch.quality_structural_domain,
+                "quality_component_cls": epoch.quality_component_cls,
+                "quality_component_domain": epoch.quality_component_domain,
                 "geometry": epoch.geometry, "alignment": epoch.alignment,
+                "train_accuracy": epoch.train_accuracy,
                 "domain_accuracy": epoch.domain_accuracy,
                 "alpha_T": epoch.alpha_T, "alpha_D": epoch.alpha_D,
                 "alpha_R": epoch.alpha_R,
@@ -120,6 +143,34 @@ def build_analysis_tables(runs: Iterable[ParsedRun]) -> dict[str, pd.DataFrame]:
                 {"method": "pearson", "correlation": float(pearsonr(x, y).statistic), "n_runs": len(x)},
                 {"method": "spearman", "correlation": float(spearmanr(x, y).statistic), "n_runs": len(x)},
             ]
+    step_history = pd.DataFrame(_diagnostic_rows(runs, "steps"))
+    structure_rows = _diagnostic_rows(runs, "structure_diagnostics")
+    decomposition_rows = []
+    relation_rows = []
+    metadata = {"run_name", "source", "target", "seed", "epoch"}
+    for row in structure_rows:
+        decomposition_rows.append(
+            {
+                key: value
+                for key, value in row.items()
+                if key in metadata
+                or key.startswith("tau_")
+                or "energy_" in key
+                or "reconstruction" in key
+            }
+        )
+        relation_rows.append(
+            {
+                key: value
+                for key, value in row.items()
+                if key in metadata
+                or (
+                    not key.startswith("tau_")
+                    and "energy_" not in key
+                    and "reconstruction" not in key
+                )
+            }
+        )
     return {
         "run_status": pd.DataFrame(status_rows),
         "run_summary": run_summary,
@@ -129,6 +180,15 @@ def build_analysis_tables(runs: Iterable[ParsedRun]) -> dict[str, pd.DataFrame]:
         "task_summary": pd.DataFrame(task_rows),
         "correlation_summary": pd.DataFrame(correlation_rows),
         "loss_diagnostics": pd.DataFrame(loss_rows),
+        "step_history": step_history,
+        "decomposition_diagnostics": pd.DataFrame(decomposition_rows),
+        "structure_diagnostics": pd.DataFrame(relation_rows),
+        "quality_diagnostics": pd.DataFrame(
+            _diagnostic_rows(runs, "quality_diagnostics")
+        ),
+        "geometry_diagnostics": pd.DataFrame(
+            _diagnostic_rows(runs, "geometry_diagnostics")
+        ),
     }
 
 

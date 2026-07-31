@@ -22,6 +22,7 @@ from .full_model import (
     StructureAwareGeometryOutput,
 )
 from .joint_trainer import (
+    JointStructureDADiagnostics,
     JointStructureDALossOutput,
     JointStructureDATrainStepOutput,
     JointStructureDATrainingConfig,
@@ -101,6 +102,7 @@ __all__ = [
     "HierarchicalQualityObjective",
     "HierarchicalQualityOutput",
     "JointStructureDALossOutput",
+    "JointStructureDADiagnostics",
     "JointStructureDATrainStepOutput",
     "JointStructureDATrainingConfig",
     "MonotoneWarpEstimator",

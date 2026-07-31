@@ -83,48 +83,155 @@ def _source_target_scatter(frame: pd.DataFrame, path: Path) -> None:
     _save(fig, path)
 
 
+def _plot_lines(
+    x: np.ndarray,
+    series: list[tuple[str, np.ndarray]],
+    path: Path,
+    title: str,
+    ylabel: str,
+) -> None:
+    fig, axis = plt.subplots(figsize=(8, 4.8))
+    for label, values in series:
+        if np.isfinite(values).any():
+            axis.plot(x, values, label=label)
+    axis.set_xlabel("Epoch")
+    axis.set_ylabel(ylabel)
+    axis.set_title(title)
+    if axis.lines:
+        axis.legend(fontsize=8, ncol=2)
+    _save(fig, path)
+
+
+def _record_series(records: list[dict], name: str) -> np.ndarray:
+    return np.asarray([record.get(name, np.nan) for record in records], dtype=float)
+
+
 def _training_figures(run: ParsedRun, root: Path) -> None:
     if not run.epochs:
         return
     epochs = np.asarray([item.epoch for item in run.epochs])
-    val = np.asarray([item.val_macro_f1 if item.val_macro_f1 is not None else np.nan for item in run.epochs])
     run_dir = root / run.run_name
+    val = np.asarray([
+        item.val_macro_f1 if item.val_macro_f1 is not None else np.nan
+        for item in run.epochs
+    ])
+    _plot_lines(
+        epochs,
+        [
+            ("total", np.asarray([item.total for item in run.epochs])),
+            ("task", np.asarray([item.task for item in run.epochs])),
+            ("quality", np.asarray([item.quality for item in run.epochs])),
+            ("quality structural cls", np.asarray([item.quality_structural_cls for item in run.epochs])),
+            ("quality structural domain", np.asarray([item.quality_structural_domain for item in run.epochs])),
+            ("quality component cls", np.asarray([item.quality_component_cls for item in run.epochs])),
+            ("quality component domain", np.asarray([item.quality_component_domain for item in run.epochs])),
+            ("geometry", np.asarray([item.geometry for item in run.epochs])),
+            ("alignment", np.asarray([item.alignment for item in run.epochs])),
+        ],
+        run_dir / "losses.png",
+        f"{run.run_name}: training losses",
+        "Loss",
+    )
+    _plot_lines(
+        epochs,
+        [
+            ("source train accuracy", 100 * np.asarray([item.train_accuracy for item in run.epochs])),
+            ("source val Macro-F1", 100 * val),
+        ],
+        run_dir / "source_train_accuracy_and_validation.png",
+        f"{run.run_name}: source training and validation",
+        "Percent",
+    )
+    _plot_lines(
+        epochs,
+        [
+            ("domain accuracy", np.asarray([item.domain_accuracy for item in run.epochs])),
+            ("GRL coefficient", np.asarray([item.grl for item in run.epochs])),
+        ],
+        run_dir / "domain_accuracy_and_grl.png",
+        f"{run.run_name}: domain accuracy and GRL",
+        "Value",
+    )
 
-    fig, axes = plt.subplots(2, 1, figsize=(7, 7), sharex=True)
-    axes[0].plot(epochs, [item.task for item in run.epochs])
-    axes[0].set_ylabel("Task loss")
-    axes[1].plot(epochs, 100 * val)
-    axes[1].set_ylabel("Source-val Macro-F1 (%)")
-    axes[1].set_xlabel("Epoch")
-    fig.suptitle(run.run_name)
-    _save(fig, run_dir / "classification_and_validation.png")
+    structure = run.structure_diagnostics
+    if structure:
+        structure_epochs = _record_series(structure, "epoch")
+        _plot_lines(
+            structure_epochs,
+            [
+                (f"{domain} {component}", _record_series(structure, f"energy_{component}_{domain}"))
+                for domain in ("s", "t")
+                for component in ("T", "D", "R")
+            ],
+            run_dir / "energy_fractions.png",
+            f"{run.run_name}: decomposition energy fractions",
+            "Fraction",
+        )
+        _plot_lines(
+            structure_epochs,
+            [
+                (f"{domain} {branch}", _record_series(structure, f"{branch}_fusion_norm_{domain}"))
+                for domain in ("s", "t")
+                for branch in ("raw", "temporal", "channel")
+            ],
+            run_dir / "fusion_norms.png",
+            f"{run.run_name}: fusion feature norms",
+            "Mean L2 norm",
+        )
+        _plot_lines(
+            structure_epochs,
+            [
+                (f"{domain} {operator} {component}", _record_series(structure, f"{operator}_{component}_valid_{domain}"))
+                for domain in ("s", "t")
+                for operator in ("temporal", "channel")
+                for component in ("T", "D")
+            ],
+            run_dir / "structure_valid_rates.png",
+            f"{run.run_name}: structure valid rates",
+            "Valid rate",
+        )
 
-    fig, axis = plt.subplots(figsize=(7, 4.5))
-    axis.plot(epochs, [item.quality for item in run.epochs], label="quality")
-    axis.plot(epochs, [item.geometry for item in run.epochs], label="geometry")
-    axis.plot(epochs, [item.alignment for item in run.epochs], label="alignment")
-    axis.set_xlabel("Epoch"); axis.set_ylabel("Loss"); axis.set_title(f"{run.run_name}: auxiliary losses")
-    axis.legend(fontsize=8)
-    _save(fig, run_dir / "quality_losses.png")
+    quality = run.quality_diagnostics
+    if quality:
+        quality_epochs = _record_series(quality, "epoch")
+        _plot_lines(
+            quality_epochs,
+            [
+                (f"{domain} alpha {component}", _record_series(quality, f"alpha_{component}_{domain}"))
+                for domain in ("s", "t")
+                for component in ("T", "D", "R")
+            ],
+            run_dir / "quality_alpha.png",
+            f"{run.run_name}: component quality alpha",
+            "Coefficient",
+        )
+        _plot_lines(
+            quality_epochs,
+            [
+                (f"{domain} beta {component} {operator}", _record_series(quality, f"beta_{component}_{operator}_{domain}"))
+                for domain in ("s", "t")
+                for component in ("T", "D")
+                for operator in ("temporal", "channel")
+            ],
+            run_dir / "quality_beta.png",
+            f"{run.run_name}: structure quality beta",
+            "Coefficient",
+        )
 
-    fig, axis = plt.subplots(figsize=(7, 4.2))
-    axis.plot(epochs, [item.domain_accuracy for item in run.epochs])
-    axis.axhline(0.5, linestyle="--", color="black", alpha=0.6)
-    axis.set_xlabel("Epoch"); axis.set_ylabel("Accuracy")
-    axis.set_title(f"{run.run_name}: domain accuracy")
-    _save(fig, run_dir / "domain_accuracy.png")
-
-    fig, axis = plt.subplots(figsize=(7, 4.2))
-    axis.plot(epochs, 100 * val)
-    finite = np.flatnonzero(np.isfinite(val))
-    if finite.size:
-        best_index = finite[np.argmax(val[finite])]
-        final_index = finite[-1]
-        axis.scatter(epochs[best_index], 100 * val[best_index], marker="*", s=120, label=f"best e{epochs[best_index]}={100 * val[best_index]:.1f}")
-        axis.scatter(epochs[final_index], 100 * val[final_index], marker="x", s=70, label=f"final={100 * val[final_index]:.1f}")
-        axis.legend()
-    axis.set_xlabel("Epoch"); axis.set_ylabel("Source-val Macro-F1 (%)"); axis.set_title(run.run_name)
-    _save(fig, run_dir / "validation_f1.png")
+    geometry = run.geometry_diagnostics
+    if geometry:
+        geometry_epochs = _record_series(geometry, "epoch")
+        _plot_lines(
+            geometry_epochs,
+            [
+                (f"{component} {loss}", _record_series(geometry, f"{component}_{loss}"))
+                for component in ("T", "D")
+                for loss in ("align", "rough", "unsupported", "center")
+            ],
+            run_dir / "geometry_losses.png",
+            f"{run.run_name}: temporal geometry losses",
+            "Loss",
+        )
 
 
 def class_metric_plot_data(

@@ -110,7 +110,9 @@ def test_final_evaluation_defaults_missing_progress_bar_to_auto(monkeypatch):
         train,
         "evaluation",
         lambda *args, **kwargs: (
-            captured.append((args[1], kwargs["progress_bar"]))
+            captured.append(
+                (args[1], kwargs["progress_bar"], kwargs.get("criterion"))
+            )
             or {
                 "accuracy": 0.0,
                 "macro_f1": 0.0,
@@ -156,7 +158,9 @@ def test_final_evaluation_defaults_missing_progress_bar_to_auto(monkeypatch):
     train.main(config)
 
     assert evaluation_domains == ["target"]
-    assert captured == [(target_test, "auto")]
+    assert len(captured) == 1
+    assert captured[0][:2] == (target_test, "auto")
+    assert isinstance(captured[0][2], torch.nn.CrossEntropyLoss)
 
 
 def test_training_selects_checkpoint_on_source_validation_and_tests_target(
@@ -291,6 +295,7 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         "--lambda_geometry", "--lambda_alignment", "--lambda_structural_cls",
         "--lambda_structural_domain", "--lambda_component_cls",
         "--lambda_component_domain",
+        "--eval_batch_size",
     ):
         assert option in result.stdout
     for option in (

@@ -143,6 +143,102 @@ def test_joint_step_supports_unequal_lengths_and_never_reads_target_label() -> N
     )
 
 
+def test_joint_step_exposes_finite_source_target_diagnostics(monkeypatch) -> None:
+    model = _model()
+    config = _config()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    recorded_outputs = []
+    original_forward = model.forward_details
+
+    def recording_forward(*args, **kwargs):
+        output = original_forward(*args, **kwargs)
+        recorded_outputs.append(output)
+        return output
+
+    monkeypatch.setattr(model, "forward_details", recording_forward)
+    result = joint_structure_da_train_step(
+        model,
+        _sample(2, 5),
+        _sample(3, 7, labels=False),
+        optimizer,
+        _objective(config),
+        config,
+        torch.device("cpu"),
+    )
+    scalars = result.diagnostics.scalars
+
+    required = {
+        "source_train_accuracy", "domain_accuracy", "grl_coefficient",
+        "loss_total", "loss_task", "loss_quality_total",
+        "loss_quality_structural_cls", "loss_quality_structural_domain",
+        "loss_quality_component_cls", "loss_quality_component_domain",
+        "loss_geometry_total", "loss_alignment",
+        "geometry_T_alignment", "geometry_T_roughness",
+        "geometry_T_unsupported", "geometry_T_phase_center",
+        "geometry_D_alignment", "geometry_D_roughness",
+        "geometry_D_unsupported", "geometry_D_phase_center",
+        "tau_fast", "tau_slow", "tau_gap",
+    }
+    for domain in ("source", "target"):
+        required.update(
+            f"{domain}_{name}"
+            for name in (
+                "trend_energy_fraction", "dynamics_energy_fraction",
+                "residual_energy_fraction", "reconstruction_relative_error",
+                "temporal_T_valid_rate", "temporal_D_valid_rate",
+                "channel_T_valid_rate", "channel_D_valid_rate",
+                "raw_T_norm", "raw_D_norm", "raw_R_norm",
+                "temporal_T_norm", "temporal_D_norm",
+                "channel_T_norm", "channel_D_norm",
+                "raw_fusion_norm", "temporal_fusion_norm",
+                "channel_fusion_norm", "fused_feature_norm",
+                "channel_T_relation_mass", "channel_D_relation_mass",
+                "channel_T_state_reliability_mean",
+                "channel_D_state_reliability_mean",
+                "channel_T_evolution_reliability_mean",
+                "channel_D_evolution_reliability_mean",
+            )
+        )
+        for coefficient in (
+            "alpha_T", "alpha_D", "alpha_R", "beta_T_temporal",
+            "beta_D_temporal", "beta_T_channel", "beta_D_channel",
+        ):
+            required.add(f"{domain}_{coefficient}_mean")
+            required.add(f"{domain}_{coefficient}_std")
+
+    assert required <= scalars.keys()
+    assert all(
+        isinstance(value, torch.Tensor)
+        and value.ndim == 0
+        and torch.isfinite(value).item()
+        for value in scalars.values()
+    )
+    for domain in ("source", "target"):
+        fraction_sum = sum(
+            scalars[f"{domain}_{component}_energy_fraction"]
+            for component in ("trend", "dynamics", "residual")
+        )
+        torch.testing.assert_close(fraction_sum, torch.ones_like(fraction_sum))
+        assert scalars[f"{domain}_reconstruction_relative_error"] < 1e-10
+
+    source_quality = recorded_outputs[0].representation.quality
+    target_quality = recorded_outputs[1].representation.quality
+    torch.testing.assert_close(
+        scalars["source_alpha_T_mean"], source_quality.alpha_trend.mean()
+    )
+    torch.testing.assert_close(
+        scalars["target_alpha_T_mean"], target_quality.alpha_trend.mean()
+    )
+    torch.testing.assert_close(
+        scalars["source_alpha_T_std"],
+        source_quality.alpha_trend.std(unbiased=False),
+    )
+    torch.testing.assert_close(
+        scalars["target_alpha_T_std"],
+        target_quality.alpha_trend.std(unbiased=False),
+    )
+
+
 def test_nonfinite_loss_raises_before_optimizer_step(monkeypatch) -> None:
     import methods.structure_da.joint_trainer as module
 
@@ -311,6 +407,13 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
 
     monkeypatch.setattr(module, "validation", fake_validation)
     monkeypatch.setattr(module, "joint_structure_da_train_step", recording_train_step)
+    monkeypatch.setattr(
+        module,
+        "tqdm",
+        lambda *args, **kwargs: pytest.fail(
+            "progress_bar=off must not construct tqdm"
+        ),
+    )
     train_joint_structure_da(
         model,
         [_sample(2, 5)],
@@ -329,19 +432,56 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
     assert _counts(restored) == (2, 2, 2, 2, 2)
     assert restored.alignment.grl.iteration.item() == 2
     epoch_log = capsys.readouterr().out
+    assert "TRAIN_STEP|" in epoch_log
     assert "TRAIN_EPOCH|" in epoch_log
-    expected_epoch_values = {
-        "domain_accuracy": sum(item.alignment.accuracy.item() for item in recorded) / 2,
-        "alpha_T": sum(item.mean_alpha_trend.item() for item in recorded) / 2,
-        "alpha_D": sum(item.mean_alpha_dynamics.item() for item in recorded) / 2,
-        "alpha_R": sum(item.mean_alpha_residual.item() for item in recorded) / 2,
-        "beta_T_temp": sum(item.mean_beta_trend_temporal.item() for item in recorded) / 2,
-        "beta_D_temp": sum(item.mean_beta_dynamics_temporal.item() for item in recorded) / 2,
-        "beta_T_channel": sum(item.mean_beta_trend_channel.item() for item in recorded) / 2,
-        "beta_D_channel": sum(item.mean_beta_dynamics_channel.item() for item in recorded) / 2,
-    }
-    for name, value in expected_epoch_values.items():
-        assert f"|{name}={value:.4f}" in epoch_log
+    assert "STRUCTURE_EPOCH|" in epoch_log
+    assert "QUALITY_EPOCH|" in epoch_log
+    assert "GEOMETRY_EPOCH|" in epoch_log
+    train_step = next(
+        line for line in epoch_log.splitlines() if line.startswith("TRAIN_STEP|")
+    )
+    for name in (
+        "total", "task", "q_total", "geometry", "alignment",
+        "train_acc", "domain_acc", "grl", "lr",
+    ):
+        assert f"|{name}=" in train_step
+    train_epoch = next(
+        line for line in epoch_log.splitlines() if line.startswith("TRAIN_EPOCH|")
+    )
+    for name in (
+        "total", "task", "q_total", "q_struct_cls", "q_struct_dom",
+        "q_comp_cls", "q_comp_dom", "geometry", "alignment",
+        "train_acc", "domain_acc", "grl", "lr",
+    ):
+        assert f"|{name}=" in train_epoch
+    structure_epoch = next(
+        line for line in epoch_log.splitlines()
+        if line.startswith("STRUCTURE_EPOCH|")
+    )
+    for name in (
+        "tau_fast", "tau_slow", "tau_gap", "energy_T_s", "energy_T_t",
+        "reconstruction_s", "reconstruction_t", "temporal_T_valid_s",
+        "channel_T_valid_t", "raw_fusion_norm_s", "temporal_fusion_norm_t",
+        "channel_fusion_norm_s", "channel_T_relation_mass_s",
+    ):
+        assert f"|{name}=" in structure_epoch
+    quality_epoch = next(
+        line for line in epoch_log.splitlines() if line.startswith("QUALITY_EPOCH|")
+    )
+    for name in (
+        "alpha_T_s", "alpha_T_t", "alpha_D_s", "alpha_D_t",
+        "alpha_R_s", "alpha_R_t", "beta_T_temporal_s",
+        "beta_T_temporal_t", "beta_D_channel_s", "beta_D_channel_t",
+    ):
+        assert f"|{name}=" in quality_epoch
+    geometry_epoch = next(
+        line for line in epoch_log.splitlines() if line.startswith("GEOMETRY_EPOCH|")
+    )
+    for name in (
+        "T_align", "T_rough", "T_unsupported", "T_center",
+        "D_align", "D_rough", "D_unsupported", "D_center",
+    ):
+        assert f"|{name}=" in geometry_epoch
     required = {
         "train/loss_total", "train/loss_task", "train/loss_quality_total",
         "train/loss_quality_structural_cls", "train/loss_quality_structural_domain",
@@ -351,5 +491,17 @@ def test_full_loop_runs_two_steps_saves_and_restores_state(tmp_path, monkeypatch
         "train/alpha_residual", "train/beta_trend_temporal",
         "train/beta_dynamics_temporal", "train/beta_trend_channel",
         "train/beta_dynamics_channel", "train/lr",
+        "train/source/energy_fraction_trend",
+        "train/target/energy_fraction_trend",
+        "train/source/temporal_valid_trend",
+        "train/target/temporal_valid_trend",
+        "train/source/fusion_norm_raw",
+        "train/target/fusion_norm_raw",
+        "train/source/alpha_trend_mean",
+        "train/source/alpha_trend_std",
+        "train/target/alpha_trend_mean",
+        "train/target/alpha_trend_std",
+        "train/geometry/trend_alignment",
+        "train/geometry/dynamics_alignment",
     }
     assert required <= writer.tags

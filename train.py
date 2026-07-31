@@ -136,6 +136,7 @@ def main(config):
             target_test_loader,
             device,
             config.classes,
+            criterion=torch.nn.CrossEntropyLoss(),
             mode='test',
             progress_bar=getattr(config, "progress_bar", "auto"),
         )
@@ -405,6 +406,12 @@ if __name__ == '__main__':
     # Training configuration
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs per fold')
     parser.add_argument('--batch_size', default=128, type=int, help='Batch size')
+    parser.add_argument(
+        '--eval_batch_size',
+        default=None,
+        type=int,
+        help='Validation/test batch size; defaults to --batch_size',
+    )
     parser.add_argument('--lr', default=1e-3, type=float, help='Learning rate')
     parser.add_argument('--weight_decay', default=1e-4, type=float, help='Weight decay rate')
     parser.add_argument('--num_pixels', default=64, type=int, help='Number of pixels to sample from the input sample')

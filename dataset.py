@@ -221,6 +221,15 @@ def create_evaluation_loaders(dataset_name, splits, config, sample_pixels_val=Fa
     """
 
     is_tsnet = config.model == "tsnet"
+    eval_batch_size = getattr(config, "eval_batch_size", None)
+    if eval_batch_size is None:
+        eval_batch_size = config.batch_size
+    if (
+        isinstance(eval_batch_size, bool)
+        or not isinstance(eval_batch_size, int)
+        or eval_batch_size <= 0
+    ):
+        raise ValueError("eval_batch_size must be a positive integer or None")
     # Validation dataset
     val_transform = transforms.Compose(
         [
@@ -245,7 +254,7 @@ def create_evaluation_loaders(dataset_name, splits, config, sample_pixels_val=Fa
         val_dataset,
         num_workers=config.num_workers,
         batch_sampler=GroupByShapesBatchSampler(
-            val_dataset, config.batch_size, by_pixel_dim=not sample_pixels_val
+            val_dataset, eval_batch_size, by_pixel_dim=not sample_pixels_val
         ),
     )
 
@@ -271,7 +280,7 @@ def create_evaluation_loaders(dataset_name, splits, config, sample_pixels_val=Fa
     test_loader = data.DataLoader(
         test_dataset,
         num_workers=config.num_workers,
-        batch_sampler=GroupByShapesBatchSampler(test_dataset, config.batch_size),
+        batch_sampler=GroupByShapesBatchSampler(test_dataset, eval_batch_size),
     )
 
     print(f"evaluation dataset:", dataset_name)

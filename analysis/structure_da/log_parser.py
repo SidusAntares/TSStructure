@@ -18,8 +18,13 @@ class EpochRecord:
     total: float
     task: float
     quality: float
+    quality_structural_cls: float
+    quality_structural_domain: float
+    quality_component_cls: float
+    quality_component_domain: float
     geometry: float
     alignment: float
+    train_accuracy: float
     domain_accuracy: float
     alpha_T: float
     alpha_D: float
@@ -56,6 +61,10 @@ class ParsedRun:
     protocol: dict[str, Any] = field(default_factory=dict)
     counts: dict[str, Any] = field(default_factory=dict)
     epochs: list[EpochRecord] = field(default_factory=list)
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    structure_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    quality_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    geometry_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     class_metrics: list[ClassMetric] = field(default_factory=list)
     confusion: Optional[np.ndarray] = None
     target_accuracy: Optional[float] = None
@@ -113,6 +122,15 @@ def _pipe_fields(line: str) -> dict[str, Any]:
             key, value = item.split("=", 1)
             result[key] = _convert_value(value)
     return result
+
+
+def _float_field(
+    values: dict[str, Any], *names: str, default: float = float("nan")
+) -> float:
+    for name in names:
+        if name in values:
+            return float(values[name])
+    return default
 
 
 def _namespace_fields(line: str) -> dict[str, Any]:
@@ -192,6 +210,24 @@ def parse_task_log(path: Path | str) -> ParsedRun:
         protocol["classes"] = tuple(str(protocol["classes"]).split(","))
     counts = next((_pipe_fields(line) for line in lines if line.startswith("CLOSED_SET_COUNTS|")), {})
 
+    steps = [
+        _pipe_fields(line) for line in lines if line.startswith("TRAIN_STEP|")
+    ]
+    structure_diagnostics = [
+        _pipe_fields(line)
+        for line in lines
+        if line.startswith("STRUCTURE_EPOCH|")
+    ]
+    quality_diagnostics = [
+        _pipe_fields(line)
+        for line in lines
+        if line.startswith("QUALITY_EPOCH|")
+    ]
+    geometry_diagnostics = [
+        _pipe_fields(line)
+        for line in lines
+        if line.startswith("GEOMETRY_EPOCH|")
+    ]
     epochs: list[EpochRecord] = []
     reported_improvement_epochs: list[int] = []
     pending: Optional[EpochRecord] = None
@@ -205,20 +241,28 @@ def parse_task_log(path: Path | str) -> ParsedRun:
             pending = EpochRecord(
                 epoch=int(str(values["epoch"]).split("/")[0]),
                 steps=int(values["steps"]),
-                total=float(values["total"]), task=float(values["task"]),
-                quality=float(values["quality"]),
-                geometry=float(values["geometry"]),
-                alignment=float(values["alignment"]),
-                domain_accuracy=float(values["domain_accuracy"]),
-                alpha_T=float(values["alpha_T"]),
-                alpha_D=float(values["alpha_D"]),
-                alpha_R=float(values["alpha_R"]),
-                beta_T_temp=float(values["beta_T_temp"]),
-                beta_D_temp=float(values["beta_D_temp"]),
-                beta_T_channel=float(values["beta_T_channel"]),
-                beta_D_channel=float(values["beta_D_channel"]),
-                grl=float(values["grl"]),
-                lr=float(values["lr"]),
+                total=_float_field(values, "total"),
+                task=_float_field(values, "task", "cls"),
+                quality=_float_field(values, "q_total", "quality"),
+                quality_structural_cls=_float_field(values, "q_struct_cls"),
+                quality_structural_domain=_float_field(values, "q_struct_dom"),
+                quality_component_cls=_float_field(values, "q_comp_cls"),
+                quality_component_domain=_float_field(values, "q_comp_dom"),
+                geometry=_float_field(values, "geometry"),
+                alignment=_float_field(values, "alignment", "sda"),
+                train_accuracy=_float_field(values, "train_acc"),
+                domain_accuracy=_float_field(
+                    values, "domain_acc", "domain_accuracy"
+                ),
+                alpha_T=_float_field(values, "alpha_T"),
+                alpha_D=_float_field(values, "alpha_D"),
+                alpha_R=_float_field(values, "alpha_R"),
+                beta_T_temp=_float_field(values, "beta_T_temp"),
+                beta_D_temp=_float_field(values, "beta_D_temp"),
+                beta_T_channel=_float_field(values, "beta_T_channel"),
+                beta_D_channel=_float_field(values, "beta_D_channel"),
+                grl=_float_field(values, "grl"),
+                lr=_float_field(values, "lr"),
             )
             epochs.append(pending)
         else:
@@ -258,7 +302,11 @@ def parse_task_log(path: Path | str) -> ParsedRun:
     return ParsedRun(
         path=path, run_name=run_name, source=source, target=target, seed=seed,
         status=status, config=config, protocol=protocol, counts=counts,
-        epochs=epochs, class_metrics=class_metrics, confusion=confusion,
+        epochs=epochs, steps=steps,
+        structure_diagnostics=structure_diagnostics,
+        quality_diagnostics=quality_diagnostics,
+        geometry_diagnostics=geometry_diagnostics,
+        class_metrics=class_metrics, confusion=confusion,
         target_accuracy=target_accuracy, target_macro_f1=target_macro_f1,
         git_head=next((line.split("|", 1)[1] for line in lines if line.startswith("GIT_HEAD|")), None),
         date_start=next((line.split("|", 1)[1] for line in lines if line.startswith("DATE_START|")), None),

@@ -365,3 +365,59 @@ def test_closed_set_is_propagated_to_structure_da_and_evaluation_loaders(
     monkeypatch.setattr(dataset, "GroupByShapesBatchSampler", lambda *args, **kwargs: [])
     dataset.create_evaluation_loaders("target", splits, config)
     assert _LoaderDataset.calls == [(True, True), (True, True)]
+
+
+@pytest.mark.parametrize(
+    "eval_batch_size,expected_batch_size",
+    [(None, 2), (128, 128)],
+)
+def test_evaluation_loaders_use_independent_batch_size(
+    monkeypatch, eval_batch_size, expected_batch_size
+):
+    config = SimpleNamespace(
+        closed_set=True,
+        data_root="data",
+        classes=["crop"],
+        model="pseltae",
+        num_pixels=2,
+        seq_length=3,
+        num_workers=0,
+        batch_size=2,
+        eval_batch_size=eval_batch_size,
+        combine_spring_and_winter=False,
+    )
+    splits = {"target": {"val": {1}, "test": {2}}}
+    sampler_batch_sizes = []
+
+    monkeypatch.setattr(dataset, "PixelSetData", _LoaderDataset)
+    monkeypatch.setattr(dataset.data, "DataLoader", _Loader)
+
+    def sampler(data_source, batch_size, **kwargs):
+        sampler_batch_sizes.append(batch_size)
+        return []
+
+    monkeypatch.setattr(dataset, "GroupByShapesBatchSampler", sampler)
+
+    dataset.create_evaluation_loaders("target", splits, config)
+
+    assert sampler_batch_sizes == [expected_batch_size, expected_batch_size]
+
+
+def test_evaluation_loader_rejects_nonpositive_eval_batch_size(monkeypatch):
+    config = SimpleNamespace(
+        closed_set=True,
+        data_root="data",
+        classes=["crop"],
+        model="pseltae",
+        num_pixels=2,
+        seq_length=3,
+        num_workers=0,
+        batch_size=2,
+        eval_batch_size=0,
+        combine_spring_and_winter=False,
+    )
+    splits = {"target": {"val": {1}, "test": {2}}}
+    monkeypatch.setattr(dataset, "PixelSetData", _LoaderDataset)
+
+    with pytest.raises(ValueError, match="eval_batch_size must be a positive integer"):
+        dataset.create_evaluation_loaders("target", splits, config)
