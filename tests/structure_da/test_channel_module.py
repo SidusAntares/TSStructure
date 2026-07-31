@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 
 import pytest
 import torch
@@ -386,10 +387,23 @@ def test_edge_raw_and_embedding_have_exact_directed_shapes() -> None:
 def test_directed_edge_buffers_use_fixed_source_major_order() -> None:
     extractor = _extractor()
 
+    assert extractor.edge_source.tolist() == [0, 0, 1, 1, 2, 2]
+    assert extractor.edge_target.tolist() == [1, 2, 0, 2, 0, 1]
     assert extractor.source_channel_indices.tolist() == [0, 0, 1, 1, 2, 2]
     assert extractor.target_channel_indices.tolist() == [1, 2, 0, 2, 0, 1]
     assert not extractor.source_channel_indices.requires_grad
     assert not extractor.target_channel_indices.requires_grad
+
+
+def test_core_channel_computation_has_no_batch_channel_edge_or_lag_loop() -> None:
+    implementations = (
+        MultiScaleChannelRelationStructure.compute_channel_coverage_weights,
+        MultiScaleChannelRelationStructure.compute_local_velocity,
+        MultiScaleChannelRelationStructure._compute_relations,
+    )
+
+    for implementation in implementations:
+        assert "for " not in inspect.getsource(implementation)
 
 
 def test_edge_encoder_is_exact_bias_free_two_linear_gelu() -> None:
@@ -600,6 +614,24 @@ def test_pair_forward_uses_one_parameter_set_for_trend_and_dynamics() -> None:
     assert not torch.allclose(before.dynamics.feature, after.dynamics.feature)
 
 
+def test_pair_forward_precomputes_temporal_geometry_once(monkeypatch) -> None:
+    extractor = _extractor()
+    operator = SharedChannelStructureOperator(extractor).eval()
+    trend, positions, mask = _inputs()
+    calls = 0
+    original = extractor._precompute_temporal_geometry
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(extractor, "_precompute_temporal_geometry", counted)
+    operator(trend, trend * 0.7, positions, channel_mask=mask)
+
+    assert calls == 1
+
+
 def test_pair_source_update_increments_each_counter_only_once() -> None:
     operator = SharedChannelStructureOperator(_extractor())
     trend, positions, mask = _inputs()
@@ -657,6 +689,262 @@ def test_pair_loss_accumulates_into_shared_parameters() -> None:
     assert dynamics.grad is not None and dynamics.grad.abs().sum() > 0
     for parameter in extractor.parameters():
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+
+
+def _reference_channel_forward(
+    extractor: MultiScaleChannelRelationStructure,
+    tokens: torch.Tensor,
+    positions: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    safe, normalized_positions, resolved_mask = extractor._prepare_inputs(
+        tokens, positions, None, mask
+    )
+    standardized = extractor.attribute_standardizer(safe)
+    standardized = torch.where(
+        resolved_mask.unsqueeze(-1), standardized, torch.zeros_like(standardized)
+    )
+    coverage = extractor.compute_channel_coverage_weights(
+        normalized_positions, resolved_mask
+    )
+    channel_mean = torch.einsum("blc,blcp->bcp", coverage, standardized)
+    centered = torch.where(
+        resolved_mask.unsqueeze(-1),
+        standardized - channel_mean.unsqueeze(1),
+        torch.zeros_like(standardized),
+    )
+    velocity, velocity_support, _, _ = extractor.compute_local_velocity(
+        standardized, normalized_positions, resolved_mask
+    )
+    delta = normalized_positions.unsqueeze(1) - normalized_positions.unsqueeze(2)
+    lag_kernel = torch.exp(
+        -0.5
+        * (
+            (delta.unsqueeze(1) - extractor.lag_centers.view(1, -1, 1, 1))
+            / extractor.lag_widths.view(1, -1, 1, 1)
+        ).square()
+    )
+    state_relations = []
+    evolution_relations = []
+    strengths = []
+    state_counts = []
+    evolution_counts = []
+    state_energy_as = []
+    state_energy_bs = []
+    evolution_energy_as = []
+    evolution_energy_bs = []
+    for source, target in zip(
+        extractor.edge_source.tolist(), extractor.edge_target.tolist()
+    ):
+        source_mask = resolved_mask[:, :, source].to(centered.dtype)
+        target_mask = resolved_mask[:, :, target].to(centered.dtype)
+        pair_weight = (
+            lag_kernel
+            * source_mask[:, None, :, None]
+            * target_mask[:, None, None, :]
+        )
+        source_state = centered[:, :, source]
+        target_state = centered[:, :, target]
+        state_numerator = torch.einsum(
+            "bgij,bip,bjp->bg", pair_weight, source_state, target_state
+        )
+        state_energy_a = torch.einsum(
+            "bgij,bi->bg", pair_weight, source_state.square().sum(dim=-1)
+        )
+        state_energy_b = torch.einsum(
+            "bgij,bj->bg", pair_weight, target_state.square().sum(dim=-1)
+        )
+        state_count = pair_weight.sum(dim=(-1, -2)).square() / (
+            pair_weight.square().sum(dim=(-1, -2)) + extractor.eps
+        )
+        state_relation = state_numerator / torch.sqrt(
+            state_energy_a * state_energy_b + extractor.eps
+        )
+        state_relation = torch.where(
+            torch.isfinite(state_relation),
+            state_relation.clamp(-1.0, 1.0),
+            torch.zeros_like(state_relation),
+        )
+        source_support = velocity_support[:, :, source]
+        target_support = velocity_support[:, :, target]
+        evolution_weight = (
+            pair_weight
+            * source_support[:, None, :, None]
+            * target_support[:, None, None, :]
+        )
+        source_velocity = velocity[:, :, source]
+        target_velocity = velocity[:, :, target]
+        evolution_numerator = torch.einsum(
+            "bgij,bip,bjp->bg",
+            evolution_weight,
+            source_velocity,
+            target_velocity,
+        )
+        evolution_energy_a = torch.einsum(
+            "bgij,bi->bg",
+            evolution_weight,
+            source_velocity.square().sum(dim=-1),
+        )
+        evolution_energy_b = torch.einsum(
+            "bgij,bj->bg",
+            evolution_weight,
+            target_velocity.square().sum(dim=-1),
+        )
+        evolution_count = evolution_weight.sum(dim=(-1, -2)).square() / (
+            evolution_weight.square().sum(dim=(-1, -2)) + extractor.eps
+        )
+        evolution_relation = evolution_numerator / torch.sqrt(
+            evolution_energy_a * evolution_energy_b + extractor.eps
+        )
+        evolution_relation = torch.where(
+            torch.isfinite(evolution_relation),
+            evolution_relation.clamp(-1.0, 1.0),
+            torch.zeros_like(evolution_relation),
+        )
+        reliable_energy = (evolution_energy_a > extractor.eps) & (
+            evolution_energy_b > extractor.eps
+        )
+        strength = torch.tanh(
+            0.5
+            * torch.log(
+                (evolution_energy_a + extractor.eps)
+                / (evolution_energy_b + extractor.eps)
+            )
+        )
+        strength = torch.where(
+            reliable_energy & torch.isfinite(strength),
+            strength,
+            torch.zeros_like(strength),
+        )
+        state_relations.append(state_relation)
+        evolution_relations.append(evolution_relation)
+        strengths.append(strength)
+        state_counts.append(state_count)
+        evolution_counts.append(evolution_count)
+        state_energy_as.append(state_energy_a)
+        state_energy_bs.append(state_energy_b)
+        evolution_energy_as.append(evolution_energy_a)
+        evolution_energy_bs.append(evolution_energy_b)
+
+    state_relation = torch.stack(state_relations, dim=1)
+    evolution_relation = torch.stack(evolution_relations, dim=1)
+    strength = torch.stack(strengths, dim=1)
+    state_count = torch.stack(state_counts, dim=1)
+    evolution_count = torch.stack(evolution_counts, dim=1)
+    state_energy_a = torch.stack(state_energy_as, dim=1)
+    state_energy_b = torch.stack(state_energy_bs, dim=1)
+    evolution_energy_a = torch.stack(evolution_energy_as, dim=1)
+    evolution_energy_b = torch.stack(evolution_energy_bs, dim=1)
+    tau_state, tau_evolution = extractor.energy_scale(
+        device=tokens.device, dtype=tokens.dtype
+    )
+    state_reliability = (
+        (state_count / extractor.min_effective_pairs).clamp(0.0, 1.0)
+        * state_energy_a
+        / (state_energy_a + tau_state)
+        * state_energy_b
+        / (state_energy_b + tau_state)
+    ).clamp(0.0, 1.0)
+    evolution_reliability = (
+        (evolution_count / extractor.min_effective_pairs).clamp(0.0, 1.0)
+        * evolution_energy_a
+        / (evolution_energy_a + tau_evolution)
+        * evolution_energy_b
+        / (evolution_energy_b + tau_evolution)
+    ).clamp(0.0, 1.0)
+    edge_raw = torch.cat(
+        [
+            state_reliability * state_relation,
+            evolution_reliability * evolution_relation,
+            evolution_reliability * strength,
+        ],
+        dim=-1,
+    )
+    edge_embedding = extractor.edge_encoder(edge_raw)
+    feature = extractor.output_head(edge_embedding.flatten(start_dim=1))
+    relation_mass = state_reliability.sum(dim=(1, 2)) + evolution_reliability.sum(
+        dim=(1, 2)
+    )
+    valid = relation_mass >= extractor.min_relation_mass
+    feature = torch.where(valid.unsqueeze(-1), feature, torch.zeros_like(feature))
+    return {
+        "state_relation": state_relation,
+        "evolution_relation": evolution_relation,
+        "relative_strength": strength,
+        "state_reliability": state_reliability,
+        "evolution_reliability": evolution_reliability,
+        "reliable_edge_raw": edge_raw,
+        "feature": feature,
+        "valid": valid,
+    }
+
+
+@pytest.mark.parametrize(
+    "case", ["full", "random_mask", "single_point", "asynchronous", "zero_dynamics"]
+)
+def test_vectorized_channel_forward_matches_edge_loop_reference(case: str) -> None:
+    optimized = _extractor(dtype=torch.float64).eval()
+    reference = copy.deepcopy(optimized)
+    tokens, positions, mask = _inputs(batch_size=2, dtype=torch.float64)
+    if case == "random_mask":
+        mask = torch.tensor(
+            [
+                [[1, 1, 0], [1, 0, 1], [1, 1, 1], [0, 1, 1], [1, 1, 1]],
+                [[1, 1, 1], [0, 1, 0], [1, 0, 1], [1, 1, 0], [1, 1, 1]],
+            ],
+            dtype=torch.bool,
+        )
+    elif case == "single_point":
+        mask.zero_()
+        mask[:, 2, :] = True
+    elif case == "asynchronous":
+        mask[:, 1, 0] = False
+        mask[:, 2, 1] = False
+        mask[:, 3, 2] = False
+        positions = torch.tensor(
+            [0.0, 0.07, 0.31, 0.74, 1.0], dtype=torch.float64
+        )
+    elif case == "zero_dynamics":
+        tokens.zero_()
+    optimized_tokens = tokens.clone().requires_grad_()
+    reference_tokens = tokens.clone().requires_grad_()
+
+    output = optimized(
+        optimized_tokens, positions, channel_mask=mask
+    )
+    expected = _reference_channel_forward(
+        reference, reference_tokens, positions, mask
+    )
+
+    for name in (
+        "state_relation",
+        "evolution_relation",
+        "relative_strength",
+        "state_reliability",
+        "evolution_reliability",
+        "reliable_edge_raw",
+        "feature",
+    ):
+        actual = getattr(output, name)
+        if actual.ndim == 4:
+            actual = actual[:, optimized.edge_source, optimized.edge_target]
+        torch.testing.assert_close(actual, expected[name], atol=1e-9, rtol=1e-7)
+    assert torch.equal(output.valid, expected["valid"])
+
+    output.feature.square().sum().backward()
+    expected["feature"].square().sum().backward()
+    torch.testing.assert_close(
+        optimized_tokens.grad, reference_tokens.grad, atol=1e-8, rtol=1e-6
+    )
+    for actual_parameter, expected_parameter in zip(
+        optimized.parameters(), reference.parameters()
+    ):
+        torch.testing.assert_close(
+            actual_parameter.grad,
+            expected_parameter.grad,
+            atol=1e-8,
+            rtol=1e-6,
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

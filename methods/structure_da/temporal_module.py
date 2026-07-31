@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from collections.abc import Iterator
 
 import torch
@@ -34,6 +34,7 @@ class TemporalStructureOutput:
     registration: TemporalRegistrationOutput
     coordinates: TemporalCoordinateOutput
     encoded: TemporalStructureFeatureOutput
+    geometry_registration: TemporalRegistrationOutput | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,26 @@ def _resolve_pair_positions(
     if not torch.isfinite(resolved).all().item():
         raise ValueError("positions must contain only finite values")
     return resolved
+
+
+def _split_batched_dataclass(value, batch_size: int):
+    """Split tensors with a leading 2B axis while preserving scalar metadata."""
+
+    if isinstance(value, Tensor):
+        if value.ndim > 0 and value.shape[0] == 2 * batch_size:
+            return value[:batch_size], value[batch_size:]
+        return value, value
+    if is_dataclass(value):
+        left = {}
+        right = {}
+        for field in fields(value):
+            first, second = _split_batched_dataclass(
+                getattr(value, field.name), batch_size
+            )
+            left[field.name] = first
+            right[field.name] = second
+        return type(value)(**left), type(value)(**right)
+    return value, value
 
 
 class TemporalStructureExtractor(nn.Module):
@@ -216,6 +237,7 @@ class TemporalStructureExtractor(nn.Module):
     def _encode_registration(
         self,
         registration: TemporalRegistrationOutput,
+        geometry_registration: TemporalRegistrationOutput | None = None,
     ) -> TemporalStructureOutput:
         coordinates = self.coordinates(registration)
         encoded = self.encoder(coordinates)
@@ -223,6 +245,7 @@ class TemporalStructureExtractor(nn.Module):
             registration=registration,
             coordinates=coordinates,
             encoded=encoded,
+            geometry_registration=geometry_registration,
         )
 
     def _make_task_registration(
@@ -272,7 +295,33 @@ class TemporalStructureExtractor(nn.Module):
             component_tokens, positions, time_mask
         )
         task_registration = self._make_task_registration(registration)
-        return self._encode_registration(task_registration)
+        return self._encode_registration(task_registration, registration)
+
+    def forward_task_pair(
+        self,
+        first: Tensor,
+        second: Tensor,
+        positions: Tensor,
+        time_mask: Tensor,
+    ) -> tuple[TemporalStructureOutput, TemporalStructureOutput]:
+        batch_size = first.shape[0]
+        combined_tokens = torch.cat([first, second], dim=0)
+        combined_positions = torch.cat([positions, positions], dim=0)
+        combined_mask = torch.cat([time_mask, time_mask], dim=0)
+        registration = self._forward_registration(
+            combined_tokens, combined_positions, combined_mask
+        )
+        task_registration = self._make_task_registration(registration)
+        first_registration, second_registration = _split_batched_dataclass(
+            registration, batch_size
+        )
+        first_task, second_task = _split_batched_dataclass(
+            task_registration, batch_size
+        )
+        return (
+            self._encode_registration(first_task, first_registration),
+            self._encode_registration(second_task, second_registration),
+        )
 
     def forward(
         self,
@@ -289,16 +338,30 @@ class TemporalStructureExtractor(nn.Module):
         time_mask: Tensor,
         source_mask: Tensor,
     ) -> TemporalGeometryForwardOutput:
-        self._validate_component_tokens(component_tokens)
+        task = self.forward_task(component_tokens, positions, time_mask)
+        return self.forward_geometry_from_task(task, source_mask)
+
+    def forward_geometry_from_task(
+        self,
+        task: TemporalStructureOutput,
+        source_mask: Tensor,
+    ) -> TemporalGeometryForwardOutput:
+        if not isinstance(task, TemporalStructureOutput):
+            raise ValueError("task must be a TemporalStructureOutput")
+        registration = task.geometry_registration
+        if registration is None:
+            raise ValueError("task output does not contain cached geometry registration")
         _validate_source_mask(
             source_mask,
-            batch_size=component_tokens.shape[0],
-            device=component_tokens.device,
+            batch_size=registration.registered_srvf.shape[0],
+            device=registration.registered_srvf.device,
         )
-        registration = self._forward_registration(
-            component_tokens, positions, time_mask
+        structure = TemporalStructureOutput(
+            registration=registration,
+            coordinates=task.coordinates,
+            encoded=task.encoded,
+            geometry_registration=registration,
         )
-        structure = self._encode_registration(registration)
         geometry = self.geometry_objective(registration, source_mask)
         return TemporalGeometryForwardOutput(
             structure=structure,
@@ -398,14 +461,14 @@ class SharedTemporalStructureOperator(nn.Module):
         positions: Tensor,
         time_mask: Tensor,
     ) -> TemporalStructurePairOutput:
-        self._validate_pair_inputs(
+        resolved_positions, resolved_time_mask = self._validate_pair_inputs(
             trend, dynamics, positions, time_mask
         )
-        trend_output = self.extractor.forward_task(
-            trend, positions, time_mask
-        )
-        dynamics_output = self.extractor.forward_task(
-            dynamics, positions, time_mask
+        trend_output, dynamics_output = self.extractor.forward_task_pair(
+            trend,
+            dynamics,
+            resolved_positions,
+            resolved_time_mask,
         )
         return TemporalStructurePairOutput(
             trend=trend_output,
@@ -429,19 +492,21 @@ class SharedTemporalStructureOperator(nn.Module):
         time_mask: Tensor,
         source_mask: Tensor,
     ) -> TemporalGeometryPairOutput:
-        self._validate_pair_inputs(
-            trend, dynamics, positions, time_mask
+        task = self.forward_task(trend, dynamics, positions, time_mask)
+        return self.forward_geometry_from_task(task, source_mask)
+
+    def forward_geometry_from_task(
+        self,
+        task: TemporalStructurePairOutput,
+        source_mask: Tensor,
+    ) -> TemporalGeometryPairOutput:
+        if not isinstance(task, TemporalStructurePairOutput):
+            raise ValueError("task must be a TemporalStructurePairOutput")
+        trend_output = self.extractor.forward_geometry_from_task(
+            task.trend, source_mask
         )
-        _validate_source_mask(
-            source_mask,
-            batch_size=trend.shape[0],
-            device=trend.device,
-        )
-        trend_output = self.extractor.forward_geometry(
-            trend, positions, time_mask, source_mask
-        )
-        dynamics_output = self.extractor.forward_geometry(
-            dynamics, positions, time_mask, source_mask
+        dynamics_output = self.extractor.forward_geometry_from_task(
+            task.dynamics, source_mask
         )
         total_loss = 0.5 * (
             trend_output.geometry.total_loss

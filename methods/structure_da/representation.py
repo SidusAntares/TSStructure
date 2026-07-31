@@ -10,7 +10,7 @@ import torch
 from torch import Tensor, nn
 
 from models.decoder import get_decoder
-from models.ltae import LTAE
+from models.ltae import ComponentAwareSharedLTAE
 
 from .channel_module import ChannelStructurePairOutput
 from .decomposition import DecompositionOutput
@@ -106,7 +106,7 @@ def _resolve_time_mask(
 
 
 class QualityAwareComponentClassifier(nn.Module):
-    """Encode T/D/R with one LTAE, quality-fuse semantics, and classify."""
+    """Encode T/D/R with component-aware stems and one shared attention body."""
 
     def __init__(
         self,
@@ -173,7 +173,7 @@ class QualityAwareComponentClassifier(nn.Module):
             raise ValueError("dropout must lie in [0, 1)")
 
         raw_component_dim = num_channels * channel_feature_dim
-        self.shared_ltae = LTAE(
+        self.component_ltae = ComponentAwareSharedLTAE(
             in_channels=raw_component_dim,
             n_head=n_head,
             d_k=d_k,
@@ -218,7 +218,7 @@ class QualityAwareComponentClassifier(nn.Module):
             self.num_channels,
             self.channel_feature_dim,
         )
-        reference_parameter = next(self.shared_ltae.parameters())
+        reference_parameter = next(self.component_ltae.parameters())
         safe_components = []
         for component in components:
             if (
@@ -354,14 +354,14 @@ class QualityAwareComponentClassifier(nn.Module):
         trend_sequence = trend.flatten(start_dim=2)
         dynamics_sequence = dynamics.flatten(start_dim=2)
         residual_sequence = residual.flatten(start_dim=2)
-        trend_embedding = self.shared_ltae(
-            trend_sequence, ltae_positions, time_mask=resolved_mask
-        )
-        dynamics_embedding = self.shared_ltae(
-            dynamics_sequence, ltae_positions, time_mask=resolved_mask
-        )
-        residual_embedding = self.shared_ltae(
-            residual_sequence, ltae_positions, time_mask=resolved_mask
+        trend_embedding, dynamics_embedding, residual_embedding = (
+            self.component_ltae(
+                trend_sequence,
+                dynamics_sequence,
+                residual_sequence,
+                ltae_positions,
+                time_mask=resolved_mask,
+            )
         )
         component_valid = resolved_mask.any(dim=-1)
         quality = self.quality_fusion(

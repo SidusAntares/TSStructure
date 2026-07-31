@@ -16,7 +16,7 @@ from methods.structure_da.temporal_module import (
     SharedTemporalStructureOperator,
     TemporalStructureExtractor,
 )
-from models.ltae import LTAE
+from models.ltae import ComponentAwareSharedLTAE
 
 
 def _model(dtype: torch.dtype = torch.float32, **overrides):
@@ -97,7 +97,9 @@ def test_model_contains_exactly_one_shared_module_of_each_kind() -> None:
     assert sum(isinstance(m, StructureBackbone) for m in model.modules()) == 1
     assert sum(isinstance(m, TemporalStructureExtractor) for m in model.modules()) == 1
     assert sum(isinstance(m, MultiScaleChannelRelationStructure) for m in model.modules()) == 1
-    assert sum(isinstance(m, LTAE) for m in model.modules()) == 1
+    assert sum(
+        isinstance(m, ComponentAwareSharedLTAE) for m in model.modules()
+    ) == 1
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -167,6 +169,42 @@ def test_source_geometry_reuses_backbone_and_routes_only_geometry_to_warp() -> N
     model.zero_grad(set_to_none=True)
     geometry.total_loss.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in warp_parameters)
+
+
+def test_cached_backbone_path_matches_wrapper_and_preserves_task_gradients() -> None:
+    model = _model().eval()
+    pixels, valid, positions = _inputs()
+    model.update_source_state(pixels, valid, positions)
+
+    expected = model.forward_details(pixels, valid, positions)
+    backbone = model.forward_backbone(pixels, valid, positions)
+    actual = model.forward_from_backbone(backbone, positions)
+
+    torch.testing.assert_close(actual.representation.logits, expected.representation.logits)
+    torch.testing.assert_close(actual.backbone.channel_tokens, expected.backbone.channel_tokens)
+    model.zero_grad(set_to_none=True)
+    actual.representation.logits.sum().backward()
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum() > 0
+        for parameter in model.backbone.parameters()
+    )
+
+
+def test_cached_source_state_update_does_not_run_backbone_or_keep_gradients() -> None:
+    model = _model()
+    pixels, valid, positions = _inputs()
+    backbone = model.forward_backbone(pixels, valid, positions)
+    calls = []
+    handle = model.backbone.register_forward_hook(lambda *args: calls.append(1))
+
+    detached = model.detach_backbone_for_state(backbone)
+    model.update_source_state_from_backbone(detached, positions)
+    handle.remove()
+
+    assert calls == []
+    assert _state_counts(model) == (1, 1, 1, 1, 1)
+    assert isinstance(detached, type(backbone))
+    assert not detached.channel_tokens.requires_grad
 
 
 def test_alignment_routes_gradients_through_both_fused_features() -> None:

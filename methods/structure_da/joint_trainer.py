@@ -367,9 +367,17 @@ def joint_structure_da_train_step(
     source_tensors = _sample_to_device(source_sample, device)
     target_tensors = _sample_to_device(target_sample, device)
     optimizer.zero_grad(set_to_none=True)
-    model.update_source_state(*source_tensors)
-    source_output = model.forward_details(*source_tensors)
-    target_output = model.forward_details(*target_tensors)
+    source_backbone = model.forward_backbone(*source_tensors)
+    target_backbone = model.forward_backbone(*target_tensors)
+    model.update_source_state_from_backbone(
+        model.detach_backbone_for_state(source_backbone), source_tensors[2]
+    )
+    source_output = model.forward_from_backbone(
+        source_backbone, source_tensors[2]
+    )
+    target_output = model.forward_from_backbone(
+        target_backbone, target_tensors[2]
+    )
 
     task_loss = F.cross_entropy(
         source_output.representation.logits, source_labels

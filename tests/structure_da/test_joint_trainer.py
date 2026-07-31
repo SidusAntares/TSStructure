@@ -128,7 +128,7 @@ def test_joint_step_supports_unequal_lengths_and_never_reads_target_label() -> N
         model.backbone.decomposition,
         model.temporal_operator,
         model.channel_operator,
-        model.representation.shared_ltae,
+        model.representation.component_ltae,
         model.representation.quality_fusion,
         model.representation.classifier,
     )
@@ -143,19 +143,57 @@ def test_joint_step_supports_unequal_lengths_and_never_reads_target_label() -> N
     )
 
 
+def test_joint_step_runs_each_domain_backbone_once_and_updates_only_source_state(
+    monkeypatch,
+) -> None:
+    model = _model()
+    config = _config()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    backbone_calls = []
+    state_inputs = []
+    original_backbone = model.forward_backbone
+    original_update = model.update_source_state_from_backbone
+
+    def counted_backbone(*args, **kwargs):
+        output = original_backbone(*args, **kwargs)
+        backbone_calls.append(output)
+        return output
+
+    def counted_update(backbone, *args, **kwargs):
+        state_inputs.append(backbone)
+        return original_update(backbone, *args, **kwargs)
+
+    monkeypatch.setattr(model, "forward_backbone", counted_backbone)
+    monkeypatch.setattr(model, "update_source_state_from_backbone", counted_update)
+    joint_structure_da_train_step(
+        model,
+        _sample(2, 5),
+        _sample(3, 7, labels=False),
+        optimizer,
+        _objective(config),
+        config,
+        torch.device("cpu"),
+    )
+
+    assert len(backbone_calls) == 2
+    assert len(state_inputs) == 1
+    assert not state_inputs[0].channel_tokens.requires_grad
+    assert state_inputs[0].channel_tokens.shape[0] == 2
+
+
 def test_joint_step_exposes_finite_source_target_diagnostics(monkeypatch) -> None:
     model = _model()
     config = _config()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     recorded_outputs = []
-    original_forward = model.forward_details
+    original_forward = model.forward_from_backbone
 
     def recording_forward(*args, **kwargs):
         output = original_forward(*args, **kwargs)
         recorded_outputs.append(output)
         return output
 
-    monkeypatch.setattr(model, "forward_details", recording_forward)
+    monkeypatch.setattr(model, "forward_from_backbone", recording_forward)
     result = joint_structure_da_train_step(
         model,
         _sample(2, 5),
@@ -283,7 +321,7 @@ def test_invalid_quality_coefficient_raises_before_optimizer_step(
     model = _model()
     config = _config()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    original_forward = model.forward_details
+    original_forward = model.forward_from_backbone
 
     def invalid_forward(*args, **kwargs):
         output = original_forward(*args, **kwargs)
@@ -296,7 +334,7 @@ def test_invalid_quality_coefficient_raises_before_optimizer_step(
             representation=replace(output.representation, quality=quality),
         )
 
-    monkeypatch.setattr(model, "forward_details", invalid_forward)
+    monkeypatch.setattr(model, "forward_from_backbone", invalid_forward)
     monkeypatch.setattr(
         optimizer,
         "step",

@@ -55,6 +55,17 @@ class _RelationComputation:
     evolution_energy_b: Tensor
 
 
+@dataclass(frozen=True)
+class _ChannelTemporalGeometry:
+    """Component-independent temporal terms shared by trend and dynamics."""
+
+    normalized_positions: Tensor
+    channel_mask: Tensor
+    coverage: Tensor
+    velocity_kernel: Tensor
+    lag_kernel: Tensor
+
+
 def _finite_float(name: str, value: float) -> float:
     try:
         converted = float(value)
@@ -383,14 +394,13 @@ class MultiScaleChannelRelationStructure(nn.Module):
                     source_indices.append(source)
                     target_indices.append(target)
         self.num_edges = len(source_indices)
-        self._directed_pairs = tuple(zip(source_indices, target_indices))
         self.register_buffer("lag_centers", torch.tensor(centers))
         self.register_buffer("lag_widths", torch.tensor(widths))
         self.register_buffer(
-            "source_channel_indices", torch.tensor(source_indices, dtype=torch.long)
+            "edge_source", torch.tensor(source_indices, dtype=torch.long)
         )
         self.register_buffer(
-            "target_channel_indices", torch.tensor(target_indices, dtype=torch.long)
+            "edge_target", torch.tensor(target_indices, dtype=torch.long)
         )
 
         self.attribute_standardizer = SourceRunningAttributeStandardizer(
@@ -417,6 +427,18 @@ class MultiScaleChannelRelationStructure(nn.Module):
             nn.Dropout(dropout),
             nn.LayerNorm(structure_dim, eps=layer_norm_eps),
         )
+
+    @property
+    def source_channel_indices(self) -> Tensor:
+        """Backward-compatible name for the source-major edge buffer."""
+
+        return self.edge_source
+
+    @property
+    def target_channel_indices(self) -> Tensor:
+        """Backward-compatible name for the target edge buffer."""
+
+        return self.edge_target
 
     def _validate_component(self, component_tokens: Tensor) -> tuple[int, int]:
         if not isinstance(component_tokens, Tensor) or component_tokens.ndim != 4:
@@ -531,10 +553,25 @@ class MultiScaleChannelRelationStructure(nn.Module):
                 or (active_values > 1.0 + self.eps).any().item()
             ):
                 raise ValueError("valid normalized positions must lie in [0, 1]")
-        for batch in range(batch_size):
-            values = normalized[batch, active_time[batch]]
-            if values.numel() > 1 and not torch.all(values[1:] > values[:-1]).item():
-                raise ValueError("valid positions must be strictly increasing")
+        active_values = torch.where(
+            active_time,
+            normalized,
+            torch.full_like(normalized, -torch.inf),
+        )
+        previous_max = torch.cat(
+            [
+                torch.full_like(active_values[:, :1], -torch.inf),
+                active_values[:, :-1].cummax(dim=1).values,
+            ],
+            dim=1,
+        )
+        has_previous = torch.isfinite(previous_max)
+        if (
+            active_time
+            & has_previous
+            & ~(normalized > previous_max)
+        ).any().item():
+            raise ValueError("valid positions must be strictly increasing")
         normalized = torch.where(
             active_time, normalized.clamp(0.0, 1.0), torch.zeros_like(normalized)
         )
@@ -572,36 +609,63 @@ class MultiScaleChannelRelationStructure(nn.Module):
             raise ValueError("positions and channel_mask must have shapes [B,L] and [B,L,C]")
         if positions.shape != channel_mask.shape[:2] or channel_mask.shape[2] != self.num_channels:
             raise ValueError("positions and channel_mask shapes are incompatible")
-        weights = positions.new_zeros(channel_mask.shape)
-        for batch in range(channel_mask.shape[0]):
-            for channel in range(self.num_channels):
-                indices = torch.nonzero(
-                    channel_mask[batch, :, channel], as_tuple=False
-                ).squeeze(-1)
-                count = indices.numel()
-                if count == 0:
-                    continue
-                if count == 1:
-                    weights[batch, indices[0], channel] = 1.0
-                    continue
-                times = positions[batch, indices]
-                raw = torch.empty_like(times)
-                raw[0] = (times[1] - times[0]) / 2.0
-                raw[-1] = (times[-1] - times[-2]) / 2.0
-                if count > 2:
-                    raw[1:-1] = (times[2:] - times[:-2]) / 2.0
-                total = raw.sum()
-                if total > self.eps:
-                    weights[batch, indices, channel] = raw / total
-                else:
-                    weights[batch, indices, channel] = 1.0 / count
-        return weights
+        batch_size, sequence_length, channels = channel_mask.shape
+        indices = torch.arange(
+            sequence_length, device=positions.device, dtype=torch.long
+        ).view(1, sequence_length, 1).expand(batch_size, -1, channels)
+        previous_inclusive = torch.where(channel_mask, indices, -1).cummax(dim=1).values
+        previous = torch.cat(
+            [torch.full_like(previous_inclusive[:, :1], -1), previous_inclusive[:, :-1]],
+            dim=1,
+        )
+        next_inclusive = torch.flip(
+            torch.flip(
+                torch.where(channel_mask, indices, sequence_length), dims=(1,)
+            ).cummin(dim=1).values,
+            dims=(1,),
+        )
+        following = torch.cat(
+            [
+                next_inclusive[:, 1:],
+                torch.full_like(next_inclusive[:, :1], sequence_length),
+            ],
+            dim=1,
+        )
+
+        expanded_positions = positions.unsqueeze(-1).expand(-1, -1, channels)
+        previous_time = torch.gather(
+            expanded_positions, 1, previous.clamp_min(0)
+        )
+        following_time = torch.gather(
+            expanded_positions, 1, following.clamp_max(sequence_length - 1)
+        )
+        has_previous = previous >= 0
+        has_following = following < sequence_length
+        raw = torch.where(
+            has_previous & has_following,
+            (following_time - previous_time) / 2.0,
+            torch.where(
+                has_following,
+                (following_time - expanded_positions) / 2.0,
+                torch.where(
+                    has_previous,
+                    (expanded_positions - previous_time) / 2.0,
+                    torch.ones_like(expanded_positions),
+                ),
+            ),
+        )
+        raw = torch.where(channel_mask, raw, torch.zeros_like(raw))
+        total = raw.sum(dim=1, keepdim=True)
+        count = channel_mask.sum(dim=1, keepdim=True).clamp_min(1)
+        fallback = channel_mask.to(raw.dtype) / count.to(raw.dtype)
+        return torch.where(total > self.eps, raw / total.clamp_min(self.eps), fallback)
 
     def compute_local_velocity(
         self,
         standardized_tokens: Tensor,
         normalized_positions: Tensor,
         channel_mask: Tensor,
+        velocity_kernel: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         if standardized_tokens.ndim != 4:
             raise ValueError("standardized_tokens must have shape [B,L,C,P]")
@@ -614,71 +678,78 @@ class MultiScaleChannelRelationStructure(nn.Module):
             standardized_tokens,
             torch.zeros_like(standardized_tokens),
         )
+        if velocity_kernel is None:
+            delta = normalized_positions.unsqueeze(1) - normalized_positions.unsqueeze(2)
+            velocity_kernel = torch.exp(
+                -0.5 * (delta / self.velocity_bandwidth).square()
+            )
+        valid = channel_mask.permute(0, 2, 1)
+        weights = (
+            velocity_kernel.unsqueeze(1)
+            * valid.unsqueeze(-1).to(tokens.dtype)
+            * valid.unsqueeze(-2).to(tokens.dtype)
+        )
+        weight_sum = weights.sum(dim=-1)
+        safe_sum = weight_sum.clamp_min(self.eps)
+        mean_time = torch.einsum(
+            "bcij,bj->bci", weights, normalized_positions
+        ) / safe_sum
+        values = tokens.permute(0, 2, 1, 3)
+        mean_value = torch.einsum("bcij,bcjp->bcip", weights, values) / safe_sum.unsqueeze(-1)
+        centered_time = normalized_positions[:, None, None, :] - mean_time.unsqueeze(-1)
+        centered_value = values.unsqueeze(2) - mean_value.unsqueeze(3)
+        time_numerator = (weights * centered_time.square()).sum(dim=-1)
+        slope_numerator = torch.einsum(
+            "bcij,bcij,bcijp->bcip", weights, centered_time, centered_value
+        )
+        sufficient_spread = time_numerator > self.eps
+        velocity = slope_numerator / time_numerator.clamp_min(self.eps).unsqueeze(-1)
+        velocity = torch.where(
+            (valid & sufficient_spread).unsqueeze(-1), velocity, torch.zeros_like(velocity)
+        )
+        effective = weight_sum.square() / (weights.square().sum(dim=-1) + self.eps)
+        spread = time_numerator / safe_sum
+        count_quality = (effective / self.min_velocity_effective_count).clamp(0.0, 1.0)
+        spread_quality = spread / (spread + self.min_velocity_time_spread)
+        support = count_quality * spread_quality
+        support = torch.where(
+            valid & sufficient_spread & torch.isfinite(support),
+            support,
+            torch.zeros_like(support),
+        )
+        velocity = torch.where(torch.isfinite(velocity), velocity, torch.zeros_like(velocity))
+        effective = torch.where(valid, effective, torch.zeros_like(effective))
+        spread = torch.where(valid, spread, torch.zeros_like(spread))
+        return (
+            velocity.permute(0, 2, 1, 3),
+            support.permute(0, 2, 1),
+            effective.permute(0, 2, 1),
+            spread.permute(0, 2, 1),
+        )
+
+    def _precompute_temporal_geometry(
+        self, normalized_positions: Tensor, channel_mask: Tensor
+    ) -> _ChannelTemporalGeometry:
+        coverage = self.compute_channel_coverage_weights(
+            normalized_positions, channel_mask
+        )
         delta = normalized_positions.unsqueeze(1) - normalized_positions.unsqueeze(2)
-        base_kernel = torch.exp(
+        velocity_kernel = torch.exp(
             -0.5 * (delta / self.velocity_bandwidth).square()
         )
-        velocities = []
-        supports = []
-        effective_counts = []
-        spreads = []
-        for channel in range(self.num_channels):
-            valid = channel_mask[:, :, channel]
-            weights = (
-                base_kernel
-                * valid.unsqueeze(-1).to(tokens.dtype)
-                * valid.unsqueeze(1).to(tokens.dtype)
-            )
-            weight_sum = weights.sum(dim=-1)
-            safe_sum = weight_sum.clamp_min(self.eps)
-            mean_time = torch.einsum(
-                "bij,bj->bi", weights, normalized_positions
-            ) / safe_sum
-            values = tokens[:, :, channel]
-            mean_value = torch.einsum("bij,bjp->bip", weights, values) / safe_sum.unsqueeze(-1)
-            centered_time = normalized_positions.unsqueeze(1) - mean_time.unsqueeze(-1)
-            centered_value = values.unsqueeze(1) - mean_value.unsqueeze(2)
-            time_numerator = (weights * centered_time.square()).sum(dim=-1)
-            slope_numerator = torch.einsum(
-                "bij,bij,bijp->bip", weights, centered_time, centered_value
-            )
-            sufficient_spread = time_numerator > self.eps
-            velocity = slope_numerator / time_numerator.clamp_min(self.eps).unsqueeze(-1)
-            velocity = torch.where(
-                (valid & sufficient_spread).unsqueeze(-1),
-                velocity,
-                torch.zeros_like(velocity),
-            )
-            effective = weight_sum.square() / (
-                weights.square().sum(dim=-1) + self.eps
-            )
-            spread = time_numerator / safe_sum
-            count_quality = (
-                effective / self.min_velocity_effective_count
-            ).clamp(0.0, 1.0)
-            spread_quality = spread / (
-                spread + self.min_velocity_time_spread
-            )
-            support = count_quality * spread_quality
-            support = torch.where(
-                valid & sufficient_spread & torch.isfinite(support),
-                support,
-                torch.zeros_like(support),
-            )
-            velocity = torch.where(
-                torch.isfinite(velocity), velocity, torch.zeros_like(velocity)
-            )
-            velocities.append(velocity)
-            supports.append(support)
-            effective_counts.append(
-                torch.where(valid, effective, torch.zeros_like(effective))
-            )
-            spreads.append(torch.where(valid, spread, torch.zeros_like(spread)))
-        return (
-            torch.stack(velocities, dim=2),
-            torch.stack(supports, dim=2),
-            torch.stack(effective_counts, dim=2),
-            torch.stack(spreads, dim=2),
+        lag_kernel = torch.exp(
+            -0.5
+            * (
+                (delta.unsqueeze(1) - self.lag_centers.view(1, -1, 1, 1))
+                / self.lag_widths.view(1, -1, 1, 1)
+            ).square()
+        )
+        return _ChannelTemporalGeometry(
+            normalized_positions=normalized_positions,
+            channel_mask=channel_mask,
+            coverage=coverage,
+            velocity_kernel=velocity_kernel,
+            lag_kernel=lag_kernel,
         )
 
     @staticmethod
@@ -694,10 +765,13 @@ class MultiScaleChannelRelationStructure(nn.Module):
         standardized_tokens: Tensor,
         normalized_positions: Tensor,
         channel_mask: Tensor,
+        geometry: _ChannelTemporalGeometry | None = None,
     ) -> _RelationComputation:
-        coverage = self.compute_channel_coverage_weights(
-            normalized_positions, channel_mask
-        )
+        if geometry is None:
+            geometry = self._precompute_temporal_geometry(
+                normalized_positions, channel_mask
+            )
+        coverage = geometry.coverage
         channel_mean = torch.einsum(
             "blc,blcp->bcp", coverage, standardized_tokens
         )
@@ -706,130 +780,94 @@ class MultiScaleChannelRelationStructure(nn.Module):
             channel_mask.unsqueeze(-1), centered, torch.zeros_like(centered)
         )
         velocity, velocity_support, _, _ = self.compute_local_velocity(
-            standardized_tokens, normalized_positions, channel_mask
+            standardized_tokens,
+            normalized_positions,
+            channel_mask,
+            velocity_kernel=geometry.velocity_kernel,
+        )
+        source = self.edge_source
+        target = self.edge_target
+        source_mask = channel_mask[:, :, source].permute(0, 2, 1).to(centered.dtype)
+        target_mask = channel_mask[:, :, target].permute(0, 2, 1).to(centered.dtype)
+        pair_weight = (
+            geometry.lag_kernel.unsqueeze(1)
+            * source_mask[:, :, None, :, None]
+            * target_mask[:, :, None, None, :]
+        )
+        source_state = centered[:, :, source].permute(0, 2, 1, 3)
+        target_state = centered[:, :, target].permute(0, 2, 1, 3)
+        state_numerator = torch.einsum(
+            "begij,beip,bejp->beg", pair_weight, source_state, target_state
+        )
+        state_energy_a_edges = torch.einsum(
+            "begij,bei->beg", pair_weight, source_state.square().sum(dim=-1)
+        )
+        state_energy_b_edges = torch.einsum(
+            "begij,bej->beg", pair_weight, target_state.square().sum(dim=-1)
+        )
+        state_count_edges = pair_weight.sum(dim=(-1, -2)).square() / (
+            pair_weight.square().sum(dim=(-1, -2)) + self.eps
+        )
+        state_relation_edges = state_numerator / torch.sqrt(
+            state_energy_a_edges * state_energy_b_edges + self.eps
+        )
+        state_relation_edges = torch.where(
+            torch.isfinite(state_relation_edges),
+            state_relation_edges.clamp(-1.0, 1.0),
+            torch.zeros_like(state_relation_edges),
         )
 
-        delta = normalized_positions.unsqueeze(1) - normalized_positions.unsqueeze(2)
-        lag_kernel = torch.exp(
-            -0.5
-            * (
-                (delta.unsqueeze(1) - self.lag_centers.view(1, -1, 1, 1))
-                / self.lag_widths.view(1, -1, 1, 1)
-            ).square()
+        source_support = velocity_support[:, :, source].permute(0, 2, 1)
+        target_support = velocity_support[:, :, target].permute(0, 2, 1)
+        evolution_weight = (
+            pair_weight
+            * source_support[:, :, None, :, None]
+            * target_support[:, :, None, None, :]
         )
-        state_relations = []
-        evolution_relations = []
-        strengths = []
-        state_counts = []
-        evolution_counts = []
-        state_energy_as = []
-        state_energy_bs = []
-        evolution_energy_as = []
-        evolution_energy_bs = []
-        for source, target in self._directed_pairs:
-            source_mask = channel_mask[:, :, source].to(centered.dtype)
-            target_mask = channel_mask[:, :, target].to(centered.dtype)
-            pair_weight = (
-                lag_kernel
-                * source_mask[:, None, :, None]
-                * target_mask[:, None, None, :]
+        source_velocity = velocity[:, :, source].permute(0, 2, 1, 3)
+        target_velocity = velocity[:, :, target].permute(0, 2, 1, 3)
+        evolution_numerator = torch.einsum(
+            "begij,beip,bejp->beg",
+            evolution_weight,
+            source_velocity,
+            target_velocity,
+        )
+        evolution_energy_a_edges = torch.einsum(
+            "begij,bei->beg",
+            evolution_weight,
+            source_velocity.square().sum(dim=-1),
+        )
+        evolution_energy_b_edges = torch.einsum(
+            "begij,bej->beg",
+            evolution_weight,
+            target_velocity.square().sum(dim=-1),
+        )
+        evolution_count_edges = evolution_weight.sum(dim=(-1, -2)).square() / (
+            evolution_weight.square().sum(dim=(-1, -2)) + self.eps
+        )
+        evolution_relation_edges = evolution_numerator / torch.sqrt(
+            evolution_energy_a_edges * evolution_energy_b_edges + self.eps
+        )
+        evolution_relation_edges = torch.where(
+            torch.isfinite(evolution_relation_edges),
+            evolution_relation_edges.clamp(-1.0, 1.0),
+            torch.zeros_like(evolution_relation_edges),
+        )
+        reliable_energy = (evolution_energy_a_edges > self.eps) & (
+            evolution_energy_b_edges > self.eps
+        )
+        strength_edges = torch.tanh(
+            0.5
+            * torch.log(
+                (evolution_energy_a_edges + self.eps)
+                / (evolution_energy_b_edges + self.eps)
             )
-            source_state = centered[:, :, source]
-            target_state = centered[:, :, target]
-            state_numerator = torch.einsum(
-                "bgij,bip,bjp->bg",
-                pair_weight,
-                source_state,
-                target_state,
-            )
-            state_energy_a = torch.einsum(
-                "bgij,bi->bg", pair_weight, source_state.square().sum(dim=-1)
-            )
-            state_energy_b = torch.einsum(
-                "bgij,bj->bg", pair_weight, target_state.square().sum(dim=-1)
-            )
-            state_count = pair_weight.sum(dim=(-1, -2)).square() / (
-                pair_weight.square().sum(dim=(-1, -2)) + self.eps
-            )
-            state_relation = state_numerator / torch.sqrt(
-                state_energy_a * state_energy_b + self.eps
-            )
-            state_relation = torch.where(
-                torch.isfinite(state_relation),
-                state_relation.clamp(-1.0, 1.0),
-                torch.zeros_like(state_relation),
-            )
-
-            source_support = velocity_support[:, :, source]
-            target_support = velocity_support[:, :, target]
-            evolution_weight = (
-                pair_weight
-                * source_support[:, None, :, None]
-                * target_support[:, None, None, :]
-            )
-            source_velocity = velocity[:, :, source]
-            target_velocity = velocity[:, :, target]
-            evolution_numerator = torch.einsum(
-                "bgij,bip,bjp->bg",
-                evolution_weight,
-                source_velocity,
-                target_velocity,
-            )
-            evolution_energy_a = torch.einsum(
-                "bgij,bi->bg",
-                evolution_weight,
-                source_velocity.square().sum(dim=-1),
-            )
-            evolution_energy_b = torch.einsum(
-                "bgij,bj->bg",
-                evolution_weight,
-                target_velocity.square().sum(dim=-1),
-            )
-            evolution_count = evolution_weight.sum(dim=(-1, -2)).square() / (
-                evolution_weight.square().sum(dim=(-1, -2)) + self.eps
-            )
-            evolution_relation = evolution_numerator / torch.sqrt(
-                evolution_energy_a * evolution_energy_b + self.eps
-            )
-            evolution_relation = torch.where(
-                torch.isfinite(evolution_relation),
-                evolution_relation.clamp(-1.0, 1.0),
-                torch.zeros_like(evolution_relation),
-            )
-            reliable_energy = (evolution_energy_a > self.eps) & (
-                evolution_energy_b > self.eps
-            )
-            strength = torch.tanh(
-                0.5
-                * torch.log(
-                    (evolution_energy_a + self.eps)
-                    / (evolution_energy_b + self.eps)
-                )
-            )
-            strength = torch.where(
-                reliable_energy & torch.isfinite(strength),
-                strength,
-                torch.zeros_like(strength),
-            )
-            state_relations.append(state_relation)
-            evolution_relations.append(evolution_relation)
-            strengths.append(strength)
-            state_counts.append(state_count)
-            evolution_counts.append(evolution_count)
-            state_energy_as.append(state_energy_a)
-            state_energy_bs.append(state_energy_b)
-            evolution_energy_as.append(evolution_energy_a)
-            evolution_energy_bs.append(evolution_energy_b)
-
-        state_relation_edges = torch.stack(state_relations, dim=1)
-        evolution_relation_edges = torch.stack(evolution_relations, dim=1)
-        strength_edges = torch.stack(strengths, dim=1)
-        state_count_edges = torch.stack(state_counts, dim=1)
-        evolution_count_edges = torch.stack(evolution_counts, dim=1)
-        state_energy_a_edges = torch.stack(state_energy_as, dim=1)
-        state_energy_b_edges = torch.stack(state_energy_bs, dim=1)
-        evolution_energy_a_edges = torch.stack(evolution_energy_as, dim=1)
-        evolution_energy_b_edges = torch.stack(evolution_energy_bs, dim=1)
+        )
+        strength_edges = torch.where(
+            reliable_energy & torch.isfinite(strength_edges),
+            strength_edges,
+            torch.zeros_like(strength_edges),
+        )
 
         tau_state, tau_evolution = self.energy_scale(
             device=standardized_tokens.device, dtype=standardized_tokens.dtype
@@ -847,8 +885,6 @@ class MultiScaleChannelRelationStructure(nn.Module):
             / (evolution_energy_b_edges + tau_evolution)
         ).clamp(0.0, 1.0)
 
-        source = self.source_channel_indices
-        target = self.target_channel_indices
         return _RelationComputation(
             state_relation=self._scatter_edges(
                 state_relation_edges, source, target, self.num_channels
@@ -933,6 +969,179 @@ class MultiScaleChannelRelationStructure(nn.Module):
             evolution_valid,
         )
 
+    @torch.no_grad()
+    def update_source_state_pair(
+        self,
+        trend: Tensor,
+        dynamics: Tensor,
+        positions: Tensor,
+        time_mask: Tensor | None = None,
+        channel_mask: Tensor | None = None,
+    ) -> None:
+        safe_trend, normalized_positions, mask = self._prepare_inputs(
+            trend, positions, time_mask, channel_mask
+        )
+        self._validate_component(dynamics)
+        if dynamics.shape != trend.shape:
+            raise ValueError("trend and dynamics must have identical shape")
+        if not torch.isfinite(dynamics[mask]).all().item():
+            raise ValueError("valid component token values must be finite")
+        safe_dynamics = torch.where(
+            mask.unsqueeze(-1), dynamics, torch.zeros_like(dynamics)
+        )
+        combined = torch.cat([safe_trend, safe_dynamics], dim=0)
+        combined_mask = torch.cat([mask, mask], dim=0)
+        self.attribute_standardizer.update(combined, combined_mask)
+        geometry = self._precompute_temporal_geometry(normalized_positions, mask)
+        relation_outputs = []
+        for component in (safe_trend, safe_dynamics):
+            standardized = self.attribute_standardizer(component)
+            standardized = torch.where(
+                mask.unsqueeze(-1), standardized, torch.zeros_like(standardized)
+            )
+            relation_outputs.append(
+                self._compute_relations(
+                    standardized,
+                    normalized_positions,
+                    mask,
+                    geometry=geometry,
+                )
+            )
+        state_energy = torch.cat(
+            [
+                torch.cat(
+                    [relations.state_energy_a, relations.state_energy_b], dim=-1
+                )
+                for relations in relation_outputs
+            ],
+            dim=0,
+        )
+        evolution_energy = torch.cat(
+            [
+                torch.cat(
+                    [relations.evolution_energy_a, relations.evolution_energy_b],
+                    dim=-1,
+                )
+                for relations in relation_outputs
+            ],
+            dim=0,
+        )
+        state_valid = torch.cat(
+            [
+                torch.cat(
+                    [
+                        relations.state_effective_pair_count[
+                            :, self.edge_source, self.edge_target
+                        ],
+                        relations.state_effective_pair_count[
+                            :, self.edge_source, self.edge_target
+                        ],
+                    ],
+                    dim=-1,
+                )
+                >= self.min_effective_pairs
+                for relations in relation_outputs
+            ],
+            dim=0,
+        )
+        evolution_valid = torch.cat(
+            [
+                torch.cat(
+                    [
+                        relations.evolution_effective_pair_count[
+                            :, self.edge_source, self.edge_target
+                        ],
+                        relations.evolution_effective_pair_count[
+                            :, self.edge_source, self.edge_target
+                        ],
+                    ],
+                    dim=-1,
+                )
+                >= self.min_effective_pairs
+                for relations in relation_outputs
+            ],
+            dim=0,
+        )
+        self.energy_scale.update(
+            state_energy, evolution_energy, state_valid, evolution_valid
+        )
+
+    def _output_from_relations(
+        self, relations: _RelationComputation
+    ) -> ChannelStructureOutput:
+        reliable_state = relations.state_reliability * relations.state_relation
+        reliable_evolution = (
+            relations.evolution_reliability * relations.evolution_relation
+        )
+        reliable_strength = (
+            relations.evolution_reliability * relations.relative_strength
+        )
+        edge_raw_matrix = torch.cat(
+            [reliable_state, reliable_evolution, reliable_strength], dim=-1
+        )
+        reliable_edge_raw = edge_raw_matrix[:, self.edge_source, self.edge_target]
+        edge_embedding = self.edge_encoder(reliable_edge_raw)
+        feature = self.output_head(edge_embedding.flatten(start_dim=1))
+        relation_mass = relations.state_reliability.sum(dim=(1, 2, 3)) + (
+            relations.evolution_reliability.sum(dim=(1, 2, 3))
+        )
+        valid = relation_mass >= self.min_relation_mass
+        feature = torch.where(valid.unsqueeze(-1), feature, torch.zeros_like(feature))
+        return ChannelStructureOutput(
+            feature=feature,
+            valid=valid,
+            state_relation=relations.state_relation,
+            evolution_relation=relations.evolution_relation,
+            relative_strength=relations.relative_strength,
+            state_reliability=relations.state_reliability,
+            evolution_reliability=relations.evolution_reliability,
+            reliable_edge_raw=reliable_edge_raw,
+            edge_embedding=edge_embedding,
+            local_velocity=relations.local_velocity,
+            velocity_support=relations.velocity_support,
+            state_effective_pair_count=relations.state_effective_pair_count,
+            evolution_effective_pair_count=relations.evolution_effective_pair_count,
+            relation_mass=relation_mass,
+        )
+
+    def forward_pair(
+        self,
+        trend: Tensor,
+        dynamics: Tensor,
+        positions: Tensor,
+        time_mask: Tensor | None = None,
+        channel_mask: Tensor | None = None,
+    ) -> ChannelStructurePairOutput:
+        safe_trend, normalized_positions, mask = self._prepare_inputs(
+            trend, positions, time_mask, channel_mask
+        )
+        self._validate_component(dynamics)
+        if dynamics.shape != trend.shape:
+            raise ValueError("trend and dynamics must have identical shape")
+        if not torch.isfinite(dynamics[mask]).all().item():
+            raise ValueError("valid component token values must be finite")
+        safe_dynamics = torch.where(
+            mask.unsqueeze(-1), dynamics, torch.zeros_like(dynamics)
+        )
+        geometry = self._precompute_temporal_geometry(normalized_positions, mask)
+        outputs = []
+        for component in (safe_trend, safe_dynamics):
+            standardized = self.attribute_standardizer(component)
+            standardized = torch.where(
+                mask.unsqueeze(-1), standardized, torch.zeros_like(standardized)
+            )
+            outputs.append(
+                self._output_from_relations(
+                    self._compute_relations(
+                        standardized,
+                        normalized_positions,
+                        mask,
+                        geometry=geometry,
+                    )
+                )
+            )
+        return ChannelStructurePairOutput(trend=outputs[0], dynamics=outputs[1])
+
     def forward(
         self,
         component_tokens: Tensor,
@@ -950,44 +1159,7 @@ class MultiScaleChannelRelationStructure(nn.Module):
         relations = self._compute_relations(
             standardized, normalized_positions, mask
         )
-        reliable_state = relations.state_reliability * relations.state_relation
-        reliable_evolution = (
-            relations.evolution_reliability * relations.evolution_relation
-        )
-        reliable_strength = (
-            relations.evolution_reliability * relations.relative_strength
-        )
-        edge_raw_matrix = torch.cat(
-            [reliable_state, reliable_evolution, reliable_strength], dim=-1
-        )
-        reliable_edge_raw = edge_raw_matrix[
-            :, self.source_channel_indices, self.target_channel_indices
-        ]
-        edge_embedding = self.edge_encoder(reliable_edge_raw)
-        feature = self.output_head(edge_embedding.flatten(start_dim=1))
-        relation_mass = relations.state_reliability.sum(dim=(1, 2, 3)) + (
-            relations.evolution_reliability.sum(dim=(1, 2, 3))
-        )
-        valid = relation_mass >= self.min_relation_mass
-        feature = torch.where(
-            valid.unsqueeze(-1), feature, torch.zeros_like(feature)
-        )
-        return ChannelStructureOutput(
-            feature=feature,
-            valid=valid,
-            state_relation=relations.state_relation,
-            evolution_relation=relations.evolution_relation,
-            relative_strength=relations.relative_strength,
-            state_reliability=relations.state_reliability,
-            evolution_reliability=relations.evolution_reliability,
-            reliable_edge_raw=reliable_edge_raw,
-            edge_embedding=edge_embedding,
-            local_velocity=relations.local_velocity,
-            velocity_support=relations.velocity_support,
-            state_effective_pair_count=relations.state_effective_pair_count,
-            evolution_effective_pair_count=relations.evolution_effective_pair_count,
-            relation_mass=relation_mass,
-        )
+        return self._output_from_relations(relations)
 
 
 class SharedChannelStructureOperator(nn.Module):
@@ -1031,13 +1203,12 @@ class SharedChannelStructureOperator(nn.Module):
         channel_mask: Tensor | None = None,
     ) -> ChannelStructurePairOutput:
         self._validate_pair(trend, dynamics)
-        return ChannelStructurePairOutput(
-            trend=self.extractor(
-                trend, positions, time_mask=time_mask, channel_mask=channel_mask
-            ),
-            dynamics=self.extractor(
-                dynamics, positions, time_mask=time_mask, channel_mask=channel_mask
-            ),
+        return self.extractor.forward_pair(
+            trend,
+            dynamics,
+            positions,
+            time_mask=time_mask,
+            channel_mask=channel_mask,
         )
 
     @torch.no_grad()
@@ -1050,13 +1221,10 @@ class SharedChannelStructureOperator(nn.Module):
         channel_mask: Tensor | None = None,
     ) -> None:
         self._validate_pair(trend, dynamics)
-        combined = torch.cat([trend, dynamics], dim=0)
-        combined_positions = self._duplicate_batch(positions, 2)
-        combined_time_mask = self._duplicate_batch(time_mask, 2)
-        combined_channel_mask = self._duplicate_batch(channel_mask, 3)
-        self.extractor.update_source_state(
-            combined,
-            combined_positions,
-            time_mask=combined_time_mask,
-            channel_mask=combined_channel_mask,
+        self.extractor.update_source_state_pair(
+            trend,
+            dynamics,
+            positions,
+            time_mask=time_mask,
+            channel_mask=channel_mask,
         )

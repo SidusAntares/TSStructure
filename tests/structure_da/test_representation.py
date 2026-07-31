@@ -27,7 +27,7 @@ from methods.structure_da.temporal_module import (
 )
 from models.decoder import get_decoder
 from models.layers import LinearLayer
-from models.ltae import LTAE
+from models.ltae import ComponentAwareSharedLTAE
 
 
 def _classifier(dtype: torch.dtype = torch.float32, **overrides):
@@ -126,21 +126,26 @@ def test_temporal_and_channel_pair_adapters_read_exact_public_features() -> None
     assert channel.trend_valid is valid
 
 
-def test_classifier_contains_exactly_one_shared_ltae() -> None:
+def test_classifier_contains_exactly_one_component_aware_shared_ltae() -> None:
     model = _classifier()
 
-    ltae_modules = [module for module in model.modules() if isinstance(module, LTAE)]
-    assert ltae_modules == [model.shared_ltae]
+    ltae_modules = [
+        module
+        for module in model.modules()
+        if isinstance(module, ComponentAwareSharedLTAE)
+    ]
+    assert ltae_modules == [model.component_ltae]
+    assert not hasattr(model, "shared_ltae")
     assert not hasattr(model, "trend_ltae")
     assert not hasattr(model, "dynamics_ltae")
     assert not hasattr(model, "residual_ltae")
 
 
-def test_shared_ltae_is_called_three_times_with_raw_c_times_p_features() -> None:
+def test_component_ltae_calls_shared_attention_once_for_three_components() -> None:
     model = _classifier().eval()
     decomposition, temporal, channel, positions, mask = _inputs()
     captured = []
-    hook = model.shared_ltae.register_forward_pre_hook(
+    hook = model.component_ltae.attention_heads.register_forward_pre_hook(
         lambda _module, args, _kwargs: captured.append(args[0].shape),
         with_kwargs=True,
     )
@@ -148,7 +153,7 @@ def test_shared_ltae_is_called_three_times_with_raw_c_times_p_features() -> None
     model(decomposition, temporal, channel, positions, mask)
     hook.remove()
 
-    assert captured == [(3, 5, 4), (3, 5, 4), (3, 5, 4)]
+    assert captured == [(9, 5, 8)]
 
 
 def test_representation_output_shapes_are_complete() -> None:
@@ -294,7 +299,7 @@ def test_task_loss_updates_ltae_classifier_quality_and_all_feature_inputs() -> N
     for tensor in (*components, *structure_tensors):
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
         assert tensor.grad.abs().sum() > 0
-    for group in (model.shared_ltae, model.quality_fusion, model.classifier):
+    for group in (model.component_ltae, model.quality_fusion, model.classifier):
         assert all(
             parameter.grad is not None
             for parameter in group.parameters()
@@ -457,7 +462,10 @@ def test_real_backbone_structure_operators_and_classifier_integrate_end_to_end()
     assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in backbone.pixel_set_encoder.parameters())
     assert backbone.decomposition._tau_fast_unconstrained.grad is not None
     assert backbone.decomposition._tau_gap_unconstrained.grad is not None
-    assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in classifier.shared_ltae.parameters())
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum() > 0
+        for parameter in classifier.component_ltae.parameters()
+    )
     assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in classifier.quality_fusion.parameters())
     assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in classifier.classifier.parameters())
     assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in channel_extractor.parameters())

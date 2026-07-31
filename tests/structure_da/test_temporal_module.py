@@ -381,6 +381,31 @@ def test_pair_geometry_total_is_mean_of_branch_losses() -> None:
     )
 
 
+def test_pair_task_batches_registration_and_cached_geometry_does_not_reregister() -> None:
+    extractor = _extractor()
+    operator = SharedTemporalStructureOperator(extractor)
+    trend, positions, time_mask = _inputs()
+    dynamics = trend * 0.5 + 0.1
+    operator.update_source_state(trend, dynamics, positions, time_mask)
+    calls = []
+    handle = extractor.registration.register_forward_hook(
+        lambda *args: calls.append(1)
+    )
+
+    task = operator.forward_task(trend, dynamics, positions, time_mask)
+    assert len(calls) == 1
+    geometry = operator.forward_geometry_from_task(
+        task, torch.ones(2, dtype=torch.bool)
+    )
+    handle.remove()
+
+    assert len(calls) == 1
+    torch.testing.assert_close(
+        geometry.total_loss,
+        0.5 * (geometry.trend.geometry.total_loss + geometry.dynamics.geometry.total_loss),
+    )
+
+
 def test_shared_task_gradients_accumulate_without_warp_gradients() -> None:
     extractor = _extractor()
     operator = SharedTemporalStructureOperator(extractor)

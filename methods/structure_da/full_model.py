@@ -15,6 +15,7 @@ from .channel_module import (
     MultiScaleChannelRelationStructure,
     SharedChannelStructureOperator,
 )
+from .decomposition import DecompositionOutput
 from .eden_alignment import EDENDomainAlignmentOutput, EDENFusedFeatureAlignment
 from .representation import (
     PairedStructureFeatures,
@@ -184,7 +185,7 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         backbone = self.backbone(pixels, valid_pixels, positions, time_mask)
         return backbone, self._resolve_channel_mask(channel_mask, backbone.time_mask)
 
-    def forward_details(
+    def forward_backbone(
         self,
         pixels: Tensor,
         valid_pixels: Tensor,
@@ -192,11 +193,41 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         extra: Tensor | None = None,
         *,
         time_mask: Tensor | None = None,
+    ) -> StructureBackboneOutput:
+        del extra
+        return self.backbone(pixels, valid_pixels, positions, time_mask)
+
+    @staticmethod
+    def detach_backbone_for_state(
+        backbone: StructureBackboneOutput,
+    ) -> StructureBackboneOutput:
+        """Build a typed, gradient-free view for source-only running state."""
+
+        if not isinstance(backbone, StructureBackboneOutput):
+            raise ValueError("backbone must be a StructureBackboneOutput")
+        return StructureBackboneOutput(
+            channel_tokens=backbone.channel_tokens.detach(),
+            time_mask=backbone.time_mask,
+            decomposition=DecompositionOutput(
+                trend=backbone.decomposition.trend.detach(),
+                dynamics=backbone.decomposition.dynamics.detach(),
+                residual=backbone.decomposition.residual.detach(),
+            ),
+        )
+
+    def forward_from_backbone(
+        self,
+        backbone: StructureBackboneOutput,
+        positions: Tensor,
+        extra: Tensor | None = None,
+        *,
         channel_mask: Tensor | None = None,
     ) -> StructureAwareForwardOutput:
         del extra
-        backbone, resolved_channel_mask = self._backbone_and_mask(
-            pixels, valid_pixels, positions, time_mask, channel_mask
+        if not isinstance(backbone, StructureBackboneOutput):
+            raise ValueError("backbone must be a StructureBackboneOutput")
+        resolved_channel_mask = self._resolve_channel_mask(
+            channel_mask, backbone.time_mask
         )
         temporal = self.temporal_operator.forward_task(
             backbone.decomposition.trend,
@@ -225,6 +256,29 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             representation=representation,
         )
 
+    def forward_details(
+        self,
+        pixels: Tensor,
+        valid_pixels: Tensor,
+        positions: Tensor,
+        extra: Tensor | None = None,
+        *,
+        time_mask: Tensor | None = None,
+        channel_mask: Tensor | None = None,
+    ) -> StructureAwareForwardOutput:
+        backbone = self.forward_backbone(
+            pixels,
+            valid_pixels,
+            positions,
+            extra,
+            time_mask=time_mask,
+        )
+        return self.forward_from_backbone(
+            backbone,
+            positions,
+            channel_mask=channel_mask,
+        )
+
     def forward(
         self,
         pixels: Tensor,
@@ -245,19 +299,17 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         ).representation.logits
 
     @torch.no_grad()
-    def update_source_state(
+    def update_source_state_from_backbone(
         self,
-        pixels: Tensor,
-        valid_pixels: Tensor,
+        backbone: StructureBackboneOutput,
         positions: Tensor,
-        extra: Tensor | None = None,
         *,
-        time_mask: Tensor | None = None,
         channel_mask: Tensor | None = None,
     ) -> None:
-        del extra
-        backbone, resolved_channel_mask = self._backbone_and_mask(
-            pixels, valid_pixels, positions, time_mask, channel_mask
+        if not isinstance(backbone, StructureBackboneOutput):
+            raise ValueError("backbone must be a StructureBackboneOutput")
+        resolved_channel_mask = self._resolve_channel_mask(
+            channel_mask, backbone.time_mask
         )
         self.temporal_operator.update_source_state(
             backbone.decomposition.trend,
@@ -273,6 +325,30 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             resolved_channel_mask,
         )
 
+    @torch.no_grad()
+    def update_source_state(
+        self,
+        pixels: Tensor,
+        valid_pixels: Tensor,
+        positions: Tensor,
+        extra: Tensor | None = None,
+        *,
+        time_mask: Tensor | None = None,
+        channel_mask: Tensor | None = None,
+    ) -> None:
+        backbone = self.forward_backbone(
+            pixels,
+            valid_pixels,
+            positions,
+            extra,
+            time_mask=time_mask,
+        )
+        self.update_source_state_from_backbone(
+            self.detach_backbone_for_state(backbone),
+            positions,
+            channel_mask=channel_mask,
+        )
+
     def forward_source_geometry(
         self,
         source_output: StructureAwareForwardOutput,
@@ -280,12 +356,10 @@ class StructureAwareDomainAdaptationModel(nn.Module):
     ) -> StructureAwareGeometryOutput:
         if not isinstance(source_output, StructureAwareForwardOutput):
             raise ValueError("source_output must be StructureAwareForwardOutput")
+        del positions
         trend = source_output.backbone.decomposition.trend
-        temporal = self.temporal_operator.forward_geometry(
-            trend,
-            source_output.backbone.decomposition.dynamics,
-            positions,
-            source_output.backbone.time_mask,
+        temporal = self.temporal_operator.forward_geometry_from_task(
+            source_output.temporal,
             source_mask=torch.ones(
                 trend.shape[0], dtype=torch.bool, device=trend.device
             ),
