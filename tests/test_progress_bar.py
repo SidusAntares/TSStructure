@@ -170,8 +170,8 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
     source_unused_test = object()
     target_val = object()
     target_test = object()
-    source_train = object()
-    target_train = object()
+    source_train = [object()]
+    target_train = [object()]
     evaluation_domains = []
     trainer_validation_loaders = []
     final_test_loaders = []
@@ -253,6 +253,7 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
         channel_feature_dim=16, pixel_hidden_dim=16, structure_dim=128,
         domain_hidden_dim=128, grl_warmup_max_iters=250,
         tensorboard_log_dir="runs", epochs=1,
+        batch_size=2, eval_batch_size=2,
         steps_per_epoch=1, lr=1e-3, weight_decay=0.0,
         lambda_task=1.0, lambda_geometry=1.0, lambda_alignment=1.0,
         lambda_structural_cls=1.0, lambda_structural_domain=1.0,
@@ -296,7 +297,7 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         "--lambda_geometry", "--lambda_alignment", "--lambda_structural_cls",
         "--lambda_structural_domain", "--lambda_component_cls",
         "--lambda_component_domain", "--quality_domain_score_warmup_epochs",
-        "--eval_batch_size",
+        "--eval_batch_size", "--grl_warmup_fraction", "--amp", "--amp_dtype",
     ):
         assert option in result.stdout
     for option in (
@@ -305,3 +306,21 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         "--quality_hidden_cap", "--quality_eta", "--sda_hidden_dim",
     ):
         assert option not in result.stdout
+
+
+def test_grl_fraction_and_absolute_override_are_cli_conflicts():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "train.py",
+            "--grl_warmup_fraction",
+            "0.2",
+            "--grl_warmup_max_iters",
+            "100",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "not allowed with argument" in result.stderr

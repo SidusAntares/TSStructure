@@ -64,8 +64,7 @@ run_task() {
             --seed "$seed" \
             --device cuda \
             --epochs 100 \
-            --steps_per_epoch 500 \
-            --batch_size 8 \
+            --batch_size 128 \
             --eval_batch_size 128 \
             --num_pixels 64 \
             --num_workers 8 \
@@ -75,7 +74,9 @@ run_task() {
             --pixel_hidden_dim 16 \
             --structure_dim 128 \
             --domain_hidden_dim 128 \
-            --grl_warmup_max_iters 10000 \
+            --grl_warmup_fraction 0.2 \
+            --amp true \
+            --amp_dtype float16 \
             --lambda_task 1 \
             --lambda_geometry 0.1 \
             --lambda_alignment 1 \

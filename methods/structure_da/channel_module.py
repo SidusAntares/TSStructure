@@ -730,6 +730,18 @@ class MultiScaleChannelRelationStructure(nn.Module):
     def _precompute_temporal_geometry(
         self, normalized_positions: Tensor, channel_mask: Tensor
     ) -> _ChannelTemporalGeometry:
+        with torch.autocast(
+            device_type=normalized_positions.device.type, enabled=False
+        ):
+            if normalized_positions.dtype in (torch.float16, torch.bfloat16):
+                normalized_positions = normalized_positions.float()
+            return self._precompute_temporal_geometry_float32(
+                normalized_positions, channel_mask
+            )
+
+    def _precompute_temporal_geometry_float32(
+        self, normalized_positions: Tensor, channel_mask: Tensor
+    ) -> _ChannelTemporalGeometry:
         coverage = self.compute_channel_coverage_weights(
             normalized_positions, channel_mask
         )
@@ -761,6 +773,27 @@ class MultiScaleChannelRelationStructure(nn.Module):
         return output
 
     def _compute_relations(
+        self,
+        standardized_tokens: Tensor,
+        normalized_positions: Tensor,
+        channel_mask: Tensor,
+        geometry: _ChannelTemporalGeometry | None = None,
+    ) -> _RelationComputation:
+        with torch.autocast(
+            device_type=standardized_tokens.device.type, enabled=False
+        ):
+            if standardized_tokens.dtype in (torch.float16, torch.bfloat16):
+                standardized_tokens = standardized_tokens.float()
+            if normalized_positions.dtype in (torch.float16, torch.bfloat16):
+                normalized_positions = normalized_positions.float()
+            return self._compute_relations_float32(
+                standardized_tokens,
+                normalized_positions,
+                channel_mask,
+                geometry,
+            )
+
+    def _compute_relations_float32(
         self,
         standardized_tokens: Tensor,
         normalized_positions: Tensor,

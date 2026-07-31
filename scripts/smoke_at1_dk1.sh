@@ -63,6 +63,8 @@ conda run -n "$CONDA_ENV" --no-capture-output \
     --structure_dim 128 \
     --domain_hidden_dim 128 \
     --grl_warmup_max_iters 250 \
+    --amp true \
+    --amp_dtype float16 \
     --lambda_task 1 \
     --lambda_geometry 1 \
     --lambda_alignment 1 \

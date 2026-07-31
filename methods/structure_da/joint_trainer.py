@@ -57,6 +57,32 @@ def resolve_domain_score_weight(epoch_index: int, warmup_epochs: int) -> float:
     return min(1.0, max(0.0, epoch_index / float(warmup_epochs - 1)))
 
 
+def resolve_grl_warmup_max_iters(
+    epochs: int,
+    steps_per_epoch: int,
+    *,
+    fraction: float | None = 0.2,
+    override: int | None = None,
+) -> int:
+    """Resolve an absolute GRL warm-up while preserving an explicit override."""
+
+    _positive_int("epochs", epochs)
+    _positive_int("steps_per_epoch", steps_per_epoch)
+    if fraction is not None and override is not None:
+        raise ValueError(
+            "grl_warmup_fraction and grl_warmup_max_iters cannot both be specified"
+        )
+    if override is not None:
+        _positive_int("grl_warmup_max_iters", override)
+        return override
+    resolved_fraction = 0.2 if fraction is None else _finite_nonnegative(
+        "grl_warmup_fraction", fraction
+    )
+    if resolved_fraction > 1.0:
+        raise ValueError("grl_warmup_fraction must lie in [0, 1]")
+    return max(1, round(epochs * steps_per_epoch * resolved_fraction))
+
+
 @dataclass(frozen=True)
 class JointStructureDALossOutput:
     total_loss: Tensor
@@ -117,6 +143,8 @@ class JointStructureDATrainingConfig:
     component_classification_weight: float = 1.0
     component_domain_weight: float = 1.0
     quality_domain_score_warmup_epochs: int = 5
+    amp: bool = False
+    amp_dtype: str = "float16"
     log_step: int = 10
     progress_bar: str = "auto"
     classes: Sequence[str] = ()
@@ -133,6 +161,10 @@ class JointStructureDATrainingConfig:
             raise ValueError(
                 "quality_domain_score_warmup_epochs must be a nonnegative integer"
             )
+        if not isinstance(self.amp, bool):
+            raise ValueError("amp must be boolean")
+        if self.amp_dtype not in ("float16", "bfloat16"):
+            raise ValueError("amp_dtype must be 'float16' or 'bfloat16'")
         object.__setattr__(self, "lr", _finite_nonnegative("lr", self.lr, positive=True))
         object.__setattr__(self, "weight_decay", _finite_nonnegative("weight_decay", self.weight_decay))
         for name in (
@@ -384,6 +416,7 @@ def joint_structure_da_train_step(
     domain_score_weight: float = 1.0,
     task_scheduler=None,
     geometry_scheduler=None,
+    task_scaler=None,
 ) -> JointStructureDATrainStepOutput:
     if not isinstance(model, StructureAwareDomainAdaptationModel):
         raise ValueError("model must be StructureAwareDomainAdaptationModel")
@@ -394,51 +427,59 @@ def joint_structure_da_train_step(
     target_tensors = _sample_to_device(target_sample, device)
     task_optimizer.zero_grad(set_to_none=True)
     geometry_optimizer.zero_grad(set_to_none=True)
-    source_backbone = model.forward_backbone(*source_tensors)
-    target_backbone = model.forward_backbone(*target_tensors)
-    model.update_source_state_from_backbone(
-        model.detach_backbone_for_state(source_backbone), source_tensors[2]
-    )
-    source_output = model.forward_from_backbone(
-        source_backbone,
-        source_tensors[2],
-        domain_score_weight=domain_score_weight,
-    )
-    target_output = model.forward_from_backbone(
-        target_backbone,
-        target_tensors[2],
-        domain_score_weight=domain_score_weight,
-    )
+    amp_enabled = training_config.amp and device.type == "cuda"
+    amp_dtype = getattr(torch, training_config.amp_dtype)
+    with torch.autocast(
+        device_type=device.type,
+        dtype=amp_dtype,
+        enabled=amp_enabled,
+    ):
+        source_backbone = model.forward_backbone(*source_tensors)
+        target_backbone = model.forward_backbone(*target_tensors)
+        model.update_source_state_from_backbone(
+            model.detach_backbone_for_state(source_backbone), source_tensors[2]
+        )
+        source_output = model.forward_from_backbone(
+            source_backbone,
+            source_tensors[2],
+            domain_score_weight=domain_score_weight,
+        )
+        target_output = model.forward_from_backbone(
+            target_backbone,
+            target_tensors[2],
+            domain_score_weight=domain_score_weight,
+        )
 
-    task_loss = F.cross_entropy(
-        source_output.representation.logits, source_labels
-    )
-    merged_quality = concatenate_hierarchical_quality_outputs(
-        source_output.representation.quality,
-        target_output.representation.quality,
-    )
-    source_batch_size = source_labels.shape[0]
-    target_batch_size = target_tensors[0].shape[0]
-    domain_labels = torch.cat(
-        [
-            torch.ones(source_batch_size, dtype=torch.long, device=device),
-            torch.zeros(target_batch_size, dtype=torch.long, device=device),
-        ]
-    )
-    source_mask = domain_labels == 1
-    class_labels = torch.cat(
-        [
-            source_labels,
-            torch.zeros(target_batch_size, dtype=torch.long, device=device),
-        ]
-    )
-    quality_loss = quality_objective(
-        merged_quality, class_labels, domain_labels, source_mask
-    )
-    geometry = model.forward_source_geometry(source_output, source_tensors[2])
-    geometry_loss = geometry.total_loss
-    alignment = model.align(source_output, target_output)
-    alignment_loss = alignment.loss
+        task_loss = F.cross_entropy(
+            source_output.representation.logits, source_labels
+        )
+        merged_quality = concatenate_hierarchical_quality_outputs(
+            source_output.representation.quality,
+            target_output.representation.quality,
+        )
+        source_batch_size = source_labels.shape[0]
+        target_batch_size = target_tensors[0].shape[0]
+        domain_labels = torch.cat(
+            [
+                torch.ones(source_batch_size, dtype=torch.long, device=device),
+                torch.zeros(target_batch_size, dtype=torch.long, device=device),
+            ]
+        )
+        source_mask = domain_labels == 1
+        class_labels = torch.cat(
+            [
+                source_labels,
+                torch.zeros(target_batch_size, dtype=torch.long, device=device),
+            ]
+        )
+        quality_loss = quality_objective(
+            merged_quality, class_labels, domain_labels, source_mask
+        )
+        alignment = model.align(source_output, target_output)
+        alignment_loss = alignment.loss
+    with torch.autocast(device_type=device.type, enabled=False):
+        geometry = model.forward_source_geometry(source_output, source_tensors[2])
+        geometry_loss = geometry.total_loss.float()
     total_loss = (
         training_config.task_weight * task_loss
         + quality_loss.total_loss
@@ -479,9 +520,17 @@ def joint_structure_da_train_step(
     geometry_optimizer.step()
     if geometry_scheduler is not None:
         geometry_scheduler.step()
-    task_total_loss.backward()
-    task_optimizer.step()
-    if task_scheduler is not None:
+    if task_scaler is not None and task_scaler.is_enabled():
+        scale_before = task_scaler.get_scale()
+        task_scaler.scale(task_total_loss).backward()
+        task_scaler.step(task_optimizer)
+        task_scaler.update()
+        task_step_succeeded = task_scaler.get_scale() >= scale_before
+    else:
+        task_total_loss.backward()
+        task_optimizer.step()
+        task_step_succeeded = True
+    if task_scheduler is not None and task_step_succeeded:
         task_scheduler.step()
     quality = merged_quality
     return JointStructureDATrainStepOutput(
@@ -504,7 +553,11 @@ def _resolve_steps(training_config, source_loader, target_loader) -> int:
     source_steps, target_steps = len(source_loader), len(target_loader)
     if source_steps == 0 or target_steps == 0:
         raise ValueError("source and target training loaders must be nonempty")
-    return training_config.steps_per_epoch or max(source_steps, target_steps)
+    return training_config.steps_per_epoch or source_steps
+
+
+def resolve_steps_per_epoch(training_config, source_loader, target_loader) -> int:
+    return _resolve_steps(training_config, source_loader, target_loader)
 
 
 def _diagnostic_tensorboard_tag(name: str) -> str | None:
@@ -607,6 +660,11 @@ def train_joint_structure_da(
         T_max=training_config.epochs * steps_per_epoch,
         eta_min=0,
     )
+    amp_enabled = training_config.amp and device.type == "cuda"
+    task_scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=amp_enabled and training_config.amp_dtype == "float16",
+    )
     quality_objective = HierarchicalQualityObjective(
         structural_classification_weight=training_config.structural_classification_weight,
         structural_domain_weight=training_config.structural_domain_weight,
@@ -647,6 +705,7 @@ def train_joint_structure_da(
                 domain_score_weight=domain_score_weight,
                 task_scheduler=task_scheduler,
                 geometry_scheduler=geometry_scheduler,
+                task_scaler=task_scaler,
             )
             losses = result.losses
             values = {

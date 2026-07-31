@@ -85,6 +85,7 @@ run_source_tasks() {
                     --combine_spring_and_winter false \
                     --epochs 100 \
                     --batch_size 128 \
+                    --eval_batch_size 128 \
                     --num_pixels 64 \
                     --lr 1e-3 \
                     --weight_decay 1e-4 \
@@ -92,7 +93,9 @@ run_source_tasks() {
                     --pixel_hidden_dim 16 \
                     --structure_dim 128 \
                     --domain_hidden_dim 128 \
-                    --grl_warmup_max_iters 250 \
+                    --grl_warmup_fraction 0.2 \
+                    --amp true \
+                    --amp_dtype float16 \
                     --lambda_task 1 \
                     --lambda_geometry 1 \
                     --lambda_alignment 1 \

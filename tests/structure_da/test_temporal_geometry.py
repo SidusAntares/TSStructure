@@ -555,6 +555,16 @@ def test_objective_preserves_floating_dtype(dtype: torch.dtype) -> None:
         assert torch.isfinite(value).all()
 
 
+def test_objective_promotes_half_precision_inputs_to_float32() -> None:
+    result = _objective()(
+        _registration_output(dtype=torch.float16),
+        torch.tensor([True, True]),
+    )
+
+    assert result.total_loss.dtype == torch.float32
+    assert torch.isfinite(result.total_loss)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

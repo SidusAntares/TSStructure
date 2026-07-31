@@ -236,13 +236,39 @@ class TemporalSRVFExtractor(nn.Module):
         positions: Tensor,
         time_mask: Tensor,
     ) -> TemporalSRVFOutput:
+        device_type = (
+            component_tokens.device.type
+            if isinstance(component_tokens, Tensor)
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            if isinstance(component_tokens, Tensor) and component_tokens.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                component_tokens = component_tokens.float()
+            if isinstance(positions, Tensor) and positions.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                positions = positions.float()
+            return self._forward_float32(
+                component_tokens, positions, time_mask
+            )
+
+    def _forward_float32(
+        self,
+        component_tokens: Tensor,
+        positions: Tensor,
+        time_mask: Tensor,
+    ) -> TemporalSRVFOutput:
         functional = self.functional_lift(
             component_tokens,
             positions,
             time_mask,
         )
         self._validate_functional_output(functional)
-        dtype = component_tokens.dtype
+        dtype = functional.function.dtype
         device = component_tokens.device
         information_variance = functional.information_variance
         tau_v = self.support_scale(device=device, dtype=dtype)

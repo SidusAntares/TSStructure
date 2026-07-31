@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from dataclasses import dataclass
 
@@ -253,6 +254,38 @@ class TemporalGeometryObjective(nn.Module):
                 raise ValueError(f"{name} must match registered_srvf device")
 
     def forward(
+        self,
+        registration_output: TemporalRegistrationOutput,
+        source_mask: Tensor,
+    ) -> TemporalGeometryLossOutput:
+        if not isinstance(registration_output, TemporalRegistrationOutput):
+            raise ValueError(
+                "registration_output must be a TemporalRegistrationOutput"
+            )
+        registered_srvf = registration_output.registered_srvf
+        with torch.autocast(
+            device_type=registered_srvf.device.type, enabled=False
+        ):
+            if registered_srvf.dtype in (torch.float16, torch.bfloat16):
+                registration_output = replace(
+                    registration_output,
+                    template_srvf=registration_output.template_srvf.float(),
+                    template_support=registration_output.template_support.float(),
+                    template_mean_support=(
+                        registration_output.template_mean_support.float()
+                    ),
+                    interval_logits=registration_output.interval_logits.float(),
+                    interval_widths=registration_output.interval_widths.float(),
+                    warp=registration_output.warp.float(),
+                    warp_derivative=registration_output.warp_derivative.float(),
+                    registered_srvf=registration_output.registered_srvf.float(),
+                    registered_support=(
+                        registration_output.registered_support.float()
+                    ),
+                )
+            return self._forward_float32(registration_output, source_mask)
+
+    def _forward_float32(
         self,
         registration_output: TemporalRegistrationOutput,
         source_mask: Tensor,

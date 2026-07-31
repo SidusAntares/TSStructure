@@ -56,11 +56,13 @@ def test_formal_script_has_new_group_and_explicit_current_arguments() -> None:
     source = FORMAL_SCRIPT.read_text(encoding="utf-8")
     assert 'EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-structure_eden_full_3seeds_v1}"' in source
     for fragment in (
-        "--epochs 100", "--batch_size 128", "--num_pixels 64",
+        "--epochs 100", "--batch_size 128", "--eval_batch_size 128",
+        "--num_pixels 64",
         "--lr 1e-3", "--weight_decay 1e-4",
         "--channel_feature_dim 16", "--pixel_hidden_dim 16",
         "--structure_dim 128", "--domain_hidden_dim 128",
-        "--grl_warmup_max_iters 250", "--lambda_task 1",
+        "--grl_warmup_fraction 0.2", "--amp true", "--amp_dtype float16",
+        "--lambda_task 1",
         "--lambda_geometry 1", "--lambda_alignment 1",
         "--lambda_structural_cls 1", "--lambda_structural_domain 1",
         "--lambda_component_cls 1", "--lambda_component_domain 1",
@@ -72,7 +74,7 @@ def test_formal_script_has_new_group_and_explicit_current_arguments() -> None:
     for option in (
         "--quality_" + "warmup_steps", "--grl_warmup_steps", "--grl_gamma",
         "--lambda_qdom", "--lambda_qcls", "--lambda_" + "div",
-        "--lambda_" + "sda",
+        "--lambda_" + "sda", "--steps_per_epoch", "--batch_size 8",
     ):
         assert option not in source
 
@@ -98,12 +100,13 @@ def test_pilot_script_maps_exactly_four_tasks_to_four_gpus() -> None:
 def test_pilot_script_has_fixed_parameters_and_runtime_guards() -> None:
     source = PILOT_SCRIPT.read_text(encoding="utf-8")
     for fragment in (
-        "--epochs 100", "--steps_per_epoch 500", "--batch_size 8",
+        "--epochs 100", "--batch_size 128",
         "--eval_batch_size 128", "--num_pixels 64", "--num_workers 8",
         "--lr 0.001", "--weight_decay 0.0001",
         "--channel_feature_dim 16", "--pixel_hidden_dim 16",
         "--structure_dim 128", "--domain_hidden_dim 128",
-        "--grl_warmup_max_iters 10000", "--lambda_task 1",
+        "--grl_warmup_fraction 0.2", "--amp true", "--amp_dtype float16",
+        "--lambda_task 1",
         "--lambda_geometry 0.1", "--lambda_alignment 1",
         "--lambda_structural_cls 0.25", "--lambda_structural_domain 0.25",
         "--lambda_component_cls 0.25", "--lambda_component_domain 0.25",
@@ -118,6 +121,8 @@ def test_pilot_script_has_fixed_parameters_and_runtime_guards() -> None:
         assert forbidden not in source
     for obsolete_parameter in (
         "--epochs 20", "--grl_warmup_max_iters 2500",
+        "--grl_warmup_max_iters 10000", "--steps_per_epoch 500",
+        "--batch_size 8",
     ):
         assert obsolete_parameter not in source
     for guard in (
@@ -145,3 +150,15 @@ def test_formal_script_keeps_twelve_domain_tasks_and_three_seeds() -> None:
         "EXPERIMENT_SUMMARY|", 'wait "$pid"',
     ):
         assert runtime_behavior in source
+
+
+def test_benchmark_cli_exposes_batch_and_amp_controls() -> None:
+    result = subprocess.run(
+        ["python", "scripts/benchmark_structure_da_step.py", "--help"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for option in ("--batch_size", "--amp", "--amp_dtype"):
+        assert option in result.stdout

@@ -114,7 +114,7 @@ def test_all_masked_half_precision_outputs_are_finite_zero() -> None:
     output = SymmetricTimeKernelDecomposition()(H, positions, time_mask)
 
     for component in (output.trend, output.dynamics, output.residual):
-        assert component.dtype == H.dtype
+        assert component.dtype == torch.float32
         assert torch.isfinite(component).all()
         torch.testing.assert_close(component, torch.zeros_like(component))
 

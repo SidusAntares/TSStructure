@@ -17,6 +17,8 @@ from methods.structure_da import (
     JointStructureDATrainingConfig,
     StructureAwareDomainAdaptationModel,
     create_joint_structure_da_train_loaders,
+    resolve_grl_warmup_max_iters,
+    resolve_steps_per_epoch,
     train_joint_structure_da,
 )
 from utils import label_utils
@@ -71,6 +73,72 @@ def main(config):
                 config.target, splits, config, sample_pixels_val
             )
 
+        training_config = None
+        source_loader = None
+        target_loader = None
+        if config.eval:
+            actual_grl_warmup_max_iters = (
+                getattr(config, "grl_warmup_max_iters", None) or 1
+            )
+        else:
+            source_loader, target_loader = create_joint_structure_da_train_loaders(
+                config, splits
+            )
+            training_config = JointStructureDATrainingConfig(
+                epochs=config.epochs,
+                steps_per_epoch=config.steps_per_epoch,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                task_weight=config.lambda_task,
+                geometry_weight=config.lambda_geometry,
+                alignment_weight=config.lambda_alignment,
+                structural_classification_weight=config.lambda_structural_cls,
+                structural_domain_weight=config.lambda_structural_domain,
+                component_classification_weight=config.lambda_component_cls,
+                component_domain_weight=config.lambda_component_domain,
+                quality_domain_score_warmup_epochs=(
+                    config.quality_domain_score_warmup_epochs
+                ),
+                amp=getattr(config, "amp", False),
+                amp_dtype=getattr(config, "amp_dtype", "float16"),
+                log_step=config.log_step,
+                progress_bar=config.progress_bar,
+                classes=tuple(config.classes),
+            )
+            resolved_steps_per_epoch = resolve_steps_per_epoch(
+                training_config, source_loader, target_loader
+            )
+            grl_fraction = getattr(config, "grl_warmup_fraction", None)
+            grl_override = getattr(config, "grl_warmup_max_iters", None)
+            actual_grl_warmup_max_iters = resolve_grl_warmup_max_iters(
+                config.epochs,
+                resolved_steps_per_epoch,
+                fraction=grl_fraction,
+                override=grl_override,
+            )
+            displayed_fraction = (
+                0.2 if grl_fraction is None and grl_override is None
+                else grl_fraction
+            )
+            eval_batch_size = config.eval_batch_size or config.batch_size
+            amp_enabled = bool(training_config.amp and device.type == "cuda")
+            print(
+                "TRAIN_PROTOCOL|"
+                f"batch_size={config.batch_size}"
+                f"|eval_batch_size={eval_batch_size}"
+                f"|source_loader_steps={len(source_loader)}"
+                f"|target_loader_steps={len(target_loader)}"
+                f"|resolved_steps_per_epoch={resolved_steps_per_epoch}"
+                f"|epochs={config.epochs}"
+                f"|total_steps={config.epochs * resolved_steps_per_epoch}"
+                f"|grl_warmup_fraction={displayed_fraction}"
+                f"|grl_warmup_max_iters={actual_grl_warmup_max_iters}"
+                "|quality_domain_score_warmup_epochs="
+                f"{config.quality_domain_score_warmup_epochs}"
+                f"|amp={str(amp_enabled).lower()}"
+                f"|amp_dtype={training_config.amp_dtype}"
+            )
+
         model = StructureAwareDomainAdaptationModel(
             num_classes=config.num_classes,
             num_channels=config.input_dim,
@@ -83,7 +151,7 @@ def main(config):
             tau_min=config.tau_min,
             delta_tau_min=config.delta_tau_min,
             alignment_hidden_dim=config.domain_hidden_dim,
-            grl_max_iters=config.grl_warmup_max_iters,
+            grl_max_iters=actual_grl_warmup_max_iters,
         )
         
         model.to(config.device)
@@ -104,26 +172,6 @@ def main(config):
             #         continue
 
             writer = SummaryWriter(log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0)
-            source_loader, target_loader = create_joint_structure_da_train_loaders(config, splits)
-            training_config = JointStructureDATrainingConfig(
-                epochs=config.epochs,
-                steps_per_epoch=config.steps_per_epoch,
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-                task_weight=config.lambda_task,
-                geometry_weight=config.lambda_geometry,
-                alignment_weight=config.lambda_alignment,
-                structural_classification_weight=config.lambda_structural_cls,
-                structural_domain_weight=config.lambda_structural_domain,
-                component_classification_weight=config.lambda_component_cls,
-                component_domain_weight=config.lambda_component_domain,
-                quality_domain_score_warmup_epochs=(
-                    config.quality_domain_score_warmup_epochs
-                ),
-                log_step=config.log_step,
-                progress_bar=config.progress_bar,
-                classes=tuple(config.classes),
-            )
             train_joint_structure_da(
                 model, source_loader, target_loader, source_val_loader,
                 training_config, writer, device, best_model_path,
@@ -427,7 +475,25 @@ if __name__ == '__main__':
     parser.add_argument('--pixel_hidden_dim', default=16, type=int)
     parser.add_argument('--structure_dim', default=128, type=int)
     parser.add_argument('--domain_hidden_dim', default=128, type=int)
-    parser.add_argument('--grl_warmup_max_iters', default=250, type=int)
+    grl_warmup_group = parser.add_mutually_exclusive_group()
+    grl_warmup_group.add_argument(
+        '--grl_warmup_max_iters',
+        default=None,
+        type=int,
+        help='explicit GRL warm-up step override',
+    )
+    grl_warmup_group.add_argument(
+        '--grl_warmup_fraction',
+        default=None,
+        type=float,
+        help='GRL warm-up fraction; defaults to 0.20 unless an override is used',
+    )
+    parser.add_argument('--amp', default=False, type=bool_flag)
+    parser.add_argument(
+        '--amp_dtype',
+        default='float16',
+        choices=['float16', 'bfloat16'],
+    )
     parser.add_argument('--lambda_task', default=1.0, type=float)
     parser.add_argument('--lambda_geometry', default=1.0, type=float)
     parser.add_argument('--lambda_alignment', default=1.0, type=float)

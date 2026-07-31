@@ -303,6 +303,46 @@ class MonotoneWarpEstimator(nn.Module):
         template_support: Tensor,
         registration_valid: Tensor,
     ) -> MonotoneWarpOutput:
+        device_type = (
+            sample_srvf.device.type if isinstance(sample_srvf, Tensor) else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            if isinstance(sample_srvf, Tensor) and sample_srvf.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                sample_srvf = sample_srvf.float()
+            if isinstance(template_srvf, Tensor) and template_srvf.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                template_srvf = template_srvf.float()
+            if isinstance(sample_support, Tensor) and sample_support.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                sample_support = sample_support.float()
+            if isinstance(template_support, Tensor) and template_support.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                template_support = template_support.float()
+            return self._forward_float32(
+                sample_srvf,
+                template_srvf,
+                sample_support,
+                template_support,
+                registration_valid,
+            )
+
+    def _forward_float32(
+        self,
+        sample_srvf: Tensor,
+        template_srvf: Tensor,
+        sample_support: Tensor,
+        template_support: Tensor,
+        registration_valid: Tensor,
+    ) -> MonotoneWarpOutput:
         self._validate_inputs(
             sample_srvf,
             template_srvf,
@@ -379,6 +419,22 @@ class MonotoneWarpEstimator(nn.Module):
 
 
 def _warp_sequence(sequence: Tensor, warp: Tensor) -> Tensor:
+    device_type = sequence.device.type if isinstance(sequence, Tensor) else "cpu"
+    with torch.autocast(device_type=device_type, enabled=False):
+        if isinstance(sequence, Tensor) and sequence.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            sequence = sequence.float()
+        if isinstance(warp, Tensor) and warp.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            warp = warp.float()
+        return _warp_sequence_float32(sequence, warp)
+
+
+def _warp_sequence_float32(sequence: Tensor, warp: Tensor) -> Tensor:
     if not isinstance(sequence, Tensor) or sequence.ndim != 3:
         raise ValueError("sequence must have shape [B, K, D]")
     if not sequence.is_floating_point():
@@ -420,6 +476,34 @@ def _apply_srvf_group_action(
     warp_derivative: Tensor,
     eps: float,
 ) -> Tensor:
+    device_type = srvf.device.type if isinstance(srvf, Tensor) else "cpu"
+    with torch.autocast(device_type=device_type, enabled=False):
+        if isinstance(srvf, Tensor) and srvf.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            srvf = srvf.float()
+        if isinstance(warp, Tensor) and warp.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            warp = warp.float()
+        if isinstance(warp_derivative, Tensor) and warp_derivative.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            warp_derivative = warp_derivative.float()
+        return _apply_srvf_group_action_float32(
+            srvf, warp, warp_derivative, eps
+        )
+
+
+def _apply_srvf_group_action_float32(
+    srvf: Tensor,
+    warp: Tensor,
+    warp_derivative: Tensor,
+    eps: float,
+) -> Tensor:
     eps = _finite_float("eps", eps)
     if eps <= 0:
         raise ValueError("eps must be greater than zero")
@@ -436,7 +520,7 @@ def _apply_srvf_group_action(
         raise ValueError("warp_derivative must contain only finite values")
     if torch.any(warp_derivative <= 0).item():
         raise ValueError("warp_derivative must be strictly positive")
-    warped_srvf = _warp_sequence(srvf, warp)
+    warped_srvf = _warp_sequence_float32(srvf, warp)
     return warped_srvf * torch.sqrt(
         warp_derivative.clamp_min(eps)
     ).unsqueeze(-1)

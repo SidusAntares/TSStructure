@@ -479,6 +479,32 @@ class TemporalFunctionalLift(nn.Module):
         positions: Tensor,
         time_mask: Tensor,
     ) -> TemporalFunctionalOutput:
+        device_type = (
+            component_tokens.device.type
+            if isinstance(component_tokens, Tensor)
+            else "cpu"
+        )
+        with torch.autocast(device_type=device_type, enabled=False):
+            if isinstance(component_tokens, Tensor) and component_tokens.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                component_tokens = component_tokens.float()
+            if isinstance(positions, Tensor) and positions.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                positions = positions.float()
+            return self._forward_float32(
+                component_tokens, positions, time_mask
+            )
+
+    def _forward_float32(
+        self,
+        component_tokens: Tensor,
+        positions: Tensor,
+        time_mask: Tensor,
+    ) -> TemporalFunctionalOutput:
         self._validate_component_tokens(component_tokens)
         batch_size, sequence_length = component_tokens.shape[:2]
         resolved_time_mask = _resolve_time_mask(

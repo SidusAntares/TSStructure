@@ -170,6 +170,8 @@ def test_each_loss_has_the_intended_gradient_route(loss_name, expected) -> None:
 def test_training_config_rejects_invalid_values_and_has_no_legacy_fields() -> None:
     config = _config()
     assert config.quality_domain_score_warmup_epochs == 5
+    assert config.amp is False
+    assert config.amp_dtype == "float16"
     for field in (
         "task_weight", "geometry_weight", "alignment_weight",
         "structural_classification_weight", "structural_domain_weight",
@@ -180,6 +182,37 @@ def test_training_config_rejects_invalid_values_and_has_no_legacy_fields() -> No
     for invalid in (-1, 1.5, True):
         with pytest.raises(ValueError, match="quality_domain_score_warmup_epochs"):
             _config(quality_domain_score_warmup_epochs=invalid)
+    with pytest.raises(ValueError, match="amp"):
+        _config(amp="true")
+    with pytest.raises(ValueError, match="amp_dtype"):
+        _config(amp_dtype="float32")
+
+
+def test_default_joint_epoch_uses_source_loader_length() -> None:
+    config = _config(steps_per_epoch=None)
+
+    assert joint_trainer_module._resolve_steps(config, [1, 2, 3], [1]) == 3
+    assert joint_trainer_module._resolve_steps(config, [1, 2], [1, 2, 3, 4]) == 2
+
+
+def test_grl_warmup_resolution_uses_fraction_override_and_conflict_rules() -> None:
+    resolve = joint_trainer_module.resolve_grl_warmup_max_iters
+
+    assert resolve(epochs=100, steps_per_epoch=37) == 740
+    assert resolve(epochs=1, steps_per_epoch=1, fraction=0.01) == 1
+    assert resolve(
+        epochs=100,
+        steps_per_epoch=37,
+        fraction=None,
+        override=123,
+    ) == 123
+    with pytest.raises(ValueError, match="both"):
+        resolve(
+            epochs=100,
+            steps_per_epoch=37,
+            fraction=0.2,
+            override=123,
+        )
 
 
 @pytest.mark.parametrize(
@@ -290,6 +323,108 @@ def test_joint_step_supports_unequal_lengths_and_never_reads_target_label() -> N
         parameter.grad is not None and parameter.grad.abs().sum() > 0
         for parameter in model.temporal_operator.extractor.warp_parameters()
     )
+
+
+def test_amp_requested_on_cpu_falls_back_to_finite_full_precision_step() -> None:
+    model = _model()
+    config = _config(amp=True, amp_dtype="float16")
+    task_optimizer, geometry_optimizer = _optimizers(model, config)
+
+    result = joint_structure_da_train_step(
+        model,
+        _sample(2, 5),
+        _sample(2, 7, labels=False),
+        task_optimizer,
+        geometry_optimizer,
+        _objective(config),
+        config,
+        torch.device("cpu"),
+    )
+
+    assert all(
+        torch.isfinite(value).item()
+        for value in (
+            result.losses.total_loss,
+            result.losses.task_loss,
+            result.losses.quality_loss.total_loss,
+            result.losses.geometry_loss,
+            result.losses.alignment_loss,
+        )
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_amp_matches_full_precision_with_finite_gradients() -> None:
+    def snapshot(amp: bool) -> dict[str, torch.Tensor]:
+        torch.manual_seed(1729)
+        model = _model().cuda().train()
+        source = _sample(2, 5)
+        source_tensors = tuple(
+            source[name].cuda() for name in ("pixels", "valid_pixels", "positions")
+        )
+        labels = source["label"].cuda()
+        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+            backbone = model.forward_backbone(*source_tensors)
+            model.update_source_state_from_backbone(
+                model.detach_backbone_for_state(backbone), source_tensors[2]
+            )
+            output = model.forward_from_backbone(backbone, source_tensors[2])
+            task_loss = F.cross_entropy(output.representation.logits, labels)
+            alignment_loss = model.align(output, output).loss
+        with torch.autocast("cuda", enabled=False):
+            geometry_loss = model.forward_source_geometry(
+                output, source_tensors[2]
+            ).total_loss.float()
+        geometry_loss.backward()
+        (task_loss + alignment_loss).backward()
+        trainable_gradients = [
+            parameter.grad
+            for parameter in model.parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+        assert trainable_gradients
+        assert all(torch.isfinite(gradient).all() for gradient in trainable_gradients)
+        quality = output.representation.quality
+        reconstruction = (
+            backbone.decomposition.trend
+            + backbone.decomposition.dynamics
+            + backbone.decomposition.residual
+        )
+        return {
+            "logits": output.representation.logits.detach().float().cpu(),
+            "task_loss": task_loss.detach().float().cpu(),
+            "geometry_loss": geometry_loss.detach().float().cpu(),
+            "alignment_loss": alignment_loss.detach().float().cpu(),
+            "alpha": torch.stack(
+                [quality.alpha_trend, quality.alpha_dynamics, quality.alpha_residual],
+                dim=-1,
+            ).detach().float().cpu(),
+            "beta": torch.stack(
+                [
+                    quality.beta_trend_temporal,
+                    quality.beta_dynamics_temporal,
+                    quality.beta_trend_channel,
+                    quality.beta_dynamics_channel,
+                ],
+                dim=-1,
+            ).detach().float().cpu(),
+            "reconstruction": reconstruction.detach().float().cpu(),
+            "tokens": backbone.channel_tokens.detach().float().cpu(),
+        }
+
+    full_precision = snapshot(False)
+    mixed_precision = snapshot(True)
+    for name in (
+        "logits", "task_loss", "geometry_loss", "alignment_loss", "alpha", "beta"
+    ):
+        assert torch.isfinite(mixed_precision[name]).all(), name
+        torch.testing.assert_close(
+            mixed_precision[name], full_precision[name], rtol=5e-2, atol=5e-3
+        )
+    for result in (full_precision, mixed_precision):
+        torch.testing.assert_close(
+            result["reconstruction"], result["tokens"], rtol=1e-5, atol=1e-6
+        )
 
 
 def test_joint_step_uses_separate_optimizers_and_schedulers() -> None:

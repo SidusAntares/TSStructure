@@ -124,6 +124,26 @@ class SymmetricTimeKernelDecomposition(nn.Module):
         positions: torch.Tensor,
         time_mask: Optional[torch.Tensor] = None,
     ) -> DecompositionOutput:
+        device_type = H.device.type if isinstance(H, torch.Tensor) else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            if isinstance(H, torch.Tensor) and H.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                H = H.float()
+            if isinstance(positions, torch.Tensor) and positions.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                positions = positions.float()
+            return self._forward_float32(H, positions, time_mask)
+
+    def _forward_float32(
+        self,
+        H: torch.Tensor,
+        positions: torch.Tensor,
+        time_mask: Optional[torch.Tensor] = None,
+    ) -> DecompositionOutput:
         """Return the trend, dynamics, and residual of ``H``.
 
         Args:
