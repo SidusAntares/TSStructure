@@ -158,11 +158,13 @@ def test_ndvi_decomposition_reuses_real_operator_and_reconstructs_irregular_seri
     components, reconstruction = diagnostics.decompose_ndvi_frame(frame)
 
     assert diagnostics.SymmetricTimeKernelDecomposition is SymmetricTimeKernelDecomposition
-    assert reconstruction.iloc[0]["max_abs_reconstruction_error"] < 1e-5
-    reconstructed = components.pivot(
+    assert reconstruction.iloc[0]["max_abs_structure_error"] < 1e-5
+    assert reconstruction.iloc[0]["max_abs_input_error"] < 1e-5
+    wide = components.pivot(
         index="day_of_year", columns="component", values="value"
-    ).sum(axis=1)
-    assert np.allclose(reconstructed.to_numpy(), frame["ndvi_mean"], atol=1e-5)
+    )
+    assert np.allclose(wide["structure"], wide["trend"] + wide["dynamics"])
+    assert np.allclose(wide["original"], wide["structure"] + wide["residual"])
 
 
 def test_ndvi_decomposition_sorts_rows_and_does_not_invent_missing_domains():
@@ -177,7 +179,9 @@ def test_ndvi_decomposition_sorts_rows_and_does_not_invent_missing_domains():
 
     components, reconstruction = diagnostics.decompose_ndvi_frame(frame)
     keys = list(components[["class_name", "domain", "day_of_year", "component"]].itertuples(index=False, name=None))
-    component_order = {"trend": 0, "dynamics": 1, "residual": 2}
+    component_order = {
+        name: index for index, name in enumerate(diagnostics.COMPONENT_ORDER)
+    }
 
     assert keys == sorted(keys, key=lambda row: (row[0], row[1], row[2], component_order[row[3]]))
     assert set(zip(reconstruction["class_name"], reconstruction["domain"])) == {
@@ -200,9 +204,10 @@ def test_ndvi_decomposition_writes_tables_and_missing_domain_figure(tmp_path):
 
     result = diagnostics.run_ndvi_decomposition(csv_path, output_dir)
 
-    assert (output_dir / "tables/ndvi_decomposition/ndvi_decomposition_long.csv").is_file()
-    assert (output_dir / "tables/ndvi_decomposition/reconstruction_check.csv").is_file()
-    assert (output_dir / "figures/raw_timeseries/ndvi_decomposition/corn.png").is_file()
+    assert (output_dir / "tables/ndvi_ts_decomposition/mean_components_long.csv").is_file()
+    assert (output_dir / "tables/ndvi_ts_decomposition/reconstruction_check.csv").is_file()
+    assert (output_dir / "figures/raw_timeseries/ndvi_ts_decomposition/class_domain_mean/corn.png").is_file()
+    assert (output_dir / "figures/raw_timeseries/ndvi_ts_decomposition/trend_structure_comparison/corn.png").is_file()
     assert set(result["components"]["domain"]) == {"FR1", "FR2"}
 
 
@@ -214,3 +219,153 @@ def test_cli_accepts_ndvi_decomposition_subcommand():
     ])
 
     assert args.command == "ndvi-decomposition"
+
+
+def test_parcel_decomposition_masks_invalid_observations_without_resampling():
+    diagnostics = _decomposition_diagnostics()
+    values = np.array([0.1, np.nan, 0.6, 0.4, 0.3])
+    doys = np.array([10.0, 30.0, 70.0, 120.0, 190.0])
+    valid = np.array([True, True, True, False, True])
+
+    result = diagnostics.decompose_ndvi_series(values, doys, valid)
+
+    assert np.array_equal(result["valid"], [True, False, True, False, True])
+    for component in diagnostics.COMPONENT_ORDER:
+        assert np.isnan(result[component][~result["valid"]]).all()
+    assert np.allclose(
+        result["structure"][result["valid"]],
+        result["trend"][result["valid"]] + result["dynamics"][result["valid"]],
+    )
+    assert np.allclose(
+        result["original"][result["valid"]],
+        result["structure"][result["valid"]] + result["residual"][result["valid"]],
+    )
+
+
+def test_reservoir_sampling_is_reproducible_and_bounded():
+    first = raw.sample_grouped_parcels(
+        (("DK1", "corn", index) for index in range(30)), 5, 17
+    )
+    second = raw.sample_grouped_parcels(
+        (("DK1", "corn", index) for index in range(30)), 5, 17
+    )
+
+    assert first == second
+    assert len(first["DK1", "corn"]) == 5
+
+
+def test_parcel_quantiles_are_computed_after_per_parcel_decomposition():
+    diagnostics = _decomposition_diagnostics()
+    doys = np.array([1.0, 20.0, 60.0, 140.0, 240.0])
+    curves = [
+        np.array([0.0, 0.2, 1.0, 0.1, 0.0]),
+        np.array([0.0, 0.8, 0.1, 0.7, 0.0]),
+        np.array([0.1, 0.0, 0.9, 0.0, 0.1]),
+    ]
+    records = [
+        diagnostics.decompose_ndvi_series(curve, doys) for curve in curves
+    ]
+
+    summary = diagnostics.summarize_parcel_components(
+        "DK1", "corn", records
+    )
+    assert set(summary["component"]) == set(diagnostics.COMPONENT_ORDER)
+    assert summary["n_samples"].eq(len(records)).all()
+    trend_median = summary[summary["component"] == "trend"]["median"].to_numpy()
+    expected = np.median(np.stack([record["trend"] for record in records]), axis=0)
+    mean_then_decompose = diagnostics.decompose_ndvi_series(
+        np.mean(curves, axis=0), doys
+    )["trend"]
+
+    assert np.allclose(trend_median, expected)
+    assert not np.allclose(trend_median, mean_then_decompose)
+
+
+def test_irregular_variation_uses_real_time_intervals():
+    diagnostics = _decomposition_diagnostics()
+    values = np.array([0.0, 2.0, 3.0])
+    doys = np.array([1.0, 3.0, 8.0])
+
+    variation = diagnostics.component_variation(values, doys)
+
+    assert variation["total_variation"] == 3.0
+    assert np.isclose(variation["roughness"], 4.0 / 2.0 + 1.0 / 5.0)
+    assert variation["n_intervals"] == 2
+
+
+def test_variation_skips_padding_but_retains_adjacent_observed_interval():
+    diagnostics = _decomposition_diagnostics()
+
+    variation = diagnostics.component_variation(
+        np.array([0.0, np.nan, 2.0]), np.array([1.0, 2.0, 5.0])
+    )
+
+    assert variation["total_variation"] == 2.0
+    assert variation["roughness"] == 1.0
+    assert variation["n_intervals"] == 1
+
+
+def test_cli_accepts_ts_diagnostic_options():
+    from scripts.analyze_structure_da import build_parser
+
+    args = build_parser().parse_args([
+        "ndvi-ts-diagnostic", "--data-root", "data", "--output-dir", "out",
+        "--samples-per-group", "3", "--sample-seed", "9",
+        "--classes", "corn", "wheat",
+    ])
+
+    assert args.command == "ndvi-ts-diagnostic"
+    assert args.samples_per_group == 3
+    assert args.sample_seed == 9
+    assert args.classes == ["corn", "wheat"]
+
+
+def test_ts_diagnostic_minimal_synthetic_dataset_writes_expected_outputs(tmp_path):
+    diagnostics = _decomposition_diagnostics()
+
+    class FakeDataset:
+        metadata = {"dates": [20170105, 20170210, 20170320, 20170515]}
+        date_positions = np.array([0, 36, 74, 130])
+
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, index):
+            pixels = np.zeros((4, 10, 2), dtype=np.float32)
+            pixels[:, 2, :] = 10000 + 500 * index
+            pixels[:, 3, :] = np.array([12000, 18000, 26000, 17000])[:, None]
+            return {"pixels": pixels, "label": 0}
+
+    def factory(data_root, dataset_name, classes):
+        return FakeDataset()
+
+    sampled_a = raw.collect_ndvi_diagnostic_parcels(
+        tmp_path, samples_per_group=2, sample_seed=1,
+        classes=("corn",), dataset_factory=factory,
+    )[1]
+    sampled_b = raw.collect_ndvi_diagnostic_parcels(
+        tmp_path, samples_per_group=2, sample_seed=1,
+        classes=("corn",), dataset_factory=factory,
+    )[1]
+    assert [item["parcel_index"] for item in sampled_a] == [
+        item["parcel_index"] for item in sampled_b
+    ]
+
+    result = diagnostics.run_ndvi_ts_diagnostic(
+        tmp_path, tmp_path / "out", samples_per_group=2, sample_seed=1,
+        classes=("corn",), dataset_factory=factory,
+    )
+
+    table_dir = tmp_path / "out/tables/ndvi_ts_decomposition"
+    figure_dir = tmp_path / "out/figures/raw_timeseries/ndvi_ts_decomposition"
+    for name in (
+        "mean_components_long.csv", "parcel_components_summary.csv",
+        "component_variation_per_parcel.csv",
+        "component_variation_group_summary.csv", "reconstruction_check.csv",
+    ):
+        assert (table_dir / name).is_file()
+    assert (figure_dir / "class_domain_mean/corn.png").is_file()
+    assert (figure_dir / "trend_structure_comparison/corn.png").is_file()
+    assert (figure_dir / "class_domain_quantiles/trend/corn.png").is_file()
+    assert (figure_dir / "class_domain_quantiles/structure/corn.png").is_file()
+    assert len(result["sampled_parcels"]) == 8

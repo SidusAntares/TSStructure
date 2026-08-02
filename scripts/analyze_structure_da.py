@@ -32,6 +32,16 @@ def build_parser() -> argparse.ArgumentParser:
     decomposition.add_argument("--ndvi-csv", type=Path, required=True)
     decomposition.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
 
+    ts_diagnostic = commands.add_parser(
+        "ndvi-ts-diagnostic",
+        help="diagnose the T/S hierarchy on mean and sampled parcel NDVI curves",
+    )
+    ts_diagnostic.add_argument("--data-root", type=Path, required=True)
+    ts_diagnostic.add_argument("--output-dir", type=Path, required=True)
+    ts_diagnostic.add_argument("--samples-per-group", type=int, default=5)
+    ts_diagnostic.add_argument("--sample-seed", type=int, default=1)
+    ts_diagnostic.add_argument("--classes", nargs="+", default=None)
+
     return parser
 
 
@@ -68,6 +78,24 @@ def main() -> None:
             f"classes={len(result['classes'])}|"
             f"groups={len(result['reconstruction'])}|"
             f"max_reconstruction_error={result['max_reconstruction_error']:.3e}"
+        )
+    elif args.command == "ndvi-ts-diagnostic":
+        from analysis.structure_da.decomposition_diagnostics import (
+            run_ndvi_ts_diagnostic,
+        )
+
+        result = run_ndvi_ts_diagnostic(
+            args.data_root,
+            args.output_dir,
+            samples_per_group=args.samples_per_group,
+            sample_seed=args.sample_seed,
+            classes=args.classes,
+        )
+        print(
+            "NDVI_TS_DIAGNOSTIC|"
+            f"classes={len(result['classes'])}|"
+            f"samples={len(result['sampled_parcels'])}|"
+            f"groups={len(result['reconstruction'])}"
         )
 
 

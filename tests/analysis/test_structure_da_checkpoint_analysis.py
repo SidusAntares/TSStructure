@@ -21,8 +21,10 @@ def _commands() -> set[str]:
     return set(subparsers.choices)
 
 
-def test_analysis_cli_exposes_exactly_three_supported_commands() -> None:
-    assert _commands() == {"logs", "raw", "ndvi-decomposition"}
+def test_analysis_cli_exposes_supported_commands() -> None:
+    assert _commands() == {
+        "logs", "raw", "ndvi-decomposition", "ndvi-ts-diagnostic"
+    }
 
 
 def test_analysis_cli_rejects_removed_checkpoint_command() -> None:

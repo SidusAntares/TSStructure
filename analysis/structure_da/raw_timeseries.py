@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import datetime as dt
 import json
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import matplotlib
 
@@ -89,6 +89,167 @@ def day_of_years(dates: Iterable[dt.date]) -> tuple[int, ...]:
     """Derive DOY from parsed real acquisition dates."""
 
     return tuple(date.timetuple().tm_yday for date in dates)
+
+
+def sample_grouped_parcels(
+    items: Iterable[tuple[str, str, object]],
+    samples_per_group: int,
+    sample_seed: int,
+) -> dict[tuple[str, str], list[object]]:
+    """Deterministically reservoir-sample a bounded number of items per group."""
+
+    if isinstance(samples_per_group, bool) or samples_per_group < 1:
+        raise ValueError("samples_per_group must be a positive integer")
+    rng = np.random.default_rng(sample_seed)
+    reservoirs: dict[tuple[str, str], list[object]] = {}
+    seen: dict[tuple[str, str], int] = {}
+    for domain, class_name, payload in items:
+        key = (domain, class_name)
+        seen[key] = seen.get(key, 0) + 1
+        reservoir = reservoirs.setdefault(key, [])
+        if len(reservoir) < samples_per_group:
+            reservoir.append(payload)
+            continue
+        replacement = int(rng.integers(0, seen[key]))
+        if replacement < samples_per_group:
+            reservoir[replacement] = payload
+    return reservoirs
+
+
+def collect_ndvi_diagnostic_parcels(
+    data_root: Path | str,
+    samples_per_group: int = 5,
+    sample_seed: int = 1,
+    classes: Iterable[str] | None = None,
+    dataset_factory: Callable[[Path, str, tuple[str, ...]], object] | None = None,
+) -> tuple[pd.DataFrame, list[dict[str, object]], list[str]]:
+    """Stream all parcels while retaining only bounded NDVI examples per group."""
+
+    if isinstance(samples_per_group, bool) or samples_per_group < 1:
+        raise ValueError("samples_per_group must be a positive integer")
+    data_root = Path(data_root)
+    if dataset_factory is None:
+        if not data_root.is_dir():
+            raise FileNotFoundError(f"TimeMatch data root does not exist: {data_root}")
+        from dataset import PixelSetData
+        from utils import label_utils
+
+        all_classes = tuple(label_utils.get_classes("denmark", "france", "austria"))
+
+        def dataset_factory(root: Path, name: str, labels: tuple[str, ...]):
+            return PixelSetData(
+                str(root), name, labels, transform=None, closed_set=True,
+                combine_spring_and_winter=False,
+            )
+    else:
+        all_classes = tuple(classes or ())
+        if not all_classes:
+            raise ValueError("classes must be provided with a custom dataset_factory")
+
+    selected = None if classes is None else tuple(dict.fromkeys(classes))
+    unknown = set(selected or ()).difference(all_classes)
+    if unknown:
+        raise ValueError(f"unknown classes requested: {sorted(unknown)}")
+    rng = np.random.default_rng(sample_seed)
+    reservoirs: dict[tuple[str, str], list[dict[str, object]]] = {}
+    seen: dict[tuple[str, str], int] = {}
+    accumulators: dict[tuple[str, str], dict[str, object]] = {}
+    class_sets: dict[str, set[str]] = {}
+
+    for domain, dataset_name in DOMAIN_DATASETS.items():
+        dataset = dataset_factory(data_root, dataset_name, all_classes)
+        dates = parse_acquisition_dates(dataset.metadata["dates"])
+        doys = np.asarray(day_of_years(dates), dtype=np.float64)
+        present: set[str] = set()
+        for parcel_index in range(len(dataset)):
+            sample = dataset[parcel_index]
+            class_name = all_classes[int(sample["label"])]
+            if selected is not None and class_name not in selected:
+                continue
+            ndvi = compute_parcel_ndvi(sample["pixels"])
+            if ndvi.shape != doys.shape:
+                raise ValueError("parcel NDVI length must match acquisition dates")
+            valid = np.isfinite(ndvi) & np.isfinite(doys)
+            if "valid_pixels" in sample:
+                pixel_valid = np.asarray(sample["valid_pixels"], dtype=bool)
+                if pixel_valid.ndim == 2 and pixel_valid.shape[0] == len(ndvi):
+                    valid &= pixel_valid.any(axis=-1)
+            if not valid.any():
+                continue
+            key = (domain, class_name)
+            present.add(class_name)
+            accumulator = accumulators.setdefault(
+                key,
+                {
+                    "dates": dates,
+                    "sum": np.zeros_like(ndvi, dtype=np.float64),
+                    "valid_count": np.zeros_like(ndvi, dtype=np.int64),
+                    "n_parcels": 0,
+                },
+            )
+            accumulator["sum"][valid] += ndvi[valid]
+            accumulator["valid_count"][valid] += 1
+            accumulator["n_parcels"] += 1
+
+            seen[key] = seen.get(key, 0) + 1
+            payload = {
+                "domain": domain,
+                "class_name": class_name,
+                "parcel_index": parcel_index,
+                "dates": dates,
+                "doys": doys.copy(),
+                "ndvi": ndvi.copy(),
+                "valid": valid.copy(),
+            }
+            reservoir = reservoirs.setdefault(key, [])
+            if len(reservoir) < samples_per_group:
+                reservoir.append(payload)
+            else:
+                replacement = int(rng.integers(0, seen[key]))
+                if replacement < samples_per_group:
+                    reservoir[replacement] = payload
+        class_sets[domain] = present
+
+    common = sorted(set.intersection(*class_sets.values())) if class_sets else []
+    if selected is not None:
+        missing = set(selected).difference(common)
+        if missing:
+            raise ValueError(
+                "requested classes are not shared by all domains: "
+                + ", ".join(sorted(missing))
+            )
+        common = list(selected)
+    rows: list[dict[str, object]] = []
+    for (domain, class_name), accumulator in sorted(accumulators.items()):
+        if class_name not in common:
+            continue
+        valid_count = accumulator["valid_count"]
+        mean = np.divide(
+            accumulator["sum"], valid_count,
+            out=np.full_like(accumulator["sum"], np.nan),
+            where=valid_count > 0,
+        )
+        for date, doy, value, count in zip(
+            accumulator["dates"], day_of_years(accumulator["dates"]), mean, valid_count
+        ):
+            if not np.isfinite(value):
+                continue
+            rows.append({
+                "class_name": class_name,
+                "domain": domain,
+                "date": date.isoformat(),
+                "day_of_year": doy,
+                "ndvi_mean": float(value),
+                "n_parcels": int(accumulator["n_parcels"]),
+                "n_valid_parcels": int(count),
+            })
+    sampled = [
+        parcel
+        for key in sorted(reservoirs)
+        if key[1] in common
+        for parcel in reservoirs[key]
+    ]
+    return pd.DataFrame(rows), sampled, common
 
 
 def aggregate_parcel_curves(parcels: Iterable[ParcelCurve]) -> dict[tuple[str, str], RawAggregate]:
