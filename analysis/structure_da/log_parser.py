@@ -31,8 +31,6 @@ class EpochRecord:
     alpha_R: float
     beta_T_temp: float
     beta_D_temp: float
-    beta_T_channel: float
-    beta_D_channel: float
     grl: float
     lr: float
     val_loss: Optional[float] = None
@@ -259,8 +257,6 @@ def parse_task_log(path: Path | str) -> ParsedRun:
                 alpha_R=_float_field(values, "alpha_R"),
                 beta_T_temp=_float_field(values, "beta_T_temp"),
                 beta_D_temp=_float_field(values, "beta_D_temp"),
-                beta_T_channel=_float_field(values, "beta_T_channel"),
-                beta_D_channel=_float_field(values, "beta_D_channel"),
                 grl=_float_field(values, "grl"),
                 lr=_float_field(values, "lr"),
             )

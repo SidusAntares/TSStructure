@@ -11,8 +11,7 @@ from methods.structure_da.temporal_functional import _evaluate_cubic_bspline
 
 def _make_lift(**kwargs) -> TemporalFunctionalLift:
     parameters = {
-        "num_channels": 3,
-        "channel_feature_dim": 4,
+        "feature_dim": 12,
         "num_basis": 8,
         "canonical_grid_size": 24,
         "roughness_grid_size": 96,
@@ -166,7 +165,7 @@ def test_spline_state_is_registered_as_non_parameter_buffers() -> None:
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_output_shapes_and_dtype(dtype: torch.dtype) -> None:
     torch.manual_seed(42)
-    tokens = torch.randn(2, 7, 3, 4, dtype=dtype)
+    tokens = torch.randn(2, 7, 12, dtype=dtype)
     positions = torch.tensor([0, 17, 51, 103, 166, 244, 330])
     time_mask = torch.ones(2, 7, dtype=torch.bool)
 
@@ -205,7 +204,7 @@ def test_information_variance_matches_batched_cholesky_reference(
 ) -> None:
     torch.manual_seed(45)
     lift = _make_lift(smoothing_weight=2e-3, eps=1e-7)
-    tokens = torch.randn(2, 6, 3, 4, dtype=dtype)
+    tokens = torch.randn(2, 6, 12, dtype=dtype)
     positions = torch.tensor(
         [[0.0, 41.0, 97.0, 153.0, 242.0, 340.0],
          [13.0, 62.0, 118.0, 191.0, 280.0, 355.0]],
@@ -248,10 +247,9 @@ def test_spline_reconstructs_smooth_polynomial_on_canonical_grid() -> None:
         [0.0, 0.04, 0.11, 0.19, 0.31, 0.46, 0.58, 0.73, 0.88, 1.0],
         dtype=torch.float64,
     )
-    values = (0.7 * u.square() - 0.4 * u + 1.2).reshape(1, -1, 1, 1)
+    values = (0.7 * u.square() - 0.4 * u + 1.2).reshape(1, -1, 1)
     lift = TemporalFunctionalLift(
-        num_channels=1,
-        channel_feature_dim=1,
+        feature_dim=1,
         num_basis=8,
         canonical_grid_size=41,
         roughness_grid_size=128,
@@ -277,10 +275,9 @@ def test_linear_function_has_constant_canonical_derivative() -> None:
         [0.0, 0.07, 0.18, 0.35, 0.54, 0.79, 1.0], dtype=torch.float64
     )
     slope, intercept = 1.75, -0.3
-    values = (slope * u + intercept).reshape(1, -1, 1, 1)
+    values = (slope * u + intercept).reshape(1, -1, 1)
     lift = TemporalFunctionalLift(
-        num_channels=1,
-        channel_feature_dim=1,
+        feature_dim=1,
         num_basis=7,
         canonical_grid_size=31,
         roughness_grid_size=96,
@@ -298,15 +295,14 @@ def test_linear_function_has_constant_canonical_derivative() -> None:
 
 def test_common_physical_coordinates_do_not_apply_per_sample_min_max() -> None:
     tokens = torch.tensor(
-        [[[[0.0]], [[1.0]], [[0.0]]], [[[0.0]], [[1.0]], [[0.0]]]]
+        [[[0.0], [1.0], [0.0]], [[0.0], [1.0], [0.0]]]
     )
     positions = torch.tensor(
         [[0.0, 73.2, 146.4], [73.2, 146.4, 219.6]]
     )
     time_mask = torch.ones(2, 3, dtype=torch.bool)
     lift = TemporalFunctionalLift(
-        num_channels=1,
-        channel_feature_dim=1,
+        feature_dim=1,
         num_basis=6,
         canonical_grid_size=32,
         roughness_grid_size=96,
@@ -321,12 +317,11 @@ def test_common_physical_coordinates_do_not_apply_per_sample_min_max() -> None:
 
 
 def test_physical_time_descriptors_ignore_masked_positions() -> None:
-    tokens = torch.randn(1, 4, 1, 1)
+    tokens = torch.randn(1, 4, 1)
     positions = torch.tensor([0.0, 50.0, 350.0, 150.0])
     time_mask = torch.tensor([True, True, False, True])
     lift = TemporalFunctionalLift(
-        num_channels=1,
-        channel_feature_dim=1,
+        feature_dim=1,
         num_basis=5,
         canonical_grid_size=16,
         roughness_grid_size=64,
@@ -346,14 +341,13 @@ def test_physical_time_descriptors_ignore_masked_positions() -> None:
 
 def test_masked_tokens_do_not_affect_fit_and_receive_zero_gradient() -> None:
     torch.manual_seed(43)
-    tokens = torch.randn(1, 5, 1, 2)
+    tokens = torch.randn(1, 5, 2)
     changed = tokens.clone()
     time_mask = torch.tensor([True, False, True, True, False])
     changed[:, ~time_mask] = 1e9
     positions = torch.tensor([0.0, 30.0, 90.0, 180.0, 300.0])
     lift = TemporalFunctionalLift(
-        num_channels=1,
-        channel_feature_dim=2,
+        feature_dim=2,
         num_basis=6,
         canonical_grid_size=20,
         roughness_grid_size=80,
@@ -382,7 +376,7 @@ def test_masked_tokens_do_not_affect_fit_and_receive_zero_gradient() -> None:
 
 
 def test_solve_valid_requires_at_least_two_distinct_observations() -> None:
-    tokens = torch.randn(3, 4, 1, 1)
+    tokens = torch.randn(3, 4, 1)
     positions = torch.tensor([0.0, 40.0, 120.0, 260.0])
     time_mask = torch.tensor(
         [
@@ -392,8 +386,7 @@ def test_solve_valid_requires_at_least_two_distinct_observations() -> None:
         ]
     )
     lift = TemporalFunctionalLift(
-        num_channels=1,
-        channel_feature_dim=1,
+        feature_dim=1,
         num_basis=5,
         canonical_grid_size=16,
         roughness_grid_size=64,
@@ -415,10 +408,10 @@ def test_solve_valid_requires_at_least_two_distinct_observations() -> None:
 
 
 def test_duplicate_valid_positions_raise_clear_error() -> None:
-    tokens = torch.randn(1, 3, 1, 1)
+    tokens = torch.randn(1, 3, 1)
 
     with pytest.raises(ValueError, match="strictly increasing"):
-        TemporalFunctionalLift(1, 1)(
+        TemporalFunctionalLift(1)(
             tokens,
             torch.tensor([0.0, 0.0, 100.0]),
             torch.ones(3, dtype=torch.bool),
@@ -428,10 +421,9 @@ def test_duplicate_valid_positions_raise_clear_error() -> None:
 @pytest.mark.parametrize(
     "tokens,match",
     [
-        (torch.randn(2, 3, 4), "four-dimensional"),
-        (torch.randn(2, 3, 2, 4), "num_channels=3"),
-        (torch.randn(2, 3, 3, 2), "channel_feature_dim=4"),
-        (torch.ones(2, 3, 3, 4, dtype=torch.long), "floating-point"),
+        (torch.randn(2, 3, 3, 4), "three-dimensional"),
+        (torch.randn(2, 3, 11), "feature_dim=12"),
+        (torch.ones(2, 3, 12, dtype=torch.long), "floating-point"),
     ],
 )
 def test_invalid_component_token_shape_or_dtype_raises_value_error(
@@ -447,8 +439,8 @@ def test_invalid_component_token_shape_or_dtype_raises_value_error(
 
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf")])
 def test_nonfinite_valid_token_raises_value_error(invalid: float) -> None:
-    tokens = torch.randn(1, 3, 3, 4)
-    tokens[0, 1, 2, 3] = invalid
+    tokens = torch.randn(1, 3, 12)
+    tokens[0, 1, 7] = invalid
 
     with pytest.raises(ValueError, match="valid component tokens must be finite"):
         _make_lift()(
@@ -470,7 +462,7 @@ def test_nonfinite_valid_token_raises_value_error(invalid: float) -> None:
 def test_invalid_positions_raise_value_error(
     positions: torch.Tensor, match: str
 ) -> None:
-    tokens = torch.randn(1, 3, 3, 4)
+    tokens = torch.randn(1, 3, 12)
 
     with pytest.raises(ValueError, match=match):
         _make_lift()(tokens, positions, torch.ones(3, dtype=torch.bool))
@@ -481,7 +473,7 @@ def test_invalid_positions_raise_value_error(
     [torch.ones(2, 4, dtype=torch.bool), torch.tensor([1.0, 2.0, 0.0])],
 )
 def test_invalid_time_mask_raises_value_error(time_mask: torch.Tensor) -> None:
-    tokens = torch.randn(1, 3, 3, 4)
+    tokens = torch.randn(1, 3, 12)
 
     with pytest.raises(ValueError, match="time_mask"):
         _make_lift()(
@@ -492,8 +484,7 @@ def test_invalid_time_mask_raises_value_error(time_mask: torch.Tensor) -> None:
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"num_channels": 0},
-        {"channel_feature_dim": 0},
+        {"feature_dim": 0},
         {"num_basis": 3},
         {"canonical_grid_size": 1},
         {"canonical_grid_size": 80, "roughness_grid_size": 64},
@@ -504,7 +495,7 @@ def test_invalid_time_mask_raises_value_error(time_mask: torch.Tensor) -> None:
     ],
 )
 def test_invalid_construction_parameters_raise_value_error(kwargs: dict) -> None:
-    parameters = {"num_channels": 3, "channel_feature_dim": 4}
+    parameters = {"feature_dim": 12}
     parameters.update(kwargs)
 
     with pytest.raises(ValueError):

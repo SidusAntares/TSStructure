@@ -550,8 +550,7 @@ class TemporalSRVFRegistration(nn.Module):
 
     def __init__(
         self,
-        num_channels: int,
-        channel_feature_dim: int,
+        feature_dim: int,
         num_basis: int = 12,
         canonical_grid_size: int = 64,
         roughness_grid_size: int = 256,
@@ -586,8 +585,7 @@ class TemporalSRVFRegistration(nn.Module):
             raise ValueError("eps must be greater than zero")
 
         self.srvf_extractor = TemporalSRVFExtractor(
-            num_channels=num_channels,
-            channel_feature_dim=channel_feature_dim,
+            feature_dim=feature_dim,
             num_basis=num_basis,
             canonical_grid_size=canonical_grid_size,
             roughness_grid_size=roughness_grid_size,
@@ -605,7 +603,6 @@ class TemporalSRVFRegistration(nn.Module):
             derivative_norm_threshold=derivative_norm_threshold,
             eps=eps,
         )
-        feature_dim = num_channels * channel_feature_dim
         self.source_template = SourceRunningSRVFTemplate(
             canonical_grid_size=canonical_grid_size,
             feature_dim=feature_dim,

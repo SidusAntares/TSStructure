@@ -22,8 +22,7 @@ from methods.structure_da.temporal_registration import (
 
 def _make_registration(**kwargs) -> TemporalSRVFRegistration:
     parameters = {
-        "num_channels": 1,
-        "channel_feature_dim": 2,
+        "feature_dim": 2,
         "num_basis": 6,
         "canonical_grid_size": 8,
         "roughness_grid_size": 64,
@@ -39,7 +38,7 @@ def _make_registration(**kwargs) -> TemporalSRVFRegistration:
 
 def _sample_batch(dtype: torch.dtype = torch.float32):
     torch.manual_seed(61)
-    tokens = torch.randn(2, 6, 1, 2, dtype=dtype)
+    tokens = torch.randn(2, 6, 2, dtype=dtype)
     positions = torch.tensor(
         [0.0, 39.0, 92.0, 157.0, 244.0, 345.0], dtype=dtype
     )

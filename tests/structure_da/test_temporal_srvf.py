@@ -14,8 +14,7 @@ from methods.structure_da import (
 
 def _make_extractor(**kwargs) -> TemporalSRVFExtractor:
     parameters = {
-        "num_channels": 1,
-        "channel_feature_dim": 2,
+        "feature_dim": 2,
         "num_basis": 6,
         "canonical_grid_size": 16,
         "roughness_grid_size": 64,
@@ -71,8 +70,7 @@ def _forward_fixed(
     tokens = torch.zeros(
         batch_size,
         3,
-        extractor.num_channels,
-        extractor.channel_feature_dim,
+        extractor.feature_dim,
         dtype=functional.derivative.dtype,
     )
     return extractor(
@@ -144,7 +142,7 @@ def test_support_scale_minimum_and_buffer_registration() -> None:
 def test_real_extractor_output_shapes_ranges_and_dtype(dtype: torch.dtype) -> None:
     torch.manual_seed(51)
     extractor = _make_extractor()
-    tokens = torch.randn(2, 7, 1, 2, dtype=dtype)
+    tokens = torch.randn(2, 7, 2, dtype=dtype)
     positions = torch.tensor([0, 31, 75, 128, 190, 271, 355], dtype=dtype)
     mask = torch.ones(2, 7, dtype=torch.bool)
 
@@ -228,7 +226,7 @@ def test_invalid_solve_forces_confidence_and_srvf_to_zero() -> None:
 
 def test_dense_observations_have_more_mean_support_than_sparse_boundaries() -> None:
     extractor = _make_extractor(canonical_grid_size=32, roughness_grid_size=96)
-    tokens = torch.randn(2, 9, 1, 2)
+    tokens = torch.randn(2, 9, 2)
     positions = torch.linspace(0.0, 366.0, 9)
     mask = torch.tensor(
         [[True] * 9, [True, False, False, False, False, False, False, False, True]]
@@ -303,7 +301,7 @@ def test_reliability_thresholds_control_structure_validity() -> None:
 def test_masked_values_do_not_change_outputs_and_have_zero_gradient() -> None:
     torch.manual_seed(52)
     extractor = _make_extractor(canonical_grid_size=20, roughness_grid_size=80)
-    tokens = torch.randn(1, 6, 1, 2)
+    tokens = torch.randn(1, 6, 2)
     changed = tokens.clone()
     mask = torch.tensor([True, False, True, True, False, True])
     changed[:, ~mask] = 1e8
@@ -345,7 +343,7 @@ def test_masked_values_do_not_change_outputs_and_have_zero_gradient() -> None:
 
 def test_forward_does_not_update_source_state_and_explicit_updates_do() -> None:
     extractor = _make_extractor()
-    tokens = torch.randn(1, 5, 1, 2)
+    tokens = torch.randn(1, 5, 2)
     positions = torch.linspace(0.0, 300.0, 5)
     mask = torch.ones(1, 5, dtype=torch.bool)
 
@@ -374,7 +372,7 @@ def test_support_update_uses_only_functional_solve_valid_rows() -> None:
 
 def test_running_support_scale_has_no_gradient_and_is_not_parameter() -> None:
     extractor = _make_extractor()
-    tokens = torch.randn(1, 6, 1, 2, requires_grad=True)
+    tokens = torch.randn(1, 6, 2, requires_grad=True)
     output = extractor(
         tokens, torch.linspace(0.0, 350.0, 6), torch.ones(1, 6, dtype=torch.bool)
     )

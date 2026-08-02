@@ -28,10 +28,6 @@ from utils.train_utils import bool_flag
 
 
 def main(config):
-    if config.with_extra:
-        raise ValueError(
-            "the channel-preserving structure model does not use geometric extra features"
-        )
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -141,9 +137,8 @@ def main(config):
 
         model = StructureAwareDomainAdaptationModel(
             num_classes=config.num_classes,
-            num_channels=config.input_dim,
-            channel_feature_dim=config.channel_feature_dim,
-            pixel_hidden_dim=config.pixel_hidden_dim,
+            input_dim=config.input_dim,
+            with_extra=config.with_extra,
             structure_dim=config.structure_dim,
             time_scale=config.time_scale,
             tau_fast_init=config.tau_fast_init,
@@ -471,8 +466,6 @@ if __name__ == '__main__':
     parser.add_argument('--with_extra', default=False, type=bool_flag, help='whether to input extra geometric features to the PSE')
     parser.add_argument('--tensorboard_log_dir', default='runs')
     parser.add_argument('--steps_per_epoch', default=None, type=int)
-    parser.add_argument('--channel_feature_dim', default=16, type=int)
-    parser.add_argument('--pixel_hidden_dim', default=16, type=int)
     parser.add_argument('--structure_dim', default=128, type=int)
     parser.add_argument('--domain_hidden_dim', default=128, type=int)
     grl_warmup_group = parser.add_mutually_exclusive_group()

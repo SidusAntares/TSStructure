@@ -89,8 +89,6 @@ run_source_tasks() {
                     --num_pixels 64 \
                     --lr 1e-3 \
                     --weight_decay 1e-4 \
-                    --channel_feature_dim 16 \
-                    --pixel_hidden_dim 16 \
                     --structure_dim 128 \
                     --domain_hidden_dim 128 \
                     --grl_warmup_fraction 0.2 \

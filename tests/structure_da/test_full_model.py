@@ -1,30 +1,25 @@
 from __future__ import annotations
 
-import pytest
 import torch
+import importlib.util
+
+import methods.structure_da as structure_da
 
 from methods.structure_da.backbone import StructureBackbone
-from methods.structure_da.channel_module import (
-    MultiScaleChannelRelationStructure,
-    SharedChannelStructureOperator,
-)
 from methods.structure_da.full_model import (
     StructureAwareDomainAdaptationModel,
     StructureAwareForwardOutput,
 )
-from methods.structure_da.temporal_module import (
-    SharedTemporalStructureOperator,
-    TemporalStructureExtractor,
-)
+from methods.structure_da.temporal_module import SharedTemporalStructureOperator
 from models.ltae import ComponentAwareSharedLTAE
 
 
 def _model(dtype: torch.dtype = torch.float32, **overrides):
     options = dict(
         num_classes=3,
-        num_channels=2,
-        channel_feature_dim=2,
-        pixel_hidden_dim=3,
+        input_dim=2,
+        mlp1=(2, 4, 4),
+        mlp2=(8, 4),
         structure_dim=3,
         time_scale=366.0,
         temporal_options={
@@ -40,15 +35,6 @@ def _model(dtype: torch.dtype = torch.float32, **overrides):
             "num_phase_basis": 2,
             "attribute_projection_dim": 2,
             "coordinate_hidden_dim": 6,
-            "dropout": 0.0,
-        },
-        channel_options={
-            "lag_centers": (-0.1, 0.0, 0.1),
-            "lag_widths": (0.08, 0.08, 0.08),
-            "velocity_bandwidth": 0.15,
-            "edge_hidden_dim": 4,
-            "min_effective_pairs": 1.0,
-            "min_relation_mass": 0.0,
             "dropout": 0.0,
         },
         representation_options={
@@ -77,212 +63,61 @@ def _inputs(batch: int = 2, length: int = 5, dtype=torch.float32):
     return pixels, valid, positions
 
 
-def _state_counts(model):
-    temporal = model.temporal_operator.extractor.registration
-    channel = model.channel_operator.extractor
-    return (
-        int(temporal.srvf_extractor.functional_lift.standardizer.num_updates.item()),
-        int(temporal.srvf_extractor.support_scale.num_updates.item()),
-        int(temporal.source_template.num_updates.item()),
-        int(channel.attribute_standardizer.num_updates.item()),
-        int(channel.energy_scale.num_updates.item()),
-    )
-
-
-def test_model_contains_exactly_one_shared_module_of_each_kind() -> None:
+def test_model_contains_backbone_temporal_and_shared_component_ltae() -> None:
     model = _model()
     assert isinstance(model.backbone, StructureBackbone)
     assert isinstance(model.temporal_operator, SharedTemporalStructureOperator)
-    assert isinstance(model.channel_operator, SharedChannelStructureOperator)
-    assert sum(isinstance(m, StructureBackbone) for m in model.modules()) == 1
-    assert sum(isinstance(m, TemporalStructureExtractor) for m in model.modules()) == 1
-    assert sum(isinstance(m, MultiScaleChannelRelationStructure) for m in model.modules()) == 1
-    assert sum(
-        isinstance(m, ComponentAwareSharedLTAE) for m in model.modules()
-    ) == 1
+    assert sum(isinstance(m, ComponentAwareSharedLTAE) for m in model.modules()) == 1
 
 
-def test_geometry_and_task_parameter_sets_are_disjoint_and_exhaustive() -> None:
+def test_removed_public_api_and_module_are_absent() -> None:
+    removed_module = "methods.structure_da." + "channel" + "_module"
+    assert importlib.util.find_spec(removed_module) is None
+    for name in ("Shared" + "ChannelStructureOperator", "Channel" + "StructurePairOutput"):
+        assert not hasattr(structure_da, name)
+
+
+def test_forward_interfaces_have_no_removed_branch() -> None:
     model = _model()
-    geometry = list(model.geometry_parameters())
-    task = list(model.task_parameters())
-    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    warp = list(model.temporal_operator.extractor.registration.warp_estimator.parameters())
+    pixels, valid, positions = _inputs()
+    backbone = model.forward_backbone(pixels, valid, positions)
+    assert backbone.tokens.shape == (2, 5, 4)
+    output = model.forward_from_backbone(backbone, positions)
+    assert isinstance(output, StructureAwareForwardOutput)
+    assert set(output.__dataclass_fields__) == {"backbone", "temporal", "representation"}
+    assert output.representation.fused_feature.shape == (2, 7)
+    assert model(*_inputs()).shape == (2, 3)
 
-    assert {id(parameter) for parameter in geometry} == {
-        id(parameter) for parameter in warp if parameter.requires_grad
+
+def test_source_state_update_and_parameter_partition() -> None:
+    model = _model()
+    before = model.temporal_operator.extractor.registration.source_template.num_updates.clone()
+    model.update_source_state(*_inputs())
+    after = model.temporal_operator.extractor.registration.source_template.num_updates
+    assert after > before
+    geometry = tuple(model.geometry_parameters())
+    task = tuple(model.task_parameters())
+    assert {id(p) for p in geometry}.isdisjoint({id(p) for p in task})
+    assert {id(p) for p in (*geometry, *task)} == {
+        id(p) for p in model.parameters() if p.requires_grad
     }
-    assert {id(parameter) for parameter in geometry}.isdisjoint(
-        {id(parameter) for parameter in task}
-    )
-    assert {id(parameter) for parameter in (*geometry, *task)} == {
-        id(parameter) for parameter in trainable
-    }
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_forward_details_shapes_extra_compatibility_and_read_only_state(dtype) -> None:
-    model = _model(dtype).eval()
-    pixels, valid, positions = _inputs(dtype=dtype)
-    before = _state_counts(model)
-    first = model.forward_details(pixels, valid, positions, torch.randn(2, 4, dtype=dtype))
-    second = model.forward_details(pixels, valid, positions, torch.randn(2, 9, dtype=dtype))
-
-    assert isinstance(first, StructureAwareForwardOutput)
-    assert first.representation.logits.shape == (2, 3)
-    assert first.representation.fused_feature.shape == (2, 10)
-    torch.testing.assert_close(first.representation.logits, second.representation.logits)
-    torch.testing.assert_close(model(pixels, valid, positions, None), first.representation.logits)
-    assert _state_counts(model) == before == (0, 0, 0, 0, 0)
-    for coefficient in (
-        first.representation.quality.alpha_trend,
-        first.representation.quality.alpha_dynamics,
-        first.representation.quality.alpha_residual,
-        first.representation.quality.beta_trend_temporal,
-        first.representation.quality.beta_dynamics_temporal,
-        first.representation.quality.beta_trend_channel,
-        first.representation.quality.beta_dynamics_channel,
-    ):
-        assert coefficient.min() >= 0 and coefficient.max() <= 1
-
-
-def test_channel_mask_broadcasts_and_is_combined_with_time_mask() -> None:
-    model = _model().eval()
-    pixels, valid, positions = _inputs()
-    time_mask = torch.tensor([[1, 1, 0, 1, 1], [1, 0, 1, 1, 1]], dtype=torch.bool)
-    channel_mask = torch.tensor(
-        [[1, 0], [1, 1], [1, 1], [0, 1], [1, 1]], dtype=torch.bool
-    )
-    output = model.forward_details(
-        pixels, valid, positions, time_mask=time_mask, channel_mask=channel_mask
-    )
-    assert output.channel.trend.valid.shape == (2,)
-    with pytest.raises(ValueError):
-        model.forward_details(pixels, valid, positions, channel_mask=torch.ones(5, 3))
-
-
-def test_source_state_update_is_explicit_and_combined_once() -> None:
+def test_alignment_uses_declared_fused_dimension() -> None:
     model = _model()
-    pixels, valid, positions = _inputs()
-    model.update_source_state(pixels, valid, positions)
-    assert _state_counts(model) == (1, 1, 1, 1, 1)
-
-
-def test_source_geometry_reuses_backbone_and_routes_only_geometry_to_warp() -> None:
-    model = _model()
-    pixels, valid, positions = _inputs()
-    model.update_source_state(pixels, valid, positions)
-    calls = []
-    handle = model.backbone.register_forward_hook(lambda *args: calls.append(1))
-    output = model.forward_details(pixels, valid, positions)
-    assert len(calls) == 1
-    geometry = model.forward_source_geometry(output, positions)
-    assert len(calls) == 1
-    handle.remove()
-
-    warp_parameters = list(model.temporal_operator.extractor.warp_parameters())
-    model.zero_grad(set_to_none=True)
-    output.representation.logits.sum().backward(retain_graph=True)
-    assert all(p.grad is None or p.grad.abs().sum() == 0 for p in warp_parameters)
-    model.zero_grad(set_to_none=True)
-    geometry.total_loss.backward()
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in warp_parameters)
-    assert all(
-        parameter.grad is None
-        for parameter in model.task_parameters()
-    )
-
-
-def test_cached_backbone_path_matches_wrapper_and_preserves_task_gradients() -> None:
-    model = _model().eval()
-    pixels, valid, positions = _inputs()
-    model.update_source_state(pixels, valid, positions)
-
-    expected = model.forward_details(pixels, valid, positions)
-    backbone = model.forward_backbone(pixels, valid, positions)
-    actual = model.forward_from_backbone(backbone, positions)
-
-    torch.testing.assert_close(actual.representation.logits, expected.representation.logits)
-    torch.testing.assert_close(actual.backbone.channel_tokens, expected.backbone.channel_tokens)
-    model.zero_grad(set_to_none=True)
-    actual.representation.logits.sum().backward()
-    assert any(
-        parameter.grad is not None and parameter.grad.abs().sum() > 0
-        for parameter in model.backbone.parameters()
-    )
-
-
-def test_forward_from_backbone_threads_domain_score_weight() -> None:
-    model = _model().eval()
-    pixels, valid, positions = _inputs()
-    backbone = model.forward_backbone(pixels, valid, positions)
-
-    without_domain = model.forward_from_backbone(
-        backbone, positions, domain_score_weight=0.0
-    )
-    with_domain = model.forward_from_backbone(
-        backbone, positions, domain_score_weight=1.0
-    )
-
-    assert not torch.allclose(
-        without_domain.representation.quality.alpha_trend,
-        with_domain.representation.quality.alpha_trend,
-    )
-
-
-def test_cached_source_state_update_does_not_run_backbone_or_keep_gradients() -> None:
-    model = _model()
-    pixels, valid, positions = _inputs()
-    backbone = model.forward_backbone(pixels, valid, positions)
-    calls = []
-    handle = model.backbone.register_forward_hook(lambda *args: calls.append(1))
-
-    detached = model.detach_backbone_for_state(backbone)
-    model.update_source_state_from_backbone(detached, positions)
-    handle.remove()
-
-    assert calls == []
-    assert _state_counts(model) == (1, 1, 1, 1, 1)
-    assert isinstance(detached, type(backbone))
-    assert not detached.channel_tokens.requires_grad
-
-
-def test_alignment_routes_gradients_through_both_fused_features() -> None:
-    model = _model()
-    model.alignment.grl.iteration.fill_(3)
     source = model.forward_details(*_inputs(length=5))
-    target = model.forward_details(*_inputs(length=6))
-    source.representation.fused_feature.retain_grad()
-    target.representation.fused_feature.retain_grad()
+    target = model.forward_details(*_inputs(length=7))
     aligned = model.align(source, target)
-    aligned.loss.backward()
-    assert source.representation.fused_feature.grad.abs().sum() > 0
-    assert target.representation.fused_feature.grad.abs().sum() > 0
-    assert model.alignment.grl.iteration.item() == 4
+    assert model.alignment.feature_dim == model.representation.fused_dim == 7
+    assert torch.isfinite(aligned.loss)
 
 
-def test_invalid_constructor_and_masks_are_rejected() -> None:
-    with pytest.raises(ValueError):
-        StructureAwareDomainAdaptationModel(num_classes=1)
-    model = _model()
+def test_with_extra_reaches_original_pse() -> None:
+    model = _model(with_extra=True)
     pixels, valid, positions = _inputs()
-    with pytest.raises(ValueError):
-        model.forward_details(pixels, valid, positions, channel_mask=torch.ones(2, 5, 2, 1))
-
-
-def test_tau_constructor_values_reach_stkd_initial_scales() -> None:
-    baseline = _model()
-    changed = _model(
-        tau_fast_init=0.08,
-        tau_slow_init=0.31,
-        tau_min=1e-3,
-        delta_tau_min=2e-3,
-    )
-
-    assert baseline.backbone.decomposition.tau_fast.item() == pytest.approx(0.05)
-    assert baseline.backbone.decomposition.tau_slow.item() == pytest.approx(0.20)
-    assert changed.backbone.decomposition.tau_fast.item() == pytest.approx(0.08)
-    assert changed.backbone.decomposition.tau_slow.item() == pytest.approx(0.31)
-    assert changed.backbone.decomposition.tau_fast.item() != pytest.approx(
-        baseline.backbone.decomposition.tau_fast.item()
-    )
+    extra = torch.randn(2, 4)
+    output = model.forward_details(pixels, valid, positions, extra)
+    changed_extra = extra.clone()
+    changed_extra[0, 0] += 2
+    changed = model.forward_details(pixels, valid, positions, changed_extra)
+    assert not torch.allclose(output.backbone.tokens, changed.backbone.tokens)

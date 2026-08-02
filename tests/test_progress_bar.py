@@ -148,8 +148,6 @@ def test_final_evaluation_defaults_missing_progress_bar_to_auto(monkeypatch):
         tau_slow_init=0.20,
         tau_min=1e-4,
         delta_tau_min=1e-4,
-        channel_feature_dim=16,
-        pixel_hidden_dim=16,
         structure_dim=128,
         domain_hidden_dim=128,
         grl_warmup_max_iters=250,
@@ -250,7 +248,7 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
         classes=["crop"], experiment_name="test", time_scale=366.0,
         tau_fast_init=0.07, tau_slow_init=0.29,
         tau_min=0.0002, delta_tau_min=0.0003,
-        channel_feature_dim=16, pixel_hidden_dim=16, structure_dim=128,
+        structure_dim=128,
         domain_hidden_dim=128, grl_warmup_max_iters=250,
         tensorboard_log_dir="runs", epochs=1,
         batch_size=2, eval_batch_size=2,
@@ -270,9 +268,8 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
     assert final_test_loaders == [target_test]
     assert model_kwargs == [{
         "num_classes": 1,
-        "num_channels": 10,
-        "channel_feature_dim": 16,
-        "pixel_hidden_dim": 16,
+        "input_dim": 10,
+        "with_extra": False,
         "structure_dim": 128,
         "time_scale": 366.0,
         "tau_fast_init": 0.07,
@@ -292,7 +289,7 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         check=True,
     )
     for option in (
-        "--channel_feature_dim", "--pixel_hidden_dim", "--structure_dim",
+        "--structure_dim",
         "--domain_hidden_dim", "--grl_warmup_max_iters", "--lambda_task",
         "--lambda_geometry", "--lambda_alignment", "--lambda_structural_cls",
         "--lambda_structural_domain", "--lambda_component_cls",
@@ -300,6 +297,8 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         "--eval_batch_size", "--grl_warmup_fraction", "--amp", "--amp_dtype",
     ):
         assert option in result.stdout
+    for option in ("--channel" + "_feature_dim", "--pixel" + "_hidden_dim"):
+        assert option not in result.stdout
     for option in (
         "--quality_" + "warmup_steps", "--grl_gamma", "--lambda_qdom",
         "--lambda_qcls", "--lambda_" + "div", "--lambda_" + "sda",

@@ -58,8 +58,6 @@ conda run -n "$CONDA_ENV" --no-capture-output \
     --batch_size 4 \
     --num_pixels 16 \
     --num_workers 0 \
-    --channel_feature_dim 16 \
-    --pixel_hidden_dim 16 \
     --structure_dim 128 \
     --domain_hidden_dim 128 \
     --grl_warmup_max_iters 250 \

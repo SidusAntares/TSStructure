@@ -1,14 +1,6 @@
 """Current structure-aware domain-adaptation building blocks."""
 
 from .backbone import StructureBackbone, StructureBackboneOutput
-from .channel_module import (
-    ChannelStructureOutput,
-    ChannelStructurePairOutput,
-    MultiScaleChannelRelationStructure,
-    SharedChannelStructureOperator,
-    SourceRunningAttributeStandardizer,
-    SourceRunningRelationEnergyScale,
-)
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
 from .diagnostics import (
     ContributionDiagnostics,
@@ -107,8 +99,6 @@ from .temporal_srvf import (
 )
 
 __all__ = [
-    "ChannelStructureOutput",
-    "ChannelStructurePairOutput",
     "ComponentQualityBundle",
     "ContributionDiagnostics",
     "DecompositionOutput",
@@ -127,7 +117,6 @@ __all__ = [
     "JointStructureDATrainingConfig",
     "MonotoneWarpEstimator",
     "MonotoneWarpOutput",
-    "MultiScaleChannelRelationStructure",
     "PairedStructureFeatures",
     "PhaseCoordinateEncoder",
     "PhaseTangentOutput",
@@ -137,10 +126,7 @@ __all__ = [
     "QualityScoreOutput",
     "QualityScorer",
     "ShapeCoordinateEncoder",
-    "SharedChannelStructureOperator",
     "SharedTemporalStructureOperator",
-    "SourceRunningAttributeStandardizer",
-    "SourceRunningRelationEnergyScale",
     "SourceRunningSRVFTemplate",
     "SourceRunningStandardizer",
     "SourceRunningSupportScale",

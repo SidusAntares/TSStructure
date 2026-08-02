@@ -1,4 +1,4 @@
-"""Three-component decomposition of 3D or channel-preserving temporal features."""
+"""Three-component decomposition of temporal feature sequences."""
 
 from dataclasses import dataclass
 import math
@@ -31,11 +31,8 @@ class SymmetricTimeKernelDecomposition(nn.Module):
 
     The two kernel scales are learned, while the decomposition itself contains
     no projections or task-specific logic. Timestamps are divided by a fixed
-    global ``time_scale`` so spacing remains comparable between samples. Legacy
-    features may have shape ``[B,L,D]``. Channel-preserving features may have
-    shape ``[B,L,C,P]``, where ``C`` is the original-variable axis and ``P`` is
-    each variable's internal feature dimension. Decomposition acts only along
-    ``L`` and never mixes ``C`` or ``P``.
+    global ``time_scale`` so spacing remains comparable between samples.
+    Features have shape ``[B,L,D]`` and decomposition acts only along ``L``.
     """
 
     def __init__(
@@ -147,11 +144,7 @@ class SymmetricTimeKernelDecomposition(nn.Module):
         """Return the trend, dynamics, and residual of ``H``.
 
         Args:
-            H: Floating-point temporal features with shape ``[B,L,D]`` or
-                ``[B,L,C,P]``. The legacy 3D form remains available to existing
-                models and scalar diagnostics. In the 4D form, decomposition
-                acts only along ``L``; the original-variable axis ``C`` and
-                internal attribute axis ``P`` are preserved without mixing.
+            H: Floating-point temporal features with shape ``[B,L,D]``.
             positions: Real timestamps with shape ``[B, L]`` or ``[L]``.
             time_mask: Optional boolean or 0/1 validity mask with shape
                 ``[B, L]`` or ``[L]``. Masked outputs are zero and masked
@@ -160,8 +153,8 @@ class SymmetricTimeKernelDecomposition(nn.Module):
 
         if not isinstance(H, torch.Tensor):
             raise ValueError("H must be a torch.Tensor")
-        if H.ndim not in (3, 4):
-            raise ValueError("H must have shape [B, L, D] or [B, L, C, P]")
+        if H.ndim != 3:
+            raise ValueError("H must have shape [B, L, D]")
         if H.shape[1] < 1 or any(size < 1 for size in H.shape[2:]):
             raise ValueError("H feature dimensions must be non-empty")
         if not H.is_floating_point():

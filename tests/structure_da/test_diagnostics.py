@@ -201,25 +201,18 @@ def _contribution_inputs(dtype=torch.float32):
         "alpha_R": torch.tensor([0.25, 0.5], dtype=dtype),
         "beta_T_temporal": torch.tensor([0.4, 0.8], dtype=dtype),
         "beta_D_temporal": torch.tensor([0.2, 0.0], dtype=dtype),
-        "beta_T_channel": torch.tensor([0.6, 0.7], dtype=dtype),
-        "beta_D_channel": torch.tensor([0.3, 0.4], dtype=dtype),
     }
     structures = {
         "temporal_T": torch.ones(2, 3, dtype=dtype),
         "temporal_D": 2.0 * torch.ones(2, 3, dtype=dtype),
-        "channel_T": 3.0 * torch.ones(2, 3, dtype=dtype),
-        "channel_D": 4.0 * torch.ones(2, 3, dtype=dtype),
     }
     fusion = {
         "raw_fusion": torch.tensor([[1.0, 0.0], [0.0, 0.0]], dtype=dtype),
         "temporal_fusion": torch.tensor([[0.0, 2.0], [0.0, 0.0]], dtype=dtype),
-        "channel_fusion": torch.tensor([[0.0, 0.0], [0.0, 0.0]], dtype=dtype),
     }
     valid = {
         "temporal_T_valid": torch.tensor([True, True]),
         "temporal_D_valid": torch.tensor([True, True]),
-        "channel_T_valid": torch.tensor([True, True]),
-        "channel_D_valid": torch.tensor([True, True]),
     }
     return {**coefficients, **structures, **fusion, **valid}
 
@@ -235,14 +228,11 @@ def test_zero_alpha_or_beta_zeroes_exact_gate_and_effective_norm() -> None:
     assert summary["effective_D_temporal_norm"].item() > 0
     inputs = _contribution_inputs()
     inputs["alpha_T"].zero_()
-    inputs["beta_D_channel"].zero_()
     zeroed = summarize_contribution_diagnostics(
         compute_structure_contribution_diagnostics(**inputs)
     )
     assert zeroed["gate_T_temporal_mean"].item() == 0.0
     assert zeroed["effective_T_temporal_norm"].item() == 0.0
-    assert zeroed["gate_D_channel_mean"].item() == 0.0
-    assert zeroed["effective_D_channel_norm"].item() == 0.0
 
 
 def test_fusion_shares_sum_to_one_and_zero_energy_is_invalid() -> None:
@@ -255,7 +245,6 @@ def test_fusion_shares_sum_to_one_and_zero_energy_is_invalid() -> None:
         for name in (
             "fusion_share_raw",
             "fusion_share_temporal",
-            "fusion_share_channel",
         )
     )
     assert total.item() == pytest.approx(1.0)

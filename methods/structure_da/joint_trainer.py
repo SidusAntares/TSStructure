@@ -134,8 +134,6 @@ class JointStructureDATrainStepOutput:
     mean_alpha_residual: Tensor
     mean_beta_trend_temporal: Tensor
     mean_beta_dynamics_temporal: Tensor
-    mean_beta_trend_channel: Tensor
-    mean_beta_dynamics_channel: Tensor
     diagnostics: JointStructureDADiagnostics
     source_decomposition_diagnostics: DecompositionDiagnostics
     target_decomposition_diagnostics: DecompositionDiagnostics
@@ -265,8 +263,6 @@ def _check_bounded_training_values(model, quality, alignment) -> None:
         "alpha_residual": quality.alpha_residual,
         "beta_trend_temporal": quality.beta_trend_temporal,
         "beta_dynamics_temporal": quality.beta_dynamics_temporal,
-        "beta_trend_channel": quality.beta_trend_channel,
-        "beta_dynamics_channel": quality.beta_dynamics_channel,
     }
     for name, value in coefficients.items():
         detached = value.detach()
@@ -316,10 +312,10 @@ def _domain_diagnostics(prefix: str, output, eps: float) -> dict[str, Tensor]:
         decomposition.trend + decomposition.dynamics + decomposition.residual
     )
     reconstruction_error = _masked_mean_square(
-        reconstruction - output.backbone.channel_tokens,
+        reconstruction - output.backbone.tokens,
         time_mask,
     ) / (
-        _masked_mean_square(output.backbone.channel_tokens, time_mask) + eps
+        _masked_mean_square(output.backbone.tokens, time_mask) + eps
     )
     values = {
         f"{prefix}_{name}_energy_fraction": energy / (energy_total + eps)
@@ -330,32 +326,16 @@ def _domain_diagnostics(prefix: str, output, eps: float) -> dict[str, Tensor]:
         {
             f"{prefix}_temporal_T_valid_rate": output.temporal.trend.encoded.valid.float().mean(),
             f"{prefix}_temporal_D_valid_rate": output.temporal.dynamics.encoded.valid.float().mean(),
-            f"{prefix}_channel_T_valid_rate": output.channel.trend.valid.float().mean(),
-            f"{prefix}_channel_D_valid_rate": output.channel.dynamics.valid.float().mean(),
             f"{prefix}_raw_T_norm": _mean_l2_norm(output.representation.trend_embedding),
             f"{prefix}_raw_D_norm": _mean_l2_norm(output.representation.dynamics_embedding),
             f"{prefix}_raw_R_norm": _mean_l2_norm(output.representation.residual_embedding),
             f"{prefix}_temporal_T_norm": _mean_l2_norm(output.representation.temporal_features.trend),
             f"{prefix}_temporal_D_norm": _mean_l2_norm(output.representation.temporal_features.dynamics),
-            f"{prefix}_channel_T_norm": _mean_l2_norm(output.representation.channel_features.trend),
-            f"{prefix}_channel_D_norm": _mean_l2_norm(output.representation.channel_features.dynamics),
             f"{prefix}_raw_fusion_norm": _mean_l2_norm(output.representation.quality.raw_fusion),
             f"{prefix}_temporal_fusion_norm": _mean_l2_norm(output.representation.quality.temporal_fusion),
-            f"{prefix}_channel_fusion_norm": _mean_l2_norm(output.representation.quality.channel_fusion),
             f"{prefix}_fused_feature_norm": _mean_l2_norm(output.representation.quality.fused_feature),
         }
     )
-    for component, channel_output in (
-        ("T", output.channel.trend),
-        ("D", output.channel.dynamics),
-    ):
-        values.update(
-            {
-                f"{prefix}_channel_{component}_relation_mass": channel_output.relation_mass.mean(),
-                f"{prefix}_channel_{component}_state_reliability_mean": channel_output.state_reliability.mean(),
-                f"{prefix}_channel_{component}_evolution_reliability_mean": channel_output.evolution_reliability.mean(),
-            }
-        )
     quality = output.representation.quality
     for name, coefficient in (
         ("alpha_T", quality.alpha_trend),
@@ -363,8 +343,6 @@ def _domain_diagnostics(prefix: str, output, eps: float) -> dict[str, Tensor]:
         ("alpha_R", quality.alpha_residual),
         ("beta_T_temporal", quality.beta_trend_temporal),
         ("beta_D_temporal", quality.beta_dynamics_temporal),
-        ("beta_T_channel", quality.beta_trend_channel),
-        ("beta_D_channel", quality.beta_dynamics_channel),
     ):
         values[f"{prefix}_{name}_mean"] = coefficient.mean()
         values[f"{prefix}_{name}_std"] = coefficient.std(unbiased=False)
@@ -422,7 +400,7 @@ def _decomposition_diagnostics(
 ) -> DecompositionDiagnostics:
     decomposition = output.backbone.decomposition
     return compute_decomposition_diagnostics(
-        output.backbone.channel_tokens,
+        output.backbone.tokens,
         decomposition.trend,
         decomposition.dynamics,
         decomposition.residual,
@@ -441,19 +419,12 @@ def _contribution_diagnostics(output) -> ContributionDiagnostics:
         alpha_R=quality.alpha_residual,
         beta_T_temporal=quality.beta_trend_temporal,
         beta_D_temporal=quality.beta_dynamics_temporal,
-        beta_T_channel=quality.beta_trend_channel,
-        beta_D_channel=quality.beta_dynamics_channel,
         temporal_T=representation.temporal_features.trend,
         temporal_D=representation.temporal_features.dynamics,
-        channel_T=representation.channel_features.trend,
-        channel_D=representation.channel_features.dynamics,
         raw_fusion=quality.raw_fusion,
         temporal_fusion=quality.temporal_fusion,
-        channel_fusion=quality.channel_fusion,
         temporal_T_valid=representation.temporal_features.trend_valid,
         temporal_D_valid=representation.temporal_features.dynamics_valid,
-        channel_T_valid=representation.channel_features.trend_valid,
-        channel_D_valid=representation.channel_features.dynamics_valid,
     )
 
 
@@ -606,8 +577,6 @@ def joint_structure_da_train_step(
         mean_alpha_residual=quality.alpha_residual.mean(),
         mean_beta_trend_temporal=quality.beta_trend_temporal.mean(),
         mean_beta_dynamics_temporal=quality.beta_dynamics_temporal.mean(),
-        mean_beta_trend_channel=quality.beta_trend_channel.mean(),
-        mean_beta_dynamics_channel=quality.beta_dynamics_channel.mean(),
         diagnostics=diagnostics,
         source_decomposition_diagnostics=source_decomposition_diagnostics,
         target_decomposition_diagnostics=target_decomposition_diagnostics,
@@ -656,25 +625,14 @@ def _diagnostic_tensorboard_tag(name: str) -> str | None:
             "reconstruction_relative_error": "reconstruction_relative_error",
             "temporal_T_valid_rate": "temporal_valid_trend",
             "temporal_D_valid_rate": "temporal_valid_dynamics",
-            "channel_T_valid_rate": "channel_valid_trend",
-            "channel_D_valid_rate": "channel_valid_dynamics",
             "raw_T_norm": "raw_norm_trend",
             "raw_D_norm": "raw_norm_dynamics",
             "raw_R_norm": "raw_norm_residual",
             "temporal_T_norm": "temporal_norm_trend",
             "temporal_D_norm": "temporal_norm_dynamics",
-            "channel_T_norm": "channel_norm_trend",
-            "channel_D_norm": "channel_norm_dynamics",
             "raw_fusion_norm": "fusion_norm_raw",
             "temporal_fusion_norm": "fusion_norm_temporal",
-            "channel_fusion_norm": "fusion_norm_channel",
             "fused_feature_norm": "fusion_norm_final",
-            "channel_T_relation_mass": "channel_relation_mass_trend",
-            "channel_D_relation_mass": "channel_relation_mass_dynamics",
-            "channel_T_state_reliability_mean": "channel_state_reliability_trend",
-            "channel_D_state_reliability_mean": "channel_state_reliability_dynamics",
-            "channel_T_evolution_reliability_mean": "channel_evolution_reliability_trend",
-            "channel_D_evolution_reliability_mean": "channel_evolution_reliability_dynamics",
             "alpha_T_mean": "alpha_trend_mean",
             "alpha_T_std": "alpha_trend_std",
             "alpha_D_mean": "alpha_dynamics_mean",
@@ -685,10 +643,6 @@ def _diagnostic_tensorboard_tag(name: str) -> str | None:
             "beta_T_temporal_std": "beta_trend_temporal_std",
             "beta_D_temporal_mean": "beta_dynamics_temporal_mean",
             "beta_D_temporal_std": "beta_dynamics_temporal_std",
-            "beta_T_channel_mean": "beta_trend_channel_mean",
-            "beta_T_channel_std": "beta_trend_channel_std",
-            "beta_D_channel_mean": "beta_dynamics_channel_mean",
-            "beta_D_channel_std": "beta_dynamics_channel_std",
         }
         if suffix in suffix_tags:
             return f"train/{domain}/{suffix_tags[suffix]}"
@@ -708,8 +662,6 @@ def _collect_validation_structure_contributions(
         raise ValueError("classes must be nonempty")
     mode_logits: dict[str, list[Tensor]] = {
         "full": [],
-        "no_temporal": [],
-        "no_channel": [],
         "raw_only": [],
     }
     labels: list[Tensor] = []
@@ -721,14 +673,10 @@ def _collect_validation_structure_contributions(
         quality = output.representation.quality
         raw = quality.raw_fusion
         temporal = quality.temporal_fusion
-        channel = quality.channel_fusion
         zero_temporal = torch.zeros_like(temporal)
-        zero_channel = torch.zeros_like(channel)
         mode_logits["full"].append(output.representation.logits.detach().cpu())
         features = {
-            "no_temporal": torch.cat([raw, zero_temporal, channel], dim=-1),
-            "no_channel": torch.cat([raw, temporal, zero_channel], dim=-1),
-            "raw_only": torch.cat([raw, zero_temporal, zero_channel], dim=-1),
+            "raw_only": torch.cat([raw, zero_temporal], dim=-1),
         }
         for name, feature in features.items():
             mode_logits[name].append(
@@ -764,14 +712,6 @@ def _collect_validation_structure_contributions(
             f"{name}_f1": values["macro_f1"]
             for name, values in per_mode.items()
         },
-        "delta_temporal": (
-            per_mode["full"]["macro_f1"]
-            - per_mode["no_temporal"]["macro_f1"]
-        ),
-        "delta_channel": (
-            per_mode["full"]["macro_f1"]
-            - per_mode["no_channel"]["macro_f1"]
-        ),
         "delta_structure": (
             per_mode["full"]["macro_f1"]
             - per_mode["raw_only"]["macro_f1"]
@@ -1050,8 +990,6 @@ def train_joint_structure_da(
                     ("train/alpha_residual", result.mean_alpha_residual),
                     ("train/beta_trend_temporal", result.mean_beta_trend_temporal),
                     ("train/beta_dynamics_temporal", result.mean_beta_dynamics_temporal),
-                    ("train/beta_trend_channel", result.mean_beta_trend_channel),
-                    ("train/beta_dynamics_channel", result.mean_beta_dynamics_channel),
                 ):
                     writer.add_scalar(tag, value.detach().item(), global_step)
                 for name, value in diagnostics.items():
@@ -1106,20 +1044,10 @@ def train_joint_structure_da(
                 f"|temporal_D_valid_s={diagnostic_average['source_temporal_D_valid_rate']:.4f}"
                 f"|temporal_T_valid_t={diagnostic_average['target_temporal_T_valid_rate']:.4f}"
                 f"|temporal_D_valid_t={diagnostic_average['target_temporal_D_valid_rate']:.4f}"
-                f"|channel_T_valid_s={diagnostic_average['source_channel_T_valid_rate']:.4f}"
-                f"|channel_D_valid_s={diagnostic_average['source_channel_D_valid_rate']:.4f}"
-                f"|channel_T_valid_t={diagnostic_average['target_channel_T_valid_rate']:.4f}"
-                f"|channel_D_valid_t={diagnostic_average['target_channel_D_valid_rate']:.4f}"
                 f"|raw_fusion_norm_s={diagnostic_average['source_raw_fusion_norm']:.4f}"
                 f"|raw_fusion_norm_t={diagnostic_average['target_raw_fusion_norm']:.4f}"
                 f"|temporal_fusion_norm_s={diagnostic_average['source_temporal_fusion_norm']:.4f}"
                 f"|temporal_fusion_norm_t={diagnostic_average['target_temporal_fusion_norm']:.4f}"
-                f"|channel_fusion_norm_s={diagnostic_average['source_channel_fusion_norm']:.4f}"
-                f"|channel_fusion_norm_t={diagnostic_average['target_channel_fusion_norm']:.4f}"
-                f"|channel_T_relation_mass_s={diagnostic_average['source_channel_T_relation_mass']:.4f}"
-                f"|channel_D_relation_mass_s={diagnostic_average['source_channel_D_relation_mass']:.4f}"
-                f"|channel_T_relation_mass_t={diagnostic_average['target_channel_T_relation_mass']:.4f}"
-                f"|channel_D_relation_mass_t={diagnostic_average['target_channel_D_relation_mass']:.4f}"
             )
             print(
                 f"QUALITY_EPOCH|epoch={epoch + 1}"
@@ -1134,10 +1062,6 @@ def train_joint_structure_da(
                 f"|beta_T_temporal_t={diagnostic_average['target_beta_T_temporal_mean']:.4f}"
                 f"|beta_D_temporal_s={diagnostic_average['source_beta_D_temporal_mean']:.4f}"
                 f"|beta_D_temporal_t={diagnostic_average['target_beta_D_temporal_mean']:.4f}"
-                f"|beta_T_channel_s={diagnostic_average['source_beta_T_channel_mean']:.4f}"
-                f"|beta_T_channel_t={diagnostic_average['target_beta_T_channel_mean']:.4f}"
-                f"|beta_D_channel_s={diagnostic_average['source_beta_D_channel_mean']:.4f}"
-                f"|beta_D_channel_t={diagnostic_average['target_beta_D_channel_mean']:.4f}"
             )
             print(
                 f"GEOMETRY_EPOCH|epoch={epoch + 1}"

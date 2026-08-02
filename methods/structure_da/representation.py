@@ -12,7 +12,6 @@ from torch import Tensor, nn
 from models.decoder import get_decoder
 from models.ltae import ComponentAwareSharedLTAE
 
-from .channel_module import ChannelStructurePairOutput
 from .decomposition import DecompositionOutput
 from .quality_fusion import HierarchicalQualityFusion, HierarchicalQualityOutput
 from .temporal_module import TemporalStructurePairOutput
@@ -38,20 +37,6 @@ class PairedStructureFeatures:
             dynamics_valid=output.dynamics.encoded.valid,
         )
 
-    @classmethod
-    def from_channel(
-        cls, output: ChannelStructurePairOutput
-    ) -> "PairedStructureFeatures":
-        if not isinstance(output, ChannelStructurePairOutput):
-            raise ValueError("output must be a ChannelStructurePairOutput")
-        return cls(
-            trend=output.trend.feature,
-            dynamics=output.dynamics.feature,
-            trend_valid=output.trend.valid,
-            dynamics_valid=output.dynamics.valid,
-        )
-
-
 @dataclass(frozen=True)
 class QualityAwareClassifierOutput:
     logits: Tensor
@@ -60,7 +45,6 @@ class QualityAwareClassifierOutput:
     dynamics_embedding: Tensor
     residual_embedding: Tensor
     temporal_features: PairedStructureFeatures
-    channel_features: PairedStructureFeatures
     quality: HierarchicalQualityOutput
     component_valid: Tensor
     ltae_positions: Tensor
@@ -110,8 +94,7 @@ class QualityAwareComponentClassifier(nn.Module):
 
     def __init__(
         self,
-        num_channels: int,
-        channel_feature_dim: int,
+        component_input_dim: int,
         structure_dim: int,
         num_classes: int,
         n_head: int = 16,
@@ -127,9 +110,8 @@ class QualityAwareComponentClassifier(nn.Module):
         quality_eps: float = 1e-8,
     ) -> None:
         super().__init__()
-        self.num_channels = _positive_int("num_channels", num_channels)
-        self.channel_feature_dim = _positive_int(
-            "channel_feature_dim", channel_feature_dim
+        self.component_input_dim = _positive_int(
+            "component_input_dim", component_input_dim
         )
         self.structure_dim = _positive_int("structure_dim", structure_dim)
         self.num_classes = _positive_int("num_classes", num_classes, minimum=2)
@@ -172,9 +154,8 @@ class QualityAwareComponentClassifier(nn.Module):
         if not math.isfinite(dropout) or not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must lie in [0, 1)")
 
-        raw_component_dim = num_channels * channel_feature_dim
         self.component_ltae = ComponentAwareSharedLTAE(
-            in_channels=raw_component_dim,
+            in_channels=self.component_input_dim,
             n_head=n_head,
             d_k=d_k,
             n_neurons=list(ltae_mlp),
@@ -185,6 +166,7 @@ class QualityAwareComponentClassifier(nn.Module):
             max_position=max_position,
         )
         self.component_dim = ltae_mlp[-1]
+        self.fused_dim = self.component_dim + structure_dim
         self.quality_fusion = HierarchicalQualityFusion(
             component_dim=self.component_dim,
             structure_dim=structure_dim,
@@ -194,7 +176,7 @@ class QualityAwareComponentClassifier(nn.Module):
         )
         self.classifier = get_decoder(
             [
-                self.component_dim + 2 * structure_dim,
+                self.fused_dim,
                 *classifier_hidden,
             ],
             num_classes,
@@ -215,8 +197,7 @@ class QualityAwareComponentClassifier(nn.Module):
         expected_shape = (
             time_mask.shape[0],
             time_mask.shape[1],
-            self.num_channels,
-            self.channel_feature_dim,
+            self.component_input_dim,
         )
         reference_parameter = next(self.component_ltae.parameters())
         safe_components = []
@@ -224,10 +205,10 @@ class QualityAwareComponentClassifier(nn.Module):
             if (
                 not isinstance(component, Tensor)
                 or component.shape != expected_shape
-                or component.ndim != 4
+                or component.ndim != 3
             ):
                 raise ValueError(
-                    "decomposition components must have identical shape [B, L, C, P]"
+                    "decomposition components must have identical shape [B, L, D]"
                 )
             if not component.is_floating_point():
                 raise ValueError("decomposition components must be floating point")
@@ -236,7 +217,7 @@ class QualityAwareComponentClassifier(nn.Module):
                     "decomposition and classifier must use the same dtype and device"
                 )
             safe = torch.where(
-                time_mask[:, :, None, None],
+                time_mask[:, :, None],
                 component,
                 torch.zeros_like(component),
             )
@@ -324,15 +305,14 @@ class QualityAwareComponentClassifier(nn.Module):
         self,
         decomposition: DecompositionOutput,
         temporal_features: PairedStructureFeatures,
-        channel_features: PairedStructureFeatures,
         positions: Tensor,
         time_mask: Tensor | None = None,
         domain_score_weight: float = 1.0,
     ) -> QualityAwareClassifierOutput:
         if not isinstance(decomposition, DecompositionOutput):
             raise ValueError("decomposition must be a DecompositionOutput")
-        if not isinstance(decomposition.trend, Tensor) or decomposition.trend.ndim != 4:
-            raise ValueError("decomposition components must have shape [B, L, C, P]")
+        if not isinstance(decomposition.trend, Tensor) or decomposition.trend.ndim != 3:
+            raise ValueError("decomposition components must have shape [B, L, D]")
         batch_size, sequence_length = decomposition.trend.shape[:2]
         resolved_mask = _resolve_time_mask(
             time_mask,
@@ -346,20 +326,14 @@ class QualityAwareComponentClassifier(nn.Module):
         self._validate_structure_features(
             temporal_features, "temporal_features", batch_size, trend
         )
-        self._validate_structure_features(
-            channel_features, "channel_features", batch_size, trend
-        )
         ltae_positions = self._resolve_positions(
             positions, resolved_mask, trend.device
         )
-        trend_sequence = trend.flatten(start_dim=2)
-        dynamics_sequence = dynamics.flatten(start_dim=2)
-        residual_sequence = residual.flatten(start_dim=2)
         trend_embedding, dynamics_embedding, residual_embedding = (
             self.component_ltae(
-                trend_sequence,
-                dynamics_sequence,
-                residual_sequence,
+                trend,
+                dynamics,
+                residual,
                 ltae_positions,
                 time_mask=resolved_mask,
             )
@@ -371,13 +345,9 @@ class QualityAwareComponentClassifier(nn.Module):
             residual_embedding,
             temporal_features.trend,
             temporal_features.dynamics,
-            channel_features.trend,
-            channel_features.dynamics,
             component_valid,
             temporal_features.trend_valid,
             temporal_features.dynamics_valid,
-            channel_features.trend_valid,
-            channel_features.dynamics_valid,
             domain_score_weight,
         )
         logits = self.classifier(quality.fused_feature)
@@ -388,7 +358,6 @@ class QualityAwareComponentClassifier(nn.Module):
             dynamics_embedding=dynamics_embedding,
             residual_embedding=residual_embedding,
             temporal_features=temporal_features,
-            channel_features=channel_features,
             quality=quality,
             component_valid=component_valid,
             ltae_positions=ltae_positions,

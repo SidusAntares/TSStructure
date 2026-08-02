@@ -590,8 +590,7 @@ def test_rejects_nonfinite_inputs(field, bad_value) -> None:
 
 def _real_registration(dtype: torch.dtype = torch.float32):
     registration = TemporalSRVFRegistration(
-        num_channels=1,
-        channel_feature_dim=2,
+        feature_dim=2,
         num_basis=6,
         canonical_grid_size=8,
         roughness_grid_size=64,
@@ -602,7 +601,7 @@ def _real_registration(dtype: torch.dtype = torch.float32):
         warp_kernel_size=3,
     ).to(dtype=dtype)
     torch.manual_seed(94)
-    tokens = torch.randn(2, 6, 1, 2, dtype=dtype)
+    tokens = torch.randn(2, 6, 2, dtype=dtype)
     positions = torch.tensor(
         [0.0, 39.0, 92.0, 157.0, 244.0, 345.0], dtype=dtype
     )

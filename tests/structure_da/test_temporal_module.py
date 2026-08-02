@@ -29,8 +29,7 @@ def _extractor(
     **overrides,
 ) -> TemporalStructureExtractor:
     kwargs = dict(
-        num_channels=1,
-        channel_feature_dim=2,
+        feature_dim=2,
         num_basis=6,
         canonical_grid_size=7,
         roughness_grid_size=64,
@@ -58,7 +57,7 @@ def _inputs(
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(72)
-    tokens = torch.randn(batch_size, 6, 1, 2, dtype=dtype)
+    tokens = torch.randn(batch_size, 6, 2, dtype=dtype)
     positions = torch.tensor(
         [0.0, 39.0, 92.0, 157.0, 244.0, 345.0], dtype=dtype
     )
@@ -587,12 +586,12 @@ def test_shared_operator_rejects_wrong_extractor_type() -> None:
 @pytest.mark.parametrize(
     "field,value,match",
     [
-        ("trend", torch.ones(2, 6, 2), "four-dimensional"),
-        ("dynamics", torch.ones(2, 6, 2), "four-dimensional"),
-        ("dynamics", torch.ones(2, 5, 1, 2), "shape"),
-        ("dynamics", torch.ones(2, 6, 1, 2, dtype=torch.float64), "dtype"),
-        ("trend", torch.full((2, 6, 1, 2), float("nan")), "finite"),
-        ("dynamics", torch.full((2, 6, 1, 2), float("inf")), "finite"),
+        ("trend", torch.ones(2, 6, 1, 2), "three-dimensional"),
+        ("dynamics", torch.ones(2, 6, 1, 2), "three-dimensional"),
+        ("dynamics", torch.ones(2, 5, 2), "shape"),
+        ("dynamics", torch.ones(2, 6, 2, dtype=torch.float64), "dtype"),
+        ("trend", torch.full((2, 6, 2), float("nan")), "finite"),
+        ("dynamics", torch.full((2, 6, 2), float("inf")), "finite"),
     ],
 )
 def test_shared_operator_rejects_invalid_components(field, value, match) -> None:
@@ -611,7 +610,7 @@ def test_shared_operator_rejects_invalid_components(field, value, match) -> None
 def test_shared_operator_rejects_component_device_mismatch() -> None:
     operator = SharedTemporalStructureOperator(_extractor())
     trend, positions, time_mask = _inputs()
-    dynamics = torch.ones(2, 6, 1, 2, device="meta")
+    dynamics = torch.ones(2, 6, 2, device="meta")
     with pytest.raises(ValueError, match="device"):
         operator.forward_task(trend, dynamics, positions, time_mask)
 
@@ -648,8 +647,7 @@ def test_geometry_rejects_invalid_source_mask(source_mask) -> None:
 @pytest.mark.parametrize(
     "overrides,match",
     [
-        ({"num_channels": 0}, "num_channels"),
-        ({"channel_feature_dim": 0}, "channel_feature_dim"),
+        ({"feature_dim": 0}, "feature_dim"),
         ({"canonical_grid_size": 2}, "canonical_grid_size"),
         ({"num_shape_basis": 0}, "num_shape_basis"),
         ({"num_phase_basis": 6}, "num_phase_basis"),

@@ -68,8 +68,6 @@ def build_analysis_tables(runs: Iterable[ParsedRun]) -> dict[str, pd.DataFrame]:
                 "alpha_R": epoch.alpha_R,
                 "beta_T_temp": epoch.beta_T_temp,
                 "beta_D_temp": epoch.beta_D_temp,
-                "beta_T_channel": epoch.beta_T_channel,
-                "beta_D_channel": epoch.beta_D_channel,
                 "grl": epoch.grl, "lr": epoch.lr, "val_loss": epoch.val_loss,
                 "val_accuracy": epoch.val_accuracy, "val_macro_f1": epoch.val_macro_f1,
             })

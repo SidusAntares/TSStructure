@@ -1,4 +1,4 @@
-"""Channel-preserving input backbone for structure-aware models."""
+"""Pixel-set input backbone for structure-aware models."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from models.pse import ChannelPreservingPixelSetEncoder
+from models.pse import PixelSetEncoder
 from .decomposition import (
     DecompositionOutput,
     SymmetricTimeKernelDecomposition,
@@ -16,9 +16,9 @@ from .decomposition import (
 
 @dataclass(frozen=True)
 class StructureBackboneOutput:
-    """Channel tokens, resolved date validity, and temporal components."""
+    """PSE tokens, resolved date validity, and temporal components."""
 
-    channel_tokens: Tensor
+    tokens: Tensor
     time_mask: Tensor
     decomposition: DecompositionOutput
 
@@ -57,13 +57,16 @@ def _resolve_time_mask(
 
 
 class StructureBackbone(nn.Module):
-    """Encode parcel pixels per channel, then decompose only along time."""
+    """Encode parcel pixel sets, then decompose their temporal features."""
 
     def __init__(
         self,
-        num_channels: int = 10,
-        channel_feature_dim: int = 16,
-        pixel_hidden_dim: int = 16,
+        input_dim: int = 10,
+        mlp1: list[int] | None = None,
+        pooling: str = "mean_std",
+        mlp2: list[int] | None = None,
+        with_extra: bool = False,
+        extra_size: int = 4,
         tau_fast_init: float = 0.05,
         tau_slow_init: float = 0.20,
         tau_min: float = 1e-4,
@@ -72,12 +75,23 @@ class StructureBackbone(nn.Module):
         eps: float = 1e-8,
     ) -> None:
         super().__init__()
-        self.pixel_set_encoder = ChannelPreservingPixelSetEncoder(
-            num_channels=num_channels,
-            channel_feature_dim=channel_feature_dim,
-            pixel_hidden_dim=pixel_hidden_dim,
-            eps=eps,
+        if mlp1 is None:
+            mlp1 = [input_dim, 32, 64]
+        if mlp2 is None:
+            mlp2 = [128, 128]
+        else:
+            mlp2 = list(mlp2)
+        if with_extra:
+            mlp2[0] += extra_size
+        self.pixel_set_encoder = PixelSetEncoder(
+            input_dim=input_dim,
+            mlp1=mlp1,
+            pooling=pooling,
+            mlp2=mlp2,
+            with_extra=with_extra,
+            extra_size=extra_size,
         )
+        self.feature_dim = self.pixel_set_encoder.output_dim
         self.decomposition = SymmetricTimeKernelDecomposition(
             tau_fast_init=tau_fast_init,
             tau_slow_init=tau_slow_init,
@@ -92,13 +106,15 @@ class StructureBackbone(nn.Module):
         pixels: Tensor,
         valid_pixels: Tensor,
         positions: Tensor,
+        extra: Tensor | None,
         time_mask: Tensor | None = None,
     ) -> StructureBackboneOutput:
-        channel_tokens = self.pixel_set_encoder(
+        tokens = self.pixel_set_encoder(
             pixels,
             valid_pixels,
+            extra,
         )
-        batch_size, sequence_length = channel_tokens.shape[:2]
+        batch_size, sequence_length = tokens.shape[:2]
         resolved_time_mask = _resolve_time_mask(
             time_mask,
             batch_size,
@@ -106,12 +122,12 @@ class StructureBackbone(nn.Module):
             pixels.device,
         )
         decomposition = self.decomposition(
-            channel_tokens,
+            tokens,
             positions,
             resolved_time_mask,
         )
         return StructureBackboneOutput(
-            channel_tokens=channel_tokens,
+            tokens=tokens,
             time_mask=resolved_time_mask,
             decomposition=decomposition,
         )

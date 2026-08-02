@@ -40,9 +40,9 @@ def _synchronize(device: torch.device) -> None:
 def _model(device: torch.device) -> StructureAwareDomainAdaptationModel:
     return StructureAwareDomainAdaptationModel(
         num_classes=3,
-        num_channels=3,
-        channel_feature_dim=4,
-        pixel_hidden_dim=6,
+        input_dim=3,
+        mlp1=(3, 12, 8),
+        mlp2=(16, 8),
         structure_dim=8,
         temporal_options={
             "num_basis": 6,
@@ -57,15 +57,6 @@ def _model(device: torch.device) -> StructureAwareDomainAdaptationModel:
             "num_phase_basis": 3,
             "attribute_projection_dim": 4,
             "coordinate_hidden_dim": 12,
-            "dropout": 0.0,
-        },
-        channel_options={
-            "lag_centers": (-0.15, 0.0, 0.15),
-            "lag_widths": (0.1, 0.1, 0.1),
-            "velocity_bandwidth": 0.15,
-            "edge_hidden_dim": 8,
-            "min_effective_pairs": 1.0,
-            "min_relation_mass": 0.0,
             "dropout": 0.0,
         },
         representation_options={

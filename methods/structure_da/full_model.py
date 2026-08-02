@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from collections.abc import Iterator
 from typing import Any
 
 import torch
 from torch import Tensor, nn
 
 from .backbone import StructureBackbone, StructureBackboneOutput
-from .channel_module import (
-    ChannelStructurePairOutput,
-    MultiScaleChannelRelationStructure,
-    SharedChannelStructureOperator,
-)
 from .decomposition import DecompositionOutput
 from .eden_alignment import EDENDomainAlignmentOutput, EDENFusedFeatureAlignment
 from .representation import (
@@ -35,7 +29,6 @@ from .temporal_module import (
 class StructureAwareForwardOutput:
     backbone: StructureBackboneOutput
     temporal: TemporalStructurePairOutput
-    channel: ChannelStructurePairOutput
     representation: QualityAwareClassifierOutput
 
 
@@ -49,9 +42,7 @@ class StructureAwareGeometryOutput:
 
 
 def _options_with_fixed(
-    name: str,
-    options: Mapping[str, Any] | None,
-    **fixed: Any,
+    name: str, options: Mapping[str, Any] | None, **fixed: Any
 ) -> dict[str, Any]:
     if options is None:
         resolved: dict[str, Any] = {}
@@ -70,9 +61,12 @@ class StructureAwareDomainAdaptationModel(nn.Module):
     def __init__(
         self,
         num_classes: int,
-        num_channels: int = 10,
-        channel_feature_dim: int = 16,
-        pixel_hidden_dim: int = 16,
+        input_dim: int = 10,
+        mlp1: Sequence[int] | None = None,
+        pooling: str = "mean_std",
+        mlp2: Sequence[int] | None = None,
+        with_extra: bool = False,
+        extra_size: int = 4,
         structure_dim: int = 128,
         time_scale: float = 366.0,
         tau_fast_init: float = 0.05,
@@ -80,7 +74,6 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         tau_min: float = 1e-4,
         delta_tau_min: float = 1e-4,
         temporal_options: Mapping[str, Any] | None = None,
-        channel_options: Mapping[str, Any] | None = None,
         representation_options: Mapping[str, Any] | None = None,
         alignment_hidden_dim: int = 128,
         grl_alpha: float = 1.0,
@@ -90,14 +83,14 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         super().__init__()
         if isinstance(num_classes, bool) or not isinstance(num_classes, int) or num_classes < 2:
             raise ValueError("num_classes must be at least 2")
-        if isinstance(num_channels, bool) or not isinstance(num_channels, int) or num_channels < 2:
-            raise ValueError("num_channels must be at least 2")
-        self.num_channels = num_channels
         self.structure_dim = structure_dim
         self.backbone = StructureBackbone(
-            num_channels=num_channels,
-            channel_feature_dim=channel_feature_dim,
-            pixel_hidden_dim=pixel_hidden_dim,
+            input_dim=input_dim,
+            mlp1=None if mlp1 is None else list(mlp1),
+            pooling=pooling,
+            mlp2=None if mlp2 is None else list(mlp2),
+            with_extra=with_extra,
+            extra_size=extra_size,
             tau_fast_init=tau_fast_init,
             tau_slow_init=tau_slow_init,
             tau_min=tau_min,
@@ -107,119 +100,49 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         temporal_kwargs = _options_with_fixed(
             "temporal_options",
             temporal_options,
-            num_channels=num_channels,
-            channel_feature_dim=channel_feature_dim,
+            feature_dim=self.backbone.feature_dim,
             structure_dim=structure_dim,
             time_scale=time_scale,
         )
         self.temporal_operator = SharedTemporalStructureOperator(
             TemporalStructureExtractor(**temporal_kwargs)
         )
-        channel_kwargs = _options_with_fixed(
-            "channel_options",
-            channel_options,
-            num_channels=num_channels,
-            token_dim=channel_feature_dim,
-            structure_dim=structure_dim,
-            time_scale=time_scale,
-        )
-        self.channel_operator = SharedChannelStructureOperator(
-            MultiScaleChannelRelationStructure(**channel_kwargs)
-        )
         representation_kwargs = _options_with_fixed(
             "representation_options",
             representation_options,
-            num_channels=num_channels,
-            channel_feature_dim=channel_feature_dim,
+            component_input_dim=self.backbone.feature_dim,
             structure_dim=structure_dim,
             num_classes=num_classes,
         )
-        self.representation = QualityAwareComponentClassifier(
-            **representation_kwargs
-        )
+        self.representation = QualityAwareComponentClassifier(**representation_kwargs)
         self.alignment = EDENFusedFeatureAlignment(
-            feature_dim=self.representation.component_dim + 2 * structure_dim,
+            feature_dim=self.representation.fused_dim,
             hidden_dim=alignment_hidden_dim,
             grl_alpha=grl_alpha,
             grl_max_iters=grl_max_iters,
             grl_weight=grl_weight,
         )
 
-    def _parameter_partition(
-        self,
-    ) -> tuple[tuple[nn.Parameter, ...], tuple[nn.Parameter, ...]]:
+    def _parameter_partition(self) -> tuple[tuple[nn.Parameter, ...], tuple[nn.Parameter, ...]]:
         geometry = tuple(
             parameter
             for parameter in self.temporal_operator.extractor.warp_parameters()
             if parameter.requires_grad
         )
         geometry_ids = {id(parameter) for parameter in geometry}
-        trainable = tuple(
-            parameter for parameter in self.parameters() if parameter.requires_grad
-        )
-        task = tuple(
-            parameter
-            for parameter in trainable
-            if id(parameter) not in geometry_ids
-        )
+        trainable = tuple(parameter for parameter in self.parameters() if parameter.requires_grad)
+        task = tuple(parameter for parameter in trainable if id(parameter) not in geometry_ids)
         task_ids = {id(parameter) for parameter in task}
         trainable_ids = {id(parameter) for parameter in trainable}
         if geometry_ids & task_ids or geometry_ids | task_ids != trainable_ids:
-            raise RuntimeError(
-                "geometry and task parameters must be disjoint and exhaustive"
-            )
+            raise RuntimeError("geometry and task parameters must be disjoint and exhaustive")
         return geometry, task
 
     def geometry_parameters(self) -> Iterator[nn.Parameter]:
-        """Yield exactly the trainable temporal warp-estimator parameters."""
-
         yield from self._parameter_partition()[0]
 
     def task_parameters(self) -> Iterator[nn.Parameter]:
-        """Yield every trainable parameter not owned by temporal geometry."""
-
         yield from self._parameter_partition()[1]
-
-    def _resolve_channel_mask(
-        self,
-        channel_mask: Tensor | None,
-        time_mask: Tensor,
-    ) -> Tensor:
-        batch_size, sequence_length = time_mask.shape
-        if channel_mask is None:
-            return time_mask.unsqueeze(-1).expand(-1, -1, self.num_channels)
-        if not isinstance(channel_mask, Tensor):
-            raise ValueError("channel_mask must be a torch.Tensor or None")
-        if channel_mask.ndim == 2:
-            if channel_mask.shape != (sequence_length, self.num_channels):
-                raise ValueError("channel_mask must have shape [L, C] or [B, L, C]")
-            channel_mask = channel_mask.unsqueeze(0).expand(batch_size, -1, -1)
-        elif channel_mask.ndim == 3:
-            if channel_mask.shape != (batch_size, sequence_length, self.num_channels):
-                raise ValueError("channel_mask must have shape [L, C] or [B, L, C]")
-        else:
-            raise ValueError("channel_mask must have shape [L, C] or [B, L, C]")
-        if channel_mask.is_complex() or (
-            channel_mask.dtype != torch.bool
-            and (
-                not torch.isfinite(channel_mask).all().item()
-                or not torch.all((channel_mask == 0) | (channel_mask == 1)).item()
-            )
-        ):
-            raise ValueError("channel_mask must contain only finite 0/1 values")
-        resolved = channel_mask.to(device=time_mask.device, dtype=torch.bool)
-        return resolved & time_mask.unsqueeze(-1)
-
-    def _backbone_and_mask(
-        self,
-        pixels: Tensor,
-        valid_pixels: Tensor,
-        positions: Tensor,
-        time_mask: Tensor | None,
-        channel_mask: Tensor | None,
-    ) -> tuple[StructureBackboneOutput, Tensor]:
-        backbone = self.backbone(pixels, valid_pixels, positions, time_mask)
-        return backbone, self._resolve_channel_mask(channel_mask, backbone.time_mask)
 
     def forward_backbone(
         self,
@@ -230,19 +153,14 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         *,
         time_mask: Tensor | None = None,
     ) -> StructureBackboneOutput:
-        del extra
-        return self.backbone(pixels, valid_pixels, positions, time_mask)
+        return self.backbone(pixels, valid_pixels, positions, extra, time_mask)
 
     @staticmethod
-    def detach_backbone_for_state(
-        backbone: StructureBackboneOutput,
-    ) -> StructureBackboneOutput:
-        """Build a typed, gradient-free view for source-only running state."""
-
+    def detach_backbone_for_state(backbone: StructureBackboneOutput) -> StructureBackboneOutput:
         if not isinstance(backbone, StructureBackboneOutput):
             raise ValueError("backbone must be a StructureBackboneOutput")
         return StructureBackboneOutput(
-            channel_tokens=backbone.channel_tokens.detach(),
+            tokens=backbone.tokens.detach(),
             time_mask=backbone.time_mask,
             decomposition=DecompositionOutput(
                 trend=backbone.decomposition.trend.detach(),
@@ -257,41 +175,26 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         positions: Tensor,
         extra: Tensor | None = None,
         *,
-        channel_mask: Tensor | None = None,
         domain_score_weight: float = 1.0,
     ) -> StructureAwareForwardOutput:
         del extra
         if not isinstance(backbone, StructureBackboneOutput):
             raise ValueError("backbone must be a StructureBackboneOutput")
-        resolved_channel_mask = self._resolve_channel_mask(
-            channel_mask, backbone.time_mask
-        )
         temporal = self.temporal_operator.forward_task(
             backbone.decomposition.trend,
             backbone.decomposition.dynamics,
             positions,
             backbone.time_mask,
         )
-        channel = self.channel_operator(
-            backbone.decomposition.trend,
-            backbone.decomposition.dynamics,
-            positions,
-            backbone.time_mask,
-            resolved_channel_mask,
-        )
         representation = self.representation(
             backbone.decomposition,
             PairedStructureFeatures.from_temporal(temporal),
-            PairedStructureFeatures.from_channel(channel),
             positions,
             backbone.time_mask,
             domain_score_weight=domain_score_weight,
         )
         return StructureAwareForwardOutput(
-            backbone=backbone,
-            temporal=temporal,
-            channel=channel,
-            representation=representation,
+            backbone=backbone, temporal=temporal, representation=representation
         )
 
     def forward_details(
@@ -302,21 +205,13 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         extra: Tensor | None = None,
         *,
         time_mask: Tensor | None = None,
-        channel_mask: Tensor | None = None,
         domain_score_weight: float = 1.0,
     ) -> StructureAwareForwardOutput:
         backbone = self.forward_backbone(
-            pixels,
-            valid_pixels,
-            positions,
-            extra,
-            time_mask=time_mask,
+            pixels, valid_pixels, positions, extra, time_mask=time_mask
         )
         return self.forward_from_backbone(
-            backbone,
-            positions,
-            channel_mask=channel_mask,
-            domain_score_weight=domain_score_weight,
+            backbone, positions, domain_score_weight=domain_score_weight
         )
 
     def forward(
@@ -327,7 +222,6 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         extra: Tensor | None = None,
         *,
         time_mask: Tensor | None = None,
-        channel_mask: Tensor | None = None,
         domain_score_weight: float = 1.0,
     ) -> Tensor:
         return self.forward_details(
@@ -336,35 +230,20 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             positions,
             extra,
             time_mask=time_mask,
-            channel_mask=channel_mask,
             domain_score_weight=domain_score_weight,
         ).representation.logits
 
     @torch.no_grad()
     def update_source_state_from_backbone(
-        self,
-        backbone: StructureBackboneOutput,
-        positions: Tensor,
-        *,
-        channel_mask: Tensor | None = None,
+        self, backbone: StructureBackboneOutput, positions: Tensor
     ) -> None:
         if not isinstance(backbone, StructureBackboneOutput):
             raise ValueError("backbone must be a StructureBackboneOutput")
-        resolved_channel_mask = self._resolve_channel_mask(
-            channel_mask, backbone.time_mask
-        )
         self.temporal_operator.update_source_state(
             backbone.decomposition.trend,
             backbone.decomposition.dynamics,
             positions,
             backbone.time_mask,
-        )
-        self.channel_operator.update_source_state(
-            backbone.decomposition.trend,
-            backbone.decomposition.dynamics,
-            positions,
-            backbone.time_mask,
-            resolved_channel_mask,
         )
 
     @torch.no_grad()
@@ -376,25 +255,16 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         extra: Tensor | None = None,
         *,
         time_mask: Tensor | None = None,
-        channel_mask: Tensor | None = None,
     ) -> None:
         backbone = self.forward_backbone(
-            pixels,
-            valid_pixels,
-            positions,
-            extra,
-            time_mask=time_mask,
+            pixels, valid_pixels, positions, extra, time_mask=time_mask
         )
         self.update_source_state_from_backbone(
-            self.detach_backbone_for_state(backbone),
-            positions,
-            channel_mask=channel_mask,
+            self.detach_backbone_for_state(backbone), positions
         )
 
     def forward_source_geometry(
-        self,
-        source_output: StructureAwareForwardOutput,
-        positions: Tensor,
+        self, source_output: StructureAwareForwardOutput, positions: Tensor
     ) -> StructureAwareGeometryOutput:
         if not isinstance(source_output, StructureAwareForwardOutput):
             raise ValueError("source_output must be StructureAwareForwardOutput")
@@ -402,9 +272,7 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         trend = source_output.backbone.decomposition.trend
         temporal = self.temporal_operator.forward_geometry_from_task(
             source_output.temporal,
-            source_mask=torch.ones(
-                trend.shape[0], dtype=torch.bool, device=trend.device
-            ),
+            source_mask=torch.ones(trend.shape[0], dtype=torch.bool, device=trend.device),
         )
         return StructureAwareGeometryOutput(temporal=temporal)
 

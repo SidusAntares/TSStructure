@@ -154,8 +154,7 @@ class TemporalStructureExtractor(nn.Module):
 
     def __init__(
         self,
-        num_channels: int,
-        channel_feature_dim: int,
+        feature_dim: int,
         num_basis: int = 12,
         canonical_grid_size: int = 64,
         roughness_grid_size: int = 256,
@@ -192,8 +191,7 @@ class TemporalStructureExtractor(nn.Module):
     ) -> None:
         super().__init__()
         self.registration = TemporalSRVFRegistration(
-            num_channels=num_channels,
-            channel_feature_dim=channel_feature_dim,
+            feature_dim=feature_dim,
             num_basis=num_basis,
             canonical_grid_size=canonical_grid_size,
             roughness_grid_size=roughness_grid_size,
@@ -217,7 +215,6 @@ class TemporalStructureExtractor(nn.Module):
             warp_min_increment=warp_min_increment,
             eps=eps,
         )
-        feature_dim = num_channels * channel_feature_dim
         self.coordinates = TemporalShapePhaseCoordinates(
             feature_dim=feature_dim,
             canonical_grid_size=canonical_grid_size,
@@ -496,9 +493,9 @@ class SharedTemporalStructureOperator(nn.Module):
         time_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
         for name, component in (("trend", trend), ("dynamics", dynamics)):
-            if not isinstance(component, Tensor) or component.ndim != 4:
+            if not isinstance(component, Tensor) or component.ndim != 3:
                 raise ValueError(
-                    f"{name} must be a four-dimensional [B, L, C, P] tensor"
+                    f"{name} must be a three-dimensional [B, L, D] tensor"
                 )
             if not component.is_floating_point():
                 raise ValueError(f"{name} must use a floating-point dtype")

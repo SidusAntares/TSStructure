@@ -111,8 +111,7 @@ class TemporalSRVFExtractor(nn.Module):
 
     def __init__(
         self,
-        num_channels: int,
-        channel_feature_dim: int,
+        feature_dim: int,
         num_basis: int = 12,
         canonical_grid_size: int = 64,
         roughness_grid_size: int = 256,
@@ -149,8 +148,7 @@ class TemporalSRVFExtractor(nn.Module):
             raise ValueError("derivative_norm_threshold must be non-negative")
 
         self.functional_lift = TemporalFunctionalLift(
-            num_channels=num_channels,
-            channel_feature_dim=channel_feature_dim,
+            feature_dim=feature_dim,
             num_basis=num_basis,
             canonical_grid_size=canonical_grid_size,
             roughness_grid_size=roughness_grid_size,
@@ -166,8 +164,7 @@ class TemporalSRVFExtractor(nn.Module):
             initial_scale=initial_support_scale,
             min_scale=min_support_scale,
         )
-        self.num_channels = num_channels
-        self.channel_feature_dim = channel_feature_dim
+        self.feature_dim = feature_dim
         self.canonical_grid_size = canonical_grid_size
         self.min_support_scale = min_support_scale
         self.min_mean_support = min_mean_support

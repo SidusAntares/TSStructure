@@ -397,7 +397,7 @@ def summarize_decomposition_diagnostics(
 def _validate_contribution_inputs(values: Mapping[str, Tensor]) -> int:
     coefficients = (
         "alpha_T", "alpha_D", "alpha_R", "beta_T_temporal",
-        "beta_D_temporal", "beta_T_channel", "beta_D_channel",
+        "beta_D_temporal",
     )
     first = values["alpha_T"]
     if not isinstance(first, Tensor) or first.ndim != 1:
@@ -410,8 +410,7 @@ def _validate_contribution_inputs(values: Mapping[str, Tensor]) -> int:
         if not value.is_floating_point() or not torch.isfinite(value).all().item():
             raise ValueError(f"{name} must contain finite floating values")
     for name in (
-        "temporal_T", "temporal_D", "channel_T", "channel_D",
-        "raw_fusion", "temporal_fusion", "channel_fusion",
+        "temporal_T", "temporal_D", "raw_fusion", "temporal_fusion",
     ):
         value = values[name]
         if not isinstance(value, Tensor) or value.ndim != 2 or value.shape[0] != batch_size:
@@ -419,7 +418,7 @@ def _validate_contribution_inputs(values: Mapping[str, Tensor]) -> int:
         if not value.is_floating_point() or not torch.isfinite(value).all().item():
             raise ValueError(f"{name} must contain finite floating values")
     for name in (
-        "temporal_T_valid", "temporal_D_valid", "channel_T_valid", "channel_D_valid"
+        "temporal_T_valid", "temporal_D_valid"
     ):
         value = values[name]
         if not isinstance(value, Tensor) or value.dtype != torch.bool or value.shape != (batch_size,):
@@ -442,19 +441,12 @@ def compute_structure_contribution_diagnostics(
     alpha_R: Tensor,
     beta_T_temporal: Tensor,
     beta_D_temporal: Tensor,
-    beta_T_channel: Tensor,
-    beta_D_channel: Tensor,
     temporal_T: Tensor,
     temporal_D: Tensor,
-    channel_T: Tensor,
-    channel_D: Tensor,
     raw_fusion: Tensor,
     temporal_fusion: Tensor,
-    channel_fusion: Tensor,
     temporal_T_valid: Tensor,
     temporal_D_valid: Tensor,
-    channel_T_valid: Tensor,
-    channel_D_valid: Tensor,
     eps: float = 1e-8,
 ) -> ContributionDiagnostics:
     if not math.isfinite(float(eps)) or eps <= 0:
@@ -474,20 +466,14 @@ def compute_structure_contribution_diagnostics(
         gates = {
             "T_temporal": floating["alpha_T"] * floating["beta_T_temporal"],
             "D_temporal": floating["alpha_D"] * floating["beta_D_temporal"],
-            "T_channel": floating["alpha_T"] * floating["beta_T_channel"],
-            "D_channel": floating["alpha_D"] * floating["beta_D_channel"],
         }
         vectors = {
             "T_temporal": floating["temporal_T"],
             "D_temporal": floating["temporal_D"],
-            "T_channel": floating["channel_T"],
-            "D_channel": floating["channel_D"],
         }
         validity = {
             "T_temporal": values["temporal_T_valid"],
             "D_temporal": values["temporal_D_valid"],
-            "T_channel": values["channel_T_valid"],
-            "D_channel": values["channel_D_valid"],
         }
         effective_norms = {}
         for name in gates:
@@ -500,7 +486,7 @@ def compute_structure_contribution_diagnostics(
             )
         fusion_energy = {
             name: floating[f"{name}_fusion"].square().sum(dim=-1)
-            for name in ("raw", "temporal", "channel")
+            for name in ("raw", "temporal")
         }
         fusion_total = sum(fusion_energy.values())
         fusion_valid = fusion_total > eps

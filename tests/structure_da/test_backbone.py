@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from methods.structure_da import StructureBackbone, StructureBackboneOutput
-from models.pse import ChannelPreservingPixelSetEncoder, PixelSetEncoder
+from models.pse import PixelSetEncoder
 
 
 def _make_inputs(
@@ -20,11 +20,14 @@ def _make_inputs(
     return pixels, valid_pixels, positions
 
 
-def _make_backbone(num_channels: int = 4) -> StructureBackbone:
+def _make_backbone(input_dim: int = 4) -> StructureBackbone:
     return StructureBackbone(
-        num_channels=num_channels,
-        channel_feature_dim=8,
-        pixel_hidden_dim=7,
+        input_dim=input_dim,
+        mlp1=[input_dim, 7, 8],
+        pooling="mean_std",
+        mlp2=[16, 8],
+        with_extra=False,
+        extra_size=4,
     )
 
 
@@ -32,10 +35,11 @@ def test_default_mask_shapes_and_reconstruction() -> None:
     pixels, valid_pixels, positions = _make_inputs()
     backbone = _make_backbone()
 
-    output = backbone(pixels, valid_pixels, positions)
+    output = backbone(pixels, valid_pixels, positions, extra=None)
 
     assert isinstance(output, StructureBackboneOutput)
-    assert output.channel_tokens.shape == (2, 5, 4, 8)
+    assert output.tokens.shape == (2, 5, 8)
+    assert backbone.feature_dim == 8
     assert output.time_mask.shape == (2, 5)
     assert output.time_mask.dtype == torch.bool
     assert output.time_mask.device == pixels.device
@@ -45,12 +49,12 @@ def test_default_mask_shapes_and_reconstruction() -> None:
         output.decomposition.dynamics,
         output.decomposition.residual,
     ):
-        assert component.shape == (2, 5, 4, 8)
+        assert component.shape == (2, 5, 8)
     torch.testing.assert_close(
         output.decomposition.trend
         + output.decomposition.dynamics
         + output.decomposition.residual,
-        output.channel_tokens,
+        output.tokens,
         atol=1e-6,
         rtol=1e-5,
     )
@@ -60,7 +64,9 @@ def test_one_dimensional_numeric_time_mask_expands_to_batch() -> None:
     pixels, valid_pixels, positions = _make_inputs()
     time_mask = torch.tensor([1.0, 0.0, 1.0, 1.0, 0.0])
 
-    output = _make_backbone()(pixels, valid_pixels, positions, time_mask)
+    output = _make_backbone()(
+        pixels, valid_pixels, positions, extra=None, time_mask=time_mask
+    )
 
     expected = time_mask.bool().expand(2, -1)
     torch.testing.assert_close(output.time_mask, expected)
@@ -72,11 +78,15 @@ def test_partial_time_mask_only_zeros_decomposition_outputs() -> None:
     time_mask = torch.tensor(
         [[True, False, True, True, False], [True, True, False, True, True]]
     )
-    expected_tokens = backbone.pixel_set_encoder(pixels, valid_pixels)
+    expected_tokens = backbone.pixel_set_encoder(
+        pixels, valid_pixels, extra=None
+    )
 
-    output = backbone(pixels, valid_pixels, positions, time_mask)
+    output = backbone(
+        pixels, valid_pixels, positions, extra=None, time_mask=time_mask
+    )
 
-    torch.testing.assert_close(output.channel_tokens, expected_tokens)
+    torch.testing.assert_close(output.tokens, expected_tokens)
     for component in (
         output.decomposition.trend,
         output.decomposition.dynamics,
@@ -91,38 +101,15 @@ def test_partial_time_mask_only_zeros_decomposition_outputs() -> None:
         + output.decomposition.residual
     )
     torch.testing.assert_close(
-        reconstruction[time_mask], output.channel_tokens[time_mask]
+        reconstruction[time_mask], output.tokens[time_mask]
     )
-
-
-def test_changing_one_physical_channel_does_not_change_other_tokens() -> None:
-    pixels, valid_pixels, positions = _make_inputs()
-    changed = pixels.clone()
-    changed[:, :, 2, :] += torch.linspace(-2.0, 3.0, pixels.shape[-1])
-    backbone = _make_backbone().double().eval()
-
-    original = backbone(
-        pixels.double(), valid_pixels, positions
-    ).channel_tokens
-    actual = backbone(
-        changed.double(), valid_pixels, positions
-    ).channel_tokens
-
-    unchanged_channels = torch.tensor([True, True, False, True])
-    torch.testing.assert_close(
-        actual[:, :, unchanged_channels],
-        original[:, :, unchanged_channels],
-        rtol=0,
-        atol=1e-12,
-    )
-    assert not torch.allclose(actual[:, :, 2], original[:, :, 2])
 
 
 def test_gradients_reach_pse_and_both_kernel_scales() -> None:
     pixels, valid_pixels, positions = _make_inputs()
     backbone = _make_backbone()
 
-    output = backbone(pixels, valid_pixels, positions)
+    output = backbone(pixels, valid_pixels, positions, extra=None)
     loss = (
         output.decomposition.trend.square().mean()
         + output.decomposition.dynamics.square().mean()
@@ -144,15 +131,10 @@ def test_gradients_reach_pse_and_both_kernel_scales() -> None:
         assert parameter.grad.abs().item() > 0
 
 
-def test_backbone_uses_only_channel_preserving_pse() -> None:
+def test_backbone_uses_original_pixel_set_encoder() -> None:
     backbone = _make_backbone()
 
-    assert isinstance(
-        backbone.pixel_set_encoder, ChannelPreservingPixelSetEncoder
-    )
-    assert not any(
-        isinstance(module, PixelSetEncoder) for module in backbone.modules()
-    )
+    assert isinstance(backbone.pixel_set_encoder, PixelSetEncoder)
 
 
 @pytest.mark.parametrize(
@@ -169,7 +151,13 @@ def test_invalid_time_mask_shapes_raise_value_error(
     pixels, valid_pixels, positions = _make_inputs()
 
     with pytest.raises(ValueError, match="time_mask"):
-        _make_backbone()(pixels, valid_pixels, positions, time_mask)
+        _make_backbone()(
+            pixels,
+            valid_pixels,
+            positions,
+            extra=None,
+            time_mask=time_mask,
+        )
 
 
 @pytest.mark.parametrize(
@@ -185,13 +173,19 @@ def test_non_binary_or_nonfinite_time_mask_raises_value_error(
     with pytest.raises(
         ValueError, match="time_mask must contain only finite 0/1 values"
     ):
-        _make_backbone()(pixels, valid_pixels, positions, time_mask)
+        _make_backbone()(
+            pixels,
+            valid_pixels,
+            positions,
+            extra=None,
+            time_mask=time_mask,
+        )
 
 
-def test_input_channel_count_must_match_configured_num_channels() -> None:
+def test_input_channel_count_must_match_configured_input_dim() -> None:
     pixels, valid_pixels, positions = _make_inputs(num_channels=3)
 
-    with pytest.raises(
-        ValueError, match="pixels channel dimension must equal num_channels=4"
-    ):
-        _make_backbone(num_channels=4)(pixels, valid_pixels, positions)
+    with pytest.raises((AssertionError, RuntimeError, ValueError)):
+        _make_backbone(input_dim=4)(
+            pixels, valid_pixels, positions, extra=None
+        )

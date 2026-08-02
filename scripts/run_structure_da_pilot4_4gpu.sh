@@ -70,8 +70,6 @@ run_task() {
             --num_workers 8 \
             --lr 0.001 \
             --weight_decay 0.0001 \
-            --channel_feature_dim 16 \
-            --pixel_hidden_dim 16 \
             --structure_dim 128 \
             --domain_hidden_dim 128 \
             --grl_warmup_fraction 0.2 \

@@ -26,8 +26,6 @@ class QualityScoreOutput:
 class StructuralQualityBundle:
     trend_temporal: QualityScoreOutput
     dynamics_temporal: QualityScoreOutput
-    trend_channel: QualityScoreOutput
-    dynamics_channel: QualityScoreOutput
 
 
 @dataclass(frozen=True)
@@ -43,21 +41,16 @@ class HierarchicalQualityOutput:
     component: ComponentQualityBundle
     beta_trend_temporal: Tensor
     beta_dynamics_temporal: Tensor
-    beta_trend_channel: Tensor
-    beta_dynamics_channel: Tensor
     alpha_trend: Tensor
     alpha_dynamics: Tensor
     alpha_residual: Tensor
     weighted_trend_temporal: Tensor
     weighted_dynamics_temporal: Tensor
-    weighted_trend_channel: Tensor
-    weighted_dynamics_channel: Tensor
     trend_component_input: Tensor
     dynamics_component_input: Tensor
     residual_component_input: Tensor
     raw_fusion: Tensor
     temporal_fusion: Tensor
-    channel_fusion: Tensor
     fused_feature: Tensor
 
 
@@ -112,8 +105,6 @@ def concatenate_hierarchical_quality_outputs(
         structural=StructuralQualityBundle(
             trend_temporal=_concatenate_score("structural.trend_temporal", source.structural.trend_temporal, target.structural.trend_temporal),
             dynamics_temporal=_concatenate_score("structural.dynamics_temporal", source.structural.dynamics_temporal, target.structural.dynamics_temporal),
-            trend_channel=_concatenate_score("structural.trend_channel", source.structural.trend_channel, target.structural.trend_channel),
-            dynamics_channel=_concatenate_score("structural.dynamics_channel", source.structural.dynamics_channel, target.structural.dynamics_channel),
         ),
         component=ComponentQualityBundle(
             trend=_concatenate_score("component.trend", source.component.trend, target.component.trend),
@@ -122,21 +113,16 @@ def concatenate_hierarchical_quality_outputs(
         ),
         beta_trend_temporal=_concatenate_batch_tensors("beta_trend_temporal", source.beta_trend_temporal, target.beta_trend_temporal),
         beta_dynamics_temporal=_concatenate_batch_tensors("beta_dynamics_temporal", source.beta_dynamics_temporal, target.beta_dynamics_temporal),
-        beta_trend_channel=_concatenate_batch_tensors("beta_trend_channel", source.beta_trend_channel, target.beta_trend_channel),
-        beta_dynamics_channel=_concatenate_batch_tensors("beta_dynamics_channel", source.beta_dynamics_channel, target.beta_dynamics_channel),
         alpha_trend=_concatenate_batch_tensors("alpha_trend", source.alpha_trend, target.alpha_trend),
         alpha_dynamics=_concatenate_batch_tensors("alpha_dynamics", source.alpha_dynamics, target.alpha_dynamics),
         alpha_residual=_concatenate_batch_tensors("alpha_residual", source.alpha_residual, target.alpha_residual),
         weighted_trend_temporal=_concatenate_batch_tensors("weighted_trend_temporal", source.weighted_trend_temporal, target.weighted_trend_temporal),
         weighted_dynamics_temporal=_concatenate_batch_tensors("weighted_dynamics_temporal", source.weighted_dynamics_temporal, target.weighted_dynamics_temporal),
-        weighted_trend_channel=_concatenate_batch_tensors("weighted_trend_channel", source.weighted_trend_channel, target.weighted_trend_channel),
-        weighted_dynamics_channel=_concatenate_batch_tensors("weighted_dynamics_channel", source.weighted_dynamics_channel, target.weighted_dynamics_channel),
         trend_component_input=_concatenate_batch_tensors("trend_component_input", source.trend_component_input, target.trend_component_input),
         dynamics_component_input=_concatenate_batch_tensors("dynamics_component_input", source.dynamics_component_input, target.dynamics_component_input),
         residual_component_input=_concatenate_batch_tensors("residual_component_input", source.residual_component_input, target.residual_component_input),
         raw_fusion=_concatenate_batch_tensors("raw_fusion", source.raw_fusion, target.raw_fusion),
         temporal_fusion=_concatenate_batch_tensors("temporal_fusion", source.temporal_fusion, target.temporal_fusion),
-        channel_fusion=_concatenate_batch_tensors("channel_fusion", source.channel_fusion, target.channel_fusion),
         fused_feature=_concatenate_batch_tensors("fused_feature", source.fused_feature, target.fused_feature),
     )
 
@@ -295,10 +281,7 @@ class HierarchicalQualityFusion(nn.Module):
         self.temporal_quality = QualityScorer(
             structure_dim, num_classes, domain_hidden_dim, eps
         )
-        self.channel_quality = QualityScorer(
-            structure_dim, num_classes, domain_hidden_dim, eps
-        )
-        quality_input_dim = component_dim + 2 * structure_dim
+        quality_input_dim = component_dim + structure_dim
         self.component_quality = nn.ModuleDict(
             {
                 "trend": QualityScorer(
@@ -316,8 +299,8 @@ class HierarchicalQualityFusion(nn.Module):
     def _validate_inputs(
         self,
         component_features: tuple[Tensor, Tensor, Tensor],
-        structure_features: tuple[Tensor, Tensor, Tensor, Tensor],
-        masks: tuple[Tensor, Tensor, Tensor, Tensor, Tensor],
+        structure_features: tuple[Tensor, Tensor],
+        masks: tuple[Tensor, Tensor, Tensor],
     ) -> None:
         batch_size = component_features[0].shape[0]
         for feature in component_features:
@@ -356,28 +339,17 @@ class HierarchicalQualityFusion(nn.Module):
         residual_embedding: Tensor,
         trend_temporal: Tensor,
         dynamics_temporal: Tensor,
-        trend_channel: Tensor,
-        dynamics_channel: Tensor,
         component_valid: Tensor,
         trend_temporal_valid: Tensor,
         dynamics_temporal_valid: Tensor,
-        trend_channel_valid: Tensor,
-        dynamics_channel_valid: Tensor,
         domain_score_weight: float = 1.0,
     ) -> HierarchicalQualityOutput:
         components = (trend_embedding, dynamics_embedding, residual_embedding)
-        structures = (
-            trend_temporal,
-            dynamics_temporal,
-            trend_channel,
-            dynamics_channel,
-        )
+        structures = (trend_temporal, dynamics_temporal)
         masks = (
             component_valid,
             trend_temporal_valid,
             dynamics_temporal_valid,
-            trend_channel_valid,
-            dynamics_channel_valid,
         )
         self._validate_inputs(components, structures, masks)
 
@@ -388,47 +360,25 @@ class HierarchicalQualityFusion(nn.Module):
             dynamics_temporal=self.temporal_quality(
                 dynamics_temporal, dynamics_temporal_valid, domain_score_weight
             ),
-            trend_channel=self.channel_quality(
-                trend_channel, trend_channel_valid, domain_score_weight
-            ),
-            dynamics_channel=self.channel_quality(
-                dynamics_channel, dynamics_channel_valid, domain_score_weight
-            ),
         )
         beta_trend_temporal = structural.trend_temporal.coefficient
         beta_dynamics_temporal = structural.dynamics_temporal.coefficient
-        beta_trend_channel = structural.trend_channel.coefficient
-        beta_dynamics_channel = structural.dynamics_channel.coefficient
         weighted_trend_temporal = (
             beta_trend_temporal.unsqueeze(-1) * trend_temporal
         )
         weighted_dynamics_temporal = (
             beta_dynamics_temporal.unsqueeze(-1) * dynamics_temporal
         )
-        weighted_trend_channel = (
-            beta_trend_channel.unsqueeze(-1) * trend_channel
-        )
-        weighted_dynamics_channel = (
-            beta_dynamics_channel.unsqueeze(-1) * dynamics_channel
-        )
         trend_component_input = torch.cat(
-            [
-                trend_embedding,
-                weighted_trend_temporal,
-                weighted_trend_channel,
-            ],
+            [trend_embedding, weighted_trend_temporal],
             dim=-1,
         )
         dynamics_component_input = torch.cat(
-            [
-                dynamics_embedding,
-                weighted_dynamics_temporal,
-                weighted_dynamics_channel,
-            ],
+            [dynamics_embedding, weighted_dynamics_temporal],
             dim=-1,
         )
         zero_structure = trend_temporal.new_zeros(
-            trend_temporal.shape[0], 2 * self.structure_dim
+            trend_temporal.shape[0], self.structure_dim
         )
         residual_component_input = torch.cat(
             [residual_embedding, zero_structure], dim=-1
@@ -456,33 +406,22 @@ class HierarchicalQualityFusion(nn.Module):
             alpha_trend.unsqueeze(-1) * weighted_trend_temporal
             + alpha_dynamics.unsqueeze(-1) * weighted_dynamics_temporal
         )
-        channel_fusion = (
-            alpha_trend.unsqueeze(-1) * weighted_trend_channel
-            + alpha_dynamics.unsqueeze(-1) * weighted_dynamics_channel
-        )
-        fused_feature = torch.cat(
-            [raw_fusion, temporal_fusion, channel_fusion], dim=-1
-        )
+        fused_feature = torch.cat([raw_fusion, temporal_fusion], dim=-1)
         return HierarchicalQualityOutput(
             structural=structural,
             component=component,
             beta_trend_temporal=beta_trend_temporal,
             beta_dynamics_temporal=beta_dynamics_temporal,
-            beta_trend_channel=beta_trend_channel,
-            beta_dynamics_channel=beta_dynamics_channel,
             alpha_trend=alpha_trend,
             alpha_dynamics=alpha_dynamics,
             alpha_residual=alpha_residual,
             weighted_trend_temporal=weighted_trend_temporal,
             weighted_dynamics_temporal=weighted_dynamics_temporal,
-            weighted_trend_channel=weighted_trend_channel,
-            weighted_dynamics_channel=weighted_dynamics_channel,
             trend_component_input=trend_component_input,
             dynamics_component_input=dynamics_component_input,
             residual_component_input=residual_component_input,
             raw_fusion=raw_fusion,
             temporal_fusion=temporal_fusion,
-            channel_fusion=channel_fusion,
             fused_feature=fused_feature,
         )
 
@@ -587,8 +526,6 @@ class HierarchicalQualityObjective(nn.Module):
         structural = (
             quality.structural.trend_temporal,
             quality.structural.dynamics_temporal,
-            quality.structural.trend_channel,
-            quality.structural.dynamics_channel,
         )
         components = (
             quality.component.trend,

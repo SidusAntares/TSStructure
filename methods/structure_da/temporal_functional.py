@@ -340,12 +340,11 @@ def _open_uniform_cubic_knots(num_basis: int) -> Tensor:
 
 
 class TemporalFunctionalLift(nn.Module):
-    """Fit masked channel-component tokens as smooth functions of physical time."""
+    """Fit masked component features as smooth functions of physical time."""
 
     def __init__(
         self,
-        num_channels: int,
-        channel_feature_dim: int,
+        feature_dim: int,
         num_basis: int = 12,
         canonical_grid_size: int = 64,
         roughness_grid_size: int = 256,
@@ -358,8 +357,7 @@ class TemporalFunctionalLift(nn.Module):
     ) -> None:
         super().__init__()
         integer_values = {
-            "num_channels": num_channels,
-            "channel_feature_dim": channel_feature_dim,
+            "feature_dim": feature_dim,
             "num_basis": num_basis,
             "canonical_grid_size": canonical_grid_size,
             "roughness_grid_size": roughness_grid_size,
@@ -367,10 +365,8 @@ class TemporalFunctionalLift(nn.Module):
         for name, value in integer_values.items():
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(f"{name} must be an integer")
-        if num_channels <= 0:
-            raise ValueError("num_channels must be positive")
-        if channel_feature_dim <= 0:
-            raise ValueError("channel_feature_dim must be positive")
+        if feature_dim <= 0:
+            raise ValueError("feature_dim must be positive")
         if num_basis < _CUBIC_DEGREE + 1:
             raise ValueError("num_basis must be at least degree + 1")
         if canonical_grid_size < 2:
@@ -390,9 +386,7 @@ class TemporalFunctionalLift(nn.Module):
         if eps <= 0:
             raise ValueError("eps must be greater than zero")
 
-        self.num_channels = num_channels
-        self.channel_feature_dim = channel_feature_dim
-        self.feature_dim = num_channels * channel_feature_dim
+        self.feature_dim = feature_dim
         self.num_basis = num_basis
         self.canonical_grid_size = canonical_grid_size
         self.roughness_grid_size = roughness_grid_size
@@ -439,19 +433,14 @@ class TemporalFunctionalLift(nn.Module):
         self.register_buffer("roughness_matrix", roughness_matrix)
 
     def _validate_component_tokens(self, component_tokens: Tensor) -> None:
-        if not isinstance(component_tokens, Tensor) or component_tokens.ndim != 4:
+        if not isinstance(component_tokens, Tensor) or component_tokens.ndim != 3:
             raise ValueError(
-                "component_tokens must be a four-dimensional [B, L, C, P] tensor"
+                "component_tokens must be a three-dimensional [B, L, D] tensor"
             )
-        if component_tokens.shape[2] != self.num_channels:
-            raise ValueError(
-                "component_tokens channel dimension must equal "
-                f"num_channels={self.num_channels}"
-            )
-        if component_tokens.shape[3] != self.channel_feature_dim:
+        if component_tokens.shape[2] != self.feature_dim:
             raise ValueError(
                 "component_tokens feature dimension must equal "
-                f"channel_feature_dim={self.channel_feature_dim}"
+                f"feature_dim={self.feature_dim}"
             )
         if not component_tokens.is_floating_point():
             raise ValueError("component_tokens must use a floating-point dtype")
@@ -468,10 +457,7 @@ class TemporalFunctionalLift(nn.Module):
             sequence_length,
             component_tokens.device,
         )
-        flattened = component_tokens.reshape(
-            batch_size, sequence_length, self.feature_dim
-        )
-        self.standardizer.update(flattened, resolved_time_mask)
+        self.standardizer.update(component_tokens, resolved_time_mask)
 
     def forward(
         self,
@@ -513,12 +499,9 @@ class TemporalFunctionalLift(nn.Module):
             sequence_length,
             component_tokens.device,
         )
-        flattened = component_tokens.reshape(
-            batch_size, sequence_length, self.feature_dim
-        )
-        if not torch.isfinite(flattened[resolved_time_mask]).all().item():
+        if not torch.isfinite(component_tokens[resolved_time_mask]).all().item():
             raise ValueError("valid component tokens must be finite")
-        standardized_tokens = self.standardizer(flattened)
+        standardized_tokens = self.standardizer(component_tokens)
         (
             normalized_positions,
             num_valid_observations,
