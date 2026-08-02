@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 import sys
 
@@ -12,6 +13,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = Path("analysis_outputs/structure_da_full_3seeds_v1")
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def _nonnegative_finite_float(value: str) -> float:
+    try:
+        converted = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "must be a finite number greater than or equal to zero"
+        ) from error
+    if not math.isfinite(converted) or converted < 0:
+        raise argparse.ArgumentTypeError(
+            "must be a finite number greater than or equal to zero"
+        )
+    return converted
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
     ts_diagnostic.add_argument("--output-dir", type=Path, required=True)
     ts_diagnostic.add_argument("--samples-per-group", type=int, default=5)
     ts_diagnostic.add_argument("--sample-seed", type=int, default=1)
+    ts_diagnostic.add_argument(
+        "--crossing-eps", type=_nonnegative_finite_float, default=1e-4
+    )
     ts_diagnostic.add_argument("--classes", nargs="+", default=None)
 
     return parser
@@ -90,6 +108,7 @@ def main() -> None:
             samples_per_group=args.samples_per_group,
             sample_seed=args.sample_seed,
             classes=args.classes,
+            crossing_eps=args.crossing_eps,
         )
         print(
             "NDVI_TS_DIAGNOSTIC|"
