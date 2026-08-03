@@ -122,12 +122,23 @@ def collect_ndvi_diagnostic_parcels(
     sample_seed: int = 1,
     classes: Iterable[str] | None = None,
     dataset_factory: Callable[[Path, str, tuple[str, ...]], object] | None = None,
+    domains: Iterable[str] | None = None,
 ) -> tuple[pd.DataFrame, list[dict[str, object]], list[str]]:
     """Stream all parcels while retaining only bounded NDVI examples per group."""
 
     if isinstance(samples_per_group, bool) or samples_per_group < 1:
         raise ValueError("samples_per_group must be a positive integer")
     data_root = Path(data_root)
+    selected_domains = (
+        tuple(DOMAIN_DATASETS)
+        if domains is None
+        else tuple(dict.fromkeys(domains))
+    )
+    unknown_domains = set(selected_domains).difference(DOMAIN_DATASETS)
+    if unknown_domains:
+        raise ValueError(f"unknown domains requested: {sorted(unknown_domains)}")
+    if len(selected_domains) < 2:
+        raise ValueError("domains must contain at least two distinct domains")
     if dataset_factory is None:
         if not data_root.is_dir():
             raise FileNotFoundError(f"TimeMatch data root does not exist: {data_root}")
@@ -156,7 +167,8 @@ def collect_ndvi_diagnostic_parcels(
     accumulators: dict[tuple[str, str], dict[str, object]] = {}
     class_sets: dict[str, set[str]] = {}
 
-    for domain, dataset_name in DOMAIN_DATASETS.items():
+    for domain in selected_domains:
+        dataset_name = DOMAIN_DATASETS[domain]
         dataset = dataset_factory(data_root, dataset_name, all_classes)
         dates = parse_acquisition_dates(dataset.metadata["dates"])
         doys = np.asarray(day_of_years(dates), dtype=np.float64)

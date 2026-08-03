@@ -60,7 +60,62 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ts_diagnostic.add_argument("--classes", nargs="+", default=None)
 
+    domain_style = commands.add_parser(
+        "ndvi-domain-style",
+        help="run ORACLE target-label raw-NDVI domain-style diagnostics",
+        description=(
+            "ORACLE DIAGNOSTIC: uses true target class labels and is not "
+            "deployable unsupervised domain adaptation."
+        ),
+    )
+    domain_style.add_argument("--data-root", type=Path, required=True)
+    domain_style.add_argument("--output-dir", type=Path, required=True)
+    domain_style.add_argument("--source-domain", choices=("DK1", "FR2", "FR1", "AT1"), required=True)
+    domain_style.add_argument("--target-domain", choices=("DK1", "FR2", "FR1", "AT1"), required=True)
+    domain_style.add_argument("--samples-per-group", type=int, default=100)
+    domain_style.add_argument("--sample-seed", type=int, default=1)
+    domain_style.add_argument("--bootstrap-repeats", type=int, default=200)
+    domain_style.add_argument("--canonical-grid-size", type=int, default=128)
+    domain_style.add_argument("--min-class-samples", type=int, default=20)
+    domain_style.add_argument("--min-common-support", type=float, default=0.65)
+    domain_style.add_argument("--min-bootstrap-valid-rate", type=float, default=0.80)
+    domain_style.add_argument("--peak-search-start", type=float, default=45.0)
+    domain_style.add_argument("--peak-search-end", type=float, default=330.0)
+    domain_style.add_argument("--min-peak-prominence-ratio", type=float, default=0.15)
+    domain_style.add_argument("--max-shift-days", type=float, default=90.0)
+    domain_style.add_argument("--shift-refine-radius-days", type=float, default=14.0)
+    domain_style.add_argument("--max-interpolation-gap-days", type=float, default=60.0)
+    domain_style.add_argument("--style-lambdas", nargs="+", type=float, default=[0.5, 1.0, 1.5])
+    domain_style.add_argument("--classes", nargs="+", default=None)
+
     return parser
+
+
+def validate_domain_style_args(args):
+    """Validate and normalize the ndvi-domain-style CLI namespace."""
+
+    from analysis.structure_da.domain_style_diagnostics import DomainStyleConfig
+
+    config = DomainStyleConfig(
+        source_domain=args.source_domain,
+        target_domain=args.target_domain,
+        samples_per_group=args.samples_per_group,
+        sample_seed=args.sample_seed,
+        bootstrap_repeats=args.bootstrap_repeats,
+        canonical_grid_size=args.canonical_grid_size,
+        min_class_samples=args.min_class_samples,
+        min_common_support=args.min_common_support,
+        min_bootstrap_valid_rate=args.min_bootstrap_valid_rate,
+        peak_search_start=args.peak_search_start,
+        peak_search_end=args.peak_search_end,
+        min_peak_prominence_ratio=args.min_peak_prominence_ratio,
+        max_shift_days=args.max_shift_days,
+        shift_refine_radius_days=args.shift_refine_radius_days,
+        max_interpolation_gap_days=args.max_interpolation_gap_days,
+        style_lambdas=tuple(args.style_lambdas),
+    )
+    args.style_lambdas = list(config.style_lambdas)
+    return config
 
 
 def main() -> None:
@@ -115,6 +170,21 @@ def main() -> None:
             f"classes={len(result['classes'])}|"
             f"samples={len(result['sampled_parcels'])}|"
             f"groups={len(result['reconstruction'])}"
+        )
+    elif args.command == "ndvi-domain-style":
+        from analysis.structure_da.domain_style_diagnostics import (
+            run_ndvi_domain_style_diagnostic,
+        )
+
+        config = validate_domain_style_args(args)
+        result = run_ndvi_domain_style_diagnostic(
+            args.data_root, args.output_dir, config, classes=args.classes,
+        )
+        print(
+            "NDVI_DOMAIN_STYLE|"
+            f"source={config.source_domain}|target={config.target_domain}|"
+            f"classes={len(result['classes'])}|eligible={len(result['eligible_classes'])}|"
+            f"samples={len(result['records'])}|bootstrap={config.bootstrap_repeats}"
         )
 
 

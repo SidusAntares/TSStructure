@@ -23,7 +23,8 @@ def _commands() -> set[str]:
 
 def test_analysis_cli_exposes_supported_commands() -> None:
     assert _commands() == {
-        "logs", "raw", "ndvi-decomposition", "ndvi-ts-diagnostic"
+        "logs", "raw", "ndvi-decomposition", "ndvi-ts-diagnostic",
+        "ndvi-domain-style",
     }
 
 
