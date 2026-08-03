@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import shutil
 import subprocess
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -73,7 +74,8 @@ class DomainStyleConfig:
     max_shift_days: float = 90.0
     shift_refine_radius_days: float = 14.0
     max_interpolation_gap_days: float = 60.0
-    style_lambdas: tuple[float, ...] = (0.5, 1.0, 1.5)
+    min_relative_phase_gain: float = 0.02
+    style_lambdas: tuple[float, ...] = (0.0, 0.5, 1.0, 1.5)
 
     def __post_init__(self) -> None:
         if self.source_domain == self.target_domain:
@@ -82,7 +84,10 @@ class DomainStyleConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) != value or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        for name in ("min_common_support", "min_bootstrap_valid_rate", "min_peak_prominence_ratio"):
+        for name in (
+            "min_common_support", "min_bootstrap_valid_rate",
+            "min_peak_prominence_ratio", "min_relative_phase_gain",
+        ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be within [0, 1]")
@@ -92,7 +97,7 @@ class DomainStyleConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        lambdas = tuple(sorted(set(float(value) for value in self.style_lambdas)))
+        lambdas = tuple(sorted({0.0, *(float(value) for value in self.style_lambdas)}))
         if not lambdas or any(not math.isfinite(value) or value < 0 for value in lambdas):
             raise ValueError("style_lambdas must be finite nonnegative values")
         object.__setattr__(self, "style_lambdas", lambdas)
@@ -286,46 +291,230 @@ def _shape_objective(source: np.ndarray, target: np.ndarray, mask: np.ndarray) -
     return float(np.mean(np.square(first - second)))
 
 
+def _search_trend_shift(
+    source_trend: np.ndarray,
+    target_trend: np.ndarray,
+    canonical_doys: np.ndarray,
+    candidate_shifts: Sequence[float],
+    min_common_support: float,
+) -> dict[str, object]:
+    """Evaluate the complete T-only objective curve over candidate shifts."""
+
+    source = np.asarray(source_trend, dtype=np.float64)
+    shifts = np.asarray(candidate_shifts, dtype=np.float64)
+    objectives = np.full(shifts.shape, np.nan, dtype=np.float64)
+    supports = np.full(shifts.shape, np.nan, dtype=np.float64)
+    aligned_curves: list[np.ndarray] = []
+    common_masks: list[np.ndarray] = []
+    for index, shift in enumerate(shifts):
+        aligned, aligned_valid = _shift_curve(
+            target_trend, canonical_doys, float(shift)
+        )
+        common = np.isfinite(source) & aligned_valid & np.isfinite(aligned)
+        support = float(np.mean(common))
+        supports[index] = support
+        if support >= min_common_support:
+            objective = _shape_objective(source, aligned, common)
+            if np.isfinite(objective):
+                objectives[index] = objective
+        aligned_curves.append(aligned)
+        common_masks.append(common)
+    return {
+        "candidate_shifts": shifts,
+        "objectives": objectives,
+        "common_supports": supports,
+        "aligned_curves": aligned_curves,
+        "common_masks": common_masks,
+    }
+
+
+def _unavailable_phase(
+    status: str, reason: str, source_peak: Mapping[str, object],
+    target_peak: Mapping[str, object], search_mode: str,
+    candidate_shifts: np.ndarray | None = None,
+    objectives: np.ndarray | None = None,
+) -> dict[str, object]:
+    return {
+        "phase_available": False,
+        "phase_status": status,
+        "search_mode": search_mode,
+        "valid": False,
+        "reason": reason,
+        "shift_days": 0.0,
+        "initial_shift_days": np.nan,
+        "identity_objective": np.nan,
+        "best_objective": np.nan,
+        "relative_gain": np.nan,
+        "second_best_objective": np.nan,
+        "objective_margin": np.nan,
+        "shift_at_boundary": False,
+        "common_support": np.nan,
+        "target_aligned": None,
+        "common_mask": None,
+        "source_peak": source_peak,
+        "target_peak": target_peak,
+        "source_peak_valid": bool(source_peak.get("valid", False)),
+        "target_peak_valid": bool(target_peak.get("valid", False)),
+        "source_peak_reason": str(source_peak.get("reason", "")),
+        "target_peak_reason": str(target_peak.get("reason", "")),
+        "candidate_shifts": (
+            np.asarray(candidate_shifts, dtype=np.float64)
+            if candidate_shifts is not None else np.empty(0, dtype=np.float64)
+        ),
+        "objective_curve": (
+            np.asarray(objectives, dtype=np.float64)
+            if objectives is not None else np.empty(0, dtype=np.float64)
+        ),
+    }
+
+
 def estimate_phase_shift(
     source_trend: np.ndarray, target_trend: np.ndarray, canonical_doys: np.ndarray,
     peak_search_start: float = 45.0, peak_search_end: float = 330.0,
     min_peak_prominence_ratio: float = 0.15, max_shift_days: float = 90.0,
     shift_refine_radius_days: float = 14.0, min_common_support: float = 0.65,
+    min_relative_phase_gain: float = 0.02,
 ) -> dict[str, object]:
-    source_peak = detect_main_peak(source_trend, canonical_doys, peak_search_start, peak_search_end, min_peak_prominence_ratio)
-    target_peak = detect_main_peak(target_trend, canonical_doys, peak_search_start, peak_search_end, min_peak_prominence_ratio)
-    if not source_peak["valid"] or not target_peak["valid"]:
-        reason = f"source:{source_peak['reason']}" if not source_peak["valid"] else f"target:{target_peak['reason']}"
-        return {"valid": False, "reason": reason, "shift_days": np.nan, "source_peak": source_peak, "target_peak": target_peak, "common_support": 0.0}
-    initial = float(source_peak["peak_doy"] - target_peak["peak_doy"])
-    lower = max(-max_shift_days, initial - shift_refine_radius_days)
-    upper = min(max_shift_days, initial + shift_refine_radius_days)
-    grid_differences = np.diff(np.asarray(canonical_doys, dtype=np.float64))
-    finite_steps = grid_differences[np.isfinite(grid_differences) & (grid_differences > 0)]
-    if finite_steps.size == 0:
-        return {"valid": False, "reason": "invalid_canonical_grid", "shift_days": np.nan, "source_peak": source_peak, "target_peak": target_peak, "common_support": 0.0}
-    grid_step = float(np.median(finite_steps))
-    offsets = np.arange(
-        math.ceil((lower - initial) / grid_step),
-        math.floor((upper - initial) / grid_step) + 1,
-        dtype=np.float64,
-    )
-    candidates = initial + offsets * grid_step
     source = np.asarray(source_trend, dtype=np.float64)
-    best = None
-    for shift in candidates:
-        aligned, aligned_valid = _shift_curve(target_trend, canonical_doys, float(shift))
-        common = np.isfinite(source) & aligned_valid & np.isfinite(aligned)
-        support = float(np.mean(common))
-        if support < min_common_support:
-            continue
-        score = _shape_objective(source, aligned, common)
-        candidate = (score, abs(float(shift)), float(shift), support, aligned, common)
-        if best is None or candidate[:2] < best[:2]:
-            best = candidate
-    if best is None:
-        return {"valid": False, "reason": "insufficient_common_support", "shift_days": np.nan, "source_peak": source_peak, "target_peak": target_peak, "common_support": 0.0}
-    return {"valid": True, "reason": "", "shift_days": best[2], "initial_shift_days": initial, "objective": best[0], "common_support": best[3], "target_aligned": best[4], "common_mask": best[5], "source_peak": source_peak, "target_peak": target_peak}
+    target = np.asarray(target_trend, dtype=np.float64)
+    doys = np.asarray(canonical_doys, dtype=np.float64)
+    if source.shape != target.shape or source.shape != doys.shape or source.ndim != 1:
+        invalid_peak = {
+            "valid": False, "reason": "invalid_samples",
+            "peak_doy": np.nan, "prominence_ratio": np.nan,
+        }
+        return _unavailable_phase(
+            "invalid_samples", "invalid_samples", invalid_peak,
+            invalid_peak.copy(), "not_searched",
+        )
+    source_peak = detect_main_peak(
+        source, doys, peak_search_start, peak_search_end,
+        min_peak_prominence_ratio,
+    )
+    target_peak = detect_main_peak(
+        target, doys, peak_search_start, peak_search_end,
+        min_peak_prominence_ratio,
+    )
+    differences = np.diff(doys)
+    if (
+        doys.size < 2 or not np.isfinite(doys).all()
+        or not np.isfinite(differences).all() or np.any(differences <= 0)
+    ):
+        return _unavailable_phase(
+            "invalid_grid", "invalid_canonical_grid", source_peak, target_peak,
+            "not_searched",
+        )
+    if min(np.isfinite(source).sum(), np.isfinite(target).sum()) < 3:
+        return _unavailable_phase(
+            "invalid_samples", "insufficient_trend_samples",
+            source_peak, target_peak, "not_searched",
+        )
+    source_range = float(np.quantile(source[np.isfinite(source)], 0.95) - np.quantile(source[np.isfinite(source)], 0.05))
+    target_range = float(np.quantile(target[np.isfinite(target)], 0.95) - np.quantile(target[np.isfinite(target)], 0.05))
+    if min(source_range, target_range) < 0.03:
+        return _unavailable_phase(
+            "invalid_flat_trend", "flat_trend", source_peak, target_peak,
+            "not_searched",
+        )
+
+    grid_step = float(np.median(differences))
+    peak_guided = bool(source_peak["valid"] and target_peak["valid"])
+    initial = (
+        float(source_peak["peak_doy"] - target_peak["peak_doy"])
+        if peak_guided else np.nan
+    )
+    if peak_guided:
+        search_center = float(np.clip(initial, -max_shift_days, max_shift_days))
+        lower = max(-max_shift_days, search_center - shift_refine_radius_days)
+        upper = min(max_shift_days, search_center + shift_refine_radius_days)
+        offsets = np.arange(
+            math.ceil((lower - search_center) / grid_step),
+            math.floor((upper - search_center) / grid_step) + 1,
+            dtype=np.float64,
+        )
+        candidates = search_center + offsets * grid_step
+        search_mode = "peak_guided"
+    else:
+        steps = np.arange(
+            math.ceil(-max_shift_days / grid_step),
+            math.floor(max_shift_days / grid_step) + 1,
+            dtype=np.float64,
+        )
+        candidates = steps * grid_step
+        search_mode = "full_trend_search"
+    candidates = np.unique(np.concatenate([candidates, np.array([0.0])]))
+    search = _search_trend_shift(
+        source, target, doys, candidates, min_common_support,
+    )
+    objectives = np.asarray(search["objectives"], dtype=np.float64)
+    available_indices = np.flatnonzero(np.isfinite(objectives))
+    if available_indices.size == 0:
+        return _unavailable_phase(
+            "invalid_common_support", "insufficient_common_support",
+            source_peak, target_peak, search_mode, candidates, objectives,
+        )
+    best_index = min(
+        available_indices,
+        key=lambda index: (
+            objectives[index], abs(float(candidates[index])),
+            float(candidates[index]),
+        ),
+    )
+    best_shift = float(candidates[best_index])
+    best_objective = float(objectives[best_index])
+    zero_index = int(np.flatnonzero(np.isclose(candidates, 0.0))[0])
+    identity_objective = float(objectives[zero_index]) if np.isfinite(objectives[zero_index]) else np.nan
+    relative_gain = (
+        (identity_objective - best_objective) / (identity_objective + EPS)
+        if np.isfinite(identity_objective) else np.nan
+    )
+    if np.isfinite(relative_gain) and relative_gain < min_relative_phase_gain:
+        final_index = zero_index
+        phase_status = "valid_identity"
+    else:
+        final_index = best_index
+        phase_status = (
+            "valid_identity" if np.isclose(candidates[best_index], 0.0)
+            else "valid_nonidentity"
+        )
+    final_shift = float(candidates[final_index])
+    separated = [
+        index for index in available_indices
+        if abs(float(candidates[index]) - best_shift) >= shift_refine_radius_days
+    ]
+    second_best = min((float(objectives[index]) for index in separated), default=np.nan)
+    denominator = identity_objective - best_objective
+    objective_margin = (
+        (second_best - best_objective) / (denominator + EPS)
+        if np.isfinite(second_best) and np.isfinite(identity_objective) else np.nan
+    )
+    return {
+        "phase_available": True,
+        "phase_status": phase_status,
+        "search_mode": search_mode,
+        "valid": True,
+        "reason": "",
+        "shift_days": final_shift,
+        "initial_shift_days": initial,
+        "identity_objective": identity_objective,
+        "best_objective": best_objective,
+        "objective": float(objectives[final_index]),
+        "relative_gain": relative_gain,
+        "second_best_objective": second_best,
+        "objective_margin": objective_margin,
+        "shift_at_boundary": bool(np.isclose(abs(final_shift), max_shift_days, atol=grid_step / 2.0)),
+        "common_support": float(search["common_supports"][final_index]),
+        "target_aligned": search["aligned_curves"][final_index],
+        "common_mask": search["common_masks"][final_index],
+        "source_peak": source_peak,
+        "target_peak": target_peak,
+        "source_peak_valid": bool(source_peak.get("valid", False)),
+        "target_peak_valid": bool(target_peak.get("valid", False)),
+        "source_peak_reason": str(source_peak.get("reason", "")),
+        "target_peak_reason": str(target_peak.get("reason", "")),
+        "candidate_shifts": candidates,
+        "objective_curve": objectives,
+    }
 
 
 def estimate_class_phase(
@@ -423,26 +612,42 @@ def fit_robust_domain_style(
 
 
 def compute_loco_domain_styles(
-    classes: Sequence[str], deltas: Mapping[str, np.ndarray],
+    evaluation_classes: Sequence[str], contributor_classes: Sequence[str],
+    deltas: Mapping[str, np.ndarray],
     valid_masks: Mapping[str, np.ndarray], base_reliability: Mapping[str, float],
     min_classes: int = MIN_STYLE_CLASSES,
+    base_reliability_by_held: Mapping[str, Mapping[str, float]] | None = None,
 ) -> dict[str, dict[str, object]]:
-    return {
-        held: fit_robust_domain_style(
-            [name for name in classes if name != held], deltas, valid_masks,
-            base_reliability, min_classes=min_classes,
-        ) if len([name for name in classes if name != held]) >= min_classes else {
-            "valid": False, "reason": "insufficient_loco_classes",
-            "style": np.full_like(np.asarray(deltas[held], dtype=np.float64), np.nan),
-            "classes_used": [name for name in classes if name != held],
-            "consensus": {}, "final_weights": {},
-        }
-        for held in classes
-    }
+    contributors = list(dict.fromkeys(contributor_classes))
+    result: dict[str, dict[str, object]] = {}
+    template = np.asarray(next(iter(deltas.values())), dtype=np.float64)
+    for held in dict.fromkeys(evaluation_classes):
+        remaining = [name for name in contributors if name != held]
+        if len(remaining) < min_classes:
+            result[held] = {
+                "valid": False, "reason": "insufficient_loco_classes",
+                "style": np.full_like(template, np.nan),
+                "classes_used": remaining, "consensus": {},
+                "final_weights": {},
+            }
+            continue
+        held_reliability = (
+            base_reliability_by_held.get(held, base_reliability)
+            if base_reliability_by_held is not None else base_reliability
+        )
+        result[held] = fit_robust_domain_style(
+            remaining, deltas, valid_masks, held_reliability,
+            min_classes=min_classes,
+        )
+    return result
 
 
 def apply_shared_style(components: Mapping[str, np.ndarray], style: np.ndarray, style_lambda: float) -> dict[str, np.ndarray]:
-    adjustment = float(style_lambda) * np.asarray(style, dtype=np.float64)
+    adjustment = (
+        np.zeros_like(np.asarray(style, dtype=np.float64))
+        if float(style_lambda) == 0.0
+        else float(style_lambda) * np.asarray(style, dtype=np.float64)
+    )
     return {name: np.asarray(components[name], dtype=np.float64) + adjustment for name in ("original", "trend", "structure")}
 
 
@@ -528,6 +733,11 @@ def bootstrap_phase_discrepancy(
     grid = source_records[0].canonical_doys
     shifts: list[float] = []
     deltas: list[np.ndarray] = []
+    relative_gains: list[float] = []
+    objective_margins: list[float] = []
+    identity_count = 0
+    nonidentity_count = 0
+    failure_counts = {"flat": 0, "support": 0, "grid": 0, "samples": 0}
     for _ in range(config.bootstrap_repeats):
         source_sample = [source_records[index] for index in rng.integers(0, len(source_records), len(source_records))]
         target_sample = [target_records[index] for index in rng.integers(0, len(target_records), len(target_records))]
@@ -538,18 +748,48 @@ def bootstrap_phase_discrepancy(
             config.peak_search_start, config.peak_search_end,
             config.min_peak_prominence_ratio, config.max_shift_days,
             config.shift_refine_radius_days, config.min_common_support,
+            config.min_relative_phase_gain,
         )
-        if not phase["valid"]:
+        if not phase["phase_available"]:
+            category = {
+                "invalid_flat_trend": "flat",
+                "invalid_common_support": "support",
+                "invalid_grid": "grid",
+                "invalid_samples": "samples",
+            }.get(str(phase["phase_status"]), "samples")
+            failure_counts[category] += 1
             continue
         aligned = np.asarray(phase["target_aligned"], float)
         delta = aligned - source_t
         delta[~np.asarray(phase["common_mask"], bool)] = np.nan
         shifts.append(float(phase["shift_days"]))
         deltas.append(delta)
-    valid_rate = len(shifts) / config.bootstrap_repeats
+        identity_count += int(phase["phase_status"] == "valid_identity")
+        nonidentity_count += int(phase["phase_status"] == "valid_nonidentity")
+        if np.isfinite(phase["relative_gain"]):
+            relative_gains.append(float(phase["relative_gain"]))
+        if np.isfinite(phase["objective_margin"]):
+            objective_margins.append(float(phase["objective_margin"]))
+    success_rate = len(shifts) / config.bootstrap_repeats
+    common_statistics = {
+        "valid_rate": success_rate,
+        "bootstrap_search_success_rate": success_rate,
+        "bootstrap_identity_rate": identity_count / config.bootstrap_repeats,
+        "bootstrap_nonidentity_rate": nonidentity_count / config.bootstrap_repeats,
+        "bootstrap_failure_flat_count": failure_counts["flat"],
+        "bootstrap_failure_support_count": failure_counts["support"],
+        "bootstrap_failure_grid_count": failure_counts["grid"],
+        "bootstrap_failure_samples_count": failure_counts["samples"],
+        "bootstrap_relative_gain_median": (
+            float(np.median(relative_gains)) if relative_gains else np.nan
+        ),
+        "bootstrap_objective_margin_median": (
+            float(np.median(objective_margins)) if objective_margins else np.nan
+        ),
+    }
     if not shifts:
-        return {
-            "valid_rate": valid_rate, "shift_median": np.nan, "shift_mad": np.nan,
+        return {**common_statistics,
+            "shift_median": np.nan, "shift_mad": np.nan,
             "shift_q25": np.nan, "shift_q75": np.nan,
             "delta_variance_integral": np.nan, "delta_finite_rate": 0.0,
             "deltas": np.empty((0, len(grid))),
@@ -557,8 +797,7 @@ def bootstrap_phase_discrepancy(
     shift_array = np.asarray(shifts)
     delta_array = np.stack(deltas)
     variance_integral = _bootstrap_variance_integral(delta_array, grid)
-    return {
-        "valid_rate": valid_rate,
+    return {**common_statistics,
         "shift_median": float(np.median(shift_array)),
         "shift_mad": float(np.median(np.abs(shift_array - np.median(shift_array)))),
         "shift_q25": float(np.quantile(shift_array, 0.25)),
@@ -566,6 +805,25 @@ def bootstrap_phase_discrepancy(
         "delta_variance_integral": variance_integral,
         "delta_finite_rate": float(np.mean(np.isfinite(delta_array), axis=0).mean()),
         "deltas": delta_array,
+    }
+
+
+def _empty_bootstrap(grid_size: int) -> dict[str, object]:
+    return {
+        "valid_rate": 0.0,
+        "bootstrap_search_success_rate": 0.0,
+        "bootstrap_identity_rate": 0.0,
+        "bootstrap_nonidentity_rate": 0.0,
+        "bootstrap_failure_flat_count": 0,
+        "bootstrap_failure_support_count": 0,
+        "bootstrap_failure_grid_count": 0,
+        "bootstrap_failure_samples_count": 0,
+        "bootstrap_relative_gain_median": np.nan,
+        "bootstrap_objective_margin_median": np.nan,
+        "shift_median": np.nan, "shift_mad": np.nan,
+        "shift_q25": np.nan, "shift_q75": np.nan,
+        "delta_variance_integral": np.nan, "delta_finite_rate": np.nan,
+        "deltas": np.empty((0, grid_size)),
     }
 
 
@@ -657,6 +915,13 @@ def _draw_distribution(
     axis.plot(grid, summary["mean"], color=color, linewidth=1.8, linestyle="--", label=f"{label} mean")
 
 
+def _phase_target_label(target: str, phase_available: bool) -> str:
+    return (
+        f"{target} T-phase aligned" if phase_available
+        else f"{target} identity fallback — not aligned"
+    )
+
+
 def _plot_phase_class(
     class_name: str, source: str, target: str, grid: np.ndarray,
     source_data: Mapping[str, tuple[np.ndarray, np.ndarray, Mapping[str, np.ndarray]]],
@@ -664,23 +929,32 @@ def _plot_phase_class(
     phase: Mapping[str, object], bootstrap: Mapping[str, object], n_source: int,
     n_target: int, path: Path,
 ) -> None:
+    phase_available = bool(phase.get("phase_available", phase.get("valid", False)))
+    target_label = _phase_target_label(target, phase_available)
     fig, axes = plt.subplots(3, 1, figsize=(11, 12), sharex=True)
     for axis, component in zip(axes, ("original", "trend", "structure")):
         _draw_distribution(axis, grid, *source_data[component], DOMAIN_COLORS[source], source)
-        _draw_distribution(axis, grid, *target_data[component], DOMAIN_COLORS[target], f"{target} phase-aligned")
+        _draw_distribution(
+            axis, grid, *target_data[component], DOMAIN_COLORS[target],
+            target_label,
+        )
         axis.set_ylabel(COMPONENT_LABELS[component])
         axis.grid(alpha=0.2)
         axis.legend(fontsize=8)
     axes[-1].set_xlabel("Canonical DOY")
-    status = "valid" if phase["valid"] else f"invalid:{phase['reason']}"
+    status = str(phase.get("phase_status", "unavailable"))
     source_t_peak = phase.get("source_peak", {}).get("peak_doy", np.nan)
     target_t_peak = phase.get("target_peak", {}).get("peak_doy", np.nan)
     fig.suptitle(
-        f"{ORACLE_NOTICE}\n{source}→{target} | {class_name} | T-only phase={status} | "
-        f"shift={phase.get('shift_days', np.nan):.1f} d | bootstrap={bootstrap['valid_rate']:.2f} | "
-        f"n={n_source}/{n_target}\nT peaks={source_t_peak:.1f}/{target_t_peak:.1f}; "
+        f"{ORACLE_NOTICE}\n{source}→{target} | {class_name} | phase_status={status} | "
+        f"search={phase.get('search_mode', 'not_searched')} | shift={phase.get('shift_days', 0.0):.1f} d | "
+        f"gain={phase.get('relative_gain', np.nan):.3f} | margin={phase.get('objective_margin', np.nan):.3f}\n"
+        f"bootstrap success={bootstrap.get('bootstrap_search_success_rate', bootstrap.get('valid_rate', 0.0)):.2f} | "
+        f"shift MAD={bootstrap.get('shift_mad', np.nan):.1f} | n={n_source}/{n_target} | "
+        f"T peak valid={phase.get('source_peak', {}).get('valid', False)}/"
+        f"{phase.get('target_peak', {}).get('valid', False)} | T peaks={source_t_peak:.1f}/{target_t_peak:.1f}; "
         f"S peaks={phase.get('structure_source_peak_doy', np.nan):.1f}/"
-        f"{phase.get('structure_target_peak_doy', np.nan):.1f} diagnostic only, never fallback"
+        f"{phase.get('structure_target_peak_doy', np.nan):.1f} diagnostic only; never used for phase"
     )
     _save_figure(fig, path)
 
@@ -707,9 +981,13 @@ def _plot_style_sweep(
             axis = axes[row, column]
             source_values, source_valid, source_summary = source_data[component]
             target_values, target_valid, target_summary = target_data[component]
-            styled_values = source_values + style_lambda * style[None, :]
+            adjustment = (
+                np.zeros_like(style) if style_lambda == 0.0
+                else style_lambda * style
+            )
+            styled_values = source_values + adjustment[None, :]
             styled_summary = {
-                name: (value + style_lambda * style if name != "n_valid" else value)
+                name: (value + adjustment if name != "n_valid" else value)
                 for name, value in source_summary.items()
             }
             _draw_distribution(
@@ -726,7 +1004,11 @@ def _plot_style_sweep(
                 item for item in metric_rows
                 if item["lambda"] == style_lambda and item["component"] == component
             ]
-            annotation = f"λ={style_lambda:g} | {COMPONENT_LABELS[component]}"
+            prefix = (
+                "no domain style (lambda=0)" if style_lambda == 0.0
+                else f"with domain style (lambda={style_lambda:g})"
+            )
+            annotation = f"{prefix} | {COMPONENT_LABELS[component]}"
             if matching:
                 metric = matching[0]
                 annotation += (
@@ -774,7 +1056,8 @@ def _summarize_aligned(
 def _phase_row(
     class_name: str, source_records: Sequence[CanonicalParcelRecord],
     target_records: Sequence[CanonicalParcelRecord], phase: Mapping[str, object],
-    bootstrap: Mapping[str, object], eligible: bool, reason: str,
+    bootstrap: Mapping[str, object], style_contributor: bool,
+    style_evaluable: bool, reason: str,
 ) -> dict[str, object]:
     source_peak = phase.get("source_peak", {})
     target_peak = phase.get("target_peak", {})
@@ -799,21 +1082,45 @@ def _phase_row(
         "trend_target_peak_valid": target_peak.get("valid", False),
         "trend_source_peak_reason": source_peak.get("reason", ""),
         "trend_target_peak_reason": target_peak.get("reason", ""),
+        "source_peak_valid": phase.get("source_peak_valid", False),
+        "target_peak_valid": phase.get("target_peak_valid", False),
+        "source_peak_reason": phase.get("source_peak_reason", ""),
+        "target_peak_reason": phase.get("target_peak_reason", ""),
         "structure_source_peak_valid": phase.get("structure_source_peak_valid", False),
         "structure_target_peak_valid": phase.get("structure_target_peak_valid", False),
         "initial_shift_days": phase.get("initial_shift_days", np.nan),
         "refined_shift_days": phase.get("shift_days", np.nan),
         "phase_objective": phase.get("objective", np.nan),
-        "common_support_fraction": phase.get("common_support", 0.0),
+        "phase_available": phase.get("phase_available", False),
+        "phase_status": phase.get("phase_status", "invalid_samples"),
+        "search_mode": phase.get("search_mode", "not_searched"),
+        "identity_objective": phase.get("identity_objective", np.nan),
+        "best_objective": phase.get("best_objective", np.nan),
+        "relative_gain": phase.get("relative_gain", np.nan),
+        "second_best_objective": phase.get("second_best_objective", np.nan),
+        "objective_margin": phase.get("objective_margin", np.nan),
+        "shift_at_boundary": phase.get("shift_at_boundary", False),
+        "common_support_fraction": phase.get("common_support", np.nan),
         "bootstrap_valid_rate": bootstrap["valid_rate"],
+        "bootstrap_search_success_rate": bootstrap["bootstrap_search_success_rate"],
+        "bootstrap_identity_rate": bootstrap["bootstrap_identity_rate"],
+        "bootstrap_nonidentity_rate": bootstrap["bootstrap_nonidentity_rate"],
+        "bootstrap_failure_flat_count": bootstrap["bootstrap_failure_flat_count"],
+        "bootstrap_failure_support_count": bootstrap["bootstrap_failure_support_count"],
+        "bootstrap_failure_grid_count": bootstrap["bootstrap_failure_grid_count"],
+        "bootstrap_failure_samples_count": bootstrap["bootstrap_failure_samples_count"],
+        "bootstrap_relative_gain_median": bootstrap["bootstrap_relative_gain_median"],
+        "bootstrap_objective_margin_median": bootstrap["bootstrap_objective_margin_median"],
         "shift_median_days": bootstrap["shift_median"],
         "shift_mad_days": bootstrap["shift_mad"],
         "shift_q25_days": bootstrap["shift_q25"],
         "shift_q75_days": bootstrap["shift_q75"],
         "delta_bootstrap_variance_integral": bootstrap["delta_variance_integral"],
         "delta_bootstrap_finite_rate": bootstrap["delta_finite_rate"],
-        "phase_valid": phase.get("valid", False),
-        "eligible": eligible,
+        "phase_valid": phase.get("phase_available", False),
+        "style_contributor": style_contributor,
+        "style_evaluable": style_evaluable,
+        "eligible": style_contributor,
         "exclusion_reason": reason,
         "phase_anchor": "trend_t_only",
         "structure_peak_role": "diagnostic_only_no_fallback",
@@ -829,9 +1136,13 @@ def _metric_row(
     min_common_support: float, physical_fraction: float,
     hierarchy: Mapping[str, float], valid: bool, reason: str,
 ) -> dict[str, object]:
-    adjusted_values = source_values + style_lambda * style[None, :]
+    adjustment = (
+        np.zeros_like(np.asarray(style, dtype=np.float64))
+        if style_lambda == 0.0 else style_lambda * style
+    )
+    adjusted_values = source_values + adjustment[None, :]
     adjusted_summary = {
-        name: (np.asarray(value) + style_lambda * style if name != "n_valid" else value)
+        name: (np.asarray(value) + adjustment if name != "n_valid" else value)
         for name, value in source_summary.items()
     }
     support = np.isfinite(source_summary["robust"]) & np.isfinite(target_summary["robust"])
@@ -859,7 +1170,7 @@ def _metric_row(
         "margin_change": after_margin - before_margin,
         "physical_violation_fraction": physical_fraction,
         "style_explained_fraction": style_explained_fraction(
-            target_summary["robust"] - source_summary["robust"], style_lambda * style, support
+            target_summary["robust"] - source_summary["robust"], adjustment, support
         ),
         "hierarchy_error": max(hierarchy["max_dynamics_error"], hierarchy["max_residual_error"]),
         "valid": bool(
@@ -894,10 +1205,13 @@ def _write_summary_plots(
     metrics_table: pd.DataFrame, styles: Mapping[str, np.ndarray],
 ) -> None:
     summary_dir = figure_dir / "task_summary"
-    eligible = [name for name, info in class_info.items() if info["eligible"]]
+    contributors = [
+        name for name, info in class_info.items()
+        if info["style_contributor"]
+    ]
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 9), sharex=True)
-    for name in eligible:
+    for name in contributors:
         axes[0].plot(grid, class_info[name]["delta_t"], alpha=0.7, label=name)
     line_styles = {
         "robust_reliability": ("black", "-", "robust reliability"),
@@ -928,25 +1242,25 @@ def _write_summary_plots(
     axis.set_title(f"{ORACLE_NOTICE}\nClass style reliability and final weights")
     _save_figure(fig, summary_dir / "class_style_weights.png")
 
-    if not eligible:
+    if not contributors:
         _placeholder(
             summary_dir / "discrepancy_cosine_matrix.png",
             f"{ORACLE_NOTICE}\nClass discrepancy cosine matrix",
-            "no eligible classes",
+            "no classes used to estimate shared style",
         )
     else:
-        matrix = np.full((len(eligible), len(eligible)), np.nan)
-        for row, first in enumerate(eligible):
-            for column, second in enumerate(eligible):
+        matrix = np.full((len(contributors), len(contributors)), np.nan)
+        for row, first in enumerate(contributors):
+            for column, second in enumerate(contributors):
                 a, b = class_info[first]["delta_t"], class_info[second]["delta_t"]
                 valid = np.isfinite(a) & np.isfinite(b)
                 if valid.sum() >= 3:
                     denominator = np.linalg.norm(a[valid]) * np.linalg.norm(b[valid])
                     matrix[row, column] = float(np.dot(a[valid], b[valid]) / denominator) if denominator > 0 else np.nan
-        fig, axis = plt.subplots(figsize=(max(6, len(eligible) * 0.6), max(5, len(eligible) * 0.55)))
+        fig, axis = plt.subplots(figsize=(max(6, len(contributors) * 0.6), max(5, len(contributors) * 0.55)))
         image = axis.imshow(matrix, vmin=-1, vmax=1, cmap="coolwarm")
-        axis.set_xticks(range(len(eligible)), eligible, rotation=45, ha="right")
-        axis.set_yticks(range(len(eligible)), eligible)
+        axis.set_xticks(range(len(contributors)), contributors, rotation=45, ha="right")
+        axis.set_yticks(range(len(contributors)), contributors)
         fig.colorbar(image, ax=axis, label="cosine")
         axis.set_title(f"{ORACLE_NOTICE}\nClass discrepancy cosine matrix")
         _save_figure(fig, summary_dir / "discrepancy_cosine_matrix.png")
@@ -980,13 +1294,24 @@ def _write_summary_plots(
     fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
     positions = np.arange(len(phase_table))
     axes[0].errorbar(positions, phase_table["shift_median_days"], yerr=[phase_table["shift_median_days"] - phase_table["shift_q25_days"], phase_table["shift_q75_days"] - phase_table["shift_median_days"]], fmt="o", label="bootstrap shift median/IQR")
-    axes[0].plot(positions, phase_table["refined_shift_days"], "x", label="refined shift")
+    axes[0].plot(positions, phase_table["refined_shift_days"], color="black", alpha=0.35, label="final shift")
+    status_markers = {
+        "valid_identity": ("o", "valid identity"),
+        "valid_nonidentity": ("^", "valid nonidentity"),
+    }
+    for status, (marker, label) in status_markers.items():
+        selected = phase_table["phase_status"] == status
+        axes[0].scatter(positions[selected], phase_table.loc[selected, "refined_shift_days"], marker=marker, label=label)
+    unavailable = ~phase_table["phase_available"].astype(bool)
+    axes[0].scatter(positions[unavailable], np.zeros(int(unavailable.sum())), marker="x", color="red", label="unavailable")
     axes[0].plot(positions, phase_table["shift_mad_days"], "+", label="bootstrap shift MAD")
-    axes[1].plot(positions, phase_table["source_t_peak_prominence_ratio"], "o-", label="source T prominence")
-    axes[1].plot(positions, phase_table["target_t_peak_prominence_ratio"], "o-", label="target T prominence")
-    axes[2].bar(positions, phase_table["bootstrap_valid_rate"], label="bootstrap valid rate", alpha=0.6)
+    axes[1].plot(positions, phase_table["relative_gain"], "o-", label="relative gain")
+    axes[1].plot(positions, phase_table["objective_margin"], "s-", label="objective margin")
+    axes[1].plot(positions, phase_table["source_t_peak_prominence_ratio"], ".-", label="source T prominence")
+    axes[1].plot(positions, phase_table["target_t_peak_prominence_ratio"], ".-", label="target T prominence")
+    axes[2].bar(positions, phase_table["bootstrap_search_success_rate"], label="bootstrap search success rate", alpha=0.6)
     axes[2].plot(positions, phase_table["common_support_fraction"], "o-", label="common support")
-    axes[2].scatter(positions, phase_table["eligible"].astype(float), marker="x", color="black", label="eligible")
+    axes[2].scatter(positions, phase_table["style_contributor"].astype(float), marker="x", color="black", label="used to estimate shared style")
     axes[2].set_xticks(positions, phase_table["class_name"], rotation=45, ha="right")
     for axis in axes: axis.legend(); axis.grid(alpha=0.2)
     axes[0].set_ylabel("T-only shift (days)"); axes[1].set_ylabel("prominence ratio"); axes[2].set_ylabel("rate")
@@ -1024,16 +1349,33 @@ def run_ndvi_domain_style_diagnostic(
     table_dir = Path(output_dir) / "tables" / "domain_style_oracle" / f"{config.source_domain}_to_{config.target_domain}"
     figure_dir = Path(output_dir) / "figures" / "raw_timeseries" / "domain_style_oracle" / f"{config.source_domain}_to_{config.target_domain}"
     table_dir.mkdir(parents=True, exist_ok=True)
+    legacy_per_class = figure_dir / "per_class"
+    if legacy_per_class.exists():
+        resolved_figure_dir = figure_dir.resolve()
+        resolved_legacy = legacy_per_class.resolve()
+        if (
+            resolved_legacy.parent != resolved_figure_dir
+            or resolved_legacy.name != "per_class"
+        ):
+            raise RuntimeError("refusing to remove legacy figures outside task directory")
+        shutil.rmtree(legacy_per_class)
+    phase_figure_dir = figure_dir / "01_phase_aligned_before_style"
+    sweep_figure_dir = figure_dir / "02_style_compensation_lambda_sweep"
+    discrepancy_figure_dir = figure_dir / "03_class_discrepancy_vs_style"
 
     for class_name in common_classes:
         source_records = grouped.get((config.source_domain, class_name), [])
         target_records = grouped.get((config.target_domain, class_name), [])
-        reason_parts = []
-        if len(source_records) < config.min_class_samples or len(target_records) < config.min_class_samples:
-            reason_parts.append("insufficient_class_samples")
         if min(len(source_records), len(target_records)) < 3:
-            phase = {"valid": False, "reason": "insufficient_robust_center_samples", "shift_days": np.nan, "common_support": 0.0, "source_peak": {}, "target_peak": {}, "structure_source_peak_valid": False, "structure_target_peak_valid": False}
-            bootstrap = {"valid_rate": 0.0, "shift_median": np.nan, "shift_mad": np.nan, "shift_q25": np.nan, "shift_q75": np.nan, "delta_variance_integral": np.nan, "delta_finite_rate": 0.0, "deltas": np.empty((0, len(grid)))}
+            phase = _unavailable_phase(
+                "invalid_samples", "insufficient_robust_center_samples",
+                {}, {}, "not_searched",
+            )
+            phase.update({
+                "structure_source_peak_valid": False,
+                "structure_target_peak_valid": False,
+            })
+            bootstrap = _empty_bootstrap(len(grid))
             source_centers = target_centers = None
         else:
             source_centers = {component: _record_center(source_records, component) for component in ("original", "trend", "structure")}
@@ -1046,17 +1388,13 @@ def run_ndvi_domain_style_diagnostic(
                 max_shift_days=config.max_shift_days,
                 shift_refine_radius_days=config.shift_refine_radius_days,
                 min_common_support=config.min_common_support,
+                min_relative_phase_gain=config.min_relative_phase_gain,
             )
             bootstrap = bootstrap_phase_discrepancy(source_records, target_records, config, class_name)
             target_centers = None
-        if not phase.get("valid", False):
-            reason_parts.append("invalid_trend_phase")
-        if bootstrap["valid_rate"] < config.min_bootstrap_valid_rate:
-            reason_parts.append("low_bootstrap_valid_rate")
-        if phase.get("common_support", 0.0) < config.min_common_support:
-            reason_parts.append("low_common_support")
 
-        shift = float(phase["shift_days"]) if phase.get("valid", False) else 0.0
+        phase_available = bool(phase.get("phase_available", False))
+        shift = float(phase["shift_days"]) if phase_available else 0.0
         if source_records and target_records:
             source_data = {}
             target_data = {}
@@ -1068,16 +1406,16 @@ def run_ndvi_domain_style_diagnostic(
                 target_data[component] = (target_values, target_valid, target_summary)
             target_centers = {component: target_data[component][2] for component in target_data}
             common = np.isfinite(source_data["trend"][2]["robust"]) & np.isfinite(target_data["trend"][2]["robust"])
-            delta_finite_ok = False
+            bootstrap_delta_available = False
             if bootstrap["deltas"].size and common.any():
                 rates = np.mean(np.isfinite(bootstrap["deltas"][:, common]), axis=0)
                 bootstrap["delta_finite_rate"] = float(np.mean(rates >= 0.80))
-                delta_finite_ok = bootstrap["delta_finite_rate"] >= 0.80
+                bootstrap_delta_available = bool(
+                    np.isfinite(bootstrap["deltas"][:, common]).any()
+                )
                 bootstrap["delta_variance_integral"] = _bootstrap_variance_integral(
                     bootstrap["deltas"], grid, common,
                 )
-            if not delta_finite_ok:
-                reason_parts.append("insufficient_bootstrap_delta_support")
             delta_t = target_data["trend"][2]["robust"] - source_data["trend"][2]["robust"]
             delta_s = target_data["structure"][2]["robust"] - source_data["structure"][2]["robust"]
             delta_h = target_data["original"][2]["robust"] - source_data["original"][2]["robust"]
@@ -1100,62 +1438,99 @@ def run_ndvi_domain_style_diagnostic(
             common = np.zeros_like(grid, bool)
             delta_t = delta_s = delta_h = np.full_like(grid, np.nan)
 
-        eligible = not reason_parts
+            bootstrap_delta_available = False
+
+        reason_parts: list[str] = []
+        if (
+            len(source_records) < config.min_class_samples
+            or len(target_records) < config.min_class_samples
+        ):
+            reason_parts.append("insufficient_class_samples")
+        if not phase_available:
+            reason_parts.append({
+                "invalid_flat_trend": "invalid_flat_trend",
+                "invalid_common_support": "phase_search_support_failure",
+                "invalid_grid": "invalid_grid",
+                "invalid_samples": "invalid_samples",
+            }.get(str(phase.get("phase_status")), "invalid_samples"))
+        if (
+            phase.get("phase_status") == "invalid_common_support"
+            or (
+                phase_available
+                and float(phase.get("common_support", np.nan))
+                < config.min_common_support
+            )
+        ):
+            reason_parts.append("phase_search_support_failure")
+        if (
+            bootstrap["bootstrap_search_success_rate"] <= 0.0
+            or not bootstrap_delta_available
+        ):
+            reason_parts.append("no_bootstrap_delta")
+        style_contributor = not reason_parts
         reason = ";".join(dict.fromkeys(reason_parts))
         class_info[class_name] = {
             "source_records": source_records, "target_records": target_records,
             "source_data": source_data, "target_data": target_data,
             "phase": phase, "bootstrap": bootstrap, "delta_t": delta_t,
             "delta_s": delta_s, "delta_h": delta_h, "common": common,
-            "eligible": eligible, "reason": reason,
+            "phase_available": phase_available,
+            "style_contributor": style_contributor,
+            "style_evaluable": False,
+            "eligible": style_contributor, "reason": reason,
         }
-        phase_rows.append(_phase_row(class_name, source_records, target_records, phase, bootstrap, eligible, reason))
-        class_dir = figure_dir / "per_class" / _safe_name(class_name)
+        phase_path = phase_figure_dir / f"{_safe_name(class_name)}.png"
         if source_data and target_data:
             _plot_phase_class(
                 class_name, config.source_domain, config.target_domain, grid,
                 source_data, target_data, phase, bootstrap, len(source_records), len(target_records),
-                class_dir / "01_phase_aligned_before_style.png",
+                phase_path,
             )
         else:
-            _placeholder(class_dir / "01_phase_aligned_before_style.png", f"{ORACLE_NOTICE} | {class_name}", reason or "no sampled parcels", 3)
+            _placeholder(
+                phase_path, f"{ORACLE_NOTICE} | {class_name}",
+                reason or "no sampled parcels", 3,
+            )
 
-    eligible_classes = [name for name in common_classes if class_info[name]["eligible"]]
-    uncertainty_values = [class_info[name]["bootstrap"]["delta_variance_integral"] for name in eligible_classes if np.isfinite(class_info[name]["bootstrap"]["delta_variance_integral"])]
+    style_contributor_classes = [
+        name for name in common_classes
+        if class_info[name]["style_contributor"]
+    ]
+    eligible_classes = style_contributor_classes
+    uncertainty_values = [class_info[name]["bootstrap"]["delta_variance_integral"] for name in style_contributor_classes if np.isfinite(class_info[name]["bootstrap"]["delta_variance_integral"])]
     uncertainty_reference = float(np.median(uncertainty_values)) if uncertainty_values else 0.0
     q_values: dict[str, dict[str, float]] = {}
     for name in common_classes:
         info = class_info[name]
         bootstrap = info["bootstrap"]
-        q_valid = float(bootstrap["valid_rate"])
+        q_valid = float(bootstrap["bootstrap_search_success_rate"])
         q_phase = math.exp(-0.5 * (float(bootstrap["shift_mad"]) / PHASE_MAD_REFERENCE_DAYS) ** 2) if np.isfinite(bootstrap["shift_mad"]) else 0.0
         uncertainty = float(bootstrap["delta_variance_integral"])
         q_precision = 1.0 if uncertainty_reference <= 0 and np.isfinite(uncertainty) and uncertainty == 0 else (1.0 / (1.0 + uncertainty / uncertainty_reference) if uncertainty_reference > 0 and np.isfinite(uncertainty) else 0.0)
-        q_coverage = float(info["phase"].get("common_support", 0.0))
-        q_values[name] = {"q_valid": q_valid, "q_phase": q_phase, "q_precision": q_precision, "q_coverage": q_coverage, "base": q_valid * q_phase * q_precision * q_coverage}
+        q_coverage = float(info["phase"].get("common_support", np.nan))
+        base_weight = (
+            q_valid * q_phase * q_precision * q_coverage
+            if info["style_contributor"] and np.isfinite(q_coverage) else 0.0
+        )
+        q_values[name] = {"q_valid": q_valid, "q_phase": q_phase, "q_precision": q_precision, "q_coverage": q_coverage, "base": base_weight}
 
-    deltas = {name: class_info[name]["delta_t"] for name in eligible_classes}
-    masks = {name: class_info[name]["common"] for name in eligible_classes}
-    base = {name: q_values[name]["base"] for name in eligible_classes}
-    robust = fit_robust_domain_style(eligible_classes, deltas, masks, base)
-    uniform_weights = {name: 1.0 for name in eligible_classes}
-    source_frequency_weights = {name: float(len(class_info[name]["source_records"])) for name in eligible_classes}
+    deltas = {name: class_info[name]["delta_t"] for name in common_classes}
+    masks = {name: class_info[name]["common"] for name in common_classes}
+    base = {name: q_values[name]["base"] for name in style_contributor_classes}
+    robust = fit_robust_domain_style(style_contributor_classes, deltas, masks, base)
+    uniform_weights = {name: 1.0 for name in style_contributor_classes}
+    source_frequency_weights = {name: float(len(class_info[name]["source_records"])) for name in style_contributor_classes}
     empty_style = np.full_like(grid, np.nan)
     schemes = {
         "robust_reliability": robust["style"] if robust["valid"] else empty_style,
-        "uniform": _weighted_style(eligible_classes, deltas, masks, uniform_weights) if len(eligible_classes) >= MIN_STYLE_CLASSES else empty_style,
-        "source_frequency": _weighted_style(eligible_classes, deltas, masks, source_frequency_weights) if len(eligible_classes) >= MIN_STYLE_CLASSES else empty_style,
+        "uniform": _weighted_style(style_contributor_classes, deltas, masks, uniform_weights) if len(style_contributor_classes) >= MIN_STYLE_CLASSES else empty_style,
+        "source_frequency": _weighted_style(style_contributor_classes, deltas, masks, source_frequency_weights) if len(style_contributor_classes) >= MIN_STYLE_CLASSES else empty_style,
     }
-    loco_robust: dict[str, dict[str, object]] = {}
-    for held_out in eligible_classes:
-        remaining = [name for name in eligible_classes if name != held_out]
-        if len(remaining) < MIN_STYLE_CLASSES:
-            loco_robust[held_out] = {
-                "valid": False, "reason": "insufficient_loco_classes",
-                "style": empty_style, "classes_used": remaining,
-                "consensus": {}, "final_weights": {},
-            }
-            continue
+    base_by_held: dict[str, dict[str, float]] = {}
+    for held_out in common_classes:
+        remaining = [
+            name for name in style_contributor_classes if name != held_out
+        ]
         remaining_uncertainty = [
             float(class_info[name]["bootstrap"]["delta_variance_integral"])
             for name in remaining
@@ -1175,9 +1550,35 @@ def run_ndvi_domain_style_diagnostic(
                 q_values[name]["q_valid"] * q_values[name]["q_phase"]
                 * q_precision * q_values[name]["q_coverage"]
             )
-        loco_robust[held_out] = fit_robust_domain_style(
-            remaining, deltas, masks, remaining_base,
+        base_by_held[held_out] = remaining_base
+    loco_robust = compute_loco_domain_styles(
+        common_classes, style_contributor_classes, deltas, masks, base,
+        base_reliability_by_held=base_by_held,
+    )
+    for name in common_classes:
+        class_info[name]["style_evaluable"] = bool(
+            class_info[name]["phase_available"]
+            and loco_robust[name]["valid"]
         )
+    phase_rows = []
+    for name in common_classes:
+        evaluation_reason = ""
+        if not class_info[name]["style_evaluable"]:
+            evaluation_reason = (
+                class_info[name]["reason"]
+                if not class_info[name]["phase_available"]
+                else "insufficient_style_contributors"
+            )
+        class_info[name]["style_evaluation_reason"] = evaluation_reason
+        row = _phase_row(
+            name, class_info[name]["source_records"],
+            class_info[name]["target_records"], class_info[name]["phase"],
+            class_info[name]["bootstrap"],
+            class_info[name]["style_contributor"],
+            class_info[name]["style_evaluable"], class_info[name]["reason"],
+        )
+        row["style_evaluation_reason"] = evaluation_reason
+        phase_rows.append(row)
 
     weights_rows = []
     source_total = sum(source_frequency_weights.values()) or 1.0
@@ -1193,7 +1594,10 @@ def run_ndvi_domain_style_diagnostic(
             "final_weight": robust.get("final_weights", {}).get(name, 0.0),
             "uniform_weight": 1.0 / len(eligible_classes) if name in eligible_classes and eligible_classes else 0.0,
             "source_frequency_weight": source_frequency_weights.get(name, 0.0) / source_total,
-            "eligible": class_info[name]["eligible"], "exclusion_reason": class_info[name]["reason"],
+            "style_contributor": class_info[name]["style_contributor"],
+            "style_evaluable": class_info[name]["style_evaluable"],
+            "eligible": class_info[name]["style_contributor"],
+            "exclusion_reason": class_info[name]["reason"],
         })
     weights_table = pd.DataFrame(weights_rows)
 
@@ -1217,7 +1621,10 @@ def run_ndvi_domain_style_diagnostic(
             ]
             style_rows.append({"weighting_scheme": scheme, "day_of_year": doy, "style_value": style[index], "n_classes_contributing": len(contributing), "total_weight": float(sum(scheme_class_weights[scheme].get(name, 0.0) for name in contributing)), "valid": bool(np.isfinite(style[index])), "oracle_target_labels": True})
     for name in common_classes:
-        loco = loco_robust.get(name, {"valid": False, "reason": class_info[name]["reason"] or "class_not_eligible", "style": empty_style, "classes_used": []})
+        loco = loco_robust.get(name, {
+            "valid": False, "reason": "insufficient_style_contributors",
+            "style": empty_style, "classes_used": [],
+        })
         for index, doy in enumerate(grid):
             contributing = [
                 other for other in loco.get("classes_used", [])
@@ -1229,12 +1636,58 @@ def run_ndvi_domain_style_diagnostic(
     metric_rows: list[dict[str, object]] = []
     for class_name in common_classes:
         info = class_info[class_name]
-        class_dir = figure_dir / "per_class" / _safe_name(class_name)
+        safe_filename = f"{_safe_name(class_name)}.png"
+        sweep_path = sweep_figure_dir / safe_filename
+        discrepancy_path = discrepancy_figure_dir / safe_filename
         loco = loco_robust.get(class_name)
-        if not info["eligible"] or loco is None or not loco["valid"]:
-            reason = info["reason"] or (loco.get("reason", "insufficient_loco_classes") if loco else "insufficient_loco_classes")
+        if not info["style_evaluable"] or loco is None or not loco["valid"]:
+            reason = info["style_evaluation_reason"]
             for scheme in schemes:
                 for style_lambda in config.style_lambdas:
+                    if style_lambda == 0.0 and info["phase_available"]:
+                        identity_style = np.zeros_like(grid)
+                        source_center_components = {
+                            component: info["source_data"][component][2]["robust"]
+                            for component in ("original", "trend", "structure")
+                        }
+                        styled_centers = apply_shared_style(
+                            source_center_components, identity_style, style_lambda,
+                        )
+                        hierarchy = hierarchy_max_errors(
+                            source_center_components, styled_centers,
+                        )
+                        physical = physical_violation_fraction(
+                            info["source_data"]["original"][0]
+                        )
+                        for component in ("original", "trend", "structure"):
+                            other_targets = [
+                                class_info[other]["target_data"][component][2]["robust"]
+                                for other in common_classes
+                                if other != class_name
+                                and class_info[other]["phase_available"]
+                                and class_info[other]["target_data"]
+                            ]
+                            row = _metric_row(
+                                class_name, component, scheme, style_lambda,
+                                info["source_data"][component][0],
+                                info["source_data"][component][1],
+                                info["target_data"][component][0],
+                                info["target_data"][component][1],
+                                info["source_data"][component][2],
+                                info["target_data"][component][2],
+                                identity_style, other_targets,
+                                config.min_common_support,
+                                physical if component == "original" else np.nan,
+                                hierarchy, True, "",
+                            )
+                            row["style_explained_t"] = style_explained_fraction(
+                                info["delta_t"], identity_style, info["common"],
+                            )
+                            row["style_transfer_explained_s"] = style_explained_fraction(
+                                info["delta_s"], identity_style, info["common"],
+                            )
+                            metric_rows.append(row)
+                        continue
                     for component in ("original", "trend", "structure"):
                         metric_rows.append({
                             "class_name": class_name, "component": component,
@@ -1250,14 +1703,14 @@ def run_ndvi_domain_style_diagnostic(
                             "style_transfer_explained_s": np.nan, "hierarchy_error": np.nan,
                             "valid": False, "invalid_reason": reason,
                         })
-            _placeholder(class_dir / "02_style_compensation_lambda_sweep.png", f"{ORACLE_NOTICE} | {class_name}", reason, 3)
-            _placeholder(class_dir / "03_class_discrepancy_vs_style.png", f"{ORACLE_NOTICE} | {class_name}", reason, 3)
+            _placeholder(sweep_path, f"{ORACLE_NOTICE} | {class_name}", reason, 3)
+            _placeholder(discrepancy_path, f"{ORACLE_NOTICE} | {class_name}", reason, 3)
             continue
         for scheme in schemes:
             if scheme == "robust_reliability":
                 style = loco["style"]
             else:
-                remaining = [name for name in eligible_classes if name != class_name]
+                remaining = [name for name in style_contributor_classes if name != class_name]
                 weights = uniform_weights if scheme == "uniform" else source_frequency_weights
                 style = _weighted_style(remaining, deltas, masks, weights) if len(remaining) >= MIN_STYLE_CLASSES else empty_style
             for style_lambda in config.style_lambdas:
@@ -1266,12 +1719,21 @@ def run_ndvi_domain_style_diagnostic(
                 hierarchy = hierarchy_max_errors(source_center_components, styled_centers)
                 if max(hierarchy.values()) >= 1e-10:
                     raise RuntimeError("shared H/T/S style application changed D or R")
+                adjustment = (
+                    np.zeros_like(style) if style_lambda == 0.0
+                    else style_lambda * style
+                )
                 physical = physical_violation_fraction(
-                    info["source_data"]["original"][0]
-                    + style_lambda * style[None, :]
+                    info["source_data"]["original"][0] + adjustment[None, :]
                 )
                 for component in ("original", "trend", "structure"):
-                    other_targets = [class_info[other]["target_data"][component][2]["robust"] for other in eligible_classes if other != class_name]
+                    other_targets = [
+                        class_info[other]["target_data"][component][2]["robust"]
+                        for other in common_classes
+                        if other != class_name
+                        and class_info[other]["phase_available"]
+                        and class_info[other]["target_data"]
+                    ]
                     row = _metric_row(
                         class_name, component, scheme, style_lambda,
                         info["source_data"][component][0], info["source_data"][component][1],
@@ -1281,20 +1743,20 @@ def run_ndvi_domain_style_diagnostic(
                         physical if component == "original" else np.nan,
                         hierarchy, bool(np.isfinite(style).any()), "",
                     )
-                    row["style_explained_t"] = style_explained_fraction(info["delta_t"], style_lambda * style, info["common"])
-                    row["style_transfer_explained_s"] = style_explained_fraction(info["delta_s"], style_lambda * style, info["common"])
+                    row["style_explained_t"] = style_explained_fraction(info["delta_t"], adjustment, info["common"])
+                    row["style_transfer_explained_s"] = style_explained_fraction(info["delta_s"], adjustment, info["common"])
                     metric_rows.append(row)
         robust_rows = [row for row in metric_rows if row["class_name"] == class_name and row["weighting_scheme"] == "robust_reliability"]
         _plot_style_sweep(
             class_name, config.source_domain, config.target_domain, grid,
             info["source_data"], info["target_data"],
             loco["style"], config.style_lambdas, robust_rows,
-            class_dir / "02_style_compensation_lambda_sweep.png",
+            sweep_path,
         )
         _plot_discrepancy_style(
             class_name, config.source_domain, config.target_domain, grid,
             info["delta_t"], info["delta_s"], loco["style"], info["common"],
-            class_dir / "03_class_discrepancy_vs_style.png",
+            discrepancy_path,
         )
 
     phase_table = pd.DataFrame(phase_rows)
@@ -1344,16 +1806,25 @@ def run_ndvi_domain_style_diagnostic(
         "warning": ORACLE_NOTICE,
         "source_domain": config.source_domain, "target_domain": config.target_domain,
         "classes": common_classes, "eligible_classes": eligible_classes,
+        "style_contributor_classes": style_contributor_classes,
         "parameters": asdict(config), "canonical_doys": grid.tolist(),
         "phase_anchor": "trend_t_only", "structure_peak": "diagnostic_only_no_fallback",
+        "phase_search": {
+            "peak_is_hard_requirement": False,
+            "peak_role": "initialization_and_diagnostic_only",
+            "fallback": "full_T_only_shift_search",
+            "structure_s_defines_phase": False,
+        },
         "target_alignment_formula": "target_aligned(u)=target(u-shift)",
         "style_definition": "robust equal-class-prior Huber IRLS over target-minus-source DeltaT",
         "style_application": "same un-clipped lambda*g_LOCO added to source H, T, and S",
         "lambda_selection": False,
         "lambda_role": "fixed sensitivity sweep only; never selected by target labels",
+        "lambda_zero_baseline_mandatory": True,
+        "figure_layout": "figure_type_then_class",
         "sensitivity_weighting": ["uniform", "source_frequency_not_recommended"],
         "weighting_formulas": {
-            "q_valid": "bootstrap_valid_rate",
+            "q_valid": "bootstrap_search_success_rate",
             "q_phase": "exp(-0.5*(shift_mad_days/14)^2)",
             "q_precision": "1/(1+U_c/U_ref)",
             "q_coverage": "common_support_fraction",
@@ -1374,6 +1845,7 @@ def run_ndvi_domain_style_diagnostic(
     (table_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return {
         "classes": common_classes, "eligible_classes": eligible_classes,
+        "style_contributor_classes": style_contributor_classes,
         "records": records, "phase": phase_table, "weights": weights_table,
         "styles": style_table, "loco_styles": loco_table, "metrics": metrics_table,
         "summary": summary_table, "manifest": manifest,

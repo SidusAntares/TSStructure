@@ -85,7 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
     domain_style.add_argument("--max-shift-days", type=float, default=90.0)
     domain_style.add_argument("--shift-refine-radius-days", type=float, default=14.0)
     domain_style.add_argument("--max-interpolation-gap-days", type=float, default=60.0)
-    domain_style.add_argument("--style-lambdas", nargs="+", type=float, default=[0.5, 1.0, 1.5])
+    domain_style.add_argument("--min-relative-phase-gain", type=float, default=0.02)
+    domain_style.add_argument(
+        "--style-lambdas", nargs="+", type=float,
+        default=[0.0, 0.5, 1.0, 1.5],
+    )
     domain_style.add_argument("--classes", nargs="+", default=None)
 
     return parser
@@ -112,6 +116,7 @@ def validate_domain_style_args(args):
         max_shift_days=args.max_shift_days,
         shift_refine_radius_days=args.shift_refine_radius_days,
         max_interpolation_gap_days=args.max_interpolation_gap_days,
+        min_relative_phase_gain=args.min_relative_phase_gain,
         style_lambdas=tuple(args.style_lambdas),
     )
     args.style_lambdas = list(config.style_lambdas)

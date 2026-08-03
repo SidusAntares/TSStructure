@@ -58,6 +58,62 @@ def test_target_peak_thirty_days_later_recovers_negative_shift():
     )
     assert result["valid"]
     assert abs(result["shift_days"] + 30.0) <= 1.0
+    assert result["phase_available"]
+    assert result["phase_status"] == "valid_nonidentity"
+    assert result["search_mode"] == "peak_guided"
+    assert 0.0 in result["candidate_shifts"]
+
+
+def test_unreliable_peak_uses_full_trend_search_and_recovers_shift():
+    module = _module()
+    grid = np.linspace(1.0, 365.0, 365)
+    result = module.estimate_phase_shift(
+        _peak_curve(grid, 60.0), _peak_curve(grid, 90.0), grid,
+        peak_search_start=45.0, peak_search_end=330.0,
+        min_peak_prominence_ratio=0.15, max_shift_days=90.0,
+        shift_refine_radius_days=14.0, min_common_support=0.65,
+    )
+    assert not result["source_peak"]["valid"]
+    assert result["phase_available"]
+    assert result["search_mode"] == "full_trend_search"
+    assert result["phase_status"] == "valid_nonidentity"
+    assert abs(result["shift_days"] + 30.0) <= 1.0
+
+
+def test_peak_guided_search_clamps_out_of_range_initial_shift_to_boundary():
+    module = _module()
+    grid = np.linspace(1.0, 365.0, 365)
+    result = module.estimate_phase_shift(
+        _peak_curve(grid, 220.0), _peak_curve(grid, 100.0), grid,
+        max_shift_days=90.0, shift_refine_radius_days=14.0,
+        min_common_support=0.65,
+    )
+    assert result["phase_available"]
+    assert result["search_mode"] == "peak_guided"
+    assert result["phase_status"] == "valid_nonidentity"
+    assert np.isclose(result["shift_days"], 90.0)
+    assert result["shift_at_boundary"]
+
+
+def test_identity_is_selected_when_relative_gain_is_below_threshold():
+    module = _module()
+    grid = np.linspace(1.0, 365.0, 128)
+    curve = _peak_curve(grid, 160.0)
+    result = module.estimate_phase_shift(curve, curve.copy(), grid)
+    assert result["phase_available"]
+    assert result["phase_status"] == "valid_identity"
+    assert result["shift_days"] == 0.0
+    assert result["relative_gain"] < 0.02
+
+
+def test_invalid_canonical_grid_has_explicit_unavailable_status():
+    module = _module()
+    grid = np.array([1.0, 10.0, 8.0, 20.0])
+    source = np.array([0.1, 0.6, 0.4, 0.2])
+    result = module.estimate_phase_shift(source, source.copy(), grid)
+    assert not result["phase_available"]
+    assert result["phase_status"] == "invalid_grid"
+    assert np.isnan(result["common_support"])
 
 
 def test_phase_refinement_uses_actual_canonical_grid_step():
@@ -88,6 +144,13 @@ def test_flat_trend_is_phase_invalid():
     result = module.detect_trend_peak(np.full(128, 0.4), grid)
     assert not result["valid"]
     assert result["reason"] == "insufficient_dynamic_range"
+    phase = module.estimate_phase_shift(
+        np.full(128, 0.4), np.full(128, 0.4), grid,
+    )
+    assert not phase["phase_available"]
+    assert phase["phase_status"] == "invalid_flat_trend"
+    assert phase["shift_days"] == 0.0
+    assert np.isnan(phase["common_support"])
 
 
 def test_invalid_trend_never_falls_back_to_structure_peak():
@@ -97,8 +160,8 @@ def test_invalid_trend_never_falls_back_to_structure_peak():
         np.full(128, 0.4), np.full(128, 0.4),
         _peak_curve(grid, 140.0), _peak_curve(grid, 170.0), grid,
     )
-    assert not result["valid"]
-    assert np.isnan(result["shift_days"])
+    assert not result["phase_available"]
+    assert result["shift_days"] == 0.0
     assert result["structure_source_peak_valid"]
     assert result["structure_target_peak_valid"]
 
@@ -145,7 +208,9 @@ def test_loco_style_excludes_held_out_class():
     deltas = {name: np.full(8, float(index)) for index, name in enumerate(classes)}
     masks = {name: np.ones(8, dtype=bool) for name in classes}
     reliability = {name: 1.0 for name in classes}
-    loco = module.compute_loco_domain_styles(classes, deltas, masks, reliability)
+    loco = module.compute_loco_domain_styles(
+        classes, classes, deltas, masks, reliability
+    )
     assert loco["c5"]["valid"]
     assert "c5" not in loco["c5"]["classes_used"]
     assert np.all(loco["c5"]["style"] < 5.0)
@@ -157,10 +222,25 @@ def test_loco_requires_five_remaining_classes():
     values = {name: np.ones(4) for name in classes}
     masks = {name: np.ones(4, bool) for name in classes}
     result = module.compute_loco_domain_styles(
-        classes, values, masks, {name: 1.0 for name in classes}
+        classes, classes, values, masks, {name: 1.0 for name in classes}
     )
     assert not result["c0"]["valid"]
     assert result["c0"]["reason"] == "insufficient_loco_classes"
+
+
+def test_loco_evaluates_noncontributor_without_leaking_held_class():
+    module = _module()
+    evaluation = [f"c{i}" for i in range(6)]
+    contributors = evaluation[:5]
+    deltas = {name: np.full(8, float(index)) for index, name in enumerate(evaluation)}
+    masks = {name: np.ones(8, dtype=bool) for name in evaluation}
+    result = module.compute_loco_domain_styles(
+        evaluation, contributors, deltas, masks,
+        {name: 1.0 for name in contributors},
+    )
+    assert result["c5"]["valid"]
+    assert "c5" not in result["c5"]["classes_used"]
+    assert result["c5"]["classes_used"] == contributors
 
 
 def test_consensus_irls_downweights_outlying_class():
@@ -201,6 +281,21 @@ def test_same_style_on_h_t_s_preserves_d_and_r_without_clipping():
     assert styled["original"][0] > 1.0
     assert module.physical_violation_fraction(styled["original"]) > 0.0
     assert module.hierarchy_max_errors(components, styled)["max_dynamics_error"] < 1e-10
+
+
+def test_style_lambda_zero_is_exact_identity_even_when_style_has_nan():
+    module = _module()
+    components = {
+        "original": np.array([0.2, 0.4, 0.6]),
+        "trend": np.array([0.1, 0.3, 0.5]),
+        "structure": np.array([0.15, 0.35, 0.55]),
+    }
+    styled = module.apply_shared_style(
+        components, np.array([np.nan, 0.5, -0.2]), 0.0
+    )
+    for name in components:
+        assert np.array_equal(styled[name], components[name])
+    assert max(module.hierarchy_max_errors(components, styled).values()) == 0.0
 
 
 def test_shared_style_lambda_one_reduces_matching_t_and_s_discrepancy():
@@ -276,7 +371,22 @@ def test_domain_style_cli_defaults_and_oracle_command():
     assert args.samples_per_group == 100
     assert args.bootstrap_repeats == 200
     assert args.canonical_grid_size == 128
-    assert args.style_lambdas == [0.5, 1.0, 1.5]
+    assert args.style_lambdas == [0.0, 0.5, 1.0, 1.5]
+
+
+def test_domain_style_config_always_adds_lambda_zero():
+    module = _module()
+    config = module.DomainStyleConfig(
+        "DK1", "FR2", style_lambdas=(1.0, 0.5, 1.0)
+    )
+    assert config.style_lambdas == (0.0, 0.5, 1.0)
+
+
+def test_phase_plot_target_label_distinguishes_alignment_from_identity_fallback():
+    module = _module()
+    assert module._phase_target_label("FR2", True) == "FR2 T-phase aligned"
+    assert "identity fallback" in module._phase_target_label("FR2", False)
+    assert "not aligned" in module._phase_target_label("FR2", False)
 
 
 def test_domain_style_cli_rejects_same_domain_and_invalid_ratios():
@@ -320,8 +430,10 @@ def test_oracle_runner_writes_declared_tables_and_figures_on_synthetic_data(tmp_
 
     class FakeDataset:
         metadata = {"dates": dates}
-        def __init__(self, target): self.target = target
-        def __len__(self): return len(classes) * 4
+        def __init__(self, target, class_count):
+            self.target = target
+            self.class_count = class_count
+        def __len__(self): return self.class_count * 4
         def __getitem__(self, index):
             label, repeat = divmod(index, 4)
             doys = np.linspace(10, 344, len(dates))
@@ -334,7 +446,7 @@ def test_oracle_runner_writes_declared_tables_and_figures_on_synthetic_data(tmp_
             return {"pixels": pixels, "label": label}
 
     def factory(root, name, labels):
-        return FakeDataset("30TXT" in name)
+        return FakeDataset("30TXT" in name, len(labels))
 
     config = module.DomainStyleConfig(
         "DK1", "FR2", samples_per_group=4, bootstrap_repeats=3,
@@ -342,6 +454,12 @@ def test_oracle_runner_writes_declared_tables_and_figures_on_synthetic_data(tmp_
         min_common_support=0.5, min_bootstrap_valid_rate=0.0,
         max_interpolation_gap_days=40, style_lambdas=(1.0,),
     )
+    stale = (
+        tmp_path / "out/figures/raw_timeseries/domain_style_oracle/"
+        "DK1_to_FR2/per_class/stale"
+    )
+    stale.mkdir(parents=True)
+    (stale / "old.png").write_bytes(b"old")
     result = module.run_ndvi_domain_style_diagnostic(
         tmp_path, tmp_path / "out", config, classes=classes, dataset_factory=factory
     )
@@ -355,21 +473,51 @@ def test_oracle_runner_writes_declared_tables_and_figures_on_synthetic_data(tmp_
     ):
         assert (table_dir / filename).is_file()
     assert (figure_dir / "task_summary/phase_diagnostics.png").is_file()
-    assert (figure_dir / "per_class/crop_0/01_phase_aligned_before_style.png").is_file()
+    assert (figure_dir / "01_phase_aligned_before_style/crop_0.png").is_file()
+    assert (figure_dir / "02_style_compensation_lambda_sweep/crop_0.png").is_file()
+    assert (figure_dir / "03_class_discrepancy_vs_style/crop_0.png").is_file()
+    assert not (figure_dir / "per_class").exists()
     assert result["manifest"]["oracle_target_labels"] is True
     assert result["manifest"]["not_for_training"] is True
     assert result["manifest"]["deployable_uda"] is False
     assert result["eligible_classes"] == list(classes)
+    assert result["style_contributor_classes"] == list(classes)
     phase = pd.read_csv(table_dir / "phase_alignment.csv")
     assert {"source_domain", "target_domain", "source_t_peak_doy",
             "source_t_peak_prominence_ratio", "common_support_fraction",
             "shift_median_days", "shift_mad_days", "shift_q25_days",
-            "shift_q75_days"} <= set(phase.columns)
+            "shift_q75_days", "phase_available", "phase_status",
+            "search_mode", "identity_objective", "best_objective",
+            "relative_gain", "second_best_objective", "objective_margin",
+            "shift_at_boundary", "bootstrap_search_success_rate",
+            "bootstrap_identity_rate", "bootstrap_nonidentity_rate",
+            "bootstrap_relative_gain_median",
+            "bootstrap_objective_margin_median", "style_contributor",
+            "style_evaluable"} <= set(phase.columns)
+    assert phase["style_contributor"].all()
+    assert phase["style_evaluable"].all()
     metrics = pd.read_csv(table_dir / "style_compensation_metrics.csv")
     assert {"lambda", "center_rmse_relative_change", "energy_relative_change",
             "nearest_class_margin_before", "nearest_class_margin_after",
             "physical_violation_fraction", "hierarchy_error",
             "invalid_reason"} <= set(metrics.columns)
+    baseline = metrics[metrics["lambda"] == 0.0]
+    assert not baseline.empty
+    assert np.array_equal(
+        baseline["center_rmse_before"].to_numpy(),
+        baseline["center_rmse_after"].to_numpy(), equal_nan=True,
+    )
+    assert np.array_equal(
+        baseline["iqr_distance_before"].to_numpy(),
+        baseline["iqr_distance_after"].to_numpy(), equal_nan=True,
+    )
+    assert np.array_equal(
+        baseline["energy_distance_before"].to_numpy(),
+        baseline["energy_distance_after"].to_numpy(), equal_nan=True,
+    )
+    assert (baseline["hierarchy_error"] == 0.0).all()
+    assert result["manifest"]["phase_search"]["peak_is_hard_requirement"] is False
+    assert result["manifest"]["figure_layout"] == "figure_type_then_class"
     for filename in (
         "class_trend_discrepancies_and_style.png", "class_style_weights.png",
         "discrepancy_cosine_matrix.png", "lambda_summary.png",
@@ -392,3 +540,41 @@ def test_oracle_runner_writes_declared_tables_and_figures_on_synthetic_data(tmp_
         tmp_path / "ineligible/figures/raw_timeseries/domain_style_oracle/"
         "DK1_to_FR2/task_summary/discrepancy_cosine_matrix.png"
     ).is_file()
+
+    five_class_result = module.run_ndvi_domain_style_diagnostic(
+        tmp_path, tmp_path / "five_classes",
+        module.DomainStyleConfig(
+            "DK1", "FR2", samples_per_group=4, bootstrap_repeats=1,
+            canonical_grid_size=48, min_class_samples=3,
+            min_common_support=0.5, min_bootstrap_valid_rate=0.0,
+            max_interpolation_gap_days=40, style_lambdas=(1.0,),
+        ),
+        classes=classes[:5], dataset_factory=factory,
+    )
+    assert five_class_result["style_contributor_classes"] == list(classes[:5])
+    five_phase = pd.read_csv(
+        tmp_path / "five_classes/tables/domain_style_oracle/DK1_to_FR2/"
+        "phase_alignment.csv"
+    )
+    assert five_phase["phase_available"].all()
+    assert not five_phase["style_evaluable"].any()
+    five_metrics = pd.read_csv(
+        tmp_path / "five_classes/tables/domain_style_oracle/DK1_to_FR2/"
+        "style_compensation_metrics.csv"
+    )
+    five_baseline = five_metrics[five_metrics["lambda"] == 0.0]
+    assert not five_baseline.empty
+    assert np.isfinite(five_baseline["center_rmse_before"]).all()
+    assert np.array_equal(
+        five_baseline["center_rmse_before"].to_numpy(),
+        five_baseline["center_rmse_after"].to_numpy(), equal_nan=True,
+    )
+    assert np.array_equal(
+        five_baseline["iqr_distance_before"].to_numpy(),
+        five_baseline["iqr_distance_after"].to_numpy(), equal_nan=True,
+    )
+    assert np.array_equal(
+        five_baseline["energy_distance_before"].to_numpy(),
+        five_baseline["energy_distance_after"].to_numpy(), equal_nan=True,
+    )
+    assert (five_baseline["hierarchy_error"] == 0.0).all()
