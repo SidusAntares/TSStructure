@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+import methods.structure_da as structure_da_api
 from methods.structure_da import (
     MonotoneWarpEstimator,
     MonotoneWarpOutput,
@@ -14,6 +15,7 @@ from methods.structure_da import (
     TemporalRegistrationOutput,
     TemporalSRVFRegistration,
 )
+from methods.structure_da import temporal_registration as registration_module
 from methods.structure_da.temporal_registration import (
     _apply_srvf_group_action,
     _warp_sequence,
@@ -47,6 +49,24 @@ def _sample_batch(dtype: torch.dtype = torch.float32):
          [True, False, True, True, False, True]]
     )
     return tokens, positions, mask
+
+
+def _warp_inputs(
+    batch_size: int = 2,
+    grid_size: int = 9,
+    feature_dim: int = 3,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cpu",
+):
+    torch.manual_seed(67)
+    sample = torch.randn(
+        batch_size, grid_size, feature_dim, dtype=dtype, device=device
+    )
+    template = torch.randn_like(sample)
+    support = torch.rand(batch_size, grid_size, dtype=dtype, device=device)
+    valid = torch.ones(batch_size, dtype=torch.bool, device=device)
+    return sample, template, support, valid
 
 
 def test_template_first_update_is_support_weighted_valid_source_mean() -> None:
@@ -232,6 +252,250 @@ def test_invalid_registration_rows_force_identity_warp() -> None:
     torch.testing.assert_close(output.interval_widths[1], torch.full((6,), 1 / 6))
     torch.testing.assert_close(output.warp[1], identity)
     torch.testing.assert_close(output.warp_derivative[1], torch.ones(7))
+
+
+def test_multi_candidate_zero_initialization_is_identity() -> None:
+    estimator = MonotoneWarpEstimator(
+        3, 9, hidden_dim=8, kernel_size=3, num_candidates=3
+    )
+    sample, template, support, valid = _warp_inputs()
+
+    output = estimator.forward_candidates(
+        sample, template, support, support, valid
+    )
+
+    assert isinstance(
+        output, registration_module.MonotoneWarpCandidatesOutput
+    )
+    assert output.interval_logits.shape == (2, 3, 8)
+    assert output.interval_widths.shape == (2, 3, 8)
+    assert output.warp.shape == (2, 3, 9)
+    assert output.warp_derivative.shape == (2, 3, 9)
+    assert output.inverse_warp.shape == (2, 3, 9)
+    identity = torch.linspace(0.0, 1.0, 9).expand(2, 3, -1)
+    torch.testing.assert_close(output.interval_logits, torch.zeros(2, 3, 8))
+    torch.testing.assert_close(
+        output.interval_widths, torch.full((2, 3, 8), 1.0 / 8)
+    )
+    torch.testing.assert_close(output.warp, identity)
+    torch.testing.assert_close(output.warp_derivative, torch.ones(2, 3, 9))
+    torch.testing.assert_close(output.inverse_warp, identity)
+
+
+def test_multi_candidate_warps_are_strictly_monotone() -> None:
+    estimator = MonotoneWarpEstimator(
+        3, 9, hidden_dim=8, kernel_size=3, num_candidates=3
+    )
+    with torch.no_grad():
+        for candidate in range(3):
+            estimator.network[-1].weight[candidate].normal_(
+                mean=0.2 * candidate, std=0.3 + 0.1 * candidate
+            )
+            estimator.network[-1].bias[candidate] = 0.1 * candidate
+    sample, template, support, valid = _warp_inputs()
+
+    output = estimator.forward_candidates(
+        sample, template, support, support, valid
+    )
+
+    assert torch.all(output.warp[..., 1:] > output.warp[..., :-1])
+    torch.testing.assert_close(output.warp[..., 0], torch.zeros(2, 3))
+    torch.testing.assert_close(output.warp[..., -1], torch.ones(2, 3))
+    assert torch.all(output.interval_widths > 0)
+    torch.testing.assert_close(
+        output.interval_widths.sum(dim=-1), torch.ones(2, 3)
+    )
+    assert torch.all(output.warp_derivative > 0)
+
+
+def test_invalid_rows_make_all_candidates_identity() -> None:
+    estimator = MonotoneWarpEstimator(
+        3, 9, hidden_dim=8, kernel_size=3, num_candidates=3
+    )
+    with torch.no_grad():
+        estimator.network[-1].weight.normal_()
+        estimator.network[-1].bias.normal_()
+    sample, template, support, _ = _warp_inputs()
+
+    output = estimator.forward_candidates(
+        sample, template, support, support, torch.tensor([True, False])
+    )
+
+    identity = torch.linspace(0.0, 1.0, 9).expand(3, -1)
+    torch.testing.assert_close(output.interval_logits[1], torch.zeros(3, 8))
+    torch.testing.assert_close(
+        output.interval_widths[1], torch.full((3, 8), 1.0 / 8)
+    )
+    torch.testing.assert_close(output.warp[1], identity)
+    torch.testing.assert_close(output.warp_derivative[1], torch.ones(3, 9))
+    torch.testing.assert_close(output.inverse_warp[1], identity)
+
+
+def test_legacy_forward_returns_candidate_zero() -> None:
+    estimator = MonotoneWarpEstimator(
+        3, 9, hidden_dim=8, kernel_size=3, num_candidates=3
+    )
+    with torch.no_grad():
+        estimator.network[-1].weight.normal_()
+    sample, template, support, valid = _warp_inputs()
+
+    legacy = estimator(sample, template, support, support, valid)
+    multi = estimator.forward_candidates(
+        sample, template, support, support, valid
+    )
+
+    torch.testing.assert_close(legacy.interval_logits, multi.interval_logits[:, 0])
+    torch.testing.assert_close(legacy.interval_widths, multi.interval_widths[:, 0])
+    torch.testing.assert_close(legacy.warp, multi.warp[:, 0])
+    torch.testing.assert_close(legacy.warp_derivative, multi.warp_derivative[:, 0])
+    registration = _make_registration(warp_num_candidates=4)
+    assert registration.warp_estimator.num_candidates == 4
+
+
+def test_select_warp_candidate_uses_per_sample_indices() -> None:
+    batch_size, candidates_count, grid_size = 4, 3, 6
+    logits = torch.arange(
+        batch_size * candidates_count * (grid_size - 1), dtype=torch.float32
+    ).reshape(batch_size, candidates_count, grid_size - 1)
+    widths = logits + 100.0
+    warp = torch.arange(
+        batch_size * candidates_count * grid_size, dtype=torch.float32
+    ).reshape(batch_size, candidates_count, grid_size)
+    derivative = warp + 200.0
+    candidates = registration_module.MonotoneWarpCandidatesOutput(
+        interval_logits=logits,
+        interval_widths=widths,
+        warp=warp,
+        warp_derivative=derivative,
+        inverse_warp=warp + 300.0,
+    )
+    indices = torch.tensor([2, 0, 1, 2], dtype=torch.long)
+
+    selected = registration_module.select_warp_candidate(candidates, indices)
+
+    rows = torch.arange(batch_size)
+    torch.testing.assert_close(selected.interval_logits, logits[rows, indices])
+    torch.testing.assert_close(selected.interval_widths, widths[rows, indices])
+    torch.testing.assert_close(selected.warp, warp[rows, indices])
+    torch.testing.assert_close(selected.warp_derivative, derivative[rows, indices])
+
+
+@pytest.mark.parametrize("shape", [(2, 7), (2, 3, 7)])
+def test_invert_identity_warp(shape) -> None:
+    identity = torch.linspace(0.0, 1.0, shape[-1])
+    warp = identity.expand(*shape[:-1], -1).clone()
+
+    inverse = registration_module.invert_monotone_warp(warp)
+
+    torch.testing.assert_close(inverse, warp)
+
+
+def test_invert_nonlinear_warp_composition() -> None:
+    warp = torch.tensor([[0.0, 0.08, 0.31, 0.67, 1.0]], dtype=torch.float64)
+    query = torch.linspace(0.0, 1.0, 41, dtype=torch.float64)
+
+    inverse = registration_module.invert_monotone_warp(warp, query)
+    reference_grid = torch.linspace(0.0, 1.0, warp.shape[-1], dtype=warp.dtype)
+    upper = torch.searchsorted(reference_grid, inverse, right=True).clamp(1, 4)
+    lower = upper - 1
+    lower_t = reference_grid[lower]
+    upper_t = reference_grid[upper]
+    fraction = (inverse - lower_t) / (upper_t - lower_t)
+    composed = torch.gather(warp, 1, lower)
+    composed += fraction * (
+        torch.gather(warp, 1, upper)
+        - composed
+    )
+
+    torch.testing.assert_close(composed.squeeze(0), query, atol=1e-10, rtol=1e-10)
+
+
+def test_invert_monotone_warp_supports_irregular_queries() -> None:
+    warp = torch.tensor(
+        [[[0.0, 0.05, 0.25, 0.62, 1.0],
+          [0.0, 0.18, 0.40, 0.81, 1.0]]]
+    )
+    query = torch.tensor([0.0, 0.03, 0.27, 0.58, 0.91, 1.0])
+
+    inverse = registration_module.invert_monotone_warp(warp, query)
+
+    assert inverse.shape == (1, 2, 6)
+    assert torch.all((inverse >= 0) & (inverse <= 1))
+    assert torch.all(inverse[..., 1:] >= inverse[..., :-1])
+    torch.testing.assert_close(inverse[..., 0], torch.zeros(1, 2))
+    torch.testing.assert_close(inverse[..., -1], torch.ones(1, 2))
+
+
+def test_invert_monotone_warp_supports_per_warp_queries() -> None:
+    warp = torch.tensor(
+        [[0.0, 0.15, 0.50, 1.0], [0.0, 0.30, 0.72, 1.0]]
+    )
+    query = torch.tensor([[0.0, 0.20, 1.0], [0.0, 0.80, 1.0]])
+
+    inverse = registration_module.invert_monotone_warp(warp, query)
+
+    assert inverse.shape == query.shape
+    torch.testing.assert_close(inverse[:, 0], torch.zeros(2))
+    torch.testing.assert_close(inverse[:, -1], torch.ones(2))
+
+
+def test_invert_monotone_warp_rejects_complex_query() -> None:
+    warp = torch.tensor([[0.0, 0.4, 1.0]])
+    query = torch.tensor([0.0 + 0.0j, 1.0 + 0.0j])
+
+    with pytest.raises(ValueError, match="real"):
+        registration_module.invert_monotone_warp(warp, query)
+
+
+def test_candidate_output_preserves_dtype_and_device() -> None:
+    devices = [torch.device("cpu")]
+    if torch.cuda.is_available():
+        devices.append(torch.device("cuda"))
+    for device in devices:
+        estimator = MonotoneWarpEstimator(
+            3, 9, hidden_dim=8, kernel_size=3, num_candidates=3
+        ).to(device=device, dtype=torch.float32)
+        sample, template, support, valid = _warp_inputs(device=device)
+
+        output = estimator.forward_candidates(
+            sample, template, support, support, valid
+        )
+
+        for value in (
+            output.interval_logits, output.interval_widths, output.warp,
+            output.warp_derivative, output.inverse_warp,
+        ):
+            assert value.dtype == torch.float32
+            assert value.device == device
+
+
+def test_candidate_gradients_reach_all_candidate_heads() -> None:
+    estimator = MonotoneWarpEstimator(
+        3, 9, hidden_dim=8, kernel_size=3, num_candidates=3
+    )
+    sample, template, support, valid = _warp_inputs()
+
+    output = estimator.forward_candidates(
+        sample, template, support, support, valid
+    )
+    weights = torch.arange(1, output.warp.numel() + 1).reshape_as(output.warp)
+    (output.warp * weights).sum().backward()
+
+    last = estimator.network[-1]
+    assert last.weight.grad is not None
+    assert torch.isfinite(last.weight.grad).all()
+    assert torch.all(last.weight.grad.flatten(1).abs().sum(dim=1) > 0)
+    assert last.bias.grad is not None and torch.isfinite(last.bias.grad).all()
+
+
+def test_multi_candidate_public_api_is_exported() -> None:
+    for name in (
+        "MonotoneWarpCandidatesOutput",
+        "invert_monotone_warp",
+        "select_warp_candidate",
+    ):
+        assert name in structure_da_api.__all__
+        assert hasattr(structure_da_api, name)
 
 
 def test_warp_sequence_identity_and_constant_sequence() -> None:
@@ -430,6 +694,7 @@ def test_registered_path_preserves_token_and_warp_head_gradients() -> None:
         (MonotoneWarpEstimator, {"feature_dim": 2, "canonical_grid_size": 4, "kernel_size": 0}),
         (MonotoneWarpEstimator, {"feature_dim": 2, "canonical_grid_size": 4, "kernel_size": 4}),
         (MonotoneWarpEstimator, {"feature_dim": 2, "canonical_grid_size": 4, "min_increment": 0.0}),
+        (MonotoneWarpEstimator, {"feature_dim": 2, "canonical_grid_size": 4, "num_candidates": 0}),
     ],
 )
 def test_invalid_constructor_arguments_raise_value_error(factory, kwargs) -> None:
@@ -475,6 +740,38 @@ def test_warp_estimator_rejects_invalid_inputs(field, value, match) -> None:
     inputs[field] = value
     with pytest.raises(ValueError, match=match):
         MonotoneWarpEstimator(2, 4)(**inputs)
+
+
+@pytest.mark.parametrize(
+    "indices,match",
+    [
+        (torch.tensor([0.0, 1.0]), "torch.long"),
+        (torch.tensor([0, 3], dtype=torch.long), "candidate range"),
+    ],
+)
+def test_select_warp_candidate_rejects_invalid_indices(indices, match) -> None:
+    values = torch.zeros(2, 3, 4)
+    candidates = registration_module.MonotoneWarpCandidatesOutput(
+        interval_logits=values[..., :-1],
+        interval_widths=values[..., :-1],
+        warp=values,
+        warp_derivative=values,
+        inverse_warp=values,
+    )
+    with pytest.raises(ValueError, match=match):
+        registration_module.select_warp_candidate(candidates, indices)
+
+
+@pytest.mark.parametrize(
+    "warp,query,match",
+    [
+        (torch.tensor([[0.0, 0.7, 0.6, 1.0]]), None, "strictly increasing"),
+        (torch.tensor([[0.0, 0.3, 0.7, 1.0]]), torch.tensor([-0.1, 0.5]), r"\[0, 1\]"),
+    ],
+)
+def test_invert_monotone_warp_rejects_invalid_inputs(warp, query, match) -> None:
+    with pytest.raises(ValueError, match=match):
+        registration_module.invert_monotone_warp(warp, query)
 
 
 @pytest.mark.parametrize(

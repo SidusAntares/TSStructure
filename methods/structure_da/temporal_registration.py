@@ -184,6 +184,131 @@ class MonotoneWarpOutput:
     warp_derivative: Tensor
 
 
+@dataclass(frozen=True)
+class MonotoneWarpCandidatesOutput:
+    interval_logits: Tensor
+    interval_widths: Tensor
+    warp: Tensor
+    warp_derivative: Tensor
+    inverse_warp: Tensor
+
+
+def invert_monotone_warp(
+    warp: Tensor,
+    query: Tensor | None = None,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Invert endpoint-preserving piecewise-linear monotone warps."""
+
+    eps = _finite_float("eps", eps)
+    if eps <= 0:
+        raise ValueError("eps must be greater than zero")
+    if not isinstance(warp, Tensor) or warp.ndim < 1 or warp.shape[-1] < 2:
+        raise ValueError("warp must have shape [..., K] with K >= 2")
+    if not warp.is_floating_point():
+        raise ValueError("warp must use a floating-point dtype")
+    if not torch.isfinite(warp).all().item():
+        raise ValueError("warp must contain only finite values")
+    if torch.any((warp < 0) | (warp > 1)).item():
+        raise ValueError("warp must lie in [0, 1]")
+    if torch.any(warp[..., 1:] <= warp[..., :-1]).item():
+        raise ValueError("warp must be strictly increasing")
+    if not torch.allclose(
+        warp[..., 0], torch.zeros_like(warp[..., 0]), atol=eps, rtol=0.0
+    ):
+        raise ValueError("warp must start at 0")
+    if not torch.allclose(
+        warp[..., -1], torch.ones_like(warp[..., -1]), atol=eps, rtol=0.0
+    ):
+        raise ValueError("warp must end at 1")
+
+    grid_size = warp.shape[-1]
+    leading_shape = warp.shape[:-1]
+    if query is None:
+        query_tensor = torch.linspace(
+            0.0, 1.0, grid_size, device=warp.device, dtype=warp.dtype
+        ).expand(*leading_shape, grid_size)
+    else:
+        try:
+            query_tensor = torch.as_tensor(query, device=warp.device)
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise ValueError(
+                "query must be a real tensor convertible to warp dtype"
+            ) from error
+        if query_tensor.is_complex() or query_tensor.dtype == torch.bool:
+            raise ValueError("query must contain real numeric values")
+        query_tensor = query_tensor.to(dtype=warp.dtype)
+        if query_tensor.ndim < 1:
+            raise ValueError("query must have shape [L] or [..., L]")
+        if query_tensor.ndim == 1:
+            query_tensor = query_tensor.expand(*leading_shape, query_tensor.shape[0])
+        elif query_tensor.shape[:-1] != leading_shape:
+            raise ValueError("query leading dimensions must match warp")
+        if not torch.isfinite(query_tensor).all().item():
+            raise ValueError("query must contain only finite values")
+        if torch.any((query_tensor < 0) | (query_tensor > 1)).item():
+            raise ValueError("query must lie in [0, 1]")
+
+    output_length = query_tensor.shape[-1]
+    flat_warp = warp.reshape(-1, grid_size).contiguous()
+    flat_query = query_tensor.reshape(-1, output_length).contiguous()
+    upper = torch.searchsorted(flat_warp, flat_query, right=True).clamp(
+        min=1, max=grid_size - 1
+    )
+    lower = upper - 1
+    lower_value = torch.gather(flat_warp, 1, lower)
+    upper_value = torch.gather(flat_warp, 1, upper)
+    fraction = (flat_query - lower_value) / (
+        upper_value - lower_value
+    ).clamp_min(eps)
+    inverse = (lower.to(dtype=warp.dtype) + fraction) / (grid_size - 1)
+    inverse = torch.where(flat_query == 0, torch.zeros_like(inverse), inverse)
+    inverse = torch.where(flat_query == 1, torch.ones_like(inverse), inverse)
+    return inverse.clamp(0.0, 1.0).reshape(*leading_shape, output_length)
+
+
+def select_warp_candidate(
+    candidates: MonotoneWarpCandidatesOutput,
+    candidate_index: Tensor,
+) -> MonotoneWarpOutput:
+    """Select one warp candidate independently for every batch row."""
+
+    if not isinstance(candidates, MonotoneWarpCandidatesOutput):
+        raise ValueError("candidates must be a MonotoneWarpCandidatesOutput")
+    if candidates.warp.ndim != 3:
+        raise ValueError("candidate warp must have shape [B, G, K]")
+    batch_size, num_candidates, grid_size = candidates.warp.shape
+    expected_shapes = {
+        "interval_logits": (batch_size, num_candidates, grid_size - 1),
+        "interval_widths": (batch_size, num_candidates, grid_size - 1),
+        "warp_derivative": (batch_size, num_candidates, grid_size),
+        "inverse_warp": (batch_size, num_candidates, grid_size),
+    }
+    for name, expected_shape in expected_shapes.items():
+        value = getattr(candidates, name)
+        if not isinstance(value, Tensor) or value.shape != expected_shape:
+            raise ValueError(f"candidate {name} has an invalid shape")
+    if not isinstance(candidate_index, Tensor) or candidate_index.dtype != torch.long:
+        raise ValueError("candidate_index must use torch.long dtype")
+    if candidate_index.shape != (batch_size,):
+        raise ValueError("candidate_index must have shape [B]")
+    if candidate_index.device != candidates.warp.device:
+        raise ValueError("candidate_index must be on the candidates device")
+    if torch.any((candidate_index < 0) | (candidate_index >= num_candidates)).item():
+        raise ValueError("candidate_index values must lie in the candidate range")
+
+    def gather(value: Tensor) -> Tensor:
+        index = candidate_index[:, None, None].expand(-1, 1, value.shape[-1])
+        return torch.gather(value, 1, index).squeeze(1)
+
+    return MonotoneWarpOutput(
+        interval_logits=gather(candidates.interval_logits),
+        interval_widths=gather(candidates.interval_widths),
+        warp=gather(candidates.warp),
+        warp_derivative=gather(candidates.warp_derivative),
+    )
+
+
 class MonotoneWarpEstimator(nn.Module):
     """Estimate a strictly monotone endpoint-preserving temporal warp."""
 
@@ -194,6 +319,7 @@ class MonotoneWarpEstimator(nn.Module):
         hidden_dim: int = 64,
         kernel_size: int = 5,
         min_increment: float = 1e-4,
+        num_candidates: int = 3,
     ) -> None:
         super().__init__()
         feature_dim = _positive_integer("feature_dim", feature_dim)
@@ -202,6 +328,7 @@ class MonotoneWarpEstimator(nn.Module):
         )
         hidden_dim = _positive_integer("hidden_dim", hidden_dim)
         kernel_size = _positive_integer("kernel_size", kernel_size)
+        num_candidates = _positive_integer("num_candidates", num_candidates)
         if kernel_size % 2 == 0:
             raise ValueError("kernel_size must be odd")
         min_increment = _finite_float("min_increment", min_increment)
@@ -213,6 +340,7 @@ class MonotoneWarpEstimator(nn.Module):
         self.hidden_dim = hidden_dim
         self.kernel_size = kernel_size
         self.min_increment = min_increment
+        self.num_candidates = num_candidates
         self.network = nn.Sequential(
             nn.Conv1d(
                 2 * feature_dim + 2,
@@ -228,7 +356,7 @@ class MonotoneWarpEstimator(nn.Module):
                 padding=kernel_size // 2,
             ),
             nn.GELU(),
-            nn.Conv1d(hidden_dim, 1, kernel_size=1),
+            nn.Conv1d(hidden_dim, num_candidates, kernel_size=1),
         )
         nn.init.zeros_(self.network[-1].weight)
         nn.init.zeros_(self.network[-1].bias)
@@ -303,6 +431,28 @@ class MonotoneWarpEstimator(nn.Module):
         template_support: Tensor,
         registration_valid: Tensor,
     ) -> MonotoneWarpOutput:
+        candidates = self.forward_candidates(
+            sample_srvf,
+            template_srvf,
+            sample_support,
+            template_support,
+            registration_valid,
+        )
+        candidate_index = torch.zeros(
+            candidates.warp.shape[0],
+            dtype=torch.long,
+            device=candidates.warp.device,
+        )
+        return select_warp_candidate(candidates, candidate_index)
+
+    def forward_candidates(
+        self,
+        sample_srvf: Tensor,
+        template_srvf: Tensor,
+        sample_support: Tensor,
+        template_support: Tensor,
+        registration_valid: Tensor,
+    ) -> MonotoneWarpCandidatesOutput:
         device_type = (
             sample_srvf.device.type if isinstance(sample_srvf, Tensor) else "cpu"
         )
@@ -327,7 +477,7 @@ class MonotoneWarpEstimator(nn.Module):
                 torch.bfloat16,
             ):
                 template_support = template_support.float()
-            return self._forward_float32(
+            return self._forward_candidates_float32(
                 sample_srvf,
                 template_srvf,
                 sample_support,
@@ -335,14 +485,14 @@ class MonotoneWarpEstimator(nn.Module):
                 registration_valid,
             )
 
-    def _forward_float32(
+    def _forward_candidates_float32(
         self,
         sample_srvf: Tensor,
         template_srvf: Tensor,
         sample_support: Tensor,
         template_support: Tensor,
         registration_valid: Tensor,
-    ) -> MonotoneWarpOutput:
+    ) -> MonotoneWarpCandidatesOutput:
         self._validate_inputs(
             sample_srvf,
             template_srvf,
@@ -360,31 +510,35 @@ class MonotoneWarpEstimator(nn.Module):
             ],
             dim=-1,
         ).transpose(1, 2)
-        point_logits = self.network(warp_input).squeeze(1)
+        point_logits = self.network(warp_input)
         interval_logits = 0.5 * (
-            point_logits[:, :-1] + point_logits[:, 1:]
+            point_logits[..., :-1] + point_logits[..., 1:]
         )
         positive_increments = F.softplus(interval_logits) + self.min_increment
         interval_widths = positive_increments / positive_increments.sum(
             dim=-1, keepdim=True
         )
         zero = torch.zeros(
-            batch_size, 1, device=sample_srvf.device, dtype=sample_srvf.dtype
+            batch_size,
+            self.num_candidates,
+            1,
+            device=sample_srvf.device,
+            dtype=sample_srvf.dtype,
         )
         one = torch.ones_like(zero)
         cumulative = interval_widths.cumsum(dim=-1)
-        warp = torch.cat([zero, cumulative[:, :-1], one], dim=-1)
+        warp = torch.cat([zero, cumulative[..., :-1], one], dim=-1)
 
         delta_u = 1.0 / (self.canonical_grid_size - 1)
         interval_derivative = interval_widths / delta_u
         middle_derivative = 0.5 * (
-            interval_derivative[:, :-1] + interval_derivative[:, 1:]
+            interval_derivative[..., :-1] + interval_derivative[..., 1:]
         )
         warp_derivative = torch.cat(
             [
-                interval_derivative[:, :1],
+                interval_derivative[..., :1],
                 middle_derivative,
-                interval_derivative[:, -1:],
+                interval_derivative[..., -1:],
             ],
             dim=-1,
         )
@@ -399,22 +553,25 @@ class MonotoneWarpEstimator(nn.Module):
             self.canonical_grid_size,
             device=sample_srvf.device,
             dtype=sample_srvf.dtype,
-        ).expand(batch_size, -1)
+        ).expand(batch_size, self.num_candidates, -1)
         interval_logits = torch.where(
-            valid.unsqueeze(-1), interval_logits, torch.zeros_like(interval_logits)
+            valid[:, None, None], interval_logits, torch.zeros_like(interval_logits)
         )
         interval_widths = torch.where(
-            valid.unsqueeze(-1), interval_widths, identity_widths
+            valid[:, None, None], interval_widths, identity_widths
         )
-        warp = torch.where(valid.unsqueeze(-1), warp, identity_warp)
+        warp = torch.where(valid[:, None, None], warp, identity_warp)
         warp_derivative = torch.where(
-            valid.unsqueeze(-1), warp_derivative, torch.ones_like(warp_derivative)
+            valid[:, None, None],
+            warp_derivative,
+            torch.ones_like(warp_derivative),
         )
-        return MonotoneWarpOutput(
+        return MonotoneWarpCandidatesOutput(
             interval_logits=interval_logits,
             interval_widths=interval_widths,
             warp=warp,
             warp_derivative=warp_derivative,
+            inverse_warp=invert_monotone_warp(warp),
         )
 
 
@@ -572,6 +729,7 @@ class TemporalSRVFRegistration(nn.Module):
         warp_hidden_dim: int = 64,
         warp_kernel_size: int = 5,
         warp_min_increment: float = 1e-4,
+        warp_num_candidates: int = 3,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -616,6 +774,7 @@ class TemporalSRVFRegistration(nn.Module):
             hidden_dim=warp_hidden_dim,
             kernel_size=warp_kernel_size,
             min_increment=warp_min_increment,
+            num_candidates=warp_num_candidates,
         )
         self.min_template_mean_support = min_template_mean_support
         self.eps = eps

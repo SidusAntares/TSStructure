@@ -85,12 +85,15 @@ from .temporal_module import (
     TemporalStructurePairOutput,
 )
 from .temporal_registration import (
+    MonotoneWarpCandidatesOutput,
     MonotoneWarpEstimator,
     MonotoneWarpOutput,
     SourceRunningSRVFTemplate,
     SourceSRVFTemplateOutput,
     TemporalRegistrationOutput,
     TemporalSRVFRegistration,
+    invert_monotone_warp,
+    select_warp_candidate,
 )
 from .temporal_srvf import (
     SourceRunningSupportScale,
@@ -115,6 +118,7 @@ __all__ = [
     "JointStructureDADiagnostics",
     "JointStructureDATrainStepOutput",
     "JointStructureDATrainingConfig",
+    "MonotoneWarpCandidatesOutput",
     "MonotoneWarpEstimator",
     "MonotoneWarpOutput",
     "PairedStructureFeatures",
@@ -162,11 +166,13 @@ __all__ = [
     "compute_structure_contribution_diagnostics",
     "create_joint_structure_da_train_loaders",
     "joint_structure_da_train_step",
+    "invert_monotone_warp",
     "merge_contribution_diagnostics",
     "merge_decomposition_diagnostics",
     "resolve_domain_score_weight",
     "resolve_grl_warmup_max_iters",
     "resolve_steps_per_epoch",
+    "select_warp_candidate",
     "train_joint_structure_da",
     "summarize_contribution_diagnostics",
     "summarize_decomposition_diagnostics",
