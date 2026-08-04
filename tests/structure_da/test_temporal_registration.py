@@ -12,44 +12,12 @@ from methods.structure_da import (
     MonotoneWarpOutput,
     SourceRunningSRVFTemplate,
     SourceSRVFTemplateOutput,
-    TemporalRegistrationOutput,
-    TemporalSRVFRegistration,
 )
 from methods.structure_da import temporal_registration as registration_module
 from methods.structure_da.temporal_registration import (
     _apply_srvf_group_action,
     _warp_sequence,
 )
-
-
-def _make_registration(**kwargs) -> TemporalSRVFRegistration:
-    parameters = {
-        "feature_dim": 2,
-        "num_basis": 6,
-        "canonical_grid_size": 8,
-        "roughness_grid_size": 64,
-        "min_mean_support": 0.0,
-        "min_dynamic_energy": 0.0,
-        "min_template_mean_support": 0.0,
-        "warp_hidden_dim": 8,
-        "warp_kernel_size": 3,
-    }
-    parameters.update(kwargs)
-    return TemporalSRVFRegistration(**parameters)
-
-
-def _sample_batch(dtype: torch.dtype = torch.float32):
-    torch.manual_seed(61)
-    tokens = torch.randn(2, 6, 2, dtype=dtype)
-    positions = torch.tensor(
-        [0.0, 39.0, 92.0, 157.0, 244.0, 345.0], dtype=dtype
-    )
-    mask = torch.tensor(
-        [[True, True, True, True, True, True],
-         [True, False, True, True, False, True]]
-    )
-    return tokens, positions, mask
-
 
 def _warp_inputs(
     batch_size: int = 2,
@@ -428,7 +396,7 @@ def test_invalid_rows_make_all_candidates_identity() -> None:
     torch.testing.assert_close(output.inverse_warp[1], identity)
 
 
-def test_legacy_forward_returns_candidate_zero() -> None:
+def test_forward_returns_candidate_zero() -> None:
     estimator = MonotoneWarpEstimator(
         3, 9, hidden_dim=8, kernel_size=3, num_candidates=3
     )
@@ -445,8 +413,6 @@ def test_legacy_forward_returns_candidate_zero() -> None:
     torch.testing.assert_close(legacy.interval_widths, multi.interval_widths[:, 0])
     torch.testing.assert_close(legacy.warp, multi.warp[:, 0])
     torch.testing.assert_close(legacy.warp_derivative, multi.warp_derivative[:, 0])
-    registration = _make_registration(warp_num_candidates=4)
-    assert registration.warp_estimator.num_candidates == 4
 
 
 def test_select_warp_candidate_uses_per_sample_indices() -> None:
@@ -647,141 +613,6 @@ def test_support_is_only_resampled_without_group_action_scale() -> None:
     assert not torch.allclose(registered_support, incorrectly_scaled)
 
 
-def test_first_forward_is_unregistered_identity_then_bootstraps_template() -> None:
-    registration = _make_registration()
-    tokens, positions, mask = _sample_batch()
-
-    output = registration(tokens, positions, mask)
-
-    assert isinstance(output, TemporalRegistrationOutput)
-    assert not output.template_initialized.item()
-    assert not output.registration_valid.any().item()
-    torch.testing.assert_close(output.registered_srvf, output.srvf_output.srvf)
-    torch.testing.assert_close(
-        output.registered_support, output.srvf_output.support_confidence
-    )
-    registration.update_source_template(output)
-    template = registration.source_template(
-        device=torch.device("cpu"), dtype=tokens.dtype
-    )
-    assert template.initialized.item()
-
-    weights = (
-        output.srvf_output.support_confidence
-        * output.srvf_output.structure_valid.unsqueeze(-1)
-    )
-    expected = (
-        weights.unsqueeze(-1) * output.srvf_output.srvf
-    ).sum(dim=0) / weights.sum(dim=0).clamp_min(1e-6).unsqueeze(-1)
-    torch.testing.assert_close(template.srvf, expected)
-
-
-def test_initialized_template_enables_registration_and_registered_update() -> None:
-    registration = _make_registration(template_momentum=0.5)
-    tokens, positions, mask = _sample_batch()
-    first = registration(tokens, positions, mask)
-    registration.update_source_template(first)
-    old_srvf = registration.source_template.running_srvf.clone()
-    old_support = registration.source_template.running_support.clone()
-
-    second = registration(tokens + 0.25, positions, mask)
-    assert second.registration_valid.all().item()
-    forced_srvf = torch.full_like(second.registered_srvf, 4.0)
-    forced_support = torch.full_like(second.registered_support, 0.7)
-    forced = replace(
-        second,
-        registered_srvf=forced_srvf,
-        registered_support=forced_support,
-        registration_valid=torch.ones_like(second.registration_valid),
-    )
-    registration.update_source_template(forced)
-
-    expected_support = 0.5 * old_support + 0.5 * 0.7
-    expected_srvf = (
-        0.5 * old_support[:, None] * old_srvf
-        + 0.5 * 0.7 * torch.full_like(old_srvf, 4.0)
-    ) / expected_support[:, None]
-    torch.testing.assert_close(
-        registration.source_template.running_srvf, expected_srvf
-    )
-    torch.testing.assert_close(
-        registration.source_template.running_support,
-        0.5 * old_support + 0.5 * torch.full_like(old_support, 0.7),
-    )
-
-
-def test_registration_forward_does_not_update_any_source_state() -> None:
-    registration = _make_registration()
-    tokens, positions, mask = _sample_batch()
-    before = {name: value.clone() for name, value in registration.named_buffers()}
-
-    registration(tokens, positions, mask)
-
-    for name, value in registration.named_buffers():
-        torch.testing.assert_close(value, before[name])
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_registration_shapes_and_dtype(dtype: torch.dtype) -> None:
-    registration = _make_registration().to(dtype=dtype)
-    tokens, positions, mask = _sample_batch(dtype)
-
-    output = registration(tokens, positions, mask)
-
-    assert output.template_srvf.shape == (2, 8, 2)
-    assert output.template_support.shape == (2, 8)
-    assert output.template_initialized.shape == ()
-    assert output.template_mean_support.shape == ()
-    assert output.interval_logits.shape == (2, 7)
-    assert output.interval_widths.shape == (2, 7)
-    assert output.warp.shape == (2, 8)
-    assert output.warp_derivative.shape == (2, 8)
-    assert output.registered_srvf.shape == (2, 8, 2)
-    assert output.registered_support.shape == (2, 8)
-    assert output.registration_valid.shape == (2,)
-    for value in (
-        output.template_srvf,
-        output.template_support,
-        output.template_mean_support,
-        output.interval_logits,
-        output.interval_widths,
-        output.warp,
-        output.warp_derivative,
-        output.registered_srvf,
-        output.registered_support,
-    ):
-        assert value.dtype == dtype
-        assert torch.isfinite(value).all()
-
-
-def test_registered_path_preserves_token_and_warp_head_gradients() -> None:
-    registration = _make_registration()
-    tokens, positions, mask = _sample_batch()
-    bootstrap = registration(tokens, positions, mask)
-    registration.update_source_template(bootstrap)
-    differentiable = tokens.clone().requires_grad_()
-
-    output = registration(differentiable, positions, mask)
-    (output.registered_srvf.square().mean() + output.warp.square().mean()).backward()
-
-    assert output.registration_valid.all().item()
-    assert differentiable.grad is not None
-    assert torch.isfinite(differentiable.grad).all()
-    assert differentiable.grad[mask].abs().sum().item() > 0
-    torch.testing.assert_close(
-        differentiable.grad[~mask],
-        torch.zeros_like(differentiable.grad[~mask]),
-        atol=0,
-        rtol=0,
-    )
-    last = registration.warp_estimator.network[-1]
-    assert last.weight.grad is not None and torch.isfinite(last.weight.grad).all()
-    assert last.bias.grad is not None and torch.isfinite(last.bias.grad).all()
-    assert not dict(registration.source_template.named_parameters())
-    for value in registration.source_template.buffers():
-        assert value.grad is None
-
-
 @pytest.mark.parametrize(
     "factory,kwargs",
     [
@@ -896,8 +727,3 @@ def test_group_action_rejects_nonpositive_warp_derivative() -> None:
             torch.tensor([[1.0, 0.0, 1.0]]),
             1e-6,
         )
-
-
-def test_template_update_rejects_wrong_registration_output_type() -> None:
-    with pytest.raises(ValueError, match="TemporalRegistrationOutput"):
-        _make_registration().update_source_template(object())

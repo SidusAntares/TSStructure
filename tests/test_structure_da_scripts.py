@@ -1,6 +1,7 @@
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 import pytest
 
@@ -151,13 +152,13 @@ def test_formal_script_keeps_twelve_domain_tasks_and_three_seeds() -> None:
         assert runtime_behavior in source
 
 
-def test_benchmark_cli_exposes_batch_and_amp_controls() -> None:
+def test_v3_benchmark_cli_exposes_device_and_iteration_controls() -> None:
     result = subprocess.run(
-        ["python", "scripts/benchmark_structure_da_step.py", "--help"],
+        [sys.executable, "scripts/benchmark_structure_da_v3.py", "--help"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=True,
     )
-    for option in ("--batch_size", "--amp", "--amp_dtype"):
+    for option in ("--device", "--warmup", "--iterations"):
         assert option in result.stdout

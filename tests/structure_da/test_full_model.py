@@ -16,13 +16,11 @@ from methods.structure_da.phase_aware_objective import (
 )
 from methods.structure_da.representation import (
     PhaseAwareTwoScaleClassifier,
-    QualityAwareComponentClassifier,
 )
 from methods.structure_da.temporal_module import (
-    SharedTemporalStructureOperator,
     TrendStructureTaskFeatureModule,
 )
-from models.ltae import ComponentAwareSharedLTAE, TrendStructureSharedLTAE
+from models.ltae import TrendStructureSharedLTAE
 
 
 def _model(dtype: torch.dtype = torch.float32, **overrides):
@@ -104,9 +102,6 @@ def test_model_contains_only_phase_aware_high_level_modules() -> None:
     assert estimator.candidate_init_warp_amplitude == pytest.approx(0.015)
     assert estimator.candidate_base_logits.shape == (3, 4)
     assert sum(isinstance(module, TrendStructureSharedLTAE) for module in model.modules()) == 1
-    assert not any(isinstance(module, SharedTemporalStructureOperator) for module in model.modules())
-    assert not any(isinstance(module, QualityAwareComponentClassifier) for module in model.modules())
-    assert not any(isinstance(module, ComponentAwareSharedLTAE) for module in model.modules())
 
 
 def test_trend_structure_and_forward_output_have_exact_final_semantics() -> None:

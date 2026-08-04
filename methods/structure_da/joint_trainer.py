@@ -299,7 +299,8 @@ class PerClassPhaseDiagnosticsAccumulator:
         self.num_candidates = int(num_candidates)
         self.max_phase_samples = int(max_phase_samples)
         self._rows = [
-            dict(count=0, phase_magnitudes=[]) for _ in range(self.num_classes)
+            dict(count=0, phase_magnitudes=torch.empty(0, dtype=torch.float32))
+            for _ in range(self.num_classes)
         ]
 
     def update(self, *, labels, label_valid, phase_base_valid, candidate_trainable,
@@ -307,44 +308,136 @@ class PerClassPhaseDiagnosticsAccumulator:
                trend_ambiguous, structure_enabled, structure_changed, structure_veto,
                phase_status, selected_candidate, phase_magnitude, accepted_shift,
                shape_valid) -> None:
-        tensors = {name: value.detach().cpu() for name, value in locals().items()
-                   if isinstance(value, Tensor)}
+        tensors = {
+            name: value.detach()
+            for name, value in locals().items()
+            if isinstance(value, Tensor)
+        }
         labels = tensors["labels"].long()
         label_valid = tensors["label_valid"].bool()
+        label_valid = (
+            label_valid & (labels >= 0) & (labels < self.num_classes)
+        )
+        metric_names = (
+            "phase_base_valid",
+            "candidate_trainable",
+            "candidate_acceptable",
+            "candidate_unique_count",
+            "candidate_collapse",
+            "trend_ambiguous",
+            "structure_enabled",
+            "structure_changed",
+            "structure_veto",
+            "valid_identity",
+            "valid_nonidentity",
+            "failure",
+            "head_denominator",
+            "structure_changed_denominator",
+            "structure_veto_denominator",
+            "accepted_shift_sum",
+            "accepted_shift_count",
+            "shape_valid",
+        )
+        status = tensors["phase_status"]
+        selected = tensors["selected_candidate"]
+        successful = status != 0
+        enabled = tensors["structure_enabled"].bool()
+        per_sample = {
+            "phase_base_valid": tensors["phase_base_valid"].float(),
+            "candidate_trainable": tensors["candidate_trainable"].float().sum(dim=-1),
+            "candidate_acceptable": tensors["candidate_acceptable"].float().sum(dim=-1),
+            "candidate_unique_count": tensors["candidate_unique_count"].float(),
+            "candidate_collapse": tensors["candidate_collapse"].float(),
+            "trend_ambiguous": tensors["trend_ambiguous"].float(),
+            "structure_enabled": tensors["structure_enabled"].float(),
+            "structure_changed": tensors["structure_changed"].float(),
+            "structure_veto": tensors["structure_veto"].float(),
+            "valid_identity": (status == 1).float(),
+            "valid_nonidentity": (status == 2).float(),
+            "failure": (status == 0).float(),
+            "head_denominator": (selected >= 0).float(),
+            "structure_changed_denominator": enabled.float(),
+            "structure_veto_denominator": enabled.float(),
+            "accepted_shift_sum": torch.where(
+                successful,
+                tensors["accepted_shift"].float(),
+                torch.zeros_like(tensors["accepted_shift"], dtype=torch.float32),
+            ),
+            "accepted_shift_count": successful.float(),
+            "shape_valid": tensors["shape_valid"].float(),
+        }
+        valid_labels = labels[label_valid]
+        counts = torch.bincount(
+            valid_labels, minlength=self.num_classes
+        )
+        per_sample_values = torch.stack(
+            [per_sample[name] for name in metric_names], dim=-1
+        )
+        aggregates = torch.zeros(
+            self.num_classes,
+            len(metric_names),
+            dtype=per_sample_values.dtype,
+            device=per_sample_values.device,
+        )
+        aggregates.index_add_(
+            0, valid_labels, per_sample_values[label_valid]
+        )
+        learned = label_valid & (selected >= 0) & (
+            selected < self.num_candidates
+        )
+        joint_index = (
+            labels[learned] * self.num_candidates + selected[learned]
+        )
+        head_counts = torch.bincount(
+            joint_index,
+            minlength=self.num_classes * self.num_candidates,
+        ).reshape(self.num_classes, self.num_candidates)
+        aggregated_cpu = torch.cat(
+            [
+                counts.to(dtype=aggregates.dtype).unsqueeze(-1),
+                aggregates,
+                head_counts.to(dtype=aggregates.dtype),
+            ],
+            dim=-1,
+        ).cpu()
+        counts_cpu = aggregated_cpu[:, 0]
+        aggregates_cpu = aggregated_cpu[
+            :, 1 : 1 + len(metric_names)
+        ]
+        head_counts_cpu = aggregated_cpu[:, 1 + len(metric_names) :]
         for class_id in range(self.num_classes):
-            mask = label_valid & (labels == class_id)
-            if not mask.any():
+            n = int(counts_cpu[class_id])
+            if n == 0:
                 continue
             row = self._rows[class_id]
-            n = int(mask.sum())
             row["count"] += n
-            def add(name, value):
-                row[name] = row.get(name, 0.0) + float(value)
-            for name in ("phase_base_valid", "candidate_collapse", "trend_ambiguous",
-                         "structure_enabled", "structure_changed", "structure_veto",
-                         "shape_valid"):
-                add(name, tensors[name][mask].float().sum())
-            add("candidate_trainable", tensors["candidate_trainable"][mask].float().sum())
-            add("candidate_acceptable", tensors["candidate_acceptable"][mask].float().sum())
-            add("candidate_unique_count", tensors["candidate_unique_count"][mask].float().sum())
-            status = tensors["phase_status"][mask]
-            add("valid_identity", (status == 1).sum())
-            add("valid_nonidentity", (status == 2).sum())
-            add("failure", (status == 0).sum())
-            selected = tensors["selected_candidate"][mask]
-            learned = selected >= 0
-            add("head_denominator", learned.sum())
+            for index, name in enumerate(metric_names):
+                row[name] = row.get(name, 0.0) + float(
+                    aggregates_cpu[class_id, index]
+                )
             for head in range(self.num_candidates):
-                add(f"head_{head}", (selected == head).sum())
-            enabled = tensors["structure_enabled"][mask].bool()
-            add("structure_changed_denominator", enabled.sum())
-            add("structure_veto_denominator", enabled.sum())
-            successful = status != 0
-            add("accepted_shift_sum", tensors["accepted_shift"][mask][successful].sum())
-            add("accepted_shift_count", successful.sum())
-            values = tensors["phase_magnitude"][mask][successful].flatten().tolist()
+                name = f"head_{head}"
+                row[name] = row.get(name, 0.0) + float(
+                    head_counts_cpu[class_id, head]
+                )
+
+        magnitude_valid = label_valid & successful
+        magnitude_labels = labels[magnitude_valid]
+        magnitude_values = tensors["phase_magnitude"][magnitude_valid].flatten()
+        if magnitude_values.numel():
+            magnitude_batch = torch.stack(
+                [magnitude_labels.float(), magnitude_values.float()], dim=-1
+            ).cpu()
+            magnitude_labels = magnitude_batch[:, 0].long()
+            magnitude_values = magnitude_batch[:, 1]
+        for class_id, row in enumerate(self._rows):
             remaining = self.max_phase_samples - len(row["phase_magnitudes"])
-            row["phase_magnitudes"].extend(values[:max(remaining, 0)])
+            if remaining <= 0 or magnitude_values.numel() == 0:
+                continue
+            values = magnitude_values[magnitude_labels == class_id][:remaining]
+            row["phase_magnitudes"] = torch.cat(
+                [row["phase_magnitudes"], values]
+            )
 
     def merge(self, other: "PerClassPhaseDiagnosticsAccumulator") -> None:
         for target, source in zip(self._rows, other._rows):
@@ -354,7 +447,9 @@ class PerClassPhaseDiagnosticsAccumulator:
                     continue
                 if name == "phase_magnitudes":
                     remaining = self.max_phase_samples - len(target[name])
-                    target[name].extend(value[:max(remaining, 0)])
+                    target[name] = torch.cat(
+                        [target[name], value[:max(remaining, 0)]]
+                    )
                 else:
                     target[name] = target.get(name, 0.0) + value
 
@@ -362,14 +457,33 @@ class PerClassPhaseDiagnosticsAccumulator:
         self, labels: Tensor, label_valid: Tensor, name: str, values: Tensor
     ) -> None:
         """Add a detached per-sample diagnostic with its own valid denominator."""
-        labels = labels.detach().cpu().long()
-        valid = label_valid.detach().cpu().bool()
-        values = values.detach().cpu().float()
+        labels = labels.detach().long()
+        values = values.detach().float()
+        valid = (
+            label_valid.detach().bool()
+            & torch.isfinite(values)
+            & (labels >= 0)
+            & (labels < self.num_classes)
+        )
+        valid_labels = labels[valid]
+        sums = torch.bincount(
+            valid_labels,
+            weights=values[valid],
+            minlength=self.num_classes,
+        ).cpu()
+        counts = torch.bincount(
+            valid_labels, minlength=self.num_classes
+        ).cpu()
         for class_id, row in enumerate(self._rows):
-            mask = valid & (labels == class_id) & torch.isfinite(values)
-            if mask.any():
-                row[f"extra_sum_{name}"] = row.get(f"extra_sum_{name}", 0.0) + float(values[mask].sum())
-                row[f"extra_count_{name}"] = row.get(f"extra_count_{name}", 0.0) + int(mask.sum())
+            if counts[class_id]:
+                row[f"extra_sum_{name}"] = (
+                    row.get(f"extra_sum_{name}", 0.0)
+                    + float(sums[class_id])
+                )
+                row[f"extra_count_{name}"] = (
+                    row.get(f"extra_count_{name}", 0.0)
+                    + int(counts[class_id])
+                )
 
     def summaries(self) -> dict[int, dict[str, float]]:
         output = {}
@@ -378,7 +492,7 @@ class PerClassPhaseDiagnosticsAccumulator:
             if count == 0:
                 continue
             safe = lambda numerator, denominator=count: float(numerator) / denominator if denominator else math.nan
-            magnitudes = torch.tensor(row["phase_magnitudes"], dtype=torch.float32)
+            magnitudes = row["phase_magnitudes"]
             result = {
                 "sample_count": count,
                 "phase_base_valid_rate": safe(row["phase_base_valid"]),

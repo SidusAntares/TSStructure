@@ -393,6 +393,44 @@ def test_per_class_phase_diagnostics_use_conditional_denominators() -> None:
     assert one["accepted_warp_shift_mean"] != one["accepted_warp_shift_mean"]
 
 
+def test_per_class_phase_magnitude_cache_is_bounded_and_mergeable() -> None:
+    def update(accumulator, values):
+        batch = len(values)
+        accumulator.update(
+            labels=torch.zeros(batch, dtype=torch.long),
+            label_valid=torch.ones(batch, dtype=torch.bool),
+            phase_base_valid=torch.ones(batch, dtype=torch.bool),
+            candidate_trainable=torch.ones(batch, 2, dtype=torch.bool),
+            candidate_acceptable=torch.ones(batch, 2, dtype=torch.bool),
+            candidate_unique_count=torch.full((batch,), 2),
+            candidate_collapse=torch.zeros(batch, dtype=torch.bool),
+            trend_ambiguous=torch.zeros(batch, dtype=torch.bool),
+            structure_enabled=torch.ones(batch, dtype=torch.bool),
+            structure_changed=torch.zeros(batch, dtype=torch.bool),
+            structure_veto=torch.zeros(batch, dtype=torch.bool),
+            phase_status=torch.full((batch,), 2),
+            selected_candidate=torch.zeros(batch, dtype=torch.long),
+            phase_magnitude=torch.tensor(values),
+            accepted_shift=torch.zeros(batch),
+            shape_valid=torch.ones(batch, dtype=torch.bool),
+        )
+
+    first = PerClassPhaseDiagnosticsAccumulator(2, 2, max_phase_samples=3)
+    second = PerClassPhaseDiagnosticsAccumulator(2, 2, max_phase_samples=3)
+    update(first, [0.1, 0.2])
+    update(second, [0.3, 0.4])
+    first.merge(second)
+
+    assert len(first._rows[0]["phase_magnitudes"]) == 3
+    torch.testing.assert_close(
+        first._rows[0]["phase_magnitudes"],
+        torch.tensor([0.1, 0.2, 0.3]),
+    )
+    assert first.summaries()[0]["phase_magnitude_p95"] == pytest.approx(
+        float(torch.quantile(torch.tensor([0.1, 0.2, 0.3]), 0.95))
+    )
+
+
 def test_step_class_diagnostics_use_true_source_and_valid_geometry_pseudo_labels() -> None:
     _, result = _step()
     source_count = sum(
