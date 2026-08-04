@@ -2,8 +2,9 @@
 set -Eeuo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-DATA_ROOT="${DATA_ROOT:-${PROJECT_ROOT}/data}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs/structure_da_v3}"
+DATA_ROOT="${DATA_ROOT:-}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs}"
+LOG_ROOT="${LOG_ROOT:-${PROJECT_ROOT}/logs}"
 CONDA_ENV="${CONDA_ENV:-timematch}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
@@ -68,14 +69,14 @@ activate_environment() {
 }
 
 print_run_header() {
-    local run_directory="$1"
-    local source_domain="$2"
-    local target_domain="$3"
-    local seed="$4"
-    local physical_gpu="$5"
-    local epochs="$6"
+    local run_output_directory="$1"
+    local run_log_directory="$2"
+    local source_domain="$3"
+    local target_domain="$4"
+    local seed="$5"
+    local physical_gpu="$6"
     local batch_size="128"
-    local environment_file="${run_directory}/environment.txt"
+    local environment_file="${run_log_directory}/environment.txt"
 
     {
         echo "CODE_VERSION=${CODE_VERSION}"
@@ -86,11 +87,75 @@ print_run_header() {
         echo "SOURCE=${source_domain}"
         echo "TARGET=${target_domain}"
         echo "SEED=${seed}"
-        echo "EPOCHS=${epochs}"
         echo "BATCH_SIZE=${batch_size}"
-        echo "OUTPUT_DIRECTORY=${run_directory}"
+        echo "OUTPUT_DIRECTORY=${run_output_directory}"
+        echo "LOG_DIRECTORY=${run_log_directory}"
         "${PYTHON_BIN}" -c 'import sys, torch; print("PYTHON_VERSION=" + sys.version.replace("\n", " ")); print("PYTORCH_VERSION=" + torch.__version__); print("CUDA_AVAILABLE=" + str(torch.cuda.is_available())); print("CUDA_DEVICE_COUNT=" + str(torch.cuda.device_count()))'
-    } | tee "${environment_file}"
+    } > "${environment_file}"
+}
+
+_validate_child_directory() {
+    local child="$1"
+    local parent="$2"
+    case "${child}" in
+        "${parent}"/*) ;;
+        *)
+            echo "Directory must be a child of ${parent}: ${child}" >&2
+            return 1
+            ;;
+    esac
+}
+
+prepare_run_group() {
+    local output_directory="$1"
+    local log_directory="$2"
+    _validate_child_directory "${output_directory}" "${OUTPUT_ROOT}"
+    _validate_child_directory "${log_directory}" "${LOG_ROOT}"
+
+    if [[ -e "${output_directory}" ]]; then
+        if [[ "${OVERWRITE}" != "1" ]]; then
+            echo "Output directory already exists: ${output_directory}" >&2
+            return 1
+        fi
+        rm -rf -- "${output_directory}"
+    fi
+    if [[ -d "${log_directory}" ]]; then
+        local entry base
+        for entry in "${log_directory}"/* "${log_directory}"/.[!.]* "${log_directory}"/..?*; do
+            [[ -e "${entry}" ]] || continue
+            base="$(basename "${entry}")"
+            if [[ "${base}" == "nohup.log" || "${base}" == "launcher.pid" ]]; then
+                continue
+            fi
+            if [[ "${OVERWRITE}" != "1" ]]; then
+                echo "Log directory contains an earlier run: ${log_directory}" >&2
+                return 1
+            fi
+            rm -rf -- "${entry}"
+        done
+    elif [[ -e "${log_directory}" ]]; then
+        echo "Log path is not a directory: ${log_directory}" >&2
+        return 1
+    fi
+    mkdir -p "${output_directory}" "${log_directory}"
+}
+
+make_run_directories() {
+    local run_output_directory="$1"
+    local run_log_directory="$2"
+    _validate_child_directory "${run_output_directory}" "${OUTPUT_ROOT}"
+    _validate_child_directory "${run_log_directory}" "${LOG_ROOT}"
+    for directory in "${run_output_directory}" "${run_log_directory}"; do
+        if [[ -e "${directory}" ]]; then
+            if [[ "${OVERWRITE}" != "1" ]]; then
+                echo "Run directory already exists: ${directory}" >&2
+                return 1
+            fi
+            rm -rf -- "${directory}"
+        fi
+    done
+    mkdir -p "${run_output_directory}/fold_0" \
+        "${run_output_directory}/tensorboard" "${run_log_directory}"
 }
 
 make_run_directory() {
@@ -197,7 +262,7 @@ V3_COMMON_ARGS=(
     --target_q_margin 0.10
     --raw_pull_confidence 0.50
     --raw_huber_delta 0.10
-    --progress_bar off
+    --progress_bar auto
     --log_step 10
 )
 
@@ -206,34 +271,53 @@ run_training() {
     local target_domain="$2"
     local seed="$3"
     local physical_gpu="$4"
-    local epochs="$5"
-    local run_directory="$6"
+    local fifth_argument="$5"
+    local sixth_argument="$6"
     shift 6
-    local extra_args=("$@")
+    local run_output_directory run_log_directory
+    local extra_args
+    if [[ "${fifth_argument}" =~ ^[0-9]+$ ]]; then
+        run_output_directory="${sixth_argument}"
+        run_log_directory="${sixth_argument}"
+        extra_args=(--epochs "${fifth_argument}" "$@")
+    else
+        run_output_directory="${fifth_argument}"
+        run_log_directory="${sixth_argument}"
+        extra_args=("$@")
+    fi
 
     require_file "${PROJECT_ROOT}/train.py"
-    require_directory "${DATA_ROOT}"
+    if [[ -n "${DATA_ROOT}" ]]; then
+        require_directory "${DATA_ROOT}"
+    fi
+    require_directory "${run_output_directory}"
+    require_directory "${run_log_directory}"
     cd "${PROJECT_ROOT}"
 
     CMD=(
         "${PYTHON_BIN}" -u train.py
-        --data_root "${DATA_ROOT}"
         --source "${source_domain}"
         --target "${target_domain}"
         --seed "${seed}"
         --device cuda:0
-        --epochs "${epochs}"
-        --output_dir "${run_directory}"
-        --tensorboard_log_dir "${run_directory}/tensorboard/events"
+        --output_dir "${run_output_directory}"
+        --tensorboard_log_dir "${run_output_directory}/tensorboard/events"
         "${V3_COMMON_ARGS[@]}"
         "${extra_args[@]}"
     )
+    if [[ -n "${DATA_ROOT}" ]]; then
+        CMD+=(--data_root "${DATA_ROOT}")
+    fi
 
-    printf '%q ' "${CMD[@]}" | tee "${run_directory}/command.txt"
-    printf '\n' | tee -a "${run_directory}/command.txt"
-    print_run_header "${run_directory}" "${source_domain}" "${target_domain}" \
-        "${seed}" "${physical_gpu}" "${epochs}"
+    printf '%q ' "${CMD[@]}" > "${run_log_directory}/command.txt"
+    printf '\n' >> "${run_log_directory}/command.txt"
+    print_run_header "${run_output_directory}" "${run_log_directory}" \
+        "${source_domain}" "${target_domain}" "${seed}" "${physical_gpu}"
     CUDA_VISIBLE_DEVICES="${physical_gpu}" "${CMD[@]}" \
-        > >(tee "${run_directory}/train.log") \
-        2> >(tee "${run_directory}/stderr.log" >&2)
+        > "${run_log_directory}/train.log" \
+        2> "${run_log_directory}/stderr.log" &
+    local training_pid=$!
+    printf '%s\n' "${training_pid}" > "${run_log_directory}/train.pid"
+    echo "TASK_PROCESS|gpu=${physical_gpu}|pid=${training_pid}"
+    wait "${training_pid}"
 }

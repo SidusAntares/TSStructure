@@ -21,8 +21,9 @@ DIAGNOSTIC = SCRIPTS / "run_structure_da_diagnostic_at1_dk1.sh"
 DIAGNOSTIC_ANALYZER = SCRIPTS / "analyze_structure_da_diagnostic.py"
 PILOT4 = SCRIPTS / "run_structure_da_pilot4_4gpu.sh"
 PILOT4_ANALYZER = SCRIPTS / "analyze_structure_da_pilot4.py"
+FORMAL = SCRIPTS / "run_structure_da_12tasks_4gpu_3seeds.sh"
 README = SCRIPTS / "README_structure_da_v3.md"
-SHELL_SCRIPTS = [COMMON, ENV_CHECK, SMOKE, DIAGNOSTIC, PILOT4]
+SHELL_SCRIPTS = [COMMON, ENV_CHECK, SMOKE, DIAGNOSTIC, PILOT4, FORMAL]
 EXPECTED_VERSION = "a7751523794b48813ae9f294303889eed62ea2e7"
 OBSOLETE_FLAGS = {
     "--structure_dim",
@@ -99,7 +100,7 @@ def test_common_configuration_uses_current_v3_cli_and_fixed_version() -> None:
     source = COMMON.read_text(encoding="utf-8")
     assert EXPECTED_VERSION in source
     for name in (
-        "PROJECT_ROOT", "DATA_ROOT", "OUTPUT_ROOT", "CONDA_ENV",
+        "PROJECT_ROOT", "DATA_ROOT", "OUTPUT_ROOT", "LOG_ROOT", "CONDA_ENV",
         "PYTHON_BIN", "NUM_WORKERS", "CODE_VERSION", "V3_COMMON_ARGS",
     ):
         assert name in source
@@ -113,11 +114,32 @@ def test_common_configuration_uses_current_v3_cli_and_fixed_version() -> None:
         "--balance-source", "--amp true", "--time_coordinate_mode",
         "--warp_num_candidates", "--shape_dim", "--lambda_cls",
         "--lambda_quality", "--lambda_global_domain",
-        "--lambda_target_semantic", "--progress_bar off",
+        "--lambda_target_semantic", "--progress_bar auto",
     ):
         assert required in source
     assert "CMD=(" in source
     assert "printf '%q '" in source
+    assert 'DATA_ROOT="${DATA_ROOT:-}"' in source
+    assert 'OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs}"' in source
+    assert 'LOG_ROOT="${LOG_ROOT:-${PROJECT_ROOT}/logs}"' in source
+    assert "${PROJECT_ROOT}/data" not in source
+    assert "${PROJECT_ROOT}/outputs/structure_da_v3" not in source
+    assert "--progress_bar off" not in source
+
+
+def test_data_root_is_only_appended_when_explicitly_set() -> None:
+    source = COMMON.read_text(encoding="utf-8")
+    command_block = source.split("CMD=(", 1)[1].split(")", 1)[0]
+    assert "--data_root" not in command_block
+    assert re.search(
+        r'if \[\[ -n "\$\{DATA_ROOT\}" \]\]; then\s*'
+        r'CMD\+=\(--data_root "\$\{DATA_ROOT\}"\)\s*fi',
+        source,
+    )
+    assert '> "${run_log_directory}/train.log"' in source
+    assert '2> "${run_log_directory}/stderr.log"' in source
+    assert 'tee "${run_log_directory}/train.log"' not in source
+    assert '| tee "${environment_file}"' not in source
 
 
 def test_every_common_training_flag_exists_in_train_help() -> None:
@@ -135,6 +157,7 @@ def test_environment_check_covers_data_dependencies_cuda_and_storage() -> None:
         "SERVER_ENV_CHECK=PASS", "SERVER_ENV_CHECK=FAIL", "df -P",
     ):
         assert fragment in source
+    assert "if ! run_training" not in source
 
 
 def test_smoke_is_short_fixed_and_checked() -> None:
@@ -145,9 +168,87 @@ def test_smoke_is_short_fixed_and_checked() -> None:
         'SEED="${SEED:-1}"', 'CUDA_DEVICE="${CUDA_DEVICE:-0}"',
         'SMOKE_EPOCHS="${SMOKE_EPOCHS:-1}"',
         'SMOKE_STEPS_PER_EPOCH="${SMOKE_STEPS_PER_EPOCH:-2}"',
-        "check_structure_da_smoke.py", "SMOKE_SUCCESS", "SMOKE_FAILED",
+        'RUN_OUTPUT_DIRECTORY="${OUTPUT_ROOT}/smoke_structure_da_v3"',
+        'RUN_LOG_DIRECTORY="${LOG_ROOT}/smoke_structure_da_v3"',
+        "check_structure_da_smoke.py", "--log-directory",
+        "SMOKE_SUCCESS", "SMOKE_FAILED",
     ):
         assert fragment in source
+
+
+def test_smoke_checker_supports_separate_output_and_log_directories() -> None:
+    source = SMOKE_CHECKER.read_text(encoding="utf-8")
+    assert 'parser.add_argument("--log-directory"' in source
+    assert "log_directory / \"train.log\"" in source
+    assert "run_directory / \"fold_0\" / \"model.pt\"" in source
+
+
+EXPECTED_FORMAL_TASKS = (
+    "AT1|austria/33UVP/2017|DK1|denmark/32VNH/2017",
+    "AT1|austria/33UVP/2017|FR1|france/31TCJ/2017",
+    "AT1|austria/33UVP/2017|FR2|france/30TXT/2017",
+    "DK1|denmark/32VNH/2017|AT1|austria/33UVP/2017",
+    "DK1|denmark/32VNH/2017|FR1|france/31TCJ/2017",
+    "DK1|denmark/32VNH/2017|FR2|france/30TXT/2017",
+    "FR1|france/31TCJ/2017|AT1|austria/33UVP/2017",
+    "FR1|france/31TCJ/2017|DK1|denmark/32VNH/2017",
+    "FR1|france/31TCJ/2017|FR2|france/30TXT/2017",
+    "FR2|france/30TXT/2017|AT1|austria/33UVP/2017",
+    "FR2|france/30TXT/2017|DK1|denmark/32VNH/2017",
+    "FR2|france/30TXT/2017|FR1|france/31TCJ/2017",
+)
+
+
+def test_formal_launcher_defines_exactly_12_tasks_and_36_runs() -> None:
+    source = FORMAL.read_text(encoding="utf-8")
+    for task in EXPECTED_FORMAL_TASKS:
+        assert f'"{task}"' in source
+    assert "SEEDS=(1 2 3)" in source
+    assert "EXPECTED_RUNS=36" in source
+    assert "--epochs" not in source
+    assert "--steps_per_epoch" not in source
+
+
+def test_formal_launcher_requires_run_group_and_uses_four_sequential_workers() -> None:
+    source = FORMAL.read_text(encoding="utf-8")
+    assert 'RUN_GROUP="${RUN_GROUP:-}"' in source
+    assert "RUN_GROUP must contain only letters, digits, underscores, and hyphens" in source
+    for gpu in range(4):
+        assert f'GPU{gpu}="${{GPU{gpu}:-{gpu}}}"' in source
+        assert f'run_worker {gpu} "${{GPU{gpu}}}" &' in source
+    assert "job_index += 4" in source
+    assert 'wait "${worker_pid}"' in source
+    assert 'CUDA_VISIBLE_DEVICES="${physical_gpu}"' in COMMON.read_text(encoding="utf-8")
+
+
+def test_formal_launcher_separates_logs_outputs_and_status_files() -> None:
+    source = FORMAL.read_text(encoding="utf-8")
+    for fragment in (
+        'GROUP_LOG_DIRECTORY="${LOG_ROOT}/${RUN_GROUP}"',
+        'GROUP_OUTPUT_DIRECTORY="${OUTPUT_ROOT}/${RUN_GROUP}"',
+        "launcher.pid", "manifest.tsv", "completed.tsv", "failed.tsv",
+        "EXPERIMENT_DONE", "EXPERIMENT_FAILED",
+        'RUN_LOG_DIRECTORY="${GROUP_LOG_DIRECTORY}/${run_name}"',
+        'RUN_OUTPUT_DIRECTORY="${GROUP_OUTPUT_DIRECTORY}/${run_name}"',
+    ):
+        assert fragment in source
+    assert "train.pid" in COMMON.read_text(encoding="utf-8")
+    assert "run_structure_da_pilot4_4gpu.sh" not in source
+
+
+def test_readme_has_standard_nohup_workflow_without_pilot_gate() -> None:
+    source = README.read_text(encoding="utf-8")
+    for fragment in (
+        "logs/smoke_structure_da_v3/nohup.log",
+        "logs/smoke_structure_da_v3/train.log",
+        'RUN_GROUP="structure_da_v3_12tasks_3seeds_$(date +%Y%m%d_%H%M%S)"',
+        "run_structure_da_12tasks_4gpu_3seeds.sh",
+        'logs/${RUN_GROUP}/AT1_DK1_seed1/train.log',
+        "只 kill launcher PID 不一定会终止已经启动的训练子进程",
+    ):
+        assert fragment in source
+    assert "PASS_FOR_PILOT4" not in source
+    assert "READY_FOR_FULL_EXPERIMENT" not in source
 
 
 def test_diagnostic_is_fixed_task_with_formal_common_parameters() -> None:

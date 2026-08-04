@@ -15,10 +15,13 @@ def _last_float(pattern: str, text: str) -> float | None:
     return float(matches[-1]) if matches else None
 
 
-def check_smoke(run_directory: Path) -> dict[str, object]:
+def check_smoke(
+    run_directory: Path, log_directory: Path | None = None
+) -> dict[str, object]:
     run_directory = Path(run_directory)
-    log_path = run_directory / "train.log"
-    stderr_path = run_directory / "stderr.log"
+    log_directory = run_directory if log_directory is None else Path(log_directory)
+    log_path = log_directory / "train.log"
+    stderr_path = log_directory / "stderr.log"
     checkpoint = run_directory / "fold_0" / "model.pt"
     metrics = sorted((run_directory / "fold_0").glob("test_metrics_*.json"))
     text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
@@ -60,7 +63,7 @@ def check_smoke(run_directory: Path) -> dict[str, object]:
         "checkpoint": str(checkpoint),
         "metrics_files": [str(path) for path in metrics],
     }
-    (run_directory / "smoke_check.json").write_text(
+    (log_directory / "smoke_check.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8"
     )
     return report
@@ -69,8 +72,9 @@ def check_smoke(run_directory: Path) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_directory", type=Path)
+    parser.add_argument("--log-directory", type=Path)
     args = parser.parse_args()
-    report = check_smoke(args.run_directory)
+    report = check_smoke(args.run_directory, args.log_directory)
     print(json.dumps(report, indent=2))
     return 0 if report["status"] == "PASS" else 1
 

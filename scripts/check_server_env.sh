@@ -24,22 +24,26 @@ if [[ "${failed}" -eq 0 ]]; then
         || fail_check "cuda_query"
 fi
 
-TIME_MATCH_DOMAINS=(
-    "austria/33UVP/2017"
-    "denmark/32VNH/2017"
-    "france/30TXT/2017"
-    "france/31TCJ/2017"
-)
-for domain in "${TIME_MATCH_DOMAINS[@]}"; do
-    domain_directory="${DATA_ROOT}/${domain}"
-    if [[ ! -d "${domain_directory}" ]]; then
-        fail_check "missing_domain:${domain}"
-        continue
-    fi
-    if ! find "${domain_directory}" -type f -readable -print -quit | grep -q .; then
-        fail_check "no_readable_data:${domain}"
-    fi
-done
+if [[ -n "${DATA_ROOT}" ]]; then
+    TIME_MATCH_DOMAINS=(
+        "austria/33UVP/2017"
+        "denmark/32VNH/2017"
+        "france/30TXT/2017"
+        "france/31TCJ/2017"
+    )
+    for domain in "${TIME_MATCH_DOMAINS[@]}"; do
+        domain_directory="${DATA_ROOT}/${domain}"
+        if [[ ! -d "${domain_directory}" ]]; then
+            fail_check "missing_domain:${domain}"
+            continue
+        fi
+        if ! find "${domain_directory}" -type f -readable -print -quit | grep -q .; then
+            fail_check "no_readable_data:${domain}"
+        fi
+    done
+else
+    echo "DATA_ROOT=TRAIN_PY_DEFAULT"
+fi
 
 if ! mkdir -p "${OUTPUT_ROOT}/.environment_check"; then
     fail_check "output_create"

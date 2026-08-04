@@ -1,61 +1,124 @@
-# TSStructure V3 offline experiment workflow
+# TSStructure V3 offline server workflow
 
-These scripts run entirely from local code and local TimeMatch data. They do
-not manage source control, contact a network service, install packages, or
-download data or weights. Set paths for the current server rather than editing
-the scripts:
+The server uses local code, its existing Python environment, and the dataset
+path already configured as the `train.py` default. No data-path environment
+variable is required. `DATA_ROOT` is only an optional explicit override.
+These scripts perform no source-control operation, network access, download,
+or package installation.
+
+## 1. Environment check
+
+From the repository root:
 
 ```bash
-export DATA_ROOT=/path/to/local/timematch_data
-export OUTPUT_ROOT=/path/to/local/structure_da_v3_outputs
-export CONDA_ENV=timematch
+bash scripts/check_server_env.sh
 ```
 
-If Conda is already active, leave `PYTHON_BIN=python`. Otherwise activate the
-environment first, or set `PYTHON_BIN` to that environment's Python executable.
+## 2. Smoke run
 
-Run the stages in this order:
+The smoke is fixed to AT1 → DK1, seed 1, GPU 0, one epoch and two steps. It
+checks execution and artifacts; its metrics are not a DA performance result.
 
-1. Check the offline environment:
+```bash
+cd /path/to/TSStructure
 
-   ```bash
-   bash scripts/check_server_env.sh
-   ```
+mkdir -p logs/smoke_structure_da_v3
 
-2. Run the short AT1 to DK1 smoke. It checks execution, validation,
-   checkpointing, finite losses and optimizer/state updates; it does not
-   evaluate DA performance.
+nohup bash scripts/smoke_structure_da_v3.sh \
+    > logs/smoke_structure_da_v3/nohup.log \
+    2>&1 < /dev/null &
 
-   ```bash
-   bash scripts/smoke_structure_da_v3.sh
-   python scripts/check_structure_da_smoke.py \
-     "$OUTPUT_ROOT/smoke/AT1_DK1/seed_1"
-   ```
+echo $! > logs/smoke_structure_da_v3/launcher.pid
+```
 
-3. Run and analyze the fixed AT1 to DK1 seed-1 diagnostic pilot. This pilot
-   uses formal model/loss settings but only 25 epochs, so it is not a final
-   experiment result.
+View the launcher log:
 
-   ```bash
-   bash scripts/run_structure_da_diagnostic_at1_dk1.sh
-   python scripts/analyze_structure_da_diagnostic.py \
-     "$OUTPUT_ROOT/diagnostic_pilot/AT1_DK1/seed_1"
-   ```
+```bash
+tail -f logs/smoke_structure_da_v3/nohup.log
+```
 
-4. Only after the diagnostic reports `PASS_FOR_PILOT4`, run the four-GPU pilot
-   and aggregate it:
+View the detailed training log:
 
-   ```bash
-   GPU0=0 GPU1=1 GPU2=2 GPU3=3 \
-     bash scripts/run_structure_da_pilot4_4gpu.sh
-   python scripts/analyze_structure_da_pilot4.py "$OUTPUT_ROOT/pilot4"
-   ```
+```bash
+tail -f logs/smoke_structure_da_v3/train.log
+```
 
-5. Build a full experiment launcher only after the pilot reports
-   `READY_FOR_FULL_EXPERIMENT`.
+Smoke results are written to `outputs/smoke_structure_da_v3/`; text logs,
+the command, environment record, PID and smoke status are written to
+`logs/smoke_structure_da_v3/`.
 
-Existing directories are never silently overwritten. Set `OVERWRITE=1` only
-when deliberately replacing a run. X2 (classic numerical SRVF comparison) and
-X3 (direct S-shape versus S-reference residual ablation) remain later work;
-class-specific reference training also depends on X1. Validation `occlusion_*`
-metrics are feature-occlusion diagnostics, not formal retrained ablations.
+## 3. Formal 12-task × 3-seed experiment
+
+After the smoke succeeds, the standard next step is the complete 36-run
+experiment. No diagnostic or four-task pilot is a prerequisite.
+
+```bash
+cd /path/to/TSStructure
+
+RUN_GROUP="structure_da_v3_12tasks_3seeds_$(date +%Y%m%d_%H%M%S)"
+
+mkdir -p "logs/${RUN_GROUP}"
+
+nohup env \
+    RUN_GROUP="${RUN_GROUP}" \
+    GPU0=0 GPU1=1 GPU2=2 GPU3=3 \
+    bash scripts/run_structure_da_12tasks_4gpu_3seeds.sh \
+    > "logs/${RUN_GROUP}/nohup.log" \
+    2>&1 < /dev/null &
+
+echo $! > "logs/${RUN_GROUP}/launcher.pid"
+
+echo "RUN_GROUP=${RUN_GROUP}"
+echo "PID=$(cat "logs/${RUN_GROUP}/launcher.pid")"
+```
+
+View overall scheduling:
+
+```bash
+tail -f "logs/${RUN_GROUP}/nohup.log"
+```
+
+View one detailed task log:
+
+```bash
+tail -f "logs/${RUN_GROUP}/AT1_DK1_seed1/train.log"
+```
+
+View GPU use:
+
+```bash
+watch -n 5 nvidia-smi
+```
+
+Training artifacts are stored under `outputs/${RUN_GROUP}/<task_seed>/`.
+All launcher and per-task text logs are stored under
+`logs/${RUN_GROUP}/`. Each of the four GPU workers runs nine jobs
+sequentially, so a physical GPU has at most one training process.
+
+## Stopping safely
+
+只 kill launcher PID 不一定会终止已经启动的训练子进程。
+
+First inspect every recorded child PID and its command:
+
+```bash
+find "logs/${RUN_GROUP}" -name train.pid -type f -print | while read -r pid_file; do
+    child_pid="$(cat "${pid_file}")"
+    ps -fp "${child_pid}"
+done
+```
+
+After confirming that each process belongs to this experiment group, stop the
+recorded children explicitly, then stop the launcher:
+
+```bash
+find "logs/${RUN_GROUP}" -name train.pid -type f -print | while read -r pid_file; do
+    child_pid="$(cat "${pid_file}")"
+    kill "${child_pid}"
+done
+kill "$(cat "logs/${RUN_GROUP}/launcher.pid")"
+```
+
+Existing experiment output is not overwritten by default. `OVERWRITE=1`
+must be intentional; it preserves the active `nohup.log` and `launcher.pid`
+while replacing earlier experiment artifacts.
