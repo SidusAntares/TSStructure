@@ -155,6 +155,9 @@ class JointStructureDATrainingConfig:
     quality_classification_weight: float = 1.0
     quality_domain_weight: float = 1.0
     quality_domain_score_warmup_epochs: int = 5
+    candidate_init_warp_amplitude: float = 0.015
+    phase_identity_tolerance: float = 1e-4
+    phase_candidate_unique_tolerance: float = 1e-4
     amp: bool = False
     amp_dtype: str = "float16"
     log_step: int = 10
@@ -191,8 +194,19 @@ class JointStructureDATrainingConfig:
             "target_semantic_weight",
             "quality_classification_weight",
             "quality_domain_weight",
+            "candidate_init_warp_amplitude",
+            "phase_identity_tolerance",
         ):
             object.__setattr__(self, name, _finite_nonnegative(name, getattr(self, name)))
+        object.__setattr__(
+            self,
+            "phase_candidate_unique_tolerance",
+            _finite_nonnegative(
+                "phase_candidate_unique_tolerance",
+                self.phase_candidate_unique_tolerance,
+                positive=True,
+            ),
+        )
         progress_bar_disabled(self.progress_bar)
 
 
@@ -304,17 +318,49 @@ def _phase_diagnostics(prefix: str, output, original_positions: Tensor) -> dict[
     )
     shift = (output.temporal.aligned_positions - positions).abs()
     mean_shift = shift.masked_select(mask).mean()
-    return {
+    candidate_count = selection.candidate_trainable_mask.shape[1]
+    if candidate_count > 1:
+        off_diagonal = ~torch.eye(
+            candidate_count,
+            dtype=torch.bool,
+            device=selection.candidate_pairwise_distance.device,
+        )
+        pairwise = selection.candidate_pairwise_distance[:, off_diagonal]
+        pairwise_mean = pairwise.mean()
+        pairwise_min = pairwise.amin()
+    else:
+        pairwise_mean = selection.candidate_pairwise_distance.sum() * 0.0
+        pairwise_min = pairwise_mean
+    selected = selection.selected_candidate_index
+    values = {
         f"{prefix}_phase_valid_rate": _rate(selection.phase_valid),
-        f"{prefix}_phase_nonidentity_rate": _rate(selection.phase_status == 2),
-        f"{prefix}_phase_identity_rate": _rate(selection.identity_accepted),
-        f"{prefix}_phase_failure_rate": _rate(selection.identity_fallback),
-        f"{prefix}_trend_ambiguous_rate": _rate(selection.trend_candidate_ambiguous),
-        f"{prefix}_structure_disambiguation_rate": _rate(selection.structure_disambiguation_used),
-        f"{prefix}_structure_veto_rate": _rate(selection.structure_candidate_vetoed),
+        f"{prefix}_valid_nonidentity_rate": _rate(selection.phase_status == 2),
+        f"{prefix}_valid_identity_rate": _rate(selection.phase_status == 1),
+        f"{prefix}_failure_rate": _rate(selection.phase_status == 0),
+        f"{prefix}_candidate_trainable_rate": _rate(selection.candidate_trainable_mask),
+        f"{prefix}_candidate_acceptable_rate": _rate(selection.candidate_acceptable_mask),
+        f"{prefix}_candidate_pairwise_distance_mean": pairwise_mean,
+        f"{prefix}_candidate_pairwise_distance_min": pairwise_min,
+        f"{prefix}_candidate_unique_count_mean": selection.candidate_unique_count.float().mean(),
+        f"{prefix}_candidate_collapse_rate": _rate(selection.candidate_collapse_mask),
+        f"{prefix}_T_ambiguity_rate": _rate(selection.trend_candidate_ambiguous),
+        f"{prefix}_S_changed_preferred_rate": _rate(
+            selection.structure_disambiguation_used
+            & (selected >= 0)
+            & (selected != selection.trend_preferred_candidate_index)
+        ),
+        f"{prefix}_S_veto_rate": _rate(selection.structure_candidate_vetoed),
+        f"{prefix}_candidate_selected_is_identity_rate": _rate(
+            selection.candidate_selected_is_identity
+        ),
         f"{prefix}_shape_valid_rate": _rate(output.representation.shape_valid),
         f"{prefix}_aligned_position_mean_absolute_shift": mean_shift,
     }
+    for candidate in range(candidate_count):
+        values[f"{prefix}_candidate_head_{candidate}_selected_rate"] = _rate(
+            selected == candidate
+        )
+    return values
 
 
 def _fusion_diagnostics(prefix: str, output) -> dict[str, Tensor]:
@@ -641,11 +687,23 @@ def _collect_validation_structure_contributions(
     mode_names = ("full", "no_shape", "trend_only", "structure_only", "shape_only")
     mode_logits: dict[str, list[Tensor]] = {name: [] for name in mode_names}
     labels: list[Tensor] = []
+    phase_sums: dict[str, float] = {}
+    phase_samples = 0
     model.eval()
     for sample in val_loader:
         target = sample["label"].to(device=device, dtype=torch.long)
         pixels, valid_pixels, positions, extra = _sample_to_device(sample, device)
         output = model.forward_details(pixels, valid_pixels, positions, extra)
+        batch_size = int(target.shape[0])
+        for name, value in _phase_diagnostics(
+            "validation", output, positions
+        ).items():
+            short_name = name.removeprefix("validation_")
+            phase_sums[short_name] = (
+                phase_sums.get(short_name, 0.0)
+                + float(value.item()) * batch_size
+            )
+        phase_samples += batch_size
         quality = output.representation.quality
         trend = quality.weighted_trend
         structure = quality.weighted_structure
@@ -687,6 +745,8 @@ def _collect_validation_structure_contributions(
     metrics["delta_shape"] = metrics["full_f1"] - metrics["no_shape_f1"]
     metrics["delta_trend"] = metrics["full_f1"] - metrics["structure_only_f1"]
     metrics["delta_structure"] = metrics["full_f1"] - metrics["trend_only_f1"]
+    for name, total in phase_sums.items():
+        metrics[f"phase_{name}"] = total / max(phase_samples, 1)
     predictions = torch.cat(mode_logits["full"]).argmax(-1)
     return metrics, all_labels, predictions
 
@@ -771,9 +831,37 @@ def _write_diagnostics(writer, step: int, diagnostics: Mapping[str, Tensor]) -> 
             group = "target"
         elif "prototype" in name or "radius" in name:
             group = "prototype"
-        elif name.startswith("source_phase") or name.startswith("source_trend_ambiguous") or name.startswith("source_structure_") or name.startswith("source_shape_valid") or name.startswith("source_aligned"):
+        elif name.startswith("source_") and any(
+            token in name
+            for token in (
+                "phase_",
+                "candidate_",
+                "T_ambiguity",
+                "S_changed",
+                "S_veto",
+                "valid_identity",
+                "valid_nonidentity",
+                "failure_rate",
+                "shape_valid",
+                "aligned_",
+            )
+        ):
             group = "phase/source"
-        elif name.startswith("target_phase") or name.startswith("target_trend_ambiguous") or name.startswith("target_structure_") or name.startswith("target_shape_valid") or name.startswith("target_aligned"):
+        elif name.startswith("target_") and any(
+            token in name
+            for token in (
+                "phase_",
+                "candidate_",
+                "T_ambiguity",
+                "S_changed",
+                "S_veto",
+                "valid_identity",
+                "valid_nonidentity",
+                "failure_rate",
+                "shape_valid",
+                "aligned_",
+            )
+        ):
             group = "phase/target"
         elif name.startswith("source_"):
             group = "fusion/source"
@@ -934,6 +1022,26 @@ def train_joint_structure_da(
                 f"|global_da={averages['loss_global_domain']:.4f}"
                 f"|target_semantic={averages['loss_target_semantic']:.4f}"
             )
+        for domain in ("source", "target"):
+            prefix = f"{domain}_"
+            phase_fields = [
+                f"PHASE_EPOCH|epoch={epoch + 1}|domain={domain}"
+            ]
+            for name, meter in meters.items():
+                short_name = name.removeprefix(prefix)
+                if name.startswith(prefix) and (
+                    short_name.startswith("candidate_")
+                    or short_name.startswith("T_")
+                    or short_name.startswith("S_")
+                    or short_name
+                    in (
+                        "valid_identity_rate",
+                        "valid_nonidentity_rate",
+                        "failure_rate",
+                    )
+                ):
+                    phase_fields.append(f"{short_name}={meter.avg:.6g}")
+            print("|".join(phase_fields))
         for domain in ("source", "target"):
             summary = summarize_decomposition_diagnostics(decomposition_epoch[domain])
             print(_format_epoch_diagnostics("DECOMP_EPOCH", epoch + 1, domain, summary))

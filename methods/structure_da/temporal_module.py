@@ -107,6 +107,7 @@ class TrendStructureTemporalCore(nn.Module):
         warp_kernel_size: int = 5,
         warp_min_increment: float = 1e-4,
         warp_num_candidates: int = 3,
+        candidate_init_warp_amplitude: float = 0.015,
         selection_config: TrendStructureSelectionConfig | None = None,
         srvf_eps: float = 1e-8,
         derivative_norm_threshold: float = 1e-8,
@@ -161,6 +162,7 @@ class TrendStructureTemporalCore(nn.Module):
             kernel_size=warp_kernel_size,
             min_increment=warp_min_increment,
             num_candidates=warp_num_candidates,
+            candidate_init_warp_amplitude=candidate_init_warp_amplitude,
         )
         if selection_config is not None and not isinstance(
             selection_config, TrendStructureSelectionConfig
@@ -439,6 +441,7 @@ class TrendStructureTaskFeatureModule(nn.Module):
         warp_kernel_size: int = 5,
         warp_min_increment: float = 1e-4,
         warp_num_candidates: int = 3,
+        candidate_init_warp_amplitude: float = 0.015,
         selection_config: TrendStructureSelectionConfig | None = None,
         srvf_eps: float = 1e-8,
         derivative_norm_threshold: float = 1e-8,
@@ -475,6 +478,7 @@ class TrendStructureTaskFeatureModule(nn.Module):
             warp_kernel_size=warp_kernel_size,
             warp_min_increment=warp_min_increment,
             warp_num_candidates=warp_num_candidates,
+            candidate_init_warp_amplitude=candidate_init_warp_amplitude,
             selection_config=selection_config,
             srvf_eps=srvf_eps,
             derivative_norm_threshold=derivative_norm_threshold,

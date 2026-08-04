@@ -384,12 +384,13 @@ def test_raw_huber_formula_has_small_and_large_branches() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def _geometry_selection(interval_widths, scores, legal, selected, phase_valid):
+def _geometry_selection(interval_widths, scores, trainable, selected, phase_valid):
     candidates = SimpleNamespace(interval_widths=interval_widths)
     return SimpleNamespace(
         candidates=candidates,
         candidate_softmin_score=scores,
-        candidate_legal_mask=legal,
+        candidate_trainable_mask=trainable,
+        candidate_acceptable_mask=torch.zeros_like(trainable),
         selected_candidate_index=selected,
         phase_valid=phase_valid,
     )
@@ -414,7 +415,7 @@ def test_trend_led_geometry_uses_differentiable_candidates_and_graph_zeros() -> 
     assert logits.grad is not None and torch.isfinite(logits.grad).all()
 
     empty = _geometry_selection(
-        widths, scores, torch.zeros_like(selection.candidate_legal_mask),
+        widths, scores, torch.zeros_like(selection.candidate_trainable_mask),
         torch.full((3,), -1), torch.zeros(3, dtype=torch.bool),
     )
     zero = TrendLedGeometryObjective()(empty, torch.zeros(3, dtype=torch.bool))

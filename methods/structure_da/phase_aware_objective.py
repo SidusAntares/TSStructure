@@ -613,14 +613,14 @@ class TrendLedGeometryObjective(nn.Module):
             raise ValueError("weights must be nonnegative and eps positive")
 
     def forward(self, selection: TrendStructurePhaseSelectionOutput, source_mask: Tensor) -> TrendLedGeometryLossOutput:
-        legal = selection.candidate_legal_mask
+        trainable = selection.candidate_trainable_mask
         widths = selection.candidates.interval_widths
-        batch = legal.shape[0] if legal.ndim == 2 else -1
+        batch = trainable.shape[0] if trainable.ndim == 2 else -1
         if (
-            legal.ndim != 2
-            or legal.dtype != torch.bool
+            trainable.ndim != 2
+            or trainable.dtype != torch.bool
             or widths.ndim != 3
-            or widths.shape[:2] != legal.shape
+            or widths.shape[:2] != trainable.shape
             or widths.shape[-1] < 1
             or selection.candidate_softmin_score.shape != (batch,)
             or selection.selected_candidate_index.dtype != torch.long
@@ -634,7 +634,7 @@ class TrendLedGeometryObjective(nn.Module):
         tensor_fields = (
             widths,
             selection.candidate_softmin_score,
-            legal,
+            trainable,
             selection.selected_candidate_index,
             selection.phase_valid,
             source_mask,
@@ -647,9 +647,9 @@ class TrendLedGeometryObjective(nn.Module):
             raise ValueError("candidate widths and scores must share a dtype")
         if not torch.isfinite(widths).all().item():
             raise ValueError("candidate widths must be finite")
-        if torch.any((selection.selected_candidate_index < -1) | (selection.selected_candidate_index >= legal.shape[1])).item():
+        if torch.any((selection.selected_candidate_index < -1) | (selection.selected_candidate_index >= trainable.shape[1])).item():
             raise ValueError("selected_candidate_index is out of range")
-        candidate_valid = legal.any(-1)
+        candidate_valid = trainable.any(-1)
         if not torch.isfinite(selection.candidate_softmin_score[candidate_valid]).all().item():
             raise ValueError("scores for valid candidates must be finite")
         candidate_loss = selection.candidate_softmin_score[candidate_valid].mean() if candidate_valid.any() else _graph_zero(selection.candidate_softmin_score, selection.candidates.interval_widths)

@@ -125,6 +125,9 @@ def test_one_epoch_joint_training_saves_phase_aware_checkpoint(tmp_path) -> None
     assert torch.isfinite(torch.tensor(best))
     checkpoint = torch.load(checkpoint_path, weights_only=False)
     assert checkpoint["training_config"]["classification_weight"] == 1.0
+    assert checkpoint["training_config"]["candidate_init_warp_amplitude"] == 0.015
+    assert checkpoint["training_config"]["phase_identity_tolerance"] == 1e-4
+    assert checkpoint["training_config"]["phase_candidate_unique_tolerance"] == 1e-4
     restored = _model()
     restored.load_state_dict(checkpoint["state_dict"])
 
@@ -143,6 +146,9 @@ def test_cli_exposes_only_phase_aware_high_level_options() -> None:
         "--lambda_target_semantic",
         "--lambda_q_to_raw_target",
         "--warp_num_candidates",
+        "--candidate_init_warp_amplitude",
+        "--phase_identity_tolerance",
+        "--phase_candidate_unique_tolerance",
     ):
         assert option in result.stdout
     for option in (

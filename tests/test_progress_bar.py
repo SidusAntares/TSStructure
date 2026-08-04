@@ -15,6 +15,107 @@ from utils import train_utils
 import train
 
 
+def _current_config(**overrides):
+    values = dict(
+        seed=1,
+        device="cpu",
+        source="source",
+        target="target",
+        num_folds=1,
+        val_ratio=0.1,
+        test_ratio=0.2,
+        overall=False,
+        closed_set=False,
+        output_dir="outputs",
+        sample_pixels_val=False,
+        eval=False,
+        input_dim=10,
+        num_classes=1,
+        with_extra=False,
+        classes=["crop"],
+        experiment_name="test",
+        time_scale=366.0,
+        tau_fast_init=0.05,
+        tau_slow_init=0.20,
+        tau_min=1e-4,
+        delta_tau_min=1e-4,
+        shape_dim=128,
+        canonical_grid_size=64,
+        warp_num_candidates=3,
+        candidate_init_warp_amplitude=0.015,
+        num_shape_basis=8,
+        num_phase_basis=8,
+        shape_attribute_dim=8,
+        time2vec_max_frequency=16.0,
+        domain_hidden_dim=128,
+        grl_warmup_max_iters=250,
+        grl_warmup_fraction=None,
+        tensorboard_log_dir="runs",
+        epochs=1,
+        batch_size=2,
+        eval_batch_size=2,
+        steps_per_epoch=1,
+        lr=1e-3,
+        weight_decay=0.0,
+        lambda_geometry=1.0,
+        lambda_cls=1.0,
+        lambda_quality=1.0,
+        lambda_source_shape=1.0,
+        lambda_source_raw=1.0,
+        lambda_global_domain=1.0,
+        lambda_target_semantic=1.0,
+        lambda_quality_cls=1.0,
+        lambda_quality_domain=1.0,
+        lambda_q_compact=1.0,
+        lambda_q_separate=1.0,
+        lambda_z_proto=1.0,
+        lambda_q_to_z_source=1.0,
+        lambda_raw_proto=1.0,
+        lambda_q_to_z_target=1.0,
+        lambda_z_pull=1.0,
+        lambda_q_to_raw_target=1.0,
+        lambda_raw_pull=1.0,
+        lambda_geometry_candidate=1.0,
+        lambda_geometry_center=1.0,
+        quality_domain_score_warmup_epochs=5,
+        phase_gain_weight=1.0,
+        phase_identity_weight=1.0,
+        phase_roughness_weight=1.0,
+        phase_unsupported_weight=1.0,
+        phase_gain_temperature=0.05,
+        phase_candidate_temperature=0.05,
+        phase_min_common_support=0.05,
+        phase_max_gain_ratio=1.0,
+        phase_identity_tolerance=1e-4,
+        phase_candidate_unique_tolerance=1e-4,
+        phase_ambiguity_relative_tolerance=0.05,
+        phase_ambiguity_absolute_tolerance=1e-6,
+        structure_veto_ratio=1.05,
+        structure_tie_tolerance=1e-6,
+        prototype_momentum=0.99,
+        radius_buffer_size=2048,
+        min_radius_samples=32,
+        q_inner_quantile=0.75,
+        q_outer_quantile=0.95,
+        feature_inner_quantile=0.75,
+        prototype_min_common_support=0.05,
+        q_temperature=0.1,
+        z_temperature=0.1,
+        trend_temperature=0.1,
+        structure_temperature=0.1,
+        q_separation_margin=1.0,
+        target_q_margin=0.1,
+        raw_pull_confidence=0.5,
+        raw_huber_delta=0.1,
+        amp=False,
+        amp_dtype="float16",
+        log_step=1,
+        progress_bar="off",
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_auto_enables_progress_bar_for_interactive_stderr(monkeypatch):
     monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
 
@@ -123,35 +224,8 @@ def test_final_evaluation_defaults_missing_progress_bar_to_auto(monkeypatch):
     )
     monkeypatch.setattr(train, "save_results", lambda *args: None)
     monkeypatch.setattr(train, "overall_performance", lambda *args: None)
-    config = SimpleNamespace(
-        seed=1,
-        device="cpu",
-        source="source",
-        target="target",
-        num_folds=1,
-        val_ratio=0.1,
-        test_ratio=0.2,
-        overall=False,
-        closed_set=False,
-        output_dir="outputs",
-        sample_pixels_val=False,
-        eval=True,
-        temporal_shift=False,
-        model="structure_da",
-        input_dim=10,
-        num_classes=1,
-        with_extra=False,
-        classes=["crop"],
-        experiment_name="test",
-        time_scale=366.0,
-        tau_fast_init=0.05,
-        tau_slow_init=0.20,
-        tau_min=1e-4,
-        delta_tau_min=1e-4,
-        structure_dim=128,
-        domain_hidden_dim=128,
-        grl_warmup_max_iters=250,
-    )
+    config = _current_config(eval=True)
+    delattr(config, "progress_bar")
 
     train.main(config)
 
@@ -240,24 +314,11 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
         "torch.utils.tensorboard",
         SimpleNamespace(SummaryWriter=Writer),
     )
-    config = SimpleNamespace(
-        seed=1, device="cpu", source="source", target="target", num_folds=1,
-        val_ratio=0.1, test_ratio=0.2, overall=False, closed_set=False,
-        output_dir="outputs", sample_pixels_val=False, eval=False,
-        model="structure_da", input_dim=10, num_classes=1, with_extra=False,
-        classes=["crop"], experiment_name="test", time_scale=366.0,
-        tau_fast_init=0.07, tau_slow_init=0.29,
-        tau_min=0.0002, delta_tau_min=0.0003,
-        structure_dim=128,
-        domain_hidden_dim=128, grl_warmup_max_iters=250,
-        tensorboard_log_dir="runs", epochs=1,
-        batch_size=2, eval_batch_size=2,
-        steps_per_epoch=1, lr=1e-3, weight_decay=0.0,
-        lambda_task=1.0, lambda_geometry=1.0, lambda_alignment=1.0,
-        lambda_structural_cls=1.0, lambda_structural_domain=1.0,
-        lambda_component_cls=1.0, lambda_component_domain=1.0,
-        quality_domain_score_warmup_epochs=5,
-        log_step=1, progress_bar="off",
+    config = _current_config(
+        tau_fast_init=0.07,
+        tau_slow_init=0.29,
+        tau_min=0.0002,
+        delta_tau_min=0.0003,
     )
 
     train.main(config)
@@ -266,19 +327,11 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
     assert trainer_validation_loaders == [source_val]
     assert target_val not in trainer_validation_loaders
     assert final_test_loaders == [target_test]
-    assert model_kwargs == [{
-        "num_classes": 1,
-        "input_dim": 10,
-        "with_extra": False,
-        "structure_dim": 128,
-        "time_scale": 366.0,
-        "tau_fast_init": 0.07,
-        "tau_slow_init": 0.29,
-        "tau_min": 0.0002,
-        "delta_tau_min": 0.0003,
-        "alignment_hidden_dim": 128,
-        "grl_max_iters": 250,
-    }]
+    assert len(model_kwargs) == 1
+    assert model_kwargs[0]["shape_dim"] == 128
+    assert model_kwargs[0]["tau_fast_init"] == 0.07
+    assert model_kwargs[0]["tau_slow_init"] == 0.29
+    assert model_kwargs[0]["temporal_options"]["candidate_init_warp_amplitude"] == 0.015
 
 
 def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
@@ -289,17 +342,19 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         check=True,
     )
     for option in (
-        "--structure_dim",
-        "--domain_hidden_dim", "--grl_warmup_max_iters", "--lambda_task",
-        "--lambda_geometry", "--lambda_alignment", "--lambda_structural_cls",
-        "--lambda_structural_domain", "--lambda_component_cls",
-        "--lambda_component_domain", "--quality_domain_score_warmup_epochs",
+        "--shape_dim", "--domain_hidden_dim", "--grl_warmup_max_iters",
+        "--lambda_geometry", "--lambda_cls", "--lambda_quality",
+        "--candidate_init_warp_amplitude", "--phase_identity_tolerance",
+        "--phase_candidate_unique_tolerance", "--quality_domain_score_warmup_epochs",
         "--eval_batch_size", "--grl_warmup_fraction", "--amp", "--amp_dtype",
     ):
         assert option in result.stdout
     for option in ("--channel" + "_feature_dim", "--pixel" + "_hidden_dim"):
         assert option not in result.stdout
     for option in (
+        "--structure_dim", "--lambda_task", "--lambda_alignment",
+        "--lambda_structural_cls", "--lambda_structural_domain",
+        "--lambda_component_cls", "--lambda_component_domain",
         "--quality_" + "warmup_steps", "--grl_gamma", "--lambda_qdom",
         "--lambda_qcls", "--lambda_" + "div", "--lambda_" + "sda",
         "--quality_hidden_cap", "--quality_eta", "--sda_hidden_dim",

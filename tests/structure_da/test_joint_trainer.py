@@ -123,6 +123,29 @@ def test_joint_step_uses_new_losses_and_different_domain_lengths() -> None:
     assert all(parameter.grad is None for parameter in model.geometry_parameters())
 
 
+def test_candidate_diagnostics_are_finite_and_head_rates_are_dynamic() -> None:
+    _, result = _step(model=_model(warp_num_candidates=4))
+    diagnostics = result.diagnostics.scalars
+    for domain in ("source", "target"):
+        for name in (
+            "candidate_trainable_rate",
+            "candidate_acceptable_rate",
+            "candidate_pairwise_distance_mean",
+            "candidate_pairwise_distance_min",
+            "candidate_unique_count_mean",
+            "candidate_collapse_rate",
+            "T_ambiguity_rate",
+            "S_changed_preferred_rate",
+            "S_veto_rate",
+            "valid_identity_rate",
+            "valid_nonidentity_rate",
+            "failure_rate",
+        ):
+            assert torch.isfinite(diagnostics[f"{domain}_{name}"])
+        for candidate in range(4):
+            assert f"{domain}_candidate_head_{candidate}_selected_rate" in diagnostics
+
+
 def test_geometry_step_precedes_task_forward_and_state_updates_once_after_both() -> None:
     model = _model()
     config = _config()
@@ -237,3 +260,7 @@ def test_validation_counterfactual_reuses_one_model_pass_per_batch() -> None:
     assert metrics["delta_shape"] == metrics["full_f1"] - metrics["no_shape_f1"]
     assert metrics["delta_trend"] == metrics["full_f1"] - metrics["structure_only_f1"]
     assert metrics["delta_structure"] == metrics["full_f1"] - metrics["trend_only_f1"]
+    assert "phase_candidate_trainable_rate" in metrics
+    assert "phase_candidate_acceptable_rate" in metrics
+    assert "phase_candidate_collapse_rate" in metrics
+    assert "phase_candidate_head_0_selected_rate" in metrics

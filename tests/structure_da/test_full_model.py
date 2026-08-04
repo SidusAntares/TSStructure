@@ -26,6 +26,7 @@ from models.ltae import ComponentAwareSharedLTAE, TrendStructureSharedLTAE
 
 
 def _model(dtype: torch.dtype = torch.float32, **overrides):
+    warp_num_candidates = overrides.pop("warp_num_candidates", 3)
     options = dict(
         num_classes=3,
         input_dim=2,
@@ -43,7 +44,7 @@ def _model(dtype: torch.dtype = torch.float32, **overrides):
             "min_template_mean_support": 0.0,
             "warp_hidden_dim": 6,
             "warp_kernel_size": 3,
-            "warp_num_candidates": 3,
+            "warp_num_candidates": warp_num_candidates,
             "num_shape_basis": 3,
             "num_phase_basis": 2,
             "attribute_projection_dim": 2,
@@ -98,6 +99,9 @@ def test_model_contains_only_phase_aware_high_level_modules() -> None:
     assert isinstance(model.representation, PhaseAwareTwoScaleClassifier)
     assert isinstance(model.prototype_alignment, PhaseAwarePrototypeAlignment)
     assert isinstance(model.geometry_objective, TrendLedGeometryObjective)
+    estimator = model.temporal_features.core.warp_estimator
+    assert estimator.candidate_init_warp_amplitude == pytest.approx(0.015)
+    assert estimator.candidate_base_logits.shape == (3, 4)
     assert sum(isinstance(module, TrendStructureSharedLTAE) for module in model.modules()) == 1
     assert not any(isinstance(module, SharedTemporalStructureOperator) for module in model.modules())
     assert not any(isinstance(module, QualityAwareComponentClassifier) for module in model.modules())

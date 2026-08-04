@@ -254,9 +254,14 @@ def test_invalid_registration_rows_force_identity_warp() -> None:
     torch.testing.assert_close(output.warp_derivative[1], torch.ones(7))
 
 
-def test_multi_candidate_zero_initialization_is_identity() -> None:
+def test_multi_candidate_initialization_is_symmetric_and_noncollapsed() -> None:
     estimator = MonotoneWarpEstimator(
-        3, 9, hidden_dim=8, kernel_size=3, num_candidates=3
+        3,
+        9,
+        hidden_dim=8,
+        kernel_size=3,
+        num_candidates=3,
+        candidate_init_warp_amplitude=0.015,
     )
     sample, template, support, valid = _warp_inputs()
 
@@ -272,14 +277,67 @@ def test_multi_candidate_zero_initialization_is_identity() -> None:
     assert output.warp.shape == (2, 3, 9)
     assert output.warp_derivative.shape == (2, 3, 9)
     assert output.inverse_warp.shape == (2, 3, 9)
-    identity = torch.linspace(0.0, 1.0, 9).expand(2, 3, -1)
-    torch.testing.assert_close(output.interval_logits, torch.zeros(2, 3, 8))
+    identity = torch.linspace(0.0, 1.0, 9)
+    assert isinstance(estimator.candidate_base_logits, nn.Parameter)
+    assert estimator.candidate_base_logits.shape == (3, 8)
+    torch.testing.assert_close(output.warp[:, 0], identity.expand(2, -1))
+    assert not torch.allclose(output.warp[:, 1], output.warp[:, 0])
+    assert not torch.allclose(output.warp[:, 2], output.warp[:, 0])
+    assert not torch.allclose(output.warp[:, 1], output.warp[:, 2])
+    deviations = (output.warp[0, 1:] - identity).abs().amax(dim=-1)
+    torch.testing.assert_close(deviations, torch.full_like(deviations, 0.015), atol=2e-4, rtol=0)
     torch.testing.assert_close(
-        output.interval_widths, torch.full((2, 3, 8), 1.0 / 8)
+        output.warp[0, 1] - identity,
+        -(output.warp[0, 2] - identity),
+        atol=5e-4,
+        rtol=0,
     )
+    assert torch.all(output.warp[..., 1:] > output.warp[..., :-1])
+    assert torch.all(output.warp_derivative > 0)
+    interval_speed = output.interval_widths[0] * 8
+    assert interval_speed.min() > 0.9
+    assert interval_speed.max() < 1.1
+    roughness = torch.diff(torch.log(interval_speed), dim=-1).square().mean(-1)
+    assert roughness.max() < 1e-3
+
+
+def test_single_candidate_initializes_as_identity() -> None:
+    estimator = MonotoneWarpEstimator(
+        3, 9, hidden_dim=8, kernel_size=3, num_candidates=1
+    )
+    sample, template, support, valid = _warp_inputs()
+    output = estimator.forward_candidates(sample, template, support, support, valid)
+    identity = torch.linspace(0.0, 1.0, 9).expand(2, 1, -1)
     torch.testing.assert_close(output.warp, identity)
-    torch.testing.assert_close(output.warp_derivative, torch.ones(2, 3, 9))
-    torch.testing.assert_close(output.inverse_warp, identity)
+    torch.testing.assert_close(estimator.candidate_base_logits, torch.zeros(1, 8))
+
+
+def test_scalar_candidate_bias_does_not_create_warp_diversity() -> None:
+    estimator = MonotoneWarpEstimator(
+        3,
+        9,
+        hidden_dim=8,
+        kernel_size=3,
+        num_candidates=3,
+        candidate_init_warp_amplitude=0.0,
+    )
+    with torch.no_grad():
+        estimator.network[-1].bias.copy_(torch.tensor([-2.0, 0.0, 2.0]))
+    sample, template, support, valid = _warp_inputs()
+    output = estimator.forward_candidates(sample, template, support, support, valid)
+    identity = torch.linspace(0.0, 1.0, 9).expand(2, 3, -1)
+    torch.testing.assert_close(output.warp, identity)
+
+
+def test_extra_candidates_use_distinct_paired_low_frequency_profiles() -> None:
+    estimator = MonotoneWarpEstimator(
+        3, 9, hidden_dim=8, kernel_size=3, num_candidates=5
+    )
+    profiles = estimator.candidate_base_logits.detach()
+    torch.testing.assert_close(profiles[0], torch.zeros_like(profiles[0]))
+    assert torch.allclose(profiles[1], -profiles[2])
+    assert torch.allclose(profiles[3], -profiles[4])
+    assert not torch.allclose(profiles[1], profiles[3])
 
 
 def test_multi_candidate_warps_are_strictly_monotone() -> None:

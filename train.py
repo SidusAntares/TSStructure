@@ -97,6 +97,11 @@ def main(config):
                 quality_domain_score_warmup_epochs=(
                     config.quality_domain_score_warmup_epochs
                 ),
+                candidate_init_warp_amplitude=config.candidate_init_warp_amplitude,
+                phase_identity_tolerance=config.phase_identity_tolerance,
+                phase_candidate_unique_tolerance=(
+                    config.phase_candidate_unique_tolerance
+                ),
                 amp=getattr(config, "amp", False),
                 amp_dtype=getattr(config, "amp_dtype", "float16"),
                 log_step=config.log_step,
@@ -138,6 +143,11 @@ def main(config):
                 f"|shape_dim={config.shape_dim}"
                 f"|canonical_grid_size={config.canonical_grid_size}"
                 f"|warp_num_candidates={config.warp_num_candidates}"
+                "|candidate_init_warp_amplitude="
+                f"{config.candidate_init_warp_amplitude}"
+                f"|phase_identity_tolerance={config.phase_identity_tolerance}"
+                "|phase_candidate_unique_tolerance="
+                f"{config.phase_candidate_unique_tolerance}"
                 f"|grl_warmup_fraction={displayed_fraction}"
                 f"|grl_warmup_max_iters={actual_grl_warmup_max_iters}"
                 "|quality_domain_score_warmup_epochs="
@@ -166,10 +176,13 @@ def main(config):
             ambiguity_absolute_tolerance=config.phase_ambiguity_absolute_tolerance,
             structure_veto_ratio=config.structure_veto_ratio,
             structure_tie_tolerance=config.structure_tie_tolerance,
+            identity_tolerance=config.phase_identity_tolerance,
+            candidate_unique_tolerance=config.phase_candidate_unique_tolerance,
         )
         temporal_options = {
             "canonical_grid_size": config.canonical_grid_size,
             "warp_num_candidates": config.warp_num_candidates,
+            "candidate_init_warp_amplitude": config.candidate_init_warp_amplitude,
             "num_shape_basis": config.num_shape_basis,
             "num_phase_basis": config.num_phase_basis,
             "attribute_projection_dim": config.shape_attribute_dim,
@@ -549,6 +562,7 @@ if __name__ == '__main__':
     parser.add_argument('--shape_dim', default=128, type=int)
     parser.add_argument('--canonical_grid_size', default=64, type=int)
     parser.add_argument('--warp_num_candidates', default=3, type=int)
+    parser.add_argument('--candidate_init_warp_amplitude', default=0.015, type=float)
     parser.add_argument('--num_shape_basis', default=8, type=int)
     parser.add_argument('--num_phase_basis', default=8, type=int)
     parser.add_argument('--shape_attribute_dim', default=8, type=int)
@@ -611,6 +625,10 @@ if __name__ == '__main__':
     parser.add_argument('--phase_candidate_temperature', default=0.05, type=float)
     parser.add_argument('--phase_min_common_support', default=0.05, type=float)
     parser.add_argument('--phase_max_gain_ratio', default=1.0, type=float)
+    parser.add_argument('--phase_identity_tolerance', default=1e-4, type=float)
+    parser.add_argument(
+        '--phase_candidate_unique_tolerance', default=1e-4, type=float
+    )
     parser.add_argument('--phase_ambiguity_relative_tolerance', default=0.05, type=float)
     parser.add_argument('--phase_ambiguity_absolute_tolerance', default=1e-6, type=float)
     parser.add_argument('--structure_veto_ratio', default=1.05, type=float)

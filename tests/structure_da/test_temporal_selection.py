@@ -15,6 +15,7 @@ from methods.structure_da.temporal_selection import (
     TrendStructureSelectionConfig,
     select_trend_structure_phase,
 )
+from methods.structure_da.phase_aware_objective import TrendLedGeometryObjective
 
 
 def _identity_candidates(
@@ -130,7 +131,28 @@ def test_identical_candidates_choose_lowest_index_deterministically() -> None:
     assert output.trend_candidate_ambiguous.item()
     assert output.structure_disambiguation_used.item()
     assert output.selected_candidate_index.item() == 0
+    assert output.phase_status.item() == 1
+    assert output.candidate_selected_is_identity.item()
+    assert output.identity_accepted.item()
+
+
+def test_selected_nonidentity_gamma_sets_valid_nonidentity_status(monkeypatch) -> None:
+    candidates = _identity_candidates()
+    candidates.interval_widths[0, 0] = torch.tensor([0.1, 0.2, 0.4, 0.3])
+    candidates.warp[0, 0] = torch.tensor([0.0, 0.1, 0.3, 0.7, 1.0])
+    output = _controlled_selection(
+        monkeypatch,
+        trend_errors=[0.1, 0.8, 0.9],
+        structure_errors=[0.1, 0.8, 0.9],
+        candidates=candidates,
+        identity_tolerance=1e-4,
+    )
+
+    assert output.selected_candidate_index.item() == 0
     assert output.phase_status.item() == 2
+    assert output.phase_valid.item()
+    assert not output.identity_accepted.item()
+    assert not output.candidate_selected_is_identity.item()
 
 
 def test_trend_candidates_do_not_depend_on_structure() -> None:
@@ -211,20 +233,21 @@ def test_invalid_trend_produces_failure_identity_even_when_structure_valid() -> 
     )
 
 
-def test_no_legal_candidate_is_valid_identity_and_softmin_is_finite() -> None:
+def test_trainable_but_unacceptable_candidates_keep_geometry_loss_and_use_identity() -> None:
     inputs = _selection_inputs()
     inputs["trend_srvf"] = inputs["trend_srvf"].requires_grad_()
     inputs["config"] = replace(inputs["config"], max_gain_ratio=1e-6)
     inputs["trend_template_srvf"] = torch.zeros_like(inputs["trend_srvf"])
     output = select_trend_structure_phase(**inputs)
 
-    assert not output.candidate_legal_mask.any().item()
+    assert output.candidate_trainable_mask.all().item()
+    assert not output.candidate_acceptable_mask.any().item()
     assert output.selected_candidate_index.item() == -1
     assert output.phase_status.item() == 1
     assert output.phase_valid.item()
     assert output.identity_accepted.item()
     assert torch.isfinite(output.candidate_softmin_score).all().item()
-    assert output.candidate_softmin_score.item() == 0.0
+    assert output.candidate_softmin_score.item() > 0.0
     output.candidate_softmin_score.sum().backward()
     assert torch.isfinite(inputs["trend_srvf"].grad).all().item()
 
@@ -236,7 +259,8 @@ def test_finite_candidate_score_is_preserved_when_legality_threshold_rejects_it(
 
     output = select_trend_structure_phase(**inputs)
 
-    assert not output.candidate_legal_mask.any().item()
+    assert output.candidate_trainable_mask.all().item()
+    assert not output.candidate_acceptable_mask.any().item()
     assert torch.isfinite(output.candidate_trend_score).all().item()
 
 
@@ -256,7 +280,8 @@ def test_trend_preference_and_near_set_exclude_lower_scoring_illegal_candidate(
         ambiguity_absolute_tolerance=0.15,
     )
 
-    assert output.candidate_legal_mask.tolist() == [[False, True, True]]
+    assert output.candidate_trainable_mask.tolist() == [[False, True, True]]
+    assert output.candidate_acceptable_mask.tolist() == [[False, True, True]]
     assert output.trend_preferred_candidate_index.item() == 1
     assert output.candidate_near_optimal_mask.tolist() == [[False, True, True]]
 
@@ -273,6 +298,42 @@ def test_structure_vetoes_all_ambiguous_candidates_to_valid_identity() -> None:
     assert output.selected_candidate_index.item() == -1
     assert output.phase_status.item() == 1
     assert output.identity_accepted.item()
+
+
+def test_candidate_diversity_diagnostics_detect_collapse_and_unique_warps() -> None:
+    collapsed = select_trend_structure_phase(**_selection_inputs())
+    assert collapsed.candidate_pairwise_distance.shape == (1, 3, 3)
+    assert collapsed.candidate_unique_count.tolist() == [1]
+    assert collapsed.candidate_collapse_mask.tolist() == [True]
+    assert torch.isfinite(collapsed.candidate_pairwise_distance).all()
+
+    estimator = MonotoneWarpEstimator(
+        1,
+        5,
+        hidden_dim=4,
+        kernel_size=3,
+        num_candidates=3,
+        candidate_init_warp_amplitude=0.015,
+    )
+    trend = torch.linspace(-1.0, 1.0, 5).reshape(1, 5, 1)
+    support = torch.ones(1, 5)
+    candidates = estimator.forward_candidates(
+        trend, trend, support, support, torch.tensor([True])
+    )
+    distinct = select_trend_structure_phase(
+        **_selection_inputs(candidates=candidates)
+    )
+    assert distinct.candidate_unique_count.item() >= 2
+    assert not distinct.candidate_collapse_mask.item()
+    assert torch.isfinite(distinct.candidate_pairwise_distance).all()
+
+    invalid_candidates = _identity_candidates()
+    invalid_candidates.warp[0, 1, 2] = torch.nan
+    invalid = select_trend_structure_phase(
+        **_selection_inputs(candidates=invalid_candidates)
+    )
+    assert not invalid.candidate_trainable_mask[0, 1]
+    assert torch.isfinite(invalid.candidate_pairwise_distance).all()
 
 
 def test_same_selected_candidate_is_gathered_for_both_scales() -> None:
@@ -337,3 +398,44 @@ def test_candidate_softmin_gradients_reach_every_candidate_head() -> None:
     assert gradient is not None
     assert torch.isfinite(gradient).all().item()
     assert torch.all(gradient.reshape(3, -1).norm(dim=1) > 0).item()
+
+
+def test_real_geometry_steps_update_trainable_but_unacceptable_candidates() -> None:
+    torch.manual_seed(92)
+    estimator = MonotoneWarpEstimator(
+        1,
+        5,
+        hidden_dim=4,
+        kernel_size=3,
+        num_candidates=3,
+        candidate_init_warp_amplitude=0.015,
+    )
+    optimizer = torch.optim.Adam(estimator.parameters(), lr=1e-3)
+    trend = torch.linspace(-1.0, 1.0, 5).reshape(1, 5, 1)
+    template = torch.zeros_like(trend)
+    support = torch.ones(1, 5)
+    before = estimator.candidate_base_logits.detach().clone()
+
+    for _ in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        candidates = estimator.forward_candidates(
+            trend, template, support, support, torch.tensor([True])
+        )
+        inputs = _selection_inputs(candidates=candidates, structure_initialized=False)
+        inputs["trend_srvf"] = trend
+        inputs["trend_template_srvf"] = template
+        inputs["config"] = replace(inputs["config"], max_gain_ratio=1e-6)
+        selection = select_trend_structure_phase(**inputs)
+        assert selection.candidate_trainable_mask.all()
+        assert not selection.candidate_acceptable_mask.any()
+        loss = TrendLedGeometryObjective(center_weight=0.0)(
+            selection, torch.tensor([True])
+        ).total_loss
+        loss.backward()
+        gradients = [parameter.grad for parameter in estimator.parameters()]
+        assert all(gradient is not None for gradient in gradients)
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
+        assert estimator.candidate_base_logits.grad.abs().sum() > 0
+        optimizer.step()
+
+    assert not torch.equal(estimator.candidate_base_logits.detach(), before)

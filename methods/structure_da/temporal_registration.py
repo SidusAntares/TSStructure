@@ -19,6 +19,73 @@ def _positive_integer(name: str, value: int, minimum: int = 1) -> int:
     return value
 
 
+def _calibrate_candidate_profile_scale(
+    profile: Tensor,
+    target_max_deviation: float,
+    min_increment: float,
+) -> float:
+    """Map a desired warp displacement to a low-frequency logit scale."""
+
+    if target_max_deviation == 0.0 or profile.numel() < 2:
+        return 0.0
+    identity = torch.linspace(
+        0.0, 1.0, profile.numel() + 1, dtype=torch.float64
+    )
+
+    def deviation(scale: float) -> float:
+        increments = F.softplus(profile * scale) + min_increment
+        widths = increments / increments.sum()
+        warp = torch.cat(
+            [
+                identity.new_zeros(1),
+                widths.cumsum(0)[:-1],
+                identity.new_ones(1),
+            ]
+        )
+        return float((warp - identity).abs().amax().item())
+
+    lower, upper = 0.0, 1.0
+    for _ in range(32):
+        if deviation(upper) >= target_max_deviation:
+            break
+        upper *= 2.0
+    else:
+        raise ValueError(
+            "candidate_init_warp_amplitude cannot be reached safely on this grid"
+        )
+    for _ in range(64):
+        middle = 0.5 * (lower + upper)
+        if deviation(middle) < target_max_deviation:
+            lower = middle
+        else:
+            upper = middle
+    return 0.5 * (lower + upper)
+
+
+def _initial_candidate_base_logits(
+    num_candidates: int,
+    canonical_grid_size: int,
+    target_max_deviation: float,
+    min_increment: float,
+) -> Tensor:
+    intervals = canonical_grid_size - 1
+    positions = (torch.arange(intervals, dtype=torch.float64) + 0.5) / intervals
+    profile = torch.cos(torch.pi * positions)
+    logits = torch.zeros(num_candidates, intervals, dtype=torch.float64)
+    if num_candidates == 1 or target_max_deviation == 0.0:
+        return logits.float()
+    pair_count = (num_candidates - 1 + 1) // 2
+    for candidate in range(1, num_candidates):
+        pair = (candidate + 1) // 2
+        amplitude = target_max_deviation * pair / pair_count
+        scale = _calibrate_candidate_profile_scale(
+            profile, amplitude, min_increment
+        )
+        sign = 1.0 if candidate % 2 == 1 else -1.0
+        logits[candidate] = sign * scale * profile
+    return logits.float()
+
+
 @dataclass(frozen=True)
 class SourceSRVFTemplateOutput:
     srvf: Tensor
@@ -320,6 +387,7 @@ class MonotoneWarpEstimator(nn.Module):
         kernel_size: int = 5,
         min_increment: float = 1e-4,
         num_candidates: int = 3,
+        candidate_init_warp_amplitude: float = 0.015,
     ) -> None:
         super().__init__()
         feature_dim = _positive_integer("feature_dim", feature_dim)
@@ -334,6 +402,13 @@ class MonotoneWarpEstimator(nn.Module):
         min_increment = _finite_float("min_increment", min_increment)
         if min_increment <= 0:
             raise ValueError("min_increment must be greater than zero")
+        candidate_init_warp_amplitude = _finite_float(
+            "candidate_init_warp_amplitude", candidate_init_warp_amplitude
+        )
+        if not 0.0 <= candidate_init_warp_amplitude < 0.5:
+            raise ValueError(
+                "candidate_init_warp_amplitude must lie in [0, 0.5)"
+            )
 
         self.feature_dim = feature_dim
         self.canonical_grid_size = canonical_grid_size
@@ -341,6 +416,7 @@ class MonotoneWarpEstimator(nn.Module):
         self.kernel_size = kernel_size
         self.min_increment = min_increment
         self.num_candidates = num_candidates
+        self.candidate_init_warp_amplitude = candidate_init_warp_amplitude
         self.network = nn.Sequential(
             nn.Conv1d(
                 2 * feature_dim + 2,
@@ -360,6 +436,14 @@ class MonotoneWarpEstimator(nn.Module):
         )
         nn.init.zeros_(self.network[-1].weight)
         nn.init.zeros_(self.network[-1].bias)
+        self.candidate_base_logits = nn.Parameter(
+            _initial_candidate_base_logits(
+                num_candidates,
+                canonical_grid_size,
+                candidate_init_warp_amplitude,
+                min_increment,
+            )
+        )
 
     def _validate_inputs(
         self,
@@ -514,6 +598,9 @@ class MonotoneWarpEstimator(nn.Module):
         interval_logits = 0.5 * (
             point_logits[..., :-1] + point_logits[..., 1:]
         )
+        interval_logits = interval_logits + self.candidate_base_logits.to(
+            device=interval_logits.device, dtype=interval_logits.dtype
+        ).unsqueeze(0)
         positive_increments = F.softplus(interval_logits) + self.min_increment
         interval_widths = positive_increments / positive_increments.sum(
             dim=-1, keepdim=True

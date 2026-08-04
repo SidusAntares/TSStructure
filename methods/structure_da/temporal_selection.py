@@ -53,6 +53,9 @@ class TrendStructureSelectionConfig:
     max_phase_magnitude: float | None = None
     max_roughness: float | None = None
 
+    identity_tolerance: float = 1e-4
+    candidate_unique_tolerance: float = 1e-4
+
     eps: float = 1e-8
 
     def __post_init__(self) -> None:
@@ -64,6 +67,7 @@ class TrendStructureSelectionConfig:
             "ambiguity_relative_tolerance",
             "ambiguity_absolute_tolerance",
             "structure_tie_tolerance",
+            "identity_tolerance",
         )
         positive = (
             "gain_temperature",
@@ -71,6 +75,7 @@ class TrendStructureSelectionConfig:
             "max_gain_ratio",
             "structure_veto_ratio",
             "eps",
+            "candidate_unique_tolerance",
         )
         for name in nonnegative:
             value = _finite_real(name, getattr(self, name))
@@ -139,9 +144,15 @@ class TrendStructurePhaseSelectionOutput:
     candidate_speed_min: Tensor
     candidate_speed_max: Tensor
 
-    candidate_legal_mask: Tensor
+    candidate_trainable_mask: Tensor
+    candidate_acceptable_mask: Tensor
     candidate_near_optimal_mask: Tensor
     candidate_softmin_score: Tensor
+
+    candidate_pairwise_distance: Tensor
+    candidate_unique_count: Tensor
+    candidate_collapse_mask: Tensor
+    candidate_selected_is_identity: Tensor
 
     trend_preferred_candidate_index: Tensor
     selected_candidate_index: Tensor
@@ -163,6 +174,10 @@ class TrendStructurePhaseSelectionOutput:
     identity_accepted: Tensor
     identity_fallback: Tensor
     structure_shape_valid: Tensor
+
+    @property
+    def candidate_selected_index(self) -> Tensor:
+        return self.selected_candidate_index
 
 
 def _resolve_initialized(value: Tensor, batch_size: int, device: torch.device, name: str) -> Tensor:
@@ -288,6 +303,23 @@ def _gather_candidate(value: Tensor, index: Tensor) -> Tensor:
         -1, 1, *value.shape[2:]
     )
     return torch.gather(value, 1, expanded).squeeze(1)
+
+
+def _candidate_diversity_diagnostics(
+    candidate_warp: Tensor, tolerance: float
+) -> tuple[Tensor, Tensor, Tensor]:
+    differences = candidate_warp[:, :, None, :] - candidate_warp[:, None, :, :]
+    pairwise = differences.square().mean(dim=-1).sqrt()
+    batch_size, num_candidates, _ = pairwise.shape
+    unique_count = torch.ones(
+        batch_size, dtype=torch.long, device=candidate_warp.device
+    )
+    for candidate in range(1, num_candidates):
+        matches_prior = (pairwise[:, candidate, :candidate] <= tolerance).any(
+            dim=-1
+        )
+        unique_count = unique_count + (~matches_prior).long()
+    return pairwise, unique_count, unique_count <= 1
 
 
 def select_trend_structure_phase(
@@ -510,51 +542,56 @@ def select_trend_structure_phase(
         raw_trend_score,
         torch.full_like(raw_trend_score, torch.inf),
     )
-    candidate_legal_mask = (
+    candidate_trainable_mask = (
         trend_eligible[:, None]
         & candidate_finite
         & widths_positive
         & (candidate_speed_min > 0)
         & (candidate_common_support >= config.min_common_support)
         & torch.isfinite(candidate_trend_score)
-        & (candidate_trend_gain_ratio <= config.max_gain_ratio)
     )
     if config.min_interval_speed is not None:
-        candidate_legal_mask &= candidate_speed_min >= config.min_interval_speed
+        candidate_trainable_mask &= candidate_speed_min >= config.min_interval_speed
     if config.max_interval_speed is not None:
-        candidate_legal_mask &= candidate_speed_max <= config.max_interval_speed
+        candidate_trainable_mask &= candidate_speed_max <= config.max_interval_speed
     if config.max_phase_magnitude is not None:
-        candidate_legal_mask &= candidate_phase_magnitude <= config.max_phase_magnitude
+        candidate_trainable_mask &= candidate_phase_magnitude <= config.max_phase_magnitude
     if config.max_roughness is not None:
-        candidate_legal_mask &= candidate_roughness <= config.max_roughness
-    has_legal = candidate_legal_mask.any(dim=1)
-    legal_trend_score = torch.where(
-        candidate_legal_mask,
+        candidate_trainable_mask &= candidate_roughness <= config.max_roughness
+    candidate_acceptable_mask = candidate_trainable_mask & (
+        candidate_trend_gain_ratio <= config.max_gain_ratio
+    )
+    has_trainable = candidate_trainable_mask.any(dim=1)
+    has_acceptable = candidate_acceptable_mask.any(dim=1)
+    acceptable_trend_score = torch.where(
+        candidate_acceptable_mask,
         candidate_trend_score,
         torch.full_like(candidate_trend_score, torch.inf),
     )
-    best_score, preferred = legal_trend_score.min(dim=1)
+    best_score, preferred = acceptable_trend_score.min(dim=1)
     trend_preferred_candidate_index = torch.where(
-        has_legal, preferred, torch.zeros_like(preferred)
+        has_acceptable, preferred, torch.zeros_like(preferred)
     )
-    finite_best = torch.where(has_legal, best_score, torch.zeros_like(best_score))
+    finite_best = torch.where(
+        has_acceptable, best_score, torch.zeros_like(best_score)
+    )
     near_threshold = (
         finite_best
         + config.ambiguity_absolute_tolerance
         + config.ambiguity_relative_tolerance * finite_best.abs()
     )
-    candidate_near_optimal_mask = candidate_legal_mask & (
+    candidate_near_optimal_mask = candidate_acceptable_mask & (
         candidate_trend_score <= near_threshold[:, None]
     )
     trend_candidate_ambiguous = candidate_near_optimal_mask.sum(dim=1) >= 2
-    legal_count = candidate_legal_mask.sum(dim=1)
+    trainable_count = candidate_trainable_mask.sum(dim=1)
     softmin_logits = torch.where(
-            candidate_legal_mask,
+            candidate_trainable_mask,
             -candidate_trend_score / config.candidate_temperature,
             torch.full_like(candidate_trend_score, -torch.inf),
         )
     softmin_logits = torch.where(
-        has_legal[:, None], softmin_logits, torch.zeros_like(softmin_logits)
+        has_trainable[:, None], softmin_logits, torch.zeros_like(softmin_logits)
     )
     logsum = torch.logsumexp(
         softmin_logits,
@@ -562,11 +599,12 @@ def select_trend_structure_phase(
     )
     candidate_softmin_score = (
         -config.candidate_temperature * logsum
-        + config.candidate_temperature * torch.log(legal_count.clamp_min(1).to(dtype))
+        + config.candidate_temperature
+        * torch.log(trainable_count.clamp_min(1).to(dtype))
     )
     connected_zero = raw_trend_score.nan_to_num().sum(dim=1) * 0.0
     candidate_softmin_score = torch.where(
-        has_legal, candidate_softmin_score, connected_zero
+        has_trainable, candidate_softmin_score, connected_zero
     )
 
     structure_input = structure_srvf.detach()
@@ -632,7 +670,7 @@ def select_trend_structure_phase(
         )
         structure_choice = tie_trend_scores.argmin(dim=1)
         selected_candidate_index = torch.where(
-            has_legal,
+            has_acceptable,
             trend_preferred_candidate_index,
             torch.full_like(trend_preferred_candidate_index, -1),
         )
@@ -647,29 +685,13 @@ def select_trend_structure_phase(
             selected_candidate_index,
         )
 
-        selected_nonidentity = selected_candidate_index >= 0
-        valid_identity = trend_eligible & ~selected_nonidentity
-        failure_identity = ~trend_eligible
-        phase_status = torch.where(
-            selected_nonidentity,
-            torch.full_like(selected_candidate_index, 2),
-            torch.where(
-                valid_identity,
-                torch.ones_like(selected_candidate_index),
-                torch.zeros_like(selected_candidate_index),
-            ),
-        )
-        phase_valid = phase_status > 0
-        identity_accepted = phase_status == 1
-        identity_fallback = phase_status == 0
-        structure_shape_valid = phase_valid & structure_valid
-
         safe_index = selected_candidate_index.clamp_min(0)
         selected_warp = select_warp_candidate(candidates, safe_index)
         identity_logits = torch.zeros(batch_size, grid_size - 1, device=device, dtype=dtype)
         identity_width = torch.full_like(identity_logits, 1.0 / (grid_size - 1))
         identity_batch = identity.expand(batch_size, -1)
-        use = selected_nonidentity[:, None]
+        candidate_selected = selected_candidate_index >= 0
+        use = candidate_selected[:, None]
         accepted_warp = MonotoneWarpOutput(
             interval_logits=torch.where(use, selected_warp.interval_logits, identity_logits),
             interval_widths=torch.where(use, selected_warp.interval_widths, identity_width),
@@ -698,6 +720,32 @@ def select_trend_structure_phase(
             _gather_candidate(candidate_structure_registered_support, safe_index),
             structure_support,
         )
+        max_abs_deviation = (accepted_warp.warp - identity_batch).abs().amax(
+            dim=-1
+        )
+        accepted_is_identity = max_abs_deviation <= config.identity_tolerance
+        candidate_selected_is_identity = candidate_selected & accepted_is_identity
+        phase_status = torch.where(
+            ~trend_eligible,
+            torch.zeros_like(selected_candidate_index),
+            torch.where(
+                accepted_is_identity,
+                torch.ones_like(selected_candidate_index),
+                torch.full_like(selected_candidate_index, 2),
+            ),
+        )
+        phase_valid = phase_status > 0
+        identity_accepted = phase_status == 1
+        identity_fallback = phase_status == 0
+        structure_shape_valid = phase_valid & structure_valid
+
+    (
+        candidate_pairwise_distance,
+        candidate_unique_count,
+        candidate_collapse_mask,
+    ) = _candidate_diversity_diagnostics(
+        safe_warp, config.candidate_unique_tolerance
+    )
 
     return TrendStructurePhaseSelectionOutput(
         candidates=candidates,
@@ -718,9 +766,14 @@ def select_trend_structure_phase(
         candidate_unsupported_error=candidate_unsupported_error,
         candidate_speed_min=candidate_speed_min,
         candidate_speed_max=candidate_speed_max,
-        candidate_legal_mask=candidate_legal_mask,
+        candidate_trainable_mask=candidate_trainable_mask,
+        candidate_acceptable_mask=candidate_acceptable_mask,
         candidate_near_optimal_mask=candidate_near_optimal_mask,
         candidate_softmin_score=candidate_softmin_score,
+        candidate_pairwise_distance=candidate_pairwise_distance,
+        candidate_unique_count=candidate_unique_count,
+        candidate_collapse_mask=candidate_collapse_mask,
+        candidate_selected_is_identity=candidate_selected_is_identity,
         trend_preferred_candidate_index=trend_preferred_candidate_index,
         selected_candidate_index=selected_candidate_index,
         trend_candidate_ambiguous=trend_candidate_ambiguous,
