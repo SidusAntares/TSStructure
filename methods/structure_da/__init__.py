@@ -83,6 +83,8 @@ from .temporal_module import (
     TemporalStructureExtractor,
     TemporalStructureOutput,
     TemporalStructurePairOutput,
+    TrendStructureTemporalCore,
+    TrendStructureTemporalCoreOutput,
 )
 from .temporal_registration import (
     MonotoneWarpCandidatesOutput,
@@ -94,6 +96,11 @@ from .temporal_registration import (
     TemporalSRVFRegistration,
     invert_monotone_warp,
     select_warp_candidate,
+)
+from .temporal_selection import (
+    TrendStructurePhaseSelectionOutput,
+    TrendStructureSelectionConfig,
+    select_trend_structure_phase,
 )
 from .temporal_srvf import (
     SourceRunningSupportScale,
@@ -160,6 +167,10 @@ __all__ = [
     "TemporalStructureOutput",
     "TemporalStructureOutputHead",
     "TemporalStructurePairOutput",
+    "TrendStructureTemporalCore",
+    "TrendStructureTemporalCoreOutput",
+    "TrendStructurePhaseSelectionOutput",
+    "TrendStructureSelectionConfig",
     "WarmStartGradientReverseLayer",
     "concatenate_hierarchical_quality_outputs",
     "compute_decomposition_diagnostics",
@@ -173,6 +184,7 @@ __all__ = [
     "resolve_grl_warmup_max_iters",
     "resolve_steps_per_epoch",
     "select_warp_candidate",
+    "select_trend_structure_phase",
     "train_joint_structure_da",
     "summarize_contribution_diagnostics",
     "summarize_decomposition_diagnostics",

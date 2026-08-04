@@ -22,11 +22,20 @@ from .temporal_head import (
     TemporalStructureFeatureOutput,
 )
 from .temporal_registration import (
+    MonotoneWarpEstimator,
+    SourceRunningSRVFTemplate,
+    SourceSRVFTemplateOutput,
     TemporalRegistrationOutput,
     TemporalSRVFRegistration,
     _apply_srvf_group_action,
     _warp_sequence,
 )
+from .temporal_selection import (
+    TrendStructurePhaseSelectionOutput,
+    TrendStructureSelectionConfig,
+    select_trend_structure_phase,
+)
+from .temporal_srvf import TemporalSRVFExtractor, TemporalSRVFOutput
 
 
 @dataclass(frozen=True)
@@ -54,6 +63,333 @@ class TemporalGeometryPairOutput:
     trend: TemporalGeometryForwardOutput
     dynamics: TemporalGeometryForwardOutput
     total_loss: Tensor
+
+
+@dataclass(frozen=True)
+class TrendStructureTemporalCoreOutput:
+    trend_srvf: TemporalSRVFOutput
+    structure_srvf: TemporalSRVFOutput
+    trend_template: SourceSRVFTemplateOutput
+    structure_diagnostic_template: SourceSRVFTemplateOutput
+    selection: TrendStructurePhaseSelectionOutput
+
+
+class TrendStructureTemporalCore(nn.Module):
+    """Extract independent T/S geometry and select one T-generated phase warp."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        trend_num_basis: int = 12,
+        structure_num_basis: int = 12,
+        canonical_grid_size: int = 64,
+        roughness_grid_size: int = 256,
+        trend_smoothing_weight: float = 1e-2,
+        structure_smoothing_weight: float = 1e-3,
+        time_reference: float = 0.0,
+        time_scale: float = 366.0,
+        statistics_momentum: float = 0.99,
+        support_scale_momentum: float = 0.99,
+        template_momentum: float = 0.99,
+        min_feature_scale: float = 1e-3,
+        initial_support_scale: float = 1.0,
+        min_support_scale: float = 1e-6,
+        min_mean_support: float = 0.05,
+        min_dynamic_energy: float = 1e-4,
+        min_template_grid_weight: float = 1e-6,
+        min_template_mean_support: float = 0.05,
+        warp_hidden_dim: int = 64,
+        warp_kernel_size: int = 5,
+        warp_min_increment: float = 1e-4,
+        warp_num_candidates: int = 3,
+        selection_config: TrendStructureSelectionConfig | None = None,
+        srvf_eps: float = 1e-8,
+        derivative_norm_threshold: float = 1e-8,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        common = dict(
+            feature_dim=feature_dim,
+            canonical_grid_size=canonical_grid_size,
+            roughness_grid_size=roughness_grid_size,
+            time_reference=time_reference,
+            time_scale=time_scale,
+            statistics_momentum=statistics_momentum,
+            min_feature_scale=min_feature_scale,
+            support_scale_momentum=support_scale_momentum,
+            initial_support_scale=initial_support_scale,
+            min_support_scale=min_support_scale,
+            min_mean_support=min_mean_support,
+            min_dynamic_energy=min_dynamic_energy,
+            srvf_eps=srvf_eps,
+            derivative_norm_threshold=derivative_norm_threshold,
+            eps=eps,
+        )
+        self.trend_srvf_extractor = TemporalSRVFExtractor(
+            num_basis=trend_num_basis,
+            smoothing_weight=trend_smoothing_weight,
+            **common,
+        )
+        self.structure_srvf_extractor = TemporalSRVFExtractor(
+            num_basis=structure_num_basis,
+            smoothing_weight=structure_smoothing_weight,
+            **common,
+        )
+        self.trend_template = SourceRunningSRVFTemplate(
+            canonical_grid_size=canonical_grid_size,
+            feature_dim=feature_dim,
+            momentum=template_momentum,
+            min_grid_weight=min_template_grid_weight,
+            eps=srvf_eps,
+        )
+        self.structure_diagnostic_template = SourceRunningSRVFTemplate(
+            canonical_grid_size=canonical_grid_size,
+            feature_dim=feature_dim,
+            momentum=template_momentum,
+            min_grid_weight=min_template_grid_weight,
+            eps=srvf_eps,
+        )
+        self.warp_estimator = MonotoneWarpEstimator(
+            feature_dim=feature_dim,
+            canonical_grid_size=canonical_grid_size,
+            hidden_dim=warp_hidden_dim,
+            kernel_size=warp_kernel_size,
+            min_increment=warp_min_increment,
+            num_candidates=warp_num_candidates,
+        )
+        if selection_config is not None and not isinstance(
+            selection_config, TrendStructureSelectionConfig
+        ):
+            raise ValueError(
+                "selection_config must be a TrendStructureSelectionConfig or None"
+            )
+        self.selection_config = selection_config or TrendStructureSelectionConfig(
+            min_common_support=min_template_mean_support,
+            eps=eps,
+        )
+        self.feature_dim = feature_dim
+        self.canonical_grid_size = canonical_grid_size
+
+    def _validate_inputs(
+        self,
+        trend: Tensor,
+        structure: Tensor,
+        positions: Tensor,
+        time_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        for name, value in (("trend", trend), ("structure", structure)):
+            if not isinstance(value, Tensor) or value.ndim != 3:
+                raise ValueError(f"{name} must have shape [B, L, D]")
+            if value.shape[-1] != self.feature_dim:
+                raise ValueError(
+                    f"{name} feature dimension must equal feature_dim={self.feature_dim}"
+                )
+            if not value.is_floating_point():
+                raise ValueError(f"{name} must use a floating-point dtype")
+        if trend.shape != structure.shape:
+            raise ValueError("trend and structure shape must match")
+        if trend.dtype != structure.dtype:
+            raise ValueError("trend and structure dtype must match")
+        if trend.device != structure.device:
+            raise ValueError("trend and structure device must match")
+        reference = next(self.warp_estimator.parameters())
+        if trend.device != reference.device:
+            raise ValueError("trend and structure device must match module parameters")
+        if trend.dtype != reference.dtype:
+            raise ValueError("trend and structure dtype must match module parameters")
+        batch_size, sequence_length = trend.shape[:2]
+        resolved_positions = _resolve_pair_positions(
+            positions,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+        )
+        resolved_mask = _resolve_time_mask(
+            time_mask, batch_size, sequence_length, trend.device
+        )
+        if not torch.isfinite(trend[resolved_mask]).all().item():
+            raise ValueError("valid trend values must be finite")
+        if not torch.isfinite(structure[resolved_mask]).all().item():
+            raise ValueError("valid structure values must be finite")
+        return resolved_positions, resolved_mask
+
+    def _read_templates(
+        self, srvf: Tensor
+    ) -> tuple[SourceSRVFTemplateOutput, SourceSRVFTemplateOutput]:
+        arguments = dict(device=srvf.device, dtype=srvf.dtype)
+        return self.trend_template(**arguments), self.structure_diagnostic_template(
+            **arguments
+        )
+
+    def _select(
+        self,
+        trend_srvf: TemporalSRVFOutput,
+        structure_srvf: TemporalSRVFOutput,
+        trend_template: SourceSRVFTemplateOutput,
+        structure_template: SourceSRVFTemplateOutput,
+    ) -> TrendStructurePhaseSelectionOutput:
+        batch_size = trend_srvf.srvf.shape[0]
+        trend_template_srvf = trend_template.srvf.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        trend_template_support = trend_template.support.unsqueeze(0).expand(
+            batch_size, -1
+        )
+        structure_template_srvf = structure_template.srvf.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        structure_template_support = structure_template.support.unsqueeze(0).expand(
+            batch_size, -1
+        )
+        integration_weights = self.trend_srvf_extractor.integration_weights.to(
+            device=trend_srvf.srvf.device, dtype=trend_srvf.srvf.dtype
+        )
+        template_mean_support = (
+            trend_template_support * integration_weights
+        ).sum(dim=-1) / integration_weights.sum()
+        trend_registration_eligible = (
+            trend_srvf.structure_valid
+            & trend_template.initialized.expand(batch_size)
+            & (
+                template_mean_support
+                >= self.selection_config.min_common_support
+            )
+        )
+        candidates = self.warp_estimator.forward_candidates(
+            trend_srvf.srvf.detach(),
+            trend_template_srvf.detach(),
+            trend_srvf.support_confidence.detach(),
+            trend_template_support.detach(),
+            trend_registration_eligible,
+        )
+        return select_trend_structure_phase(
+            trend_srvf=trend_srvf.srvf,
+            trend_support=trend_srvf.support_confidence,
+            trend_valid=trend_srvf.structure_valid,
+            trend_template_srvf=trend_template_srvf,
+            trend_template_support=trend_template_support,
+            trend_template_initialized=trend_template.initialized,
+            structure_srvf=structure_srvf.srvf,
+            structure_support=structure_srvf.support_confidence,
+            structure_valid=structure_srvf.structure_valid,
+            structure_template_srvf=structure_template_srvf,
+            structure_template_support=structure_template_support,
+            structure_template_initialized=structure_template.initialized,
+            candidates=candidates,
+            integration_weights=integration_weights,
+            config=self.selection_config,
+        )
+
+    def forward(
+        self,
+        trend: Tensor,
+        structure: Tensor,
+        positions: Tensor,
+        time_mask: Tensor,
+    ) -> TrendStructureTemporalCoreOutput:
+        resolved_positions, resolved_mask = self._validate_inputs(
+            trend, structure, positions, time_mask
+        )
+        trend_srvf = self.trend_srvf_extractor(
+            trend, resolved_positions, resolved_mask
+        )
+        structure_srvf = self.structure_srvf_extractor(
+            structure, resolved_positions, resolved_mask
+        )
+        trend_template, structure_template = self._read_templates(
+            trend_srvf.srvf
+        )
+        selection = self._select(
+            trend_srvf, structure_srvf, trend_template, structure_template
+        )
+        return TrendStructureTemporalCoreOutput(
+            trend_srvf=trend_srvf,
+            structure_srvf=structure_srvf,
+            trend_template=trend_template,
+            structure_diagnostic_template=structure_template,
+            selection=selection,
+        )
+
+    def warp_parameters(self) -> Iterator[nn.Parameter]:
+        yield from self.warp_estimator.parameters()
+
+    def non_warp_parameters(self) -> Iterator[nn.Parameter]:
+        warp_ids = {id(parameter) for parameter in self.warp_estimator.parameters()}
+        for parameter in self.parameters():
+            if id(parameter) not in warp_ids:
+                yield parameter
+
+    @torch.no_grad()
+    def update_source_state(
+        self,
+        trend: Tensor,
+        structure: Tensor,
+        positions: Tensor,
+        time_mask: Tensor,
+    ) -> None:
+        resolved_positions, resolved_mask = self._validate_inputs(
+            trend, structure, positions, time_mask
+        )
+        self.trend_srvf_extractor.update_source_statistics(trend, resolved_mask)
+        self.structure_srvf_extractor.update_source_statistics(
+            structure, resolved_mask
+        )
+        first_trend = self.trend_srvf_extractor(
+            trend, resolved_positions, resolved_mask
+        )
+        first_structure = self.structure_srvf_extractor(
+            structure, resolved_positions, resolved_mask
+        )
+        self.trend_srvf_extractor.update_source_support_scale(
+            first_trend.functional
+        )
+        self.structure_srvf_extractor.update_source_support_scale(
+            first_structure.functional
+        )
+        second_trend = self.trend_srvf_extractor(
+            trend, resolved_positions, resolved_mask
+        )
+        second_structure = self.structure_srvf_extractor(
+            structure, resolved_positions, resolved_mask
+        )
+        before_trend, before_structure = self._read_templates(second_trend.srvf)
+        trend_was_initialized = bool(before_trend.initialized.item())
+        structure_was_initialized = bool(before_structure.initialized.item())
+
+        if not trend_was_initialized:
+            self.trend_template.update(
+                second_trend.srvf,
+                second_trend.support_confidence,
+                second_trend.structure_valid,
+            )
+        if not structure_was_initialized:
+            self.structure_diagnostic_template.update(
+                second_structure.srvf,
+                second_structure.support_confidence,
+                second_structure.structure_valid,
+            )
+
+        refreshed_trend, refreshed_structure = self._read_templates(
+            second_trend.srvf
+        )
+        if trend_was_initialized or structure_was_initialized:
+            selection = self._select(
+                second_trend,
+                second_structure,
+                refreshed_trend,
+                refreshed_structure,
+            )
+            if trend_was_initialized:
+                self.trend_template.update(
+                    selection.accepted_trend_registered_srvf,
+                    selection.accepted_trend_registered_support,
+                    selection.phase_valid,
+                )
+            if structure_was_initialized:
+                self.structure_diagnostic_template.update(
+                    selection.accepted_structure_registered_srvf,
+                    selection.accepted_structure_registered_support,
+                    selection.structure_shape_valid,
+                )
 
 
 def _validate_source_mask(
