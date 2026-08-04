@@ -109,7 +109,7 @@ def test_template_low_weight_grid_is_not_initialized_or_updated() -> None:
     )
 
 
-def test_template_second_update_uses_gridwise_ema() -> None:
+def test_template_second_update_uses_support_aware_ema() -> None:
     template = SourceRunningSRVFTemplate(3, 1, momentum=0.75)
     valid = torch.tensor([True])
     template.update(
@@ -126,16 +126,55 @@ def test_template_second_update_uses_gridwise_ema() -> None:
         valid,
     )
 
-    torch.testing.assert_close(
-        template.running_srvf,
-        0.75 * previous_srvf
-        + 0.25 * torch.tensor([[10.0], [12.0], [14.0]]),
-    )
+    batch = torch.tensor([[10.0], [12.0], [14.0]])
+    batch_support = torch.tensor([0.5, 0.75, 1.0])
+    expected_support = 0.75 * previous_support + 0.25 * batch_support
+    expected_srvf = (
+        0.75 * previous_support[:, None] * previous_srvf
+        + 0.25 * batch_support[:, None] * batch
+    ) / expected_support[:, None]
+    torch.testing.assert_close(template.running_srvf, expected_srvf)
     torch.testing.assert_close(
         template.running_support,
         0.75 * previous_support + 0.25 * torch.tensor([0.5, 0.75, 1.0]),
     )
     assert template.num_updates.item() == 2
+
+
+def test_template_support_aware_ema_handles_gridwise_zero_support() -> None:
+    template = SourceRunningSRVFTemplate(4, 1, momentum=0.5)
+    valid = torch.tensor([True])
+    template.update(
+        torch.tensor([[[2.0], [4.0], [6.0], [8.0]]]),
+        torch.tensor([[1.0, 0.0, 0.5, 0.0]]),
+        valid,
+    )
+    template.update(
+        torch.tensor([[[20.0], [40.0], [60.0], [80.0]]]),
+        torch.tensor([[0.0, 1.0, 0.1, 0.0]]),
+        valid,
+    )
+
+    expected_support = torch.tensor([0.5, 0.5, 0.3, 0.0])
+    expected_srvf = torch.tensor([[2.0], [40.0], [15.0], [0.0]])
+    torch.testing.assert_close(template.running_support, expected_support)
+    torch.testing.assert_close(template.running_srvf, expected_srvf)
+    assert torch.isfinite(template.running_srvf).all()
+
+
+def test_template_high_support_batch_moves_reference_more() -> None:
+    def movement(batch_support: float) -> Tensor:
+        template = SourceRunningSRVFTemplate(2, 1, momentum=0.9)
+        valid = torch.tensor([True])
+        template.update(torch.zeros(1, 2, 1), torch.ones(1, 2), valid)
+        template.update(
+            torch.full((1, 2, 1), 10.0),
+            torch.full((1, 2), batch_support),
+            valid,
+        )
+        return template.running_srvf.abs().mean()
+
+    assert movement(1.0) > movement(0.1)
 
 
 def test_template_no_valid_sample_is_read_only() -> None:
@@ -657,9 +696,13 @@ def test_initialized_template_enables_registration_and_registered_update() -> No
     )
     registration.update_source_template(forced)
 
+    expected_support = 0.5 * old_support + 0.5 * 0.7
+    expected_srvf = (
+        0.5 * old_support[:, None] * old_srvf
+        + 0.5 * 0.7 * torch.full_like(old_srvf, 4.0)
+    ) / expected_support[:, None]
     torch.testing.assert_close(
-        registration.source_template.running_srvf,
-        0.5 * old_srvf + 0.5 * torch.full_like(old_srvf, 4.0),
+        registration.source_template.running_srvf, expected_srvf
     )
     torch.testing.assert_close(
         registration.source_template.running_support,

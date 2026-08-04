@@ -91,6 +91,22 @@ def test_checkpoint_roundtrip_restores_state_and_eval_logits() -> None:
     assert restored.temporal_features.core.trend_template.num_updates.equal(
         model.temporal_features.core.trend_template.num_updates
     )
+    torch.testing.assert_close(
+        restored.temporal_features.core.trend_template.running_srvf,
+        model.temporal_features.core.trend_template.running_srvf,
+    )
+    torch.testing.assert_close(
+        restored.temporal_features.core.trend_template.running_support,
+        model.temporal_features.core.trend_template.running_support,
+    )
+    torch.testing.assert_close(
+        restored.temporal_features.core.structure_diagnostic_template.running_srvf,
+        model.temporal_features.core.structure_diagnostic_template.running_srvf,
+    )
+    torch.testing.assert_close(
+        restored.temporal_features.core.structure_diagnostic_template.running_support,
+        model.temporal_features.core.structure_diagnostic_template.running_support,
+    )
     assert restored.prototype_alignment.q_update_count.equal(
         model.prototype_alignment.q_update_count
     )

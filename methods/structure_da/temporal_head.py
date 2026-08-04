@@ -8,6 +8,7 @@ from numbers import Real
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from .temporal_coordinates import TemporalCoordinateOutput
 
@@ -204,6 +205,8 @@ class ShapeFeatureEncoder(nn.Module):
         self,
         shape_coordinates: Tensor,
         valid: Tensor,
+        *,
+        deterministic: bool = False,
     ) -> ShapeFeatureOutput:
         _validate_floating_tensor(
             "shape_coordinates",
@@ -220,7 +223,14 @@ class ShapeFeatureEncoder(nn.Module):
             device=shape_coordinates.device,
         )
         flattened = shape_coordinates.reshape(shape_coordinates.shape[0], -1)
-        feature = self.network(flattened)
+        feature = self.network[0](flattened)
+        feature = self.network[1](feature)
+        feature = F.dropout(
+            feature,
+            p=self.dropout,
+            training=self.training and not deterministic,
+        )
+        feature = self.network[3](feature)
         feature = torch.where(
             valid.unsqueeze(-1), feature, torch.zeros_like(feature)
         )

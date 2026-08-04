@@ -100,6 +100,21 @@ def test_encoder_networks_have_exact_required_layer_order() -> None:
     assert encoder.phase_encoder.network[2].p == 0.25
 
 
+def test_shape_feature_encoder_deterministic_forward_disables_only_dropout() -> None:
+    encoder = ShapeFeatureEncoder(4, 5, 7, hidden_dim=8, dropout=0.75).train()
+    coordinates = torch.randn(3, 4, 5)
+    valid = torch.tensor([True, True, False])
+
+    torch.manual_seed(1)
+    first = encoder(coordinates, valid, deterministic=True).feature
+    torch.manual_seed(999)
+    second = encoder(coordinates, valid, deterministic=True).feature
+
+    torch.testing.assert_close(first, second)
+    assert torch.isfinite(first).all()
+    assert encoder.training
+
+
 def test_output_head_has_exact_required_layer_structure() -> None:
     head = TemporalStructureOutputHead(16, 12, dropout=0.2)
 

@@ -94,7 +94,7 @@ class SourceSRVFTemplateOutput:
 
 
 class SourceRunningSRVFTemplate(nn.Module):
-    """Maintain a support-weighted source SRVF template as running buffers."""
+    """Maintain a source SRVF template with a support-aware EMA."""
 
     def __init__(
         self,
@@ -186,7 +186,7 @@ class SourceRunningSRVFTemplate(nn.Module):
         weights = support * valid.unsqueeze(-1)
         weight_sum = weights.sum(dim=0)
         grid_valid = weight_sum >= self.min_grid_weight
-        if not torch.any(grid_valid).item():
+        if self.num_updates.item() == 0 and not torch.any(grid_valid).item():
             return
         batch_srvf = (
             weights.unsqueeze(-1) * srvf
@@ -203,27 +203,32 @@ class SourceRunningSRVFTemplate(nn.Module):
         )
         grid_valid = grid_valid.to(device=self.running_support.device)
         if self.num_updates.item() == 0:
-            updated_srvf = batch_srvf
-            updated_support = batch_support
-        else:
-            updated_srvf = (
-                self.momentum * self.running_srvf
-                + (1.0 - self.momentum) * batch_srvf
+            updated_support = torch.where(
+                grid_valid, batch_support, torch.zeros_like(batch_support)
             )
+            updated_srvf = torch.where(
+                grid_valid.unsqueeze(-1), batch_srvf, torch.zeros_like(batch_srvf)
+            )
+        else:
             updated_support = (
                 self.momentum * self.running_support
                 + (1.0 - self.momentum) * batch_support
             )
-        self.running_srvf.copy_(
-            torch.where(
-                grid_valid.unsqueeze(-1),
-                updated_srvf,
-                self.running_srvf,
+            numerator = (
+                self.momentum
+                * self.running_support.unsqueeze(-1)
+                * self.running_srvf
+                + (1.0 - self.momentum)
+                * batch_support.unsqueeze(-1)
+                * batch_srvf
             )
-        )
-        self.running_support.copy_(
-            torch.where(grid_valid, updated_support, self.running_support)
-        )
+            updated_srvf = torch.where(
+                (updated_support > self.eps).unsqueeze(-1),
+                numerator / updated_support.clamp_min(self.eps).unsqueeze(-1),
+                torch.zeros_like(numerator),
+            )
+        self.running_srvf.copy_(updated_srvf)
+        self.running_support.copy_(updated_support)
         self.num_updates.add_(1)
 
     def forward(

@@ -580,6 +580,9 @@ def joint_structure_da_train_step(
             target_shape_feature_da = model.forward_target_shape_feature_da(
                 target_output
             )
+            target_shape_teacher_feature = (
+                model.forward_target_shape_teacher_feature(target_output)
+            )
             merged_quality = concatenate_two_scale_quality_outputs(
                 source_output.representation.quality,
                 target_output.representation.quality,
@@ -608,6 +611,7 @@ def joint_structure_da_train_step(
                 source_labels,
                 target_output,
                 target_shape_feature_da,
+                target_shape_teacher_feature,
             )
             task_loss = task_objective(
                 source_output.representation.logits,
@@ -641,9 +645,12 @@ def joint_structure_da_train_step(
         task_scheduler.step()
     task_optimizer.zero_grad(set_to_none=True)
 
-    model.update_source_state_from_output(
-        source_output, source_tensors[2], source_labels
-    )
+    source_state_update_executed = False
+    if task_step_succeeded:
+        model.update_source_state_from_output(
+            source_output, source_tensors[2], source_labels
+        )
+        source_state_update_executed = True
     reported_total = (
         task_loss.total_loss.detach()
         + training_config.geometry_weight * geometry_output.total_loss.detach()
@@ -666,6 +673,34 @@ def joint_structure_da_train_step(
         quality_loss,
         domain_score_weight,
     )
+    step_succeeded = torch.as_tensor(
+        float(task_step_succeeded), device=device
+    )
+    step_scalars = dict(diagnostics.scalars)
+    step_scalars.update(
+        task_optimizer_step_succeeded=step_succeeded,
+        task_optimizer_step_skipped=1.0 - step_succeeded,
+        task_optimizer_skip_rate=1.0 - step_succeeded,
+        task_step_success_rate=step_succeeded,
+        task_step_skip_rate=1.0 - step_succeeded,
+        source_state_update_executed=torch.as_tensor(
+            float(source_state_update_executed), device=device
+        ),
+        source_state_update_rate=torch.as_tensor(
+            float(source_state_update_executed), device=device
+        ),
+        trend_reference_support=(
+            model.temporal_features.core.trend_template.running_support
+            .mean()
+            .detach()
+        ),
+        structure_diagnostic_reference_support=(
+            model.temporal_features.core.structure_diagnostic_template
+            .running_support.mean()
+            .detach()
+        ),
+    )
+    diagnostics = JointStructureDADiagnostics(step_scalars)
     eps = model.backbone.decomposition.eps
     return JointStructureDATrainStepOutput(
         losses=losses,
@@ -1042,6 +1077,9 @@ def train_joint_structure_da(
                 f"|source_raw={averages['loss_source_raw']:.4f}"
                 f"|global_da={averages['loss_global_domain']:.4f}"
                 f"|target_semantic={averages['loss_target_semantic']:.4f}"
+                f"|task_step_success_rate={averages['task_step_success_rate']:.3f}"
+                f"|task_step_skip_rate={averages['task_step_skip_rate']:.3f}"
+                f"|source_state_update_rate={averages['source_state_update_rate']:.3f}"
             )
         for domain in ("source", "target"):
             prefix = f"{domain}_"

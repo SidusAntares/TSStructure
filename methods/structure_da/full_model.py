@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -313,9 +313,25 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             raise ValueError("target_output must be StructureAwareForwardOutput")
         coordinates = target_output.temporal.coordinates.shape_coordinates.detach()
         valid = target_output.temporal.coordinates.shape_valid
-        return self.temporal_features.shape_encoder(coordinates, valid).feature.to(
+        return self.temporal_features.shape_encoder(
+            coordinates, valid, deterministic=False
+        ).feature.to(
             dtype=target_output.semantic.shape_feature.dtype
         )
+
+    @torch.no_grad()
+    def forward_target_shape_teacher_feature(
+        self, target_output: StructureAwareForwardOutput
+    ) -> Tensor:
+        """Return the dropout-free target Shape confirmation feature."""
+
+        if not isinstance(target_output, StructureAwareForwardOutput):
+            raise ValueError("target_output must be StructureAwareForwardOutput")
+        coordinates = target_output.temporal.coordinates.shape_coordinates.detach()
+        valid = target_output.temporal.coordinates.shape_valid
+        return self.temporal_features.shape_encoder(
+            coordinates, valid, deterministic=True
+        ).feature.to(dtype=target_output.semantic.shape_feature.dtype)
 
     def forward_geometry_from_backbones(
         self,
@@ -355,11 +371,17 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         source_labels: Tensor,
         target_output: StructureAwareForwardOutput,
         target_shape_feature_da: Tensor,
+        target_shape_teacher_feature: Tensor | None = None,
     ) -> PrototypeAlignmentLossOutput:
+        target_semantic = target_output.semantic
+        if target_shape_teacher_feature is not None:
+            target_semantic = replace(
+                target_semantic, shape_feature=target_shape_teacher_feature
+            )
         return self.prototype_alignment(
             source_output.semantic,
             source_labels,
-            target_output.semantic,
+            target_semantic,
             target_shape_feature_da,
         )
 

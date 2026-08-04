@@ -238,9 +238,39 @@ def test_target_shape_da_detaches_coordinates_but_updates_shape_encoder() -> Non
         parameter.grad is not None and parameter.grad.abs().sum() > 0
         for parameter in model.temporal_features.shape_encoder.parameters()
     )
+    assert all(parameter.grad is None for parameter in model.geometry_parameters())
     assert torch.equal(
         feature[~output.temporal.coordinates.shape_valid],
         torch.zeros_like(feature[~output.temporal.coordinates.shape_valid]),
+    )
+
+
+def test_target_shape_teacher_is_deterministic_no_grad_and_used_for_gating() -> None:
+    model = _model().train()
+    inputs = _inputs()
+    _initialize_temporal_source_state(model, inputs)
+    source = model.forward_details(*inputs)
+    target = model.forward_details(*inputs)
+
+    torch.manual_seed(1)
+    first = model.forward_target_shape_teacher_feature(target)
+    torch.manual_seed(999)
+    second = model.forward_target_shape_teacher_feature(target)
+    torch.testing.assert_close(first, second)
+    assert not first.requires_grad
+    assert model.training
+
+    captured = {}
+    def capture_target(_module, args):
+        captured["target"] = args[2]
+
+    handle = model.prototype_alignment.register_forward_pre_hook(capture_target)
+    student = model.forward_target_shape_feature_da(target)
+    model.prototype_losses(source, torch.tensor([0, 1, 2]), target, student, first)
+    handle.remove()
+    torch.testing.assert_close(captured["target"].shape_feature, first)
+    torch.testing.assert_close(
+        target.semantic.shape_feature, target.representation.shape_feature
     )
 
 

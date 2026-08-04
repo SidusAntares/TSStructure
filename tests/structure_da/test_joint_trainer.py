@@ -219,6 +219,83 @@ def test_source_state_is_updated_once_and_target_has_no_update_api() -> None:
     assert not hasattr(model, "update_target_state")
 
 
+class _FakeGradScaler:
+    def __init__(self, *, succeeds: bool) -> None:
+        self._scale = 8.0
+        self.succeeds = succeeds
+
+    def is_enabled(self):
+        return True
+
+    def get_scale(self):
+        return self._scale
+
+    def scale(self, loss):
+        return loss
+
+    def step(self, optimizer):
+        if self.succeeds:
+            optimizer.step()
+
+    def update(self):
+        if not self.succeeds:
+            self._scale /= 2
+
+
+@pytest.mark.parametrize("succeeds", [False, True])
+def test_task_step_success_gates_all_source_state_updates(succeeds) -> None:
+    model = _model()
+    config = _config()
+    quality, task = _objectives(config)
+    task_optimizer = torch.optim.Adam(model.task_parameters(), lr=config.lr)
+    geometry_optimizer = torch.optim.Adam(model.geometry_parameters(), lr=config.lr)
+    source_state_prefixes = (
+        "temporal_features.core.trend_template.",
+        "temporal_features.core.structure_diagnostic_template.",
+        "prototype_alignment.",
+    )
+    before = {
+        name: value.clone()
+        for name, value in model.named_buffers()
+        if name.startswith(source_state_prefixes)
+    }
+    task_parameters_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if id(parameter) in {id(value) for value in model.task_parameters()}
+    }
+
+    result = joint_structure_da_train_step(
+        model,
+        _sample(3, 5),
+        _sample(2, 7, labels=False),
+        task_optimizer,
+        geometry_optimizer,
+        quality,
+        task,
+        config,
+        torch.device("cpu"),
+        task_scaler=_FakeGradScaler(succeeds=succeeds),
+    )
+
+    diagnostics = result.diagnostics.scalars
+    assert diagnostics["task_optimizer_step_succeeded"].item() == float(succeeds)
+    assert diagnostics["task_optimizer_step_skipped"].item() == float(not succeeds)
+    assert diagnostics["source_state_update_executed"].item() == float(succeeds)
+    changed = [
+        name
+        for name, value in model.named_buffers()
+        if name in before and not torch.equal(value, before[name])
+    ]
+    if succeeds:
+        assert changed
+    else:
+        assert not changed
+        for name, parameter in model.named_parameters():
+            if name in task_parameters_before:
+                assert torch.equal(parameter, task_parameters_before[name])
+
+
 def test_cpu_bfloat16_amp_step_keeps_phase_semantics_finite() -> None:
     _, result = _step(config=_config(amp=True, amp_dtype="bfloat16"))
     assert torch.isfinite(result.losses.reported_total_loss)
