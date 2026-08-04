@@ -101,7 +101,7 @@ run_source_tasks() {
                     --lambda_structural_domain 1 \
                     --lambda_component_cls 1 \
                     --lambda_component_domain 1 \
-                    --time_scale 366 \
+                    --time_scale 365 \
                     --tau_fast_init 0.05 \
                     --tau_slow_init 0.20 \
                     --tau_min 0.0001 \

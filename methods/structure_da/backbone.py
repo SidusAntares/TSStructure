@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import Tensor, nn
@@ -20,6 +21,7 @@ class StructureBackboneOutput:
 
     tokens: Tensor
     time_mask: Tensor
+    normalized_positions: Tensor
     decomposition: DecompositionOutput
 
 
@@ -71,6 +73,7 @@ class StructureBackbone(nn.Module):
         tau_slow_init: float = 0.20,
         tau_min: float = 1e-4,
         delta_tau_min: float = 1e-4,
+        time_reference: float = 0.0,
         time_scale: float = 365.0,
         eps: float = 1e-8,
     ) -> None:
@@ -92,14 +95,71 @@ class StructureBackbone(nn.Module):
             extra_size=extra_size,
         )
         self.feature_dim = self.pixel_set_encoder.output_dim
+        try:
+            self.time_reference = float(time_reference)
+            self.time_scale = float(time_scale)
+        except (TypeError, ValueError) as error:
+            raise ValueError("time_reference and time_scale must be finite") from error
+        if not math.isfinite(self.time_reference):
+            raise ValueError("time_reference must be finite")
+        if not math.isfinite(self.time_scale) or self.time_scale <= 0:
+            raise ValueError("time_scale must be finite and greater than zero")
+        self.eps = float(eps)
         self.decomposition = SymmetricTimeKernelDecomposition(
             tau_fast_init=tau_fast_init,
             tau_slow_init=tau_slow_init,
             tau_min=tau_min,
             delta_tau_min=delta_tau_min,
-            time_scale=time_scale,
+            time_scale=1.0,
             eps=eps,
         )
+
+    def _normalize_positions(
+        self,
+        positions: Tensor,
+        time_mask: Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor:
+        """Map shared physical positions to the model's normalized coordinates."""
+
+        if not isinstance(positions, Tensor) or positions.is_complex() or positions.dtype == torch.bool:
+            raise ValueError("physical positions must be a real torch.Tensor")
+        batch_size, sequence_length = time_mask.shape
+        if positions.ndim == 1 and positions.shape == (sequence_length,):
+            resolved = positions.unsqueeze(0).expand(batch_size, -1)
+        elif positions.ndim == 2 and positions.shape == (batch_size, sequence_length):
+            resolved = positions
+        else:
+            raise ValueError("physical positions must have shape [L] or [B, L]")
+        resolved = resolved.to(device=device, dtype=dtype)
+        for sample_index in range(batch_size):
+            valid = resolved[sample_index, time_mask[sample_index]]
+            if not torch.isfinite(valid).all().item():
+                raise ValueError(
+                    f"sample {sample_index} physical positions must be finite"
+                )
+            if valid.numel() > 1 and not torch.all(valid[1:] > valid[:-1]).item():
+                raise ValueError(
+                    f"sample {sample_index} physical positions must be strictly increasing"
+                )
+        safe = torch.where(
+            time_mask,
+            resolved,
+            torch.full_like(resolved, self.time_reference),
+        )
+        normalized = (safe - self.time_reference) / self.time_scale
+        valid_normalized = normalized[time_mask]
+        tolerance = 1e-6
+        if valid_normalized.numel() and (
+            torch.any(valid_normalized < -tolerance).item()
+            or torch.any(valid_normalized > 1.0 + tolerance).item()
+        ):
+            raise ValueError("valid normalized positions must lie in [0, 1]")
+        if not torch.isfinite(normalized).all().item():
+            raise ValueError("normalized positions must be finite")
+        return torch.where(time_mask, normalized, torch.zeros_like(normalized))
 
     def forward(
         self,
@@ -121,13 +181,20 @@ class StructureBackbone(nn.Module):
             sequence_length,
             pixels.device,
         )
+        normalized_positions = self._normalize_positions(
+            positions,
+            resolved_time_mask,
+            dtype=tokens.dtype,
+            device=tokens.device,
+        )
         decomposition = self.decomposition(
             tokens,
-            positions,
+            normalized_positions,
             resolved_time_mask,
         )
         return StructureBackboneOutput(
             tokens=tokens,
             time_mask=resolved_time_mask,
+            normalized_positions=normalized_positions,
             decomposition=decomposition,
         )

@@ -227,7 +227,7 @@ def test_invalid_solve_forces_confidence_and_srvf_to_zero() -> None:
 def test_dense_observations_have_more_mean_support_than_sparse_boundaries() -> None:
     extractor = _make_extractor(canonical_grid_size=32, roughness_grid_size=96)
     tokens = torch.randn(2, 9, 2)
-    positions = torch.linspace(0.0, 366.0, 9)
+    positions = torch.linspace(0.0, 365.0, 9)
     mask = torch.tensor(
         [[True] * 9, [True, False, False, False, False, False, False, False, True]]
     )

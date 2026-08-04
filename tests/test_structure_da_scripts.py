@@ -65,7 +65,7 @@ def test_formal_script_has_new_group_and_explicit_current_arguments() -> None:
         "--lambda_geometry 1", "--lambda_alignment 1",
         "--lambda_structural_cls 1", "--lambda_structural_domain 1",
         "--lambda_component_cls 1", "--lambda_component_domain 1",
-        "--time_scale 366", "--tau_fast_init 0.05",
+          "--time_scale 365", "--tau_fast_init 0.05",
         "--tau_slow_init 0.20", "--tau_min 0.0001",
         "--delta_tau_min 0.0001",
     ):
@@ -108,7 +108,7 @@ def test_pilot_script_has_fixed_parameters_and_runtime_guards() -> None:
         "--lambda_geometry 0.1", "--lambda_alignment 1",
         "--lambda_structural_cls 0.25", "--lambda_structural_domain 0.25",
         "--lambda_component_cls 0.25", "--lambda_component_domain 0.25",
-        "--time_scale 366", "--tau_fast_init 0.05",
+          "--time_scale 365", "--tau_fast_init 0.05",
         "--tau_slow_init 0.20", "--tau_min 0.0001",
         "--delta_tau_min 0.0001", "--closed_set true",
         "--combine_spring_and_winter false", "--progress_bar off",

@@ -257,7 +257,7 @@ def test_spline_reconstructs_smooth_polynomial_on_canonical_grid() -> None:
         eps=1e-8,
     )
 
-    output = lift(values, u * 366.0, torch.ones(len(u), dtype=torch.bool))
+    output = lift(values, u * 365.0, torch.ones(len(u), dtype=torch.bool))
     expected = (
         0.7 * lift.canonical_grid.square()
         - 0.4 * lift.canonical_grid
@@ -285,7 +285,7 @@ def test_linear_function_has_constant_canonical_derivative() -> None:
         eps=1e-8,
     )
 
-    output = lift(values, u * 366.0, torch.ones(len(u), dtype=torch.bool))
+    output = lift(values, u * 365.0, torch.ones(len(u), dtype=torch.bool))
 
     expected = torch.full_like(output.derivative[0, 2:-2, 0], slope)
     torch.testing.assert_close(
@@ -332,10 +332,10 @@ def test_physical_time_descriptors_ignore_masked_positions() -> None:
     assert output.num_valid_observations.item() == 3
     assert output.num_distinct_observations.item() == 3
     torch.testing.assert_close(
-        output.time_span, torch.tensor([150.0 / 366.0])
+        output.time_span, torch.tensor([150.0 / 365.0])
     )
     torch.testing.assert_close(
-        output.max_internal_gap, torch.tensor([100.0 / 366.0])
+            output.max_internal_gap, torch.tensor([100.0 / 365.0])
     )
 
 

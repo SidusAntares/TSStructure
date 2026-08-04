@@ -1024,7 +1024,7 @@ def test_aligned_positions_use_continuous_inverse_warp_and_mask_reference() -> N
 
     resolved_positions = positions.unsqueeze(0).expand(2, -1)
     safe_u = torch.where(mask, resolved_positions / 366.0, torch.zeros_like(resolved_positions))
-    expected = 366.0 * invert_monotone_warp(warp, query=safe_u, eps=module.eps)
+    expected = invert_monotone_warp(warp, query=safe_u, eps=module.eps)
     expected = torch.where(mask, expected, torch.zeros_like(expected))
     torch.testing.assert_close(aligned, expected)
     assert not torch.allclose(aligned[0, 1:-1], positions[1:-1])
@@ -1059,7 +1059,7 @@ def test_identity_and_failure_aligned_position_semantics() -> None:
 
     valid_positions, valid = module._align_positions(positions, mask, valid_core)
     failed_positions, failed_valid = module._align_positions(positions, mask, failed_core)
-    expected = positions.unsqueeze(0).expand(2, -1).clone()
+    expected = positions.unsqueeze(0).expand(2, -1).clone() / module.time_scale
     expected = torch.where(mask, expected, torch.zeros_like(expected))
 
     torch.testing.assert_close(valid_positions, expected)

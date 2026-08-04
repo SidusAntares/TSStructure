@@ -122,7 +122,7 @@ class PhaseAwareTwoScaleClassifier(nn.Module):
         ltae_mlp: Sequence[int] = (256, 128),
         dropout: float = 0.2,
         time_reference: float = 0.0,
-        time_scale: float = 366.0,
+        time_scale: float = 365.0,
         max_initial_frequency: float = 16.0,
         classifier_hidden: Sequence[int] = (64, 32),
         quality_domain_hidden_dim: int = 128,

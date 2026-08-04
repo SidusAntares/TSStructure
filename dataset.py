@@ -21,6 +21,63 @@ from transforms import (
 from utils import label_utils
 
 
+TIME_COORDINATE_MODE = "canonical_day_of_year"
+
+
+def _parse_calendar_date(value):
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    if isinstance(value, bool):
+        raise ValueError("date must use YYYYMMDD format")
+    text = str(value)
+    if len(text) != 8 or not text.isdigit():
+        raise ValueError("date must use YYYYMMDD format")
+    return dt.date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+
+
+def canonical_day_position(date) -> float:
+    """Map a calendar month/day onto the fixed non-leap year 2001."""
+
+    parsed = _parse_calendar_date(date)
+    if parsed.month == 2 and parsed.day == 29:
+        return 58.5
+    canonical = dt.date(2001, parsed.month, parsed.day)
+    return float((canonical - dt.date(2001, 1, 1)).days)
+
+
+def canonical_day_positions(dates, *, sample_identifier: str) -> list[float]:
+    """Validate acquisition order and return canonical physical positions."""
+
+    parsed_dates = []
+    for value in dates:
+        try:
+            parsed_dates.append(_parse_calendar_date(value))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"invalid acquisition date for {sample_identifier}: {value!r}"
+            ) from error
+    for previous_raw, current_raw, previous, current in zip(
+        dates, dates[1:], parsed_dates, parsed_dates[1:]
+    ):
+        if not previous < current:
+            raise ValueError(
+                "acquisition dates must be strictly increasing for "
+                f"{sample_identifier}: {previous_raw!r}, {current_raw!r}"
+            )
+    positions = [canonical_day_position(date) for date in parsed_dates]
+    for previous_raw, current_raw, previous, current in zip(
+        dates, dates[1:], positions, positions[1:]
+    ):
+        if not previous < current:
+            raise ValueError(
+                "canonical acquisition positions must be strictly increasing for "
+                f"{sample_identifier}: {previous_raw!r}, {current_raw!r}"
+            )
+    return positions
+
+
 class PixelSetData(data.Dataset):
     def __init__(
         self,
@@ -32,6 +89,7 @@ class PixelSetData(data.Dataset):
         with_extra=False,
         closed_set=False,
         combine_spring_and_winter=False,
+        time_coordinate_mode=TIME_COORDINATE_MODE,
     ):
         super(PixelSetData, self).__init__()
 
@@ -45,6 +103,11 @@ class PixelSetData(data.Dataset):
         self.with_extra = with_extra
         self.closed_set = closed_set
         self.combine_spring_and_winter = combine_spring_and_winter
+        if time_coordinate_mode != TIME_COORDINATE_MODE:
+            raise ValueError(
+                "time_coordinate_mode must be 'canonical_day_of_year'"
+            )
+        self.time_coordinate_mode = time_coordinate_mode
 
         self.classes = classes
         self.class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
@@ -54,7 +117,9 @@ class PixelSetData(data.Dataset):
         )
 
         self.dates = self.metadata["dates"]
-        self.date_positions = self.days_after(self.metadata["start_date"], self.dates)
+        self.date_positions = canonical_day_positions(
+            self.dates, sample_identifier=self.dataset_name
+        )
         self.date_indices = np.arange(len(self.date_positions))
 
     def get_shapes(self):
@@ -140,17 +205,6 @@ class PixelSetData(data.Dataset):
         assert len(metadata["parcels"]) == len(instances)
 
         return instances, metadata
-
-    def days_after(self, start_date, dates):
-        def parse(date):
-            d = str(date)
-            return int(d[:4]), int(d[4:6]), int(d[6:])
-
-        def interval_days(date1, date2):
-            return abs((dt.datetime(*parse(date1)) - dt.datetime(*parse(date2))).days)
-
-        date_positions = [interval_days(d, start_date) for d in dates]
-        return date_positions
 
     def get_unknown_labels(self):
         """
@@ -249,6 +303,9 @@ def create_evaluation_loaders(dataset_name, splits, config, sample_pixels_val=Fa
         combine_spring_and_winter=getattr(
             config, "combine_spring_and_winter", False
         ),
+        time_coordinate_mode=getattr(
+            config, "time_coordinate_mode", TIME_COORDINATE_MODE
+        ),
     )
     val_loader = data.DataLoader(
         val_dataset,
@@ -275,6 +332,9 @@ def create_evaluation_loaders(dataset_name, splits, config, sample_pixels_val=Fa
         closed_set=getattr(config, "closed_set", False),
         combine_spring_and_winter=getattr(
             config, "combine_spring_and_winter", False
+        ),
+        time_coordinate_mode=getattr(
+            config, "time_coordinate_mode", TIME_COORDINATE_MODE
         ),
     )
     test_loader = data.DataLoader(

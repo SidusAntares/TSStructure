@@ -276,14 +276,14 @@ class ComponentAwareSharedLTAE(nn.Module):
 
 
 class ContinuousTime2Vec(nn.Module):
-    """Learn a continuous linear-plus-periodic encoding of physical time."""
+    """Learn a continuous linear-plus-periodic encoding of normalized time."""
 
     def __init__(
         self,
         output_dim: int,
         *,
         time_reference: float = 0.0,
-        time_scale: float = 366.0,
+        time_scale: float = 365.0,
         max_initial_frequency: float = 16.0,
     ) -> None:
         super().__init__()
@@ -386,12 +386,7 @@ class ContinuousTime2Vec(nn.Module):
         ).clamp(0.0, 1.0)
         linear = self.linear_weight * normalized + self.linear_bias
         periodic = torch.sin(
-            2.0
-            * torch.pi
-            * (
-                normalized.unsqueeze(-1) * self.frequencies
-                + self.phase
-            )
+            normalized.unsqueeze(-1) * self.frequencies + self.phase
         )
         encoding = torch.cat([linear.unsqueeze(-1), periodic], dim=-1)
         encoding = torch.where(
@@ -403,7 +398,7 @@ class ContinuousTime2Vec(nn.Module):
 
 
 class TrendStructureSharedLTAE(nn.Module):
-    """Encode trend and structure through private stems and one shared body."""
+    """Encode T/S with a shared input projection and branch-specific norms."""
 
     component_names = ("trend", "structure")
 
@@ -417,7 +412,7 @@ class TrendStructureSharedLTAE(nn.Module):
         d_model: int = 256,
         *,
         time_reference: float = 0.0,
-        time_scale: float = 366.0,
+        time_scale: float = 365.0,
         max_initial_frequency: float = 16.0,
     ) -> None:
         super().__init__()
@@ -455,17 +450,12 @@ class TrendStructureSharedLTAE(nn.Module):
         self.d_model = d_model
         self.n_neurons = list(neurons)
         self.component_dim = neurons[-1]
-        self.stems = nn.ModuleDict(
-            {
-                name: nn.Sequential(
-                    nn.Linear(in_channels, d_model, bias=False),
-                    nn.LayerNorm(d_model),
-                    nn.ReLU(),
-                )
-                for name in self.component_names
-            }
+        self.shared_input_projection = nn.Linear(
+            in_channels, d_model, bias=False
         )
-        self.time_encoder = ContinuousTime2Vec(
+        self.trend_input_norm = nn.LayerNorm(d_model)
+        self.structure_input_norm = nn.LayerNorm(d_model)
+        self.shared_time_encoder = ContinuousTime2Vec(
             d_model,
             time_reference=time_reference,
             time_scale=time_scale,
@@ -481,12 +471,20 @@ class TrendStructureSharedLTAE(nn.Module):
             )
         self.shared_projection = nn.Sequential(*projection_layers)
         self.dropout = nn.Dropout(dropout)
-        self.output_norms = nn.ModuleDict(
-            {
-                name: nn.LayerNorm(self.component_dim)
-                for name in self.component_names
-            }
-        )
+        self.trend_output_norm = nn.LayerNorm(self.component_dim)
+        self.structure_output_norm = nn.LayerNorm(self.component_dim)
+
+    @property
+    def trend_input_projection(self) -> nn.Linear:
+        """The trend branch uses the single shared input projection."""
+
+        return self.shared_input_projection
+
+    @property
+    def structure_input_projection(self) -> nn.Linear:
+        """The structure branch uses the single shared input projection."""
+
+        return self.shared_input_projection
 
     def forward(
         self,
@@ -526,28 +524,33 @@ class TrendStructureSharedLTAE(nn.Module):
                 device=trend.device,
             )
         )
-        time_encoding = self.time_encoder(
+        time_encoding = self.shared_time_encoder(
             positions, time_mask=resolved_mask
         )
         if time_encoding.shape[:2] != (batch_size, sequence_length):
             raise ValueError("positions must have shape [L] or [B, L]")
-        stemmed = []
-        for name, component in zip(self.component_names, (trend, structure)):
+        branch_tokens = []
+        input_norms = (self.trend_input_norm, self.structure_input_norm)
+        for component, input_norm in zip((trend, structure), input_norms):
             safe = torch.where(
                 resolved_mask.unsqueeze(-1), component, torch.zeros_like(component)
             )
             if not torch.isfinite(safe).all().item():
                 raise ValueError("valid component values must be finite")
-            stemmed.append(self.stems[name](safe) + time_encoding)
-        stacked = torch.cat(stemmed, dim=0)
-        stacked_mask = torch.cat([resolved_mask, resolved_mask], dim=0)
-        encoded, _ = self.attention_heads(stacked, time_mask=stacked_mask)
-        encoded = self.dropout(self.shared_projection(encoded))
-        chunks = encoded.split(batch_size, dim=0)
+            projected = self.shared_input_projection(safe)
+            branch_tokens.append(torch.relu(input_norm(projected)) + time_encoding)
+
+        shared_outputs = []
+        for tokens in branch_tokens:
+            encoded, _ = self.attention_heads(tokens, time_mask=resolved_mask)
+            shared_outputs.append(
+                self.dropout(self.shared_projection(encoded))
+            )
         sample_valid = resolved_mask.any(dim=-1)
         outputs = []
-        for name, chunk in zip(self.component_names, chunks):
-            normalized = self.output_norms[name](chunk)
+        output_norms = (self.trend_output_norm, self.structure_output_norm)
+        for shared_output, output_norm in zip(shared_outputs, output_norms):
+            normalized = output_norm(shared_output)
             outputs.append(
                 torch.where(
                     sample_valid.unsqueeze(-1),

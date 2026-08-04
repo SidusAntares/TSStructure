@@ -128,6 +128,9 @@ def test_one_epoch_joint_training_saves_phase_aware_checkpoint(tmp_path) -> None
     assert checkpoint["training_config"]["candidate_init_warp_amplitude"] == 0.015
     assert checkpoint["training_config"]["phase_identity_tolerance"] == 1e-4
     assert checkpoint["training_config"]["phase_candidate_unique_tolerance"] == 1e-4
+    assert checkpoint["training_config"]["time_reference"] == 0.0
+    assert checkpoint["training_config"]["time_scale"] == 365.0
+    assert checkpoint["training_config"]["time_coordinate_mode"] == "canonical_day_of_year"
     restored = _model()
     restored.load_state_dict(checkpoint["state_dict"])
 
@@ -149,6 +152,9 @@ def test_cli_exposes_only_phase_aware_high_level_options() -> None:
         "--candidate_init_warp_amplitude",
         "--phase_identity_tolerance",
         "--phase_candidate_unique_tolerance",
+        "--time_reference",
+        "--time_scale",
+        "--time_coordinate_mode",
     ):
         assert option in result.stdout
     for option in (

@@ -79,7 +79,8 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         with_extra: bool = False,
         extra_size: int = 4,
         shape_dim: int = 128,
-        time_scale: float = 366.0,
+        time_reference: float = 0.0,
+        time_scale: float = 365.0,
         tau_fast_init: float = 0.05,
         tau_slow_init: float = 0.20,
         tau_min: float = 1e-4,
@@ -111,6 +112,7 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             tau_slow_init=tau_slow_init,
             tau_min=tau_min,
             delta_tau_min=delta_tau_min,
+            time_reference=time_reference,
             time_scale=time_scale,
         )
         temporal_kwargs = _options_with_fixed(
@@ -118,7 +120,8 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             temporal_options,
             feature_dim=self.backbone.feature_dim,
             shape_output_dim=shape_dim,
-            time_scale=time_scale,
+            time_reference=0.0,
+            time_scale=1.0,
         )
         self.temporal_features = TrendStructureTaskFeatureModule(**temporal_kwargs)
         representation_kwargs = _options_with_fixed(
@@ -127,7 +130,8 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             component_input_dim=self.backbone.feature_dim,
             shape_dim=shape_dim,
             num_classes=num_classes,
-            time_scale=time_scale,
+            time_reference=0.0,
+            time_scale=1.0,
         )
         self.representation = PhaseAwareTwoScaleClassifier(**representation_kwargs)
         prototype_kwargs = _options_with_fixed(
@@ -221,12 +225,8 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             resolved = positions
         else:
             raise ValueError("positions must have shape [L] or [B,L]")
-        resolved = resolved.to(
-            device=backbone.tokens.device, dtype=backbone.tokens.dtype
-        )
-        if not torch.isfinite(resolved[backbone.time_mask]).all().item():
-            raise ValueError("valid positions must be finite")
-        return resolved
+        del resolved
+        return backbone.normalized_positions
 
     def forward_from_backbone(
         self,

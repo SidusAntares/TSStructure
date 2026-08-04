@@ -94,6 +94,9 @@ def test_training_config_has_only_phase_aware_weights_and_validates_them() -> No
         "target_semantic_weight",
         "quality_classification_weight",
         "quality_domain_weight",
+        "time_reference",
+        "time_scale",
+        "time_coordinate_mode",
     } <= names
     assert not {
         "task_weight",
@@ -108,6 +111,13 @@ def test_training_config_has_only_phase_aware_weights_and_validates_them() -> No
     with pytest.raises(ValueError, match="lr"):
         _config(lr=0)
     assert _config(amp=True, amp_dtype="bfloat16", progress_bar="auto").amp
+    assert _config().time_reference == 0.0
+    assert _config().time_scale == 365.0
+    assert _config().time_coordinate_mode == "canonical_day_of_year"
+    with pytest.raises(ValueError, match="time_scale"):
+        _config(time_scale=0.0)
+    with pytest.raises(ValueError, match="time_coordinate_mode"):
+        _config(time_coordinate_mode="per_domain_minmax")
 
 
 def test_joint_step_uses_new_losses_and_different_domain_lengths() -> None:

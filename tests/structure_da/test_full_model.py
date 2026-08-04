@@ -33,7 +33,8 @@ def _model(dtype: torch.dtype = torch.float32, **overrides):
         mlp1=(2, 4, 4),
         mlp2=(8, 4),
         shape_dim=4,
-        time_scale=366.0,
+        time_reference=0.0,
+        time_scale=365.0,
         temporal_options={
             "trend_num_basis": 4,
             "structure_num_basis": 4,
@@ -149,6 +150,58 @@ def test_trend_structure_and_forward_output_have_exact_final_semantics() -> None
     assert model(pixels, valid, positions).shape == (3, 3)
 
 
+def test_backbone_normalizes_physical_positions_exactly_once() -> None:
+    model = _model().eval()
+    pixels, valid, _ = _inputs(length=3)
+    physical_positions = torch.tensor([0.0, 182.5, 365.0])
+
+    backbone = model.forward_backbone(pixels, valid, physical_positions)
+
+    expected = torch.tensor([0.0, 0.5, 1.0]).expand(3, -1)
+    torch.testing.assert_close(backbone.normalized_positions, expected)
+    torch.testing.assert_close(
+        model._task_positions(physical_positions, backbone), expected
+    )
+
+
+def test_backbone_rejects_nonincreasing_and_out_of_contract_physical_time() -> None:
+    model = _model().eval()
+    pixels, valid, _ = _inputs(length=3)
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        model.forward_backbone(
+            pixels, valid, torch.tensor([0.0, 182.5, 182.5])
+        )
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        model.forward_backbone(
+            pixels, valid, torch.tensor([-1.0, 182.5, 365.0])
+        )
+
+
+def test_task_loss_updates_time_encoder_and_shared_ltae_but_not_warp() -> None:
+    model = _model()
+    inputs = _inputs()
+    _initialize_temporal_source_state(model, inputs)
+
+    output = model.forward_details(*inputs)
+    output.representation.logits.square().mean().backward()
+
+    ltae = model.representation.component_ltae
+    for module in (
+        ltae.shared_time_encoder,
+        ltae.shared_input_projection,
+        ltae.attention_heads,
+    ):
+        gradients = [parameter.grad for parameter in module.parameters()]
+        assert any(
+            gradient is not None
+            and torch.isfinite(gradient).all()
+            and gradient.abs().sum() > 0
+            for gradient in gradients
+        )
+    assert all(parameter.grad is None for parameter in model.geometry_parameters())
+
+
 def test_residual_is_not_an_independent_task_branch() -> None:
     model = _model().eval()
     pixels, valid, positions = _inputs()
@@ -156,6 +209,7 @@ def test_residual_is_not_an_independent_task_branch() -> None:
     changed = StructureBackboneOutput(
         tokens=backbone.tokens,
         time_mask=backbone.time_mask,
+        normalized_positions=backbone.normalized_positions,
         decomposition=replace(
             backbone.decomposition,
             residual=backbone.decomposition.residual + 1000,

@@ -158,6 +158,9 @@ class JointStructureDATrainingConfig:
     candidate_init_warp_amplitude: float = 0.015
     phase_identity_tolerance: float = 1e-4
     phase_candidate_unique_tolerance: float = 1e-4
+    time_reference: float = 0.0
+    time_scale: float = 365.0
+    time_coordinate_mode: str = "canonical_day_of_year"
     amp: bool = False
     amp_dtype: str = "float16"
     log_step: int = 10
@@ -207,6 +210,21 @@ class JointStructureDATrainingConfig:
                 positive=True,
             ),
         )
+        try:
+            time_reference = float(self.time_reference)
+            time_scale = float(self.time_scale)
+        except (TypeError, ValueError) as error:
+            raise ValueError("time_reference and time_scale must be finite") from error
+        if not math.isfinite(time_reference):
+            raise ValueError("time_reference must be finite")
+        if not math.isfinite(time_scale) or time_scale <= 0:
+            raise ValueError("time_scale must be finite and greater than zero")
+        if self.time_coordinate_mode != "canonical_day_of_year":
+            raise ValueError(
+                "time_coordinate_mode must be 'canonical_day_of_year'"
+            )
+        object.__setattr__(self, "time_reference", time_reference)
+        object.__setattr__(self, "time_scale", time_scale)
         progress_bar_disabled(self.progress_bar)
 
 
@@ -225,6 +243,9 @@ def create_joint_structure_da_train_loaders(config, splits):
         with_extra=False,
         closed_set=config.closed_set,
         combine_spring_and_winter=config.combine_spring_and_winter,
+        time_coordinate_mode=getattr(
+            config, "time_coordinate_mode", "canonical_day_of_year"
+        ),
     )
     source_dataset = PixelSetData(
         dataset_name=config.source,

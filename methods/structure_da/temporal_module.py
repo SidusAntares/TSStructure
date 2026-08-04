@@ -92,7 +92,7 @@ class TrendStructureTemporalCore(nn.Module):
         trend_smoothing_weight: float = 1e-2,
         structure_smoothing_weight: float = 1e-3,
         time_reference: float = 0.0,
-        time_scale: float = 366.0,
+        time_scale: float = 365.0,
         statistics_momentum: float = 0.99,
         support_scale_momentum: float = 0.99,
         template_momentum: float = 0.99,
@@ -426,7 +426,7 @@ class TrendStructureTaskFeatureModule(nn.Module):
         trend_smoothing_weight: float = 1e-2,
         structure_smoothing_weight: float = 1e-3,
         time_reference: float = 0.0,
-        time_scale: float = 366.0,
+        time_scale: float = 365.0,
         statistics_momentum: float = 0.99,
         support_scale_momentum: float = 0.99,
         template_momentum: float = 0.99,
@@ -584,16 +584,15 @@ class TrendStructureTaskFeatureModule(nn.Module):
             query=safe_u,
             eps=self.eps,
         )
-        mapped_positions = self.time_reference + self.time_scale * mapped_u
         aligned_positions = torch.where(
             core.selection.phase_valid[:, None],
-            mapped_positions,
-            resolved_positions,
+            mapped_u,
+            normalized,
         )
         aligned_positions = torch.where(
             resolved_mask,
             aligned_positions,
-            torch.full_like(aligned_positions, self.time_reference),
+            torch.zeros_like(aligned_positions),
         ).detach()
         aligned_positions_valid = (
             core.selection.phase_valid & resolved_mask.any(dim=-1)
@@ -760,7 +759,7 @@ class TemporalStructureExtractor(nn.Module):
         roughness_grid_size: int = 256,
         smoothing_weight: float = 1e-3,
         time_reference: float = 0.0,
-        time_scale: float = 366.0,
+        time_scale: float = 365.0,
         statistics_momentum: float = 0.99,
         min_feature_scale: float = 1e-3,
         support_scale_momentum: float = 0.99,

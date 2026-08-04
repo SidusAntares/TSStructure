@@ -102,6 +102,11 @@ def main(config):
                 phase_candidate_unique_tolerance=(
                     config.phase_candidate_unique_tolerance
                 ),
+                time_reference=getattr(config, "time_reference", 0.0),
+                time_scale=config.time_scale,
+                time_coordinate_mode=getattr(
+                    config, "time_coordinate_mode", "canonical_day_of_year"
+                ),
                 amp=getattr(config, "amp", False),
                 amp_dtype=getattr(config, "amp_dtype", "float16"),
                 log_step=config.log_step,
@@ -228,6 +233,7 @@ def main(config):
             input_dim=config.input_dim,
             with_extra=config.with_extra,
             shape_dim=config.shape_dim,
+            time_reference=getattr(config, "time_reference", 0.0),
             time_scale=config.time_scale,
             tau_fast_init=config.tau_fast_init,
             tau_slow_init=config.tau_slow_init,
@@ -289,6 +295,11 @@ def main(config):
 
 
 def prepare_data_protocol(config):
+    dataset_time_options = (
+        {"time_coordinate_mode": config.time_coordinate_mode}
+        if hasattr(config, "time_coordinate_mode")
+        else {}
+    )
     candidate_classes = label_utils.get_classes(
         config.source.split('/')[0],
         combine_spring_and_winter=config.combine_spring_and_winter,
@@ -300,6 +311,7 @@ def prepare_data_protocol(config):
             config.source,
             candidate_classes,
             combine_spring_and_winter=config.combine_spring_and_winter,
+            **dataset_time_options,
         )
         labels, counts = np.unique(source_data.get_labels(), return_counts=True)
         source_classes = [
@@ -315,6 +327,7 @@ def prepare_data_protocol(config):
             config.target,
             source_classes,
             combine_spring_and_winter=config.combine_spring_and_winter,
+            **dataset_time_options,
         )
         return {
             config.source: len(source_data),
@@ -332,6 +345,7 @@ def prepare_data_protocol(config):
         candidate_classes,
         closed_set=True,
         combine_spring_and_winter=config.combine_spring_and_winter,
+        **dataset_time_options,
     )
     labels, counts = np.unique(
         candidate_source_dataset.get_labels(), return_counts=True
@@ -360,6 +374,7 @@ def prepare_data_protocol(config):
         config.classes,
         closed_set=True,
         combine_spring_and_winter=config.combine_spring_and_winter,
+        **dataset_time_options,
     )
     target_protocol_dataset = PixelSetData(
         config.data_root,
@@ -367,6 +382,7 @@ def prepare_data_protocol(config):
         config.classes,
         closed_set=True,
         combine_spring_and_winter=config.combine_spring_and_winter,
+        **dataset_time_options,
     )
     eligible_indices = {
         config.source: source_protocol_dataset.get_parcel_indices().tolist(),
@@ -378,6 +394,11 @@ def prepare_data_protocol(config):
         "target": config.target,
         "min_source_samples_per_class": 200,
         "combine_spring_and_winter": config.combine_spring_and_winter,
+        "time_reference": getattr(config, "time_reference", 0.0),
+        "time_scale": getattr(config, "time_scale", 365.0),
+        "time_coordinate_mode": getattr(
+            config, "time_coordinate_mode", "canonical_day_of_year"
+        ),
         "classes": config.classes,
         "class_to_idx": {
             class_name: index for index, class_name in enumerate(config.classes)
@@ -612,7 +633,13 @@ if __name__ == '__main__':
         default=5,
         type=int,
     )
-    parser.add_argument('--time_scale', default=366.0, type=float)
+    parser.add_argument('--time_reference', default=0.0, type=float)
+    parser.add_argument('--time_scale', default=365.0, type=float)
+    parser.add_argument(
+        '--time_coordinate_mode',
+        default='canonical_day_of_year',
+        choices=['canonical_day_of_year'],
+    )
     parser.add_argument('--tau_fast_init', default=0.05, type=float)
     parser.add_argument('--tau_slow_init', default=0.20, type=float)
     parser.add_argument('--tau_min', default=1e-4, type=float)

@@ -350,7 +350,7 @@ class TemporalFunctionalLift(nn.Module):
         roughness_grid_size: int = 256,
         smoothing_weight: float = 1e-3,
         time_reference: float = 0.0,
-        time_scale: float = 366.0,
+        time_scale: float = 365.0,
         statistics_momentum: float = 0.99,
         min_feature_scale: float = 1e-3,
         eps: float = 1e-6,
