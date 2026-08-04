@@ -342,6 +342,8 @@ def test_closed_set_is_propagated_to_structure_da_and_evaluation_loaders(
         train_on_target=False,
         combine_spring_and_winter=True,
         with_extra=False,
+        balance_source=True,
+        seed=7,
     )
     splits = {
         "source": {"train": {1}, "val": {2}, "test": {3}},
@@ -350,14 +352,14 @@ def test_closed_set_is_propagated_to_structure_da_and_evaluation_loaders(
 
     _LoaderDataset.calls = []
     monkeypatch.setattr(structure_da_trainer, "PixelSetData", _LoaderDataset)
-    monkeypatch.setattr(
-        structure_da_trainer,
-        "create_train_loader",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")),
-    )
-    with pytest.raises(RuntimeError, match="stop"):
-        structure_da_trainer.create_joint_structure_da_train_loaders(config, splits)
+    calls = []
+    monkeypatch.setattr(structure_da_trainer, "BalancedBatchSampler", lambda labels, batch_size, seed=None: ("balanced", seed))
+    monkeypatch.setattr(structure_da_trainer, "DataLoader", lambda **kwargs: calls.append(kwargs) or kwargs)
+    monkeypatch.setattr(structure_da_trainer, "create_train_loader", lambda *args, **kwargs: calls.append((args, kwargs)) or "target")
+    source_loader, target_loader = structure_da_trainer.create_joint_structure_da_train_loaders(config, splits)
     assert _LoaderDataset.calls == [(True, True), (True, True)]
+    assert source_loader["batch_sampler"] == ("balanced", 7)
+    assert target_loader == "target"
 
     _LoaderDataset.calls = []
     monkeypatch.setattr(dataset, "PixelSetData", _LoaderDataset)

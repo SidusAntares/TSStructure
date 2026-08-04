@@ -174,6 +174,7 @@ class TrendStructurePhaseSelectionOutput:
     identity_accepted: Tensor
     identity_fallback: Tensor
     structure_shape_valid: Tensor
+    phase_base_valid: Tensor
 
     @property
     def candidate_selected_index(self) -> Tensor:
@@ -790,4 +791,5 @@ def select_trend_structure_phase(
         identity_accepted=identity_accepted,
         identity_fallback=identity_fallback,
         structure_shape_valid=structure_shape_valid,
+        phase_base_valid=trend_eligible,
     )

@@ -88,6 +88,7 @@ run_task() {
             --tau_min 0.0001 \
             --delta_tau_min 0.0001 \
             --closed_set true \
+            --balance-source \
             --combine_spring_and_winter false \
             --progress_bar off \
             --log_step 25 \

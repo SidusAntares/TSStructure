@@ -7,6 +7,7 @@ import torch
 
 from methods.structure_da.joint_trainer import (
     JointStructureDATrainingConfig,
+    PerClassPhaseDiagnosticsAccumulator,
     joint_structure_da_train_step,
     validation_structure_contributions,
 )
@@ -114,6 +115,7 @@ def test_training_config_has_only_phase_aware_weights_and_validates_them() -> No
     assert _config().time_reference == 0.0
     assert _config().time_scale == 365.0
     assert _config().time_coordinate_mode == "canonical_day_of_year"
+    assert _config().balance_source is True
     with pytest.raises(ValueError, match="time_scale"):
         _config(time_scale=0.0)
     with pytest.raises(ValueError, match="time_coordinate_mode"):
@@ -342,12 +344,64 @@ def test_validation_counterfactual_reuses_one_model_pass_per_batch() -> None:
         model, loader, torch.device("cpu"), ("a", "b", "c")
     )
     assert calls == len(loader)
-    modes = {"full", "no_shape", "trend_only", "structure_only", "shape_only"}
+    modes = {
+        "occlusion_full",
+        "occlusion_no_shape",
+        "occlusion_trend_only",
+        "occlusion_structure_only",
+        "occlusion_shape_only",
+    }
     assert {f"{mode}_{suffix}" for mode in modes for suffix in ("loss", "f1")} <= set(metrics)
-    assert metrics["delta_shape"] == metrics["full_f1"] - metrics["no_shape_f1"]
-    assert metrics["delta_trend"] == metrics["full_f1"] - metrics["structure_only_f1"]
-    assert metrics["delta_structure"] == metrics["full_f1"] - metrics["trend_only_f1"]
+    assert metrics["delta_shape"] == metrics["occlusion_full_f1"] - metrics["occlusion_no_shape_f1"]
+    assert metrics["delta_trend"] == metrics["occlusion_full_f1"] - metrics["occlusion_structure_only_f1"]
+    assert metrics["delta_structure"] == metrics["occlusion_full_f1"] - metrics["occlusion_trend_only_f1"]
     assert "phase_candidate_trainable_rate" in metrics
     assert "phase_candidate_acceptable_rate" in metrics
     assert "phase_candidate_collapse_rate" in metrics
     assert "phase_candidate_head_0_selected_rate" in metrics
+
+
+def test_per_class_phase_diagnostics_use_conditional_denominators() -> None:
+    accumulator = PerClassPhaseDiagnosticsAccumulator(num_classes=3, num_candidates=3)
+    accumulator.update(
+        labels=torch.tensor([0, 0, 1, 1]),
+        label_valid=torch.tensor([True, True, True, False]),
+        phase_base_valid=torch.tensor([True, True, True, True]),
+        candidate_trainable=torch.tensor([[1, 1, 0], [1, 0, 0], [1, 1, 1], [1, 1, 1]], dtype=torch.bool),
+        candidate_acceptable=torch.tensor([[1, 1, 0], [1, 0, 0], [1, 1, 0], [1, 1, 1]], dtype=torch.bool),
+        candidate_unique_count=torch.tensor([2, 1, 3, 3]),
+        candidate_collapse=torch.tensor([False, True, False, False]),
+        trend_ambiguous=torch.tensor([True, False, True, True]),
+        structure_enabled=torch.tensor([True, False, True, True]),
+        structure_changed=torch.tensor([True, False, False, True]),
+        structure_veto=torch.tensor([False, False, True, False]),
+        phase_status=torch.tensor([2, 1, 0, 2]),
+        selected_candidate=torch.tensor([2, -1, 1, 0]),
+        phase_magnitude=torch.tensor([0.3, 0.0, 0.2, 0.4]),
+        accepted_shift=torch.tensor([0.1, 0.0, 0.0, 0.2]),
+        shape_valid=torch.tensor([True, True, False, True]),
+    )
+    summaries = accumulator.summaries()
+    assert set(summaries) == {0, 1}
+    zero = summaries[0]
+    assert zero["sample_count"] == 2
+    assert zero["structure_changed_preferred_rate"] == 1.0
+    assert zero["candidate_head_2_selected_rate"] == 1.0
+    assert zero["valid_identity_rate"] + zero["valid_nonidentity_rate"] + zero["failure_rate"] == pytest.approx(1.0)
+    one = summaries[1]
+    assert one["structure_veto_all_rate"] == 1.0
+    assert one["accepted_warp_shift_mean"] != one["accepted_warp_shift_mean"]
+
+
+def test_step_class_diagnostics_use_true_source_and_valid_geometry_pseudo_labels() -> None:
+    _, result = _step()
+    source_count = sum(
+        row["sample_count"]
+        for row in result.phase_class_diagnostics["source"].summaries().values()
+    )
+    target_count = sum(
+        row["sample_count"]
+        for row in result.phase_class_diagnostics["target"].summaries().values()
+    )
+    assert source_count == result.source_batch_size
+    assert target_count == int(result.losses.task.prototype.target_teacher_mask.sum())

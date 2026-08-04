@@ -82,6 +82,7 @@ run_source_tasks() {
                     --seed "$seed" \
                     --device cuda \
                     --closed_set true \
+                    --balance-source \
                     --combine_spring_and_winter false \
                     --epochs 100 \
                     --batch_size 128 \

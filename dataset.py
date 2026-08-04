@@ -443,25 +443,29 @@ class GroupByShapesBatchSampler(torch.utils.data.BatchSampler):
 class BalancedBatchSampler(torch.utils.data.sampler.BatchSampler):
     """
     BatchSampler - from a MNIST-like dataset, samples n_samples for each of the n_classes.
-    Returns batches of size n_classes * (batch_size // n_classes)
+    Preserves the requested batch size; per-class counts differ by at most one.
     Taken from https://github.com/criteo-research/pytorch-ada/blob/master/adalib/ada/datasets/sampler.py
     """
 
-    def __init__(self, labels, batch_size):
+    def __init__(self, labels, batch_size, seed=None):
         classes = sorted(set(labels))
         n_classes = len(classes)
-        self._n_samples = batch_size // n_classes
-        if self._n_samples == 0:
+        self._samples_per_class = batch_size // n_classes
+        self._remainder = batch_size % n_classes
+        if self._samples_per_class == 0:
             raise ValueError(
                 f"batch_size should be bigger than the number of classes, got {batch_size}"
             )
 
+        self._rng = np.random.default_rng(seed)
         self._class_iters = [
-            InfiniteSliceIterator(np.where(labels == class_)[0], class_=class_)
+            InfiniteSliceIterator(
+                np.where(labels == class_)[0], class_=class_, rng=self._rng
+            )
             for class_ in classes
         ]
 
-        batch_size = self._n_samples * n_classes
+        self.batch_size = batch_size
         self.n_dataset = len(labels)
         self._n_batches = self.n_dataset // batch_size
         if self._n_batches == 0:
@@ -473,9 +477,15 @@ class BalancedBatchSampler(torch.utils.data.sampler.BatchSampler):
     def __iter__(self):
         for _ in range(self._n_batches):
             indices = []
-            for class_iter in self._class_iters:
-                indices.extend(class_iter.get(self._n_samples))
-            np.random.shuffle(indices)
+            extra_classes = set(
+                self._rng.permutation(len(self._class_iters))[: self._remainder]
+            )
+            for class_index, class_iter in enumerate(self._class_iters):
+                sample_count = self._samples_per_class + int(
+                    class_index in extra_classes
+                )
+                indices.extend(class_iter.get(sample_count))
+            self._rng.shuffle(indices)
             yield indices
 
         for class_iter in self._class_iters:
@@ -486,11 +496,12 @@ class BalancedBatchSampler(torch.utils.data.sampler.BatchSampler):
 
 
 class InfiniteSliceIterator:
-    def __init__(self, array, class_):
+    def __init__(self, array, class_, rng=None):
         assert type(array) is np.ndarray
         self.array = array
         self.i = 0
         self.class_ = class_
+        self.rng = np.random.default_rng() if rng is None else rng
 
     def reset(self):
         self.i = 0
@@ -501,7 +512,7 @@ class InfiniteSliceIterator:
         if len_ < n:
             print(f"there are really few items in class {self.class_}")
             self.reset()
-            np.random.shuffle(self.array)
+            self.rng.shuffle(self.array)
             mul = n // len_
             rest = n - mul * len_
             return np.concatenate((np.tile(self.array, mul), self.array[:rest]))
@@ -511,7 +522,7 @@ class InfiniteSliceIterator:
             self.reset()
 
         if self.i == 0:
-            np.random.shuffle(self.array)
+            self.rng.shuffle(self.array)
         i = self.i
         self.i += n
         return self.array[i : self.i]

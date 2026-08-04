@@ -41,6 +41,7 @@ def main(config):
         config.val_ratio,
         config.test_ratio,
     )
+    print("SPLIT_PROTOCOL|name=random_parcel_split")
 
     if config.overall:
         overall_performance(config)
@@ -112,6 +113,7 @@ def main(config):
                 log_step=config.log_step,
                 progress_bar=config.progress_bar,
                 classes=tuple(config.classes),
+                balance_source=getattr(config, "balance_source", True),
             )
             resolved_steps_per_epoch = resolve_steps_per_epoch(
                 training_config, source_loader, target_loader
@@ -526,7 +528,16 @@ if __name__ == '__main__':
     # Setup parameters
     parser.add_argument('--data_root', default='/data/user/dataset/timematch_data', type=str,
                         help='Path to datasets root directory')
-    parser.add_argument('--num_blocks', default=100, type=int, help='Number of geographical blocks in dataset for splitting. Default 100.')
+    source_balance = parser.add_mutually_exclusive_group()
+    source_balance.add_argument(
+        '--balance-source', dest='balance_source', action='store_true',
+        help='balance source-domain classes in V3 training batches (default)',
+    )
+    source_balance.add_argument(
+        '--no-balance-source', dest='balance_source', action='store_false',
+        help='disable source-domain class-balanced V3 batches',
+    )
+    parser.set_defaults(balance_source=True)
 
     available_tiles = ['denmark/32VNH/2017', 'france/30TXT/2017', 'france/31TCJ/2017', 'austria/33UVP/2017']
 

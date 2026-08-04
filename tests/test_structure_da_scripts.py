@@ -111,6 +111,7 @@ def test_pilot_script_has_fixed_parameters_and_runtime_guards() -> None:
           "--time_scale 365", "--tau_fast_init 0.05",
         "--tau_slow_init 0.20", "--tau_min 0.0001",
         "--delta_tau_min 0.0001", "--closed_set true",
+        "--balance-source",
         "--combine_spring_and_winter false", "--progress_bar off",
         "--log_step 25",
     ):

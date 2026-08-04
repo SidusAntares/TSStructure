@@ -11,10 +11,16 @@ import sklearn.metrics
 import torch
 from torch import Tensor
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
 from tqdm import tqdm
 
-from dataset import PixelSetData, create_train_loader
+from dataset import (
+    BalancedBatchSampler,
+    PixelSetData,
+    create_train_loader,
+    worker_init_fn,
+)
 from transforms import Normalize, RandomSamplePixels, ToTensor
 from utils.train_utils import AverageMeter, cycle, progress_bar_disabled, to_cuda
 
@@ -137,6 +143,7 @@ class JointStructureDATrainStepOutput:
     diagnostics: JointStructureDADiagnostics
     source_decomposition_diagnostics: DecompositionDiagnostics
     target_decomposition_diagnostics: DecompositionDiagnostics
+    phase_class_diagnostics: Mapping[str, "PerClassPhaseDiagnosticsAccumulator"]
 
 
 @dataclass(frozen=True)
@@ -166,6 +173,7 @@ class JointStructureDATrainingConfig:
     log_step: int = 10
     progress_bar: str = "auto"
     classes: Sequence[str] = ()
+    balance_source: bool = True
 
     def __post_init__(self) -> None:
         _positive_int("epochs", self.epochs)
@@ -181,6 +189,8 @@ class JointStructureDATrainingConfig:
             )
         if not isinstance(self.amp, bool):
             raise ValueError("amp must be boolean")
+        if not isinstance(self.balance_source, bool):
+            raise ValueError("balance_source must be boolean")
         if self.amp_dtype not in ("float16", "bfloat16"):
             raise ValueError("amp_dtype must be 'float16' or 'bfloat16'")
         object.__setattr__(self, "lr", _finite_nonnegative("lr", self.lr, positive=True))
@@ -229,7 +239,7 @@ class JointStructureDATrainingConfig:
 
 
 def create_joint_structure_da_train_loaders(config, splits):
-    """Create independently shuffled source and target loaders without extras."""
+    """Create V3 train loaders, balancing only the labelled source domain."""
 
     source_transform = transforms.Compose(
         [RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()]
@@ -259,10 +269,144 @@ def create_joint_structure_da_train_loaders(config, splits):
         indices=splits[config.target]["train"],
         **common,
     )
-    return (
-        create_train_loader(source_dataset, config.batch_size, config.num_workers),
-        create_train_loader(target_dataset, config.batch_size, config.num_workers),
+    if getattr(config, "balance_source", True):
+        source_loader = DataLoader(
+            dataset=source_dataset,
+            batch_sampler=BalancedBatchSampler(
+                source_dataset.get_labels(), config.batch_size, seed=config.seed
+            ),
+            num_workers=config.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            worker_init_fn=worker_init_fn,
+        )
+    else:
+        source_loader = create_train_loader(
+            source_dataset, config.batch_size, config.num_workers
+        )
+    target_loader = create_train_loader(
+        target_dataset, config.batch_size, config.num_workers
     )
+    return source_loader, target_loader
+
+
+class PerClassPhaseDiagnosticsAccumulator:
+    """Bounded per-class Phase counters; target labels are supplied by the caller."""
+
+    def __init__(
+        self, num_classes: int, num_candidates: int, max_phase_samples: int = 4096
+    ):
+        self.num_classes = int(num_classes)
+        self.num_candidates = int(num_candidates)
+        self.max_phase_samples = int(max_phase_samples)
+        self._rows = [
+            dict(count=0, phase_magnitudes=[]) for _ in range(self.num_classes)
+        ]
+
+    def update(self, *, labels, label_valid, phase_base_valid, candidate_trainable,
+               candidate_acceptable, candidate_unique_count, candidate_collapse,
+               trend_ambiguous, structure_enabled, structure_changed, structure_veto,
+               phase_status, selected_candidate, phase_magnitude, accepted_shift,
+               shape_valid) -> None:
+        tensors = {name: value.detach().cpu() for name, value in locals().items()
+                   if isinstance(value, Tensor)}
+        labels = tensors["labels"].long()
+        label_valid = tensors["label_valid"].bool()
+        for class_id in range(self.num_classes):
+            mask = label_valid & (labels == class_id)
+            if not mask.any():
+                continue
+            row = self._rows[class_id]
+            n = int(mask.sum())
+            row["count"] += n
+            def add(name, value):
+                row[name] = row.get(name, 0.0) + float(value)
+            for name in ("phase_base_valid", "candidate_collapse", "trend_ambiguous",
+                         "structure_enabled", "structure_changed", "structure_veto",
+                         "shape_valid"):
+                add(name, tensors[name][mask].float().sum())
+            add("candidate_trainable", tensors["candidate_trainable"][mask].float().sum())
+            add("candidate_acceptable", tensors["candidate_acceptable"][mask].float().sum())
+            add("candidate_unique_count", tensors["candidate_unique_count"][mask].float().sum())
+            status = tensors["phase_status"][mask]
+            add("valid_identity", (status == 1).sum())
+            add("valid_nonidentity", (status == 2).sum())
+            add("failure", (status == 0).sum())
+            selected = tensors["selected_candidate"][mask]
+            learned = selected >= 0
+            add("head_denominator", learned.sum())
+            for head in range(self.num_candidates):
+                add(f"head_{head}", (selected == head).sum())
+            enabled = tensors["structure_enabled"][mask].bool()
+            add("structure_changed_denominator", enabled.sum())
+            add("structure_veto_denominator", enabled.sum())
+            successful = status != 0
+            add("accepted_shift_sum", tensors["accepted_shift"][mask][successful].sum())
+            add("accepted_shift_count", successful.sum())
+            values = tensors["phase_magnitude"][mask][successful].flatten().tolist()
+            remaining = self.max_phase_samples - len(row["phase_magnitudes"])
+            row["phase_magnitudes"].extend(values[:max(remaining, 0)])
+
+    def merge(self, other: "PerClassPhaseDiagnosticsAccumulator") -> None:
+        for target, source in zip(self._rows, other._rows):
+            target["count"] += source["count"]
+            for name, value in source.items():
+                if name == "count":
+                    continue
+                if name == "phase_magnitudes":
+                    remaining = self.max_phase_samples - len(target[name])
+                    target[name].extend(value[:max(remaining, 0)])
+                else:
+                    target[name] = target.get(name, 0.0) + value
+
+    def add_sample_metric(
+        self, labels: Tensor, label_valid: Tensor, name: str, values: Tensor
+    ) -> None:
+        """Add a detached per-sample diagnostic with its own valid denominator."""
+        labels = labels.detach().cpu().long()
+        valid = label_valid.detach().cpu().bool()
+        values = values.detach().cpu().float()
+        for class_id, row in enumerate(self._rows):
+            mask = valid & (labels == class_id) & torch.isfinite(values)
+            if mask.any():
+                row[f"extra_sum_{name}"] = row.get(f"extra_sum_{name}", 0.0) + float(values[mask].sum())
+                row[f"extra_count_{name}"] = row.get(f"extra_count_{name}", 0.0) + int(mask.sum())
+
+    def summaries(self) -> dict[int, dict[str, float]]:
+        output = {}
+        for class_id, row in enumerate(self._rows):
+            count = row["count"]
+            if count == 0:
+                continue
+            safe = lambda numerator, denominator=count: float(numerator) / denominator if denominator else math.nan
+            magnitudes = torch.tensor(row["phase_magnitudes"], dtype=torch.float32)
+            result = {
+                "sample_count": count,
+                "phase_base_valid_rate": safe(row["phase_base_valid"]),
+                "candidate_trainable_rate": safe(row["candidate_trainable"], count * self.num_candidates),
+                "candidate_acceptable_rate": safe(row["candidate_acceptable"], count * self.num_candidates),
+                "candidate_unique_count_mean": safe(row["candidate_unique_count"]),
+                "candidate_collapse_rate": safe(row["candidate_collapse"]),
+                "trend_ambiguity_rate": safe(row["trend_ambiguous"]),
+                "structure_disambiguation_enabled_rate": safe(row["structure_enabled"]),
+                "structure_changed_preferred_rate": safe(row["structure_changed"], row["structure_changed_denominator"]),
+                "structure_changed_preferred_overall_rate": safe(row["structure_changed"]),
+                "structure_veto_all_rate": safe(row["structure_veto"], row["structure_veto_denominator"]),
+                "valid_identity_rate": safe(row["valid_identity"]),
+                "valid_nonidentity_rate": safe(row["valid_nonidentity"]),
+                "failure_rate": safe(row["failure"]),
+                "phase_magnitude_mean": float(magnitudes.mean()) if magnitudes.numel() else math.nan,
+                "phase_magnitude_p95": float(torch.quantile(magnitudes, .95)) if magnitudes.numel() else math.nan,
+                "accepted_warp_shift_mean": safe(row["accepted_shift_sum"], row["accepted_shift_count"]),
+                "structure_shape_valid_rate": safe(row["shape_valid"]),
+            }
+            for head in range(self.num_candidates):
+                result[f"candidate_head_{head}_selected_rate"] = safe(row[f"head_{head}"], row["head_denominator"])
+            for name, value in row.items():
+                if name.startswith("extra_sum_"):
+                    metric = name.removeprefix("extra_sum_")
+                    result[metric] = safe(value, row[f"extra_count_{metric}"])
+            output[class_id] = result
+        return output
 
 
 def _sample_to_device(sample, device):
@@ -382,6 +526,45 @@ def _phase_diagnostics(prefix: str, output, original_positions: Tensor) -> dict[
             selected == candidate
         )
     return values
+
+
+def _phase_class_accumulator(output, original_positions, labels, label_valid, num_classes):
+    selection = output.temporal.core.selection
+    mask = output.backbone.time_mask
+    positions = original_positions
+    if positions.ndim == 1:
+        positions = positions.unsqueeze(0).expand_as(mask)
+    positions = positions.to(output.temporal.aligned_positions)
+    token_shift = (output.temporal.aligned_positions - positions).abs()
+    accepted_shift = (token_shift * mask).sum(-1) / mask.sum(-1).clamp_min(1)
+    selected = selection.selected_candidate_index
+    selected_magnitude = selection.candidate_phase_magnitude.gather(
+        1, selected.clamp_min(0).unsqueeze(1)
+    ).squeeze(1)
+    selected_magnitude = torch.where(selected >= 0, selected_magnitude, torch.zeros_like(selected_magnitude))
+    accumulator = PerClassPhaseDiagnosticsAccumulator(
+        num_classes, selection.candidate_trainable_mask.shape[1]
+    )
+    accumulator.update(
+        labels=labels,
+        label_valid=label_valid,
+        phase_base_valid=selection.phase_base_valid,
+        candidate_trainable=selection.candidate_trainable_mask,
+        candidate_acceptable=selection.candidate_acceptable_mask,
+        candidate_unique_count=selection.candidate_unique_count,
+        candidate_collapse=selection.candidate_collapse_mask,
+        trend_ambiguous=selection.trend_candidate_ambiguous,
+        structure_enabled=selection.structure_disambiguation_used,
+        structure_changed=(selection.structure_disambiguation_used & (selected >= 0)
+                           & (selected != selection.trend_preferred_candidate_index)),
+        structure_veto=selection.structure_candidate_vetoed,
+        phase_status=selection.phase_status,
+        selected_candidate=selected,
+        phase_magnitude=selected_magnitude,
+        accepted_shift=accepted_shift,
+        shape_valid=selection.structure_shape_valid,
+    )
+    return accumulator
 
 
 def _fusion_diagnostics(prefix: str, output) -> dict[str, Tensor]:
@@ -702,6 +885,51 @@ def joint_structure_da_train_step(
     )
     diagnostics = JointStructureDADiagnostics(step_scalars)
     eps = model.backbone.decomposition.eps
+    source_class_diagnostics = _phase_class_accumulator(
+        source_output,
+        source_tensors[2],
+        source_labels,
+        torch.ones_like(source_labels, dtype=torch.bool),
+        len(training_config.classes),
+    )
+    prototype_module = model.prototype_alignment
+    source_valid = torch.ones_like(source_labels, dtype=torch.bool)
+    for metric, ready in (
+        ("shape_geometry_prototype_ready_rate", prototype_module.q_prototype_ready),
+        ("shape_feature_prototype_ready_rate", prototype_module.z_prototype_ready),
+        ("trend_raw_prototype_ready_rate", prototype_module.trend_prototype_ready),
+        ("structure_raw_prototype_ready_rate", prototype_module.structure_prototype_ready),
+    ):
+        source_class_diagnostics.add_sample_metric(
+            source_labels, source_valid, metric, ready[source_labels].float()
+        )
+    source_class_diagnostics.add_sample_metric(
+        source_labels, source_valid, "alpha_trend_mean",
+        source_output.representation.quality.alpha_trend.squeeze(-1),
+    )
+    source_class_diagnostics.add_sample_metric(
+        source_labels, source_valid, "alpha_structure_mean",
+        source_output.representation.quality.alpha_structure.squeeze(-1),
+    )
+    target_class_diagnostics = _phase_class_accumulator(
+        target_output,
+        target_tensors[2],
+        prototype.target_pseudo_label,
+        prototype.target_teacher_mask,
+        len(training_config.classes),
+    )
+    for metric, values in (
+        ("q_z_consistency_rate", prototype.target_teacher_mask.float()),
+        ("geometry_teacher_inner_rate", prototype.target_inner_mask.float()),
+        ("geometry_teacher_middle_rate", prototype.target_middle_mask.float()),
+        ("geometry_teacher_outer_rate", prototype.target_outer_mask.float()),
+    ):
+        target_class_diagnostics.add_sample_metric(
+            prototype.target_pseudo_label,
+            prototype.target_teacher_mask,
+            metric,
+            values,
+        )
     return JointStructureDATrainStepOutput(
         losses=losses,
         alignment=alignment,
@@ -717,6 +945,10 @@ def joint_structure_da_train_step(
         target_decomposition_diagnostics=_decomposition_diagnostics(
             target_output, target_tensors[2], eps
         ),
+        phase_class_diagnostics={
+            "source": source_class_diagnostics,
+            "target": target_class_diagnostics,
+        },
     )
 
 
@@ -740,7 +972,13 @@ def _collect_validation_structure_contributions(
 ) -> tuple[dict[str, float], Tensor, Tensor]:
     if not classes:
         raise ValueError("classes must be nonempty")
-    mode_names = ("full", "no_shape", "trend_only", "structure_only", "shape_only")
+    mode_names = (
+        "occlusion_full",
+        "occlusion_no_shape",
+        "occlusion_trend_only",
+        "occlusion_structure_only",
+        "occlusion_shape_only",
+    )
     mode_logits: dict[str, list[Tensor]] = {name: [] for name in mode_names}
     labels: list[Tensor] = []
     phase_sums: dict[str, float] = {}
@@ -768,16 +1006,16 @@ def _collect_validation_structure_contributions(
         zero_structure = torch.zeros_like(structure)
         zero_shape = torch.zeros_like(shape)
         features = {
-            "full": torch.cat([trend, structure, shape], -1),
-            "no_shape": torch.cat([trend, structure, zero_shape], -1),
-            "trend_only": torch.cat([trend, zero_structure, zero_shape], -1),
-            "structure_only": torch.cat([zero_trend, structure, zero_shape], -1),
-            "shape_only": torch.cat([zero_trend, zero_structure, shape], -1),
+            "occlusion_full": torch.cat([trend, structure, shape], -1),
+            "occlusion_no_shape": torch.cat([trend, structure, zero_shape], -1),
+            "occlusion_trend_only": torch.cat([trend, zero_structure, zero_shape], -1),
+            "occlusion_structure_only": torch.cat([zero_trend, structure, zero_shape], -1),
+            "occlusion_shape_only": torch.cat([zero_trend, zero_structure, shape], -1),
         }
         for name, feature in features.items():
             logits = (
                 output.representation.logits
-                if name == "full"
+                if name == "occlusion_full"
                 else model.representation.classifier(feature)
             )
             mode_logits[name].append(logits.detach().cpu())
@@ -798,12 +1036,12 @@ def _collect_validation_structure_contributions(
                 zero_division=0,
             )
         )
-    metrics["delta_shape"] = metrics["full_f1"] - metrics["no_shape_f1"]
-    metrics["delta_trend"] = metrics["full_f1"] - metrics["structure_only_f1"]
-    metrics["delta_structure"] = metrics["full_f1"] - metrics["trend_only_f1"]
+    metrics["delta_shape"] = metrics["occlusion_full_f1"] - metrics["occlusion_no_shape_f1"]
+    metrics["delta_trend"] = metrics["occlusion_full_f1"] - metrics["occlusion_structure_only_f1"]
+    metrics["delta_structure"] = metrics["occlusion_full_f1"] - metrics["occlusion_trend_only_f1"]
     for name, total in phase_sums.items():
         metrics[f"phase_{name}"] = total / max(phase_samples, 1)
-    predictions = torch.cat(mode_logits["full"]).argmax(-1)
+    predictions = torch.cat(mode_logits["occlusion_full"]).argmax(-1)
     return metrics, all_labels, predictions
 
 
@@ -832,7 +1070,7 @@ def _validation_with_structure_contributions(
     metrics, labels, predictions = _collect_validation_structure_contributions(
         model, val_loader, device, training_config.classes
     )
-    val_loss, val_f1 = metrics["full_loss"], metrics["full_f1"]
+    val_loss, val_f1 = metrics["occlusion_full_loss"], metrics["occlusion_full_f1"]
     val_accuracy = float(sklearn.metrics.accuracy_score(labels.numpy(), predictions.numpy()))
     val_kappa = float(
         sklearn.metrics.cohen_kappa_score(
@@ -935,7 +1173,7 @@ def _log_validation_contributions(writer, epoch: int, metrics) -> None:
     for name, value in metrics.items():
         fields.append(f"{name}={value:.6g}")
         if writer is not None:
-            writer.add_scalar(f"val/counterfactual/{name}", value, epoch - 1)
+            writer.add_scalar(f"val/feature_occlusion/{name}", value, epoch - 1)
     print("|".join(fields))
 
 
@@ -998,6 +1236,8 @@ def train_joint_structure_da(
         model.train()
         meters: dict[str, AverageMeter] = {}
         decomposition_epoch = {"source": None, "target": None}
+        phase_class_epoch = {"source": None, "target": None}
+        source_class_batch_presence = [0] * len(training_config.classes)
         source_iterator, target_iterator = cycle(source_loader), cycle(target_loader)
         bar = None if progress_disabled else tqdm(range(steps_per_epoch))
         step_iterator = range(steps_per_epoch) if bar is None else bar
@@ -1020,6 +1260,13 @@ def train_joint_structure_da(
             )
             for name, value in result.diagnostics.scalars.items():
                 meters.setdefault(name, AverageMeter()).update(value.item())
+            for domain, accumulator in result.phase_class_diagnostics.items():
+                if phase_class_epoch[domain] is None:
+                    phase_class_epoch[domain] = accumulator
+                else:
+                    phase_class_epoch[domain].merge(accumulator)
+            for class_id in result.phase_class_diagnostics["source"].summaries():
+                source_class_batch_presence[class_id] += 1
             for domain, diagnostics in (
                 ("source", result.source_decomposition_diagnostics),
                 ("target", result.target_decomposition_diagnostics),
@@ -1101,6 +1348,37 @@ def train_joint_structure_da(
                 ):
                     phase_fields.append(f"{short_name}={meter.avg:.6g}")
             print("|".join(phase_fields))
+        for domain, label_source in (
+            ("source", "source_true"),
+            ("target", "target_geometry_pseudo"),
+        ):
+            accumulator = phase_class_epoch[domain]
+            if accumulator is None:
+                continue
+            for class_id, summary in accumulator.summaries().items():
+                fields = [
+                    f"PHASE_CLASS_EPOCH|epoch={epoch + 1}|split={domain}",
+                    f"label_source={label_source}",
+                    f"class_id={class_id}",
+                ]
+                fields.extend(f"{name}={value:.6g}" for name, value in summary.items())
+                print("|".join(fields))
+                if writer is not None:
+                    path = f"phase/{label_source}_class_{class_id}"
+                    for name, value in summary.items():
+                        if math.isfinite(float(value)):
+                            writer.add_scalar(f"{path}/{name}", value, epoch)
+        source_summaries = phase_class_epoch["source"].summaries()
+        for class_id, summary in source_summaries.items():
+            sampled = summary["sample_count"]
+            presence = source_class_batch_presence[class_id] / steps_per_epoch
+            print(
+                f"SOURCE_BALANCE_EPOCH|epoch={epoch + 1}|class_id={class_id}"
+                f"|source_sample_count={sampled}|source_batch_presence_rate={presence:.6g}"
+            )
+            if writer is not None:
+                writer.add_scalar(f"protocol/source_sample_count_class_{class_id}", sampled, epoch)
+                writer.add_scalar(f"protocol/source_batch_presence_rate_class_{class_id}", presence, epoch)
         for domain in ("source", "target"):
             summary = summarize_decomposition_diagnostics(decomposition_epoch[domain])
             print(_format_epoch_diagnostics("DECOMP_EPOCH", epoch + 1, domain, summary))

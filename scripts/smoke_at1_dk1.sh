@@ -50,6 +50,7 @@ conda run -n "$CONDA_ENV" --no-capture-output \
     --source "austria/33UVP/2017" \
     --target "denmark/32VNH/2017" \
     --closed_set True \
+    --balance-source \
     --num_folds 1 \
     --seed 1 \
     --device cuda \

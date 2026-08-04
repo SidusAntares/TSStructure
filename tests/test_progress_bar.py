@@ -347,6 +347,7 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         "--candidate_init_warp_amplitude", "--phase_identity_tolerance",
         "--phase_candidate_unique_tolerance", "--quality_domain_score_warmup_epochs",
         "--eval_batch_size", "--grl_warmup_fraction", "--amp", "--amp_dtype",
+        "--balance-source", "--no-balance-source",
     ):
         assert option in result.stdout
     for option in ("--channel" + "_feature_dim", "--pixel" + "_hidden_dim"):
@@ -360,6 +361,7 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         "--quality_hidden_cap", "--quality_eta", "--sda_hidden_dim",
     ):
         assert option not in result.stdout
+    assert "--num_blocks" not in result.stdout
 
 
 def test_grl_fraction_and_absolute_override_are_cli_conflicts():

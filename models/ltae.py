@@ -121,7 +121,7 @@ class LTAE(nn.Module):
 
 
 class ComponentAwareSharedLTAE(nn.Module):
-    """Encode trend, dynamics, and residual with private stems and shared attention."""
+    """Legacy T/D/R encoder with component-specific projections and shared attention."""
 
     component_names = ("trend", "dynamics", "residual")
 

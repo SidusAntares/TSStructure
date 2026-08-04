@@ -3,9 +3,11 @@ from __future__ import annotations
 import datetime as dt
 import pickle
 
+import numpy as np
 import pytest
 
 import dataset
+from dataset import BalancedBatchSampler
 
 
 def _write_dataset(root, name: str, *, dates, start_date) -> None:
@@ -146,3 +148,20 @@ def test_dataset_rejects_unsupported_time_coordinate_mode(
             closed_set=True,
             time_coordinate_mode="sample_min_max",
         )
+
+
+def test_balanced_batch_sampler_is_seed_reproducible() -> None:
+    labels = np.repeat(np.arange(3), 6)
+    first = list(BalancedBatchSampler(labels, 6, seed=11))
+    second = list(BalancedBatchSampler(labels, 6, seed=11))
+    different = list(BalancedBatchSampler(labels, 6, seed=12))
+    assert first == second
+    assert first != different
+    assert all(set(labels[batch]) == {0, 1, 2} for batch in first)
+
+
+def test_balanced_batch_sampler_preserves_requested_batch_size() -> None:
+    labels = np.repeat(np.arange(3), 9)
+    batches = list(BalancedBatchSampler(labels, 8, seed=2))
+    assert all(len(batch) == 8 for batch in batches)
+    assert all(np.bincount(labels[batch], minlength=3).max() <= 3 for batch in batches)
