@@ -13,9 +13,9 @@ import torch.backends.cudnn
 from dataset import PixelSetData, create_evaluation_loaders
 from evaluation import evaluation
 from methods.structure_da import (
-    HierarchicalQualityObjective,
     JointStructureDATrainingConfig,
     StructureAwareDomainAdaptationModel,
+    TrendStructureSelectionConfig,
     create_joint_structure_da_train_loaders,
     resolve_grl_warmup_max_iters,
     resolve_steps_per_epoch,
@@ -85,13 +85,15 @@ def main(config):
                 steps_per_epoch=config.steps_per_epoch,
                 lr=config.lr,
                 weight_decay=config.weight_decay,
-                task_weight=config.lambda_task,
                 geometry_weight=config.lambda_geometry,
-                alignment_weight=config.lambda_alignment,
-                structural_classification_weight=config.lambda_structural_cls,
-                structural_domain_weight=config.lambda_structural_domain,
-                component_classification_weight=config.lambda_component_cls,
-                component_domain_weight=config.lambda_component_domain,
+                classification_weight=config.lambda_cls,
+                quality_weight=config.lambda_quality,
+                source_shape_weight=config.lambda_source_shape,
+                source_raw_weight=config.lambda_source_raw,
+                global_domain_weight=config.lambda_global_domain,
+                target_semantic_weight=config.lambda_target_semantic,
+                quality_classification_weight=config.lambda_quality_cls,
+                quality_domain_weight=config.lambda_quality_domain,
                 quality_domain_score_warmup_epochs=(
                     config.quality_domain_score_warmup_epochs
                 ),
@@ -117,7 +119,13 @@ def main(config):
                 else grl_fraction
             )
             eval_batch_size = config.eval_batch_size or config.batch_size
-            amp_enabled = bool(training_config.amp and device.type == "cuda")
+            amp_enabled = bool(
+                training_config.amp
+                and (
+                    device.type == "cuda"
+                    or training_config.amp_dtype == "bfloat16"
+                )
+            )
             print(
                 "TRAIN_PROTOCOL|"
                 f"batch_size={config.batch_size}"
@@ -127,24 +135,96 @@ def main(config):
                 f"|resolved_steps_per_epoch={resolved_steps_per_epoch}"
                 f"|epochs={config.epochs}"
                 f"|total_steps={config.epochs * resolved_steps_per_epoch}"
+                f"|shape_dim={config.shape_dim}"
+                f"|canonical_grid_size={config.canonical_grid_size}"
+                f"|warp_num_candidates={config.warp_num_candidates}"
                 f"|grl_warmup_fraction={displayed_fraction}"
                 f"|grl_warmup_max_iters={actual_grl_warmup_max_iters}"
                 "|quality_domain_score_warmup_epochs="
                 f"{config.quality_domain_score_warmup_epochs}"
                 f"|amp={str(amp_enabled).lower()}"
                 f"|amp_dtype={training_config.amp_dtype}"
+                f"|lambda_geometry={config.lambda_geometry}"
+                f"|lambda_cls={config.lambda_cls}"
+                f"|lambda_quality={config.lambda_quality}"
+                f"|lambda_source_shape={config.lambda_source_shape}"
+                f"|lambda_source_raw={config.lambda_source_raw}"
+                f"|lambda_global_domain={config.lambda_global_domain}"
+                f"|lambda_target_semantic={config.lambda_target_semantic}"
             )
 
+        selection_config = TrendStructureSelectionConfig(
+            gain_weight=config.phase_gain_weight,
+            identity_weight=config.phase_identity_weight,
+            roughness_weight=config.phase_roughness_weight,
+            unsupported_weight=config.phase_unsupported_weight,
+            gain_temperature=config.phase_gain_temperature,
+            candidate_temperature=config.phase_candidate_temperature,
+            min_common_support=config.phase_min_common_support,
+            max_gain_ratio=config.phase_max_gain_ratio,
+            ambiguity_relative_tolerance=config.phase_ambiguity_relative_tolerance,
+            ambiguity_absolute_tolerance=config.phase_ambiguity_absolute_tolerance,
+            structure_veto_ratio=config.structure_veto_ratio,
+            structure_tie_tolerance=config.structure_tie_tolerance,
+        )
+        temporal_options = {
+            "canonical_grid_size": config.canonical_grid_size,
+            "warp_num_candidates": config.warp_num_candidates,
+            "num_shape_basis": config.num_shape_basis,
+            "num_phase_basis": config.num_phase_basis,
+            "attribute_projection_dim": config.shape_attribute_dim,
+            "selection_config": selection_config,
+        }
+        representation_options = {
+            "max_initial_frequency": config.time2vec_max_frequency,
+        }
+        prototype_options = {
+            "prototype_momentum": config.prototype_momentum,
+            "radius_buffer_size": config.radius_buffer_size,
+            "min_radius_samples": config.min_radius_samples,
+            "q_inner_quantile": config.q_inner_quantile,
+            "q_outer_quantile": config.q_outer_quantile,
+            "feature_inner_quantile": config.feature_inner_quantile,
+            "min_common_support": config.prototype_min_common_support,
+            "q_temperature": config.q_temperature,
+            "z_temperature": config.z_temperature,
+            "trend_temperature": config.trend_temperature,
+            "structure_temperature": config.structure_temperature,
+            "q_separation_margin": config.q_separation_margin,
+            "target_q_margin": config.target_q_margin,
+            "raw_pull_confidence": config.raw_pull_confidence,
+            "raw_huber_delta": config.raw_huber_delta,
+        }
+        prototype_weight_options = {
+            "q_compact": config.lambda_q_compact,
+            "q_separate": config.lambda_q_separate,
+            "z_proto": config.lambda_z_proto,
+            "q_to_z_source": config.lambda_q_to_z_source,
+            "raw_proto": config.lambda_raw_proto,
+            "q_to_z_target": config.lambda_q_to_z_target,
+            "z_pull": config.lambda_z_pull,
+            "q_to_raw_target": config.lambda_q_to_raw_target,
+            "raw_pull": config.lambda_raw_pull,
+        }
+        geometry_objective_options = {
+            "candidate_weight": config.lambda_geometry_candidate,
+            "center_weight": config.lambda_geometry_center,
+        }
         model = StructureAwareDomainAdaptationModel(
             num_classes=config.num_classes,
             input_dim=config.input_dim,
             with_extra=config.with_extra,
-            structure_dim=config.structure_dim,
+            shape_dim=config.shape_dim,
             time_scale=config.time_scale,
             tau_fast_init=config.tau_fast_init,
             tau_slow_init=config.tau_slow_init,
             tau_min=config.tau_min,
             delta_tau_min=config.delta_tau_min,
+            temporal_options=temporal_options,
+            representation_options=representation_options,
+            prototype_options=prototype_options,
+            prototype_weight_options=prototype_weight_options,
+            geometry_objective_options=geometry_objective_options,
             alignment_hidden_dim=config.domain_hidden_dim,
             grl_max_iters=actual_grl_warmup_max_iters,
         )
@@ -466,7 +546,13 @@ if __name__ == '__main__':
     parser.add_argument('--with_extra', default=False, type=bool_flag, help='whether to input extra geometric features to the PSE')
     parser.add_argument('--tensorboard_log_dir', default='runs')
     parser.add_argument('--steps_per_epoch', default=None, type=int)
-    parser.add_argument('--structure_dim', default=128, type=int)
+    parser.add_argument('--shape_dim', default=128, type=int)
+    parser.add_argument('--canonical_grid_size', default=64, type=int)
+    parser.add_argument('--warp_num_candidates', default=3, type=int)
+    parser.add_argument('--num_shape_basis', default=8, type=int)
+    parser.add_argument('--num_phase_basis', default=8, type=int)
+    parser.add_argument('--shape_attribute_dim', default=8, type=int)
+    parser.add_argument('--time2vec_max_frequency', default=16.0, type=float)
     parser.add_argument('--domain_hidden_dim', default=128, type=int)
     grl_warmup_group = parser.add_mutually_exclusive_group()
     grl_warmup_group.add_argument(
@@ -487,13 +573,26 @@ if __name__ == '__main__':
         default='float16',
         choices=['float16', 'bfloat16'],
     )
-    parser.add_argument('--lambda_task', default=1.0, type=float)
     parser.add_argument('--lambda_geometry', default=1.0, type=float)
-    parser.add_argument('--lambda_alignment', default=1.0, type=float)
-    parser.add_argument('--lambda_structural_cls', default=1.0, type=float)
-    parser.add_argument('--lambda_structural_domain', default=1.0, type=float)
-    parser.add_argument('--lambda_component_cls', default=1.0, type=float)
-    parser.add_argument('--lambda_component_domain', default=1.0, type=float)
+    parser.add_argument('--lambda_cls', default=1.0, type=float)
+    parser.add_argument('--lambda_quality', default=1.0, type=float)
+    parser.add_argument('--lambda_source_shape', default=1.0, type=float)
+    parser.add_argument('--lambda_source_raw', default=1.0, type=float)
+    parser.add_argument('--lambda_global_domain', default=1.0, type=float)
+    parser.add_argument('--lambda_target_semantic', default=1.0, type=float)
+    parser.add_argument('--lambda_quality_cls', default=1.0, type=float)
+    parser.add_argument('--lambda_quality_domain', default=1.0, type=float)
+    parser.add_argument('--lambda_q_compact', default=1.0, type=float)
+    parser.add_argument('--lambda_q_separate', default=1.0, type=float)
+    parser.add_argument('--lambda_z_proto', default=1.0, type=float)
+    parser.add_argument('--lambda_q_to_z_source', default=1.0, type=float)
+    parser.add_argument('--lambda_raw_proto', default=1.0, type=float)
+    parser.add_argument('--lambda_q_to_z_target', default=1.0, type=float)
+    parser.add_argument('--lambda_z_pull', default=1.0, type=float)
+    parser.add_argument('--lambda_q_to_raw_target', default=1.0, type=float)
+    parser.add_argument('--lambda_raw_pull', default=1.0, type=float)
+    parser.add_argument('--lambda_geometry_candidate', default=1.0, type=float)
+    parser.add_argument('--lambda_geometry_center', default=1.0, type=float)
     parser.add_argument(
         '--quality_domain_score_warmup_epochs',
         default=5,
@@ -504,6 +603,33 @@ if __name__ == '__main__':
     parser.add_argument('--tau_slow_init', default=0.20, type=float)
     parser.add_argument('--tau_min', default=1e-4, type=float)
     parser.add_argument('--delta_tau_min', default=1e-4, type=float)
+    parser.add_argument('--phase_gain_weight', default=1.0, type=float)
+    parser.add_argument('--phase_identity_weight', default=1.0, type=float)
+    parser.add_argument('--phase_roughness_weight', default=1.0, type=float)
+    parser.add_argument('--phase_unsupported_weight', default=1.0, type=float)
+    parser.add_argument('--phase_gain_temperature', default=0.05, type=float)
+    parser.add_argument('--phase_candidate_temperature', default=0.05, type=float)
+    parser.add_argument('--phase_min_common_support', default=0.05, type=float)
+    parser.add_argument('--phase_max_gain_ratio', default=1.0, type=float)
+    parser.add_argument('--phase_ambiguity_relative_tolerance', default=0.05, type=float)
+    parser.add_argument('--phase_ambiguity_absolute_tolerance', default=1e-6, type=float)
+    parser.add_argument('--structure_veto_ratio', default=1.05, type=float)
+    parser.add_argument('--structure_tie_tolerance', default=1e-6, type=float)
+    parser.add_argument('--prototype_momentum', default=0.99, type=float)
+    parser.add_argument('--radius_buffer_size', default=2048, type=int)
+    parser.add_argument('--min_radius_samples', default=32, type=int)
+    parser.add_argument('--q_inner_quantile', default=0.75, type=float)
+    parser.add_argument('--q_outer_quantile', default=0.95, type=float)
+    parser.add_argument('--feature_inner_quantile', default=0.75, type=float)
+    parser.add_argument('--prototype_min_common_support', default=0.05, type=float)
+    parser.add_argument('--q_temperature', default=0.10, type=float)
+    parser.add_argument('--z_temperature', default=0.10, type=float)
+    parser.add_argument('--trend_temperature', default=0.10, type=float)
+    parser.add_argument('--structure_temperature', default=0.10, type=float)
+    parser.add_argument('--q_separation_margin', default=1.0, type=float)
+    parser.add_argument('--target_q_margin', default=0.10, type=float)
+    parser.add_argument('--raw_pull_confidence', default=0.50, type=float)
+    parser.add_argument('--raw_huber_delta', default=0.10, type=float)
 
     cfg = parser.parse_args()
 

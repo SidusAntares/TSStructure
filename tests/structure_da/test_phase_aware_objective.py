@@ -452,6 +452,85 @@ def test_geometry_center_updates_selected_candidate_and_identity_is_exact_zero()
     assert identity_output.center_loss.item() == pytest.approx(0.0, abs=1e-12)
 
 
+def test_geometry_forward_pair_weights_candidates_and_centers_source_only() -> None:
+    source_logits = torch.randn(2, 2, 3, requires_grad=True)
+    target_logits = torch.randn(3, 2, 3, requires_grad=True)
+    source_widths = torch.softmax(source_logits, dim=-1)
+    target_widths = torch.softmax(target_logits, dim=-1)
+    source_scores = source_widths.square().sum((-1, -2))
+    target_scores = target_widths.square().sum((-1, -2))
+    source = _geometry_selection(
+        source_widths,
+        source_scores,
+        torch.tensor([[True, False], [False, False]]),
+        torch.tensor([0, -1]),
+        torch.tensor([True, False]),
+    )
+    target = _geometry_selection(
+        target_widths,
+        target_scores,
+        torch.tensor([[True, True], [False, True], [False, False]]),
+        torch.tensor([1, 1, -1]),
+        torch.tensor([True, True, False]),
+    )
+    objective = TrendLedGeometryObjective(candidate_weight=2.0, center_weight=3.0)
+
+    paired = objective.forward_pair(source, target)
+    source_only = objective(source, torch.ones(2, dtype=torch.bool))
+    expected_candidate = (source_scores[0] + target_scores[:2].sum()) / 3
+
+    torch.testing.assert_close(paired.candidate_loss, expected_candidate)
+    torch.testing.assert_close(paired.center_loss, source_only.center_loss)
+    assert paired.valid_candidate_sample_count.item() == 3
+    assert paired.source_center_count.item() == 1
+    torch.testing.assert_close(
+        paired.total_loss,
+        2.0 * paired.candidate_loss + 3.0 * paired.center_loss,
+    )
+    paired.total_loss.backward()
+    assert source_logits.grad is not None and torch.isfinite(source_logits.grad).all()
+    assert target_logits.grad is not None and torch.isfinite(target_logits.grad).all()
+    assert target_logits.grad.abs().sum() > 0
+
+
+def test_geometry_forward_pair_handles_empty_candidates_and_rejects_mismatch() -> None:
+    source_logits = torch.randn(1, 2, 3, requires_grad=True)
+    target_logits = torch.randn(2, 2, 3, requires_grad=True)
+    source_widths = torch.softmax(source_logits, dim=-1)
+    target_widths = torch.softmax(target_logits, dim=-1)
+    source = _geometry_selection(
+        source_widths,
+        torch.full((1,), float("inf"), device=source_widths.device),
+        torch.zeros(1, 2, dtype=torch.bool),
+        torch.tensor([-1]),
+        torch.tensor([False]),
+    )
+    target = _geometry_selection(
+        target_widths,
+        torch.full((2,), float("inf"), device=target_widths.device),
+        torch.zeros(2, 2, dtype=torch.bool),
+        torch.full((2,), -1),
+        torch.zeros(2, dtype=torch.bool),
+    )
+
+    output = TrendLedGeometryObjective().forward_pair(source, target)
+    assert output.candidate_loss.item() == 0
+    assert output.center_loss.item() == 0
+    assert output.total_loss.requires_grad
+    output.total_loss.backward()
+    assert source_logits.grad is not None and target_logits.grad is not None
+
+    mismatched = _geometry_selection(
+        target_widths[:, :1],
+        target_widths.sum((-1, -2)) * 0,
+        torch.zeros(2, 1, dtype=torch.bool),
+        torch.full((2,), -1),
+        torch.zeros(2, dtype=torch.bool),
+    )
+    with pytest.raises(ValueError, match="candidate count"):
+        TrendLedGeometryObjective().forward_pair(source, mismatched)
+
+
 def _prototype_loss(**overrides) -> PrototypeAlignmentLossOutput:
     scalar = torch.tensor(1.0, requires_grad=True)
     values = {}

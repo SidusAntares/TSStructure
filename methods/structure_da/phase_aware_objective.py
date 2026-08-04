@@ -211,7 +211,13 @@ def _masked_softmax(logits: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
 def _graph_zero(*references: Tensor) -> Tensor:
     if not references:
         return torch.tensor(0.0)
-    return sum((x.sum() * 0 for x in references), references[0].new_zeros(()))
+    return sum(
+        (
+            torch.where(torch.isfinite(x), x, torch.zeros_like(x)).sum() * 0
+            for x in references
+        ),
+        references[0].new_zeros(()),
+    )
 
 
 def _resolve_class_radius(
@@ -639,11 +645,13 @@ class TrendLedGeometryObjective(nn.Module):
             raise ValueError("candidate widths and scores must be floating point")
         if widths.dtype != selection.candidate_softmin_score.dtype:
             raise ValueError("candidate widths and scores must share a dtype")
-        if not torch.isfinite(widths).all().item() or not torch.isfinite(selection.candidate_softmin_score).all().item():
-            raise ValueError("candidate widths and scores must be finite")
+        if not torch.isfinite(widths).all().item():
+            raise ValueError("candidate widths must be finite")
         if torch.any((selection.selected_candidate_index < -1) | (selection.selected_candidate_index >= legal.shape[1])).item():
             raise ValueError("selected_candidate_index is out of range")
         candidate_valid = legal.any(-1)
+        if not torch.isfinite(selection.candidate_softmin_score[candidate_valid]).all().item():
+            raise ValueError("scores for valid candidates must be finite")
         candidate_loss = selection.candidate_softmin_score[candidate_valid].mean() if candidate_valid.any() else _graph_zero(selection.candidate_softmin_score, selection.candidates.interval_widths)
         batch, _, intervals = widths.shape
         safe = selection.selected_candidate_index.clamp_min(0)
@@ -659,6 +667,69 @@ class TrendLedGeometryObjective(nn.Module):
             center_loss = _graph_zero(tangent, widths)
         total = self.candidate_weight * candidate_loss + self.center_weight * center_loss
         return TrendLedGeometryLossOutput(total, candidate_loss, center_loss, candidate_valid.sum(), center_mask.sum())
+
+    def forward_pair(
+        self,
+        source_selection: TrendStructurePhaseSelectionOutput,
+        target_selection: TrendStructurePhaseSelectionOutput,
+    ) -> TrendLedGeometryLossOutput:
+        source_widths = source_selection.candidates.interval_widths
+        target_widths = target_selection.candidates.interval_widths
+        if source_widths.device != target_widths.device:
+            raise ValueError("source and target candidates must share a device")
+        if source_widths.dtype != target_widths.dtype:
+            raise ValueError("source and target candidates must share a dtype")
+        if source_widths.shape[1] != target_widths.shape[1]:
+            raise ValueError("source and target candidate count must match")
+        if source_widths.shape[2] != target_widths.shape[2]:
+            raise ValueError("source and target canonical grid must match")
+
+        source_result = self.forward(
+            source_selection,
+            torch.ones(
+                source_widths.shape[0],
+                dtype=torch.bool,
+                device=source_widths.device,
+            ),
+        )
+        target_result = self.forward(
+            target_selection,
+            torch.zeros(
+                target_widths.shape[0],
+                dtype=torch.bool,
+                device=target_widths.device,
+            ),
+        )
+        candidate_count = (
+            source_result.valid_candidate_sample_count
+            + target_result.valid_candidate_sample_count
+        )
+        candidate_numerator = (
+            source_result.candidate_loss
+            * source_result.valid_candidate_sample_count
+            + target_result.candidate_loss
+            * target_result.valid_candidate_sample_count
+        )
+        candidate_loss = torch.where(
+            candidate_count > 0,
+            candidate_numerator / candidate_count.clamp_min(1),
+            _graph_zero(
+                source_selection.candidate_softmin_score,
+                target_selection.candidate_softmin_score,
+            ),
+        )
+        center_loss = source_result.center_loss
+        total = (
+            self.candidate_weight * candidate_loss
+            + self.center_weight * center_loss
+        )
+        return TrendLedGeometryLossOutput(
+            total,
+            candidate_loss,
+            center_loss,
+            candidate_count,
+            source_result.source_center_count,
+        )
 
 
 @dataclass(frozen=True)
