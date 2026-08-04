@@ -103,6 +103,12 @@ class TemporalStructureFeatureOutput:
     valid: Tensor
 
 
+@dataclass(frozen=True)
+class ShapeFeatureOutput:
+    feature: Tensor
+    valid: Tensor
+
+
 class ShapeCoordinateEncoder(nn.Module):
     """Encode flattened shape coordinates with an independent two-layer MLP."""
 
@@ -161,6 +167,64 @@ class ShapeCoordinateEncoder(nn.Module):
             embedding,
             torch.zeros_like(embedding),
         )
+
+
+class ShapeFeatureEncoder(nn.Module):
+    """Encode Shape-only coordinates directly into the final shape feature."""
+
+    def __init__(
+        self,
+        num_shape_basis: int,
+        attribute_projection_dim: int,
+        output_dim: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.num_shape_basis = _positive_integer(
+            "num_shape_basis", num_shape_basis
+        )
+        self.attribute_projection_dim = _positive_integer(
+            "attribute_projection_dim", attribute_projection_dim
+        )
+        self.output_dim = _positive_integer("output_dim", output_dim)
+        self.hidden_dim = _positive_integer("hidden_dim", hidden_dim)
+        self.dropout = _dropout_probability(dropout)
+        self.network = nn.Sequential(
+            nn.Linear(
+                self.num_shape_basis * self.attribute_projection_dim,
+                self.hidden_dim,
+            ),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, self.output_dim),
+        )
+
+    def forward(
+        self,
+        shape_coordinates: Tensor,
+        valid: Tensor,
+    ) -> ShapeFeatureOutput:
+        _validate_floating_tensor(
+            "shape_coordinates",
+            shape_coordinates,
+            expected_tail=(
+                self.num_shape_basis,
+                self.attribute_projection_dim,
+            ),
+            parameter=self.network[0].weight,
+        )
+        _validate_valid_mask(
+            valid,
+            batch_size=shape_coordinates.shape[0],
+            device=shape_coordinates.device,
+        )
+        flattened = shape_coordinates.reshape(shape_coordinates.shape[0], -1)
+        feature = self.network(flattened)
+        feature = torch.where(
+            valid.unsqueeze(-1), feature, torch.zeros_like(feature)
+        )
+        return ShapeFeatureOutput(feature=feature, valid=valid)
 
 
 class PhaseCoordinateEncoder(nn.Module):

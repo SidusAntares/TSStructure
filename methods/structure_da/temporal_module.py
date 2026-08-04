@@ -11,6 +11,8 @@ from torch import Tensor, nn
 from .temporal_coordinates import (
     TemporalCoordinateOutput,
     TemporalShapePhaseCoordinates,
+    TrendStructureCoordinateOutput,
+    TrendStructureCoordinates,
 )
 from .temporal_functional import _resolve_time_mask
 from .temporal_geometry import (
@@ -18,6 +20,8 @@ from .temporal_geometry import (
     TemporalGeometryObjective,
 )
 from .temporal_head import (
+    ShapeFeatureEncoder,
+    ShapeFeatureOutput,
     TemporalStructureEncoder,
     TemporalStructureFeatureOutput,
 )
@@ -29,6 +33,7 @@ from .temporal_registration import (
     TemporalSRVFRegistration,
     _apply_srvf_group_action,
     _warp_sequence,
+    invert_monotone_warp,
 )
 from .temporal_selection import (
     TrendStructurePhaseSelectionOutput,
@@ -390,6 +395,261 @@ class TrendStructureTemporalCore(nn.Module):
                     selection.accepted_structure_registered_support,
                     selection.structure_shape_valid,
                 )
+
+
+@dataclass(frozen=True)
+class TrendStructureTaskFeatureOutput:
+    core: TrendStructureTemporalCoreOutput
+    coordinates: TrendStructureCoordinateOutput
+    shape: ShapeFeatureOutput
+
+    aligned_positions: Tensor
+    aligned_positions_valid: Tensor
+
+    aligned_structure_srvf: Tensor
+    aligned_structure_support: Tensor
+
+
+class TrendStructureTaskFeatureModule(nn.Module):
+    """Build differentiable Shape and inverse-warped time task features."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        shape_output_dim: int,
+        trend_num_basis: int = 12,
+        structure_num_basis: int = 12,
+        canonical_grid_size: int = 64,
+        roughness_grid_size: int = 256,
+        trend_smoothing_weight: float = 1e-2,
+        structure_smoothing_weight: float = 1e-3,
+        time_reference: float = 0.0,
+        time_scale: float = 366.0,
+        statistics_momentum: float = 0.99,
+        support_scale_momentum: float = 0.99,
+        template_momentum: float = 0.99,
+        min_feature_scale: float = 1e-3,
+        initial_support_scale: float = 1.0,
+        min_support_scale: float = 1e-6,
+        min_mean_support: float = 0.05,
+        min_dynamic_energy: float = 1e-4,
+        min_template_grid_weight: float = 1e-6,
+        min_template_mean_support: float = 0.05,
+        warp_hidden_dim: int = 64,
+        warp_kernel_size: int = 5,
+        warp_min_increment: float = 1e-4,
+        warp_num_candidates: int = 3,
+        selection_config: TrendStructureSelectionConfig | None = None,
+        srvf_eps: float = 1e-8,
+        derivative_norm_threshold: float = 1e-8,
+        eps: float = 1e-6,
+        num_shape_basis: int = 8,
+        num_phase_basis: int = 8,
+        attribute_projection_dim: int = 8,
+        min_basis_support: float = 1e-4,
+        shape_hidden_dim: int = 128,
+        shape_dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.core = TrendStructureTemporalCore(
+            feature_dim=feature_dim,
+            trend_num_basis=trend_num_basis,
+            structure_num_basis=structure_num_basis,
+            canonical_grid_size=canonical_grid_size,
+            roughness_grid_size=roughness_grid_size,
+            trend_smoothing_weight=trend_smoothing_weight,
+            structure_smoothing_weight=structure_smoothing_weight,
+            time_reference=time_reference,
+            time_scale=time_scale,
+            statistics_momentum=statistics_momentum,
+            support_scale_momentum=support_scale_momentum,
+            template_momentum=template_momentum,
+            min_feature_scale=min_feature_scale,
+            initial_support_scale=initial_support_scale,
+            min_support_scale=min_support_scale,
+            min_mean_support=min_mean_support,
+            min_dynamic_energy=min_dynamic_energy,
+            min_template_grid_weight=min_template_grid_weight,
+            min_template_mean_support=min_template_mean_support,
+            warp_hidden_dim=warp_hidden_dim,
+            warp_kernel_size=warp_kernel_size,
+            warp_min_increment=warp_min_increment,
+            warp_num_candidates=warp_num_candidates,
+            selection_config=selection_config,
+            srvf_eps=srvf_eps,
+            derivative_norm_threshold=derivative_norm_threshold,
+            eps=eps,
+        )
+        self.coordinates = TrendStructureCoordinates(
+            feature_dim=feature_dim,
+            canonical_grid_size=canonical_grid_size,
+            num_shape_basis=num_shape_basis,
+            num_phase_basis=num_phase_basis,
+            attribute_projection_dim=attribute_projection_dim,
+            min_basis_support=min_basis_support,
+            eps=eps,
+        )
+        self.shape_encoder = ShapeFeatureEncoder(
+            num_shape_basis=num_shape_basis,
+            attribute_projection_dim=attribute_projection_dim,
+            output_dim=shape_output_dim,
+            hidden_dim=shape_hidden_dim,
+            dropout=shape_dropout,
+        )
+        self.time_reference = float(time_reference)
+        self.time_scale = float(time_scale)
+        self.eps = float(eps)
+
+    def _rebuild_task_aligned_structure(
+        self,
+        core: TrendStructureTemporalCoreOutput,
+    ) -> tuple[Tensor, Tensor]:
+        if not isinstance(core, TrendStructureTemporalCoreOutput):
+            raise ValueError("core must be a TrendStructureTemporalCoreOutput")
+        warp = core.selection.accepted_warp.warp.detach()
+        warp_derivative = (
+            core.selection.accepted_warp.warp_derivative.detach()
+        )
+        aligned_srvf = _apply_srvf_group_action(
+            core.structure_srvf.srvf,
+            warp,
+            warp_derivative,
+            self.eps,
+        )
+        aligned_support = _warp_sequence(
+            core.structure_srvf.support_confidence.unsqueeze(-1),
+            warp,
+        ).squeeze(-1)
+        shape_valid = core.selection.structure_shape_valid
+        aligned_srvf = torch.where(
+            shape_valid[:, None, None],
+            aligned_srvf,
+            torch.zeros_like(aligned_srvf),
+        )
+        aligned_support = torch.where(
+            shape_valid[:, None],
+            aligned_support,
+            torch.zeros_like(aligned_support),
+        )
+        if not torch.isfinite(aligned_srvf).all().item() or not torch.isfinite(
+            aligned_support
+        ).all().item():
+            raise ValueError("aligned structure outputs must be finite")
+        return aligned_srvf, aligned_support
+
+    def _align_positions(
+        self,
+        positions: Tensor,
+        time_mask: Tensor,
+        core: TrendStructureTemporalCoreOutput,
+    ) -> tuple[Tensor, Tensor]:
+        if not isinstance(core, TrendStructureTemporalCoreOutput):
+            raise ValueError("core must be a TrendStructureTemporalCoreOutput")
+        batch_size = core.selection.phase_valid.shape[0]
+        if not isinstance(positions, Tensor) or not positions.is_floating_point():
+            raise ValueError("positions must be a floating-point tensor")
+        sequence_length = positions.shape[-1] if positions.ndim in (1, 2) else -1
+        resolved_positions = _resolve_pair_positions(
+            positions,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+        )
+        resolved_mask = _resolve_time_mask(
+            time_mask,
+            batch_size,
+            sequence_length,
+            resolved_positions.device,
+        )
+        valid_positions = resolved_positions[resolved_mask]
+        normalized_valid = (
+            valid_positions - self.time_reference
+        ) / self.time_scale
+        if normalized_valid.numel() and (
+            torch.any(normalized_valid < -self.eps).item()
+            or torch.any(normalized_valid > 1.0 + self.eps).item()
+        ):
+            raise ValueError("valid normalized positions must lie in [0, 1]")
+        normalized = (
+            (resolved_positions - self.time_reference) / self.time_scale
+        ).clamp(0.0, 1.0)
+        safe_u = torch.where(
+            resolved_mask, normalized, torch.zeros_like(normalized)
+        )
+        mapped_u = invert_monotone_warp(
+            core.selection.accepted_warp.warp.detach(),
+            query=safe_u,
+            eps=self.eps,
+        )
+        mapped_positions = self.time_reference + self.time_scale * mapped_u
+        aligned_positions = torch.where(
+            core.selection.phase_valid[:, None],
+            mapped_positions,
+            resolved_positions,
+        )
+        aligned_positions = torch.where(
+            resolved_mask,
+            aligned_positions,
+            torch.full_like(aligned_positions, self.time_reference),
+        ).detach()
+        aligned_positions_valid = (
+            core.selection.phase_valid & resolved_mask.any(dim=-1)
+        )
+        return aligned_positions, aligned_positions_valid
+
+    def forward(
+        self,
+        trend: Tensor,
+        structure: Tensor,
+        positions: Tensor,
+        time_mask: Tensor,
+    ) -> TrendStructureTaskFeatureOutput:
+        core = self.core(trend, structure, positions, time_mask)
+        aligned_structure_srvf, aligned_structure_support = (
+            self._rebuild_task_aligned_structure(core)
+        )
+        coordinates = self.coordinates(
+            aligned_structure_srvf=aligned_structure_srvf,
+            aligned_structure_support=aligned_structure_support,
+            interval_widths=(
+                core.selection.accepted_warp.interval_widths.detach()
+            ),
+            shape_valid=core.selection.structure_shape_valid,
+            phase_valid=core.selection.phase_valid,
+        )
+        shape = self.shape_encoder(
+            coordinates.shape_coordinates,
+            coordinates.shape_valid,
+        )
+        aligned_positions, aligned_positions_valid = self._align_positions(
+            positions, time_mask, core
+        )
+        return TrendStructureTaskFeatureOutput(
+            core=core,
+            coordinates=coordinates,
+            shape=shape,
+            aligned_positions=aligned_positions,
+            aligned_positions_valid=aligned_positions_valid,
+            aligned_structure_srvf=aligned_structure_srvf,
+            aligned_structure_support=aligned_structure_support,
+        )
+
+    def warp_parameters(self) -> Iterator[nn.Parameter]:
+        yield from self.core.warp_parameters()
+
+    def non_warp_parameters(self) -> Iterator[nn.Parameter]:
+        yield from self.core.non_warp_parameters()
+        yield from self.coordinates.parameters()
+        yield from self.shape_encoder.parameters()
+
+    @torch.no_grad()
+    def update_source_state(
+        self,
+        trend: Tensor,
+        structure: Tensor,
+        positions: Tensor,
+        time_mask: Tensor,
+    ) -> None:
+        self.core.update_source_state(trend, structure, positions, time_mask)
 
 
 def _validate_source_mask(

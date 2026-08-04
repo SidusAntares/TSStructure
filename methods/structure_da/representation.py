@@ -10,10 +10,15 @@ import torch
 from torch import Tensor, nn
 
 from models.decoder import get_decoder
-from models.ltae import ComponentAwareSharedLTAE
+from models.ltae import ComponentAwareSharedLTAE, TrendStructureSharedLTAE
 
 from .decomposition import DecompositionOutput
-from .quality_fusion import HierarchicalQualityFusion, HierarchicalQualityOutput
+from .quality_fusion import (
+    HierarchicalQualityFusion,
+    HierarchicalQualityOutput,
+    TwoScaleQualityFusion,
+    TwoScaleQualityOutput,
+)
 from .temporal_module import TemporalStructurePairOutput
 
 
@@ -48,6 +53,20 @@ class QualityAwareClassifierOutput:
     quality: HierarchicalQualityOutput
     component_valid: Tensor
     ltae_positions: Tensor
+    time_mask: Tensor
+
+
+@dataclass(frozen=True)
+class PhaseAwareTwoScaleClassifierOutput:
+    logits: Tensor
+    fused_feature: Tensor
+    trend_embedding: Tensor
+    structure_embedding: Tensor
+    shape_feature: Tensor
+    quality: TwoScaleQualityOutput
+    component_valid: Tensor
+    shape_valid: Tensor
+    aligned_positions: Tensor
     time_mask: Tensor
 
 
@@ -87,6 +106,145 @@ def _resolve_time_mask(
     ):
         raise ValueError("time_mask must contain only finite 0/1 values")
     return time_mask.to(device=device, dtype=torch.bool)
+
+
+class PhaseAwareTwoScaleClassifier(nn.Module):
+    """Classify quality-weighted T/S embeddings with an unscored Shape feature."""
+
+    def __init__(
+        self,
+        component_input_dim: int,
+        shape_dim: int,
+        num_classes: int,
+        n_head: int = 16,
+        d_k: int = 8,
+        d_model: int = 256,
+        ltae_mlp: Sequence[int] = (256, 128),
+        dropout: float = 0.2,
+        time_reference: float = 0.0,
+        time_scale: float = 366.0,
+        max_initial_frequency: float = 16.0,
+        classifier_hidden: Sequence[int] = (64, 32),
+        quality_domain_hidden_dim: int = 128,
+        quality_eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        self.component_input_dim = _positive_int(
+            "component_input_dim", component_input_dim
+        )
+        self.shape_dim = _positive_int("shape_dim", shape_dim)
+        self.num_classes = _positive_int("num_classes", num_classes, minimum=2)
+        n_head = _positive_int("n_head", n_head)
+        d_k = _positive_int("d_k", d_k)
+        d_model = _positive_int("d_model", d_model)
+        quality_domain_hidden_dim = _positive_int(
+            "quality_domain_hidden_dim", quality_domain_hidden_dim
+        )
+        if d_model % n_head != 0:
+            raise ValueError("d_model must be divisible by n_head")
+        try:
+            ltae_mlp = tuple(ltae_mlp)
+            classifier_hidden = tuple(classifier_hidden)
+        except TypeError as error:
+            raise ValueError(
+                "ltae_mlp and classifier_hidden must be sequences"
+            ) from error
+        if (
+            not ltae_mlp
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in ltae_mlp
+            )
+            or ltae_mlp[0] != d_model
+        ):
+            raise ValueError(
+                "ltae_mlp must be nonempty, positive, and start with d_model"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in classifier_hidden
+        ):
+            raise ValueError("classifier_hidden must contain positive integers")
+        try:
+            dropout = float(dropout)
+        except (TypeError, ValueError) as error:
+            raise ValueError("dropout must lie in [0, 1)") from error
+        if not math.isfinite(dropout) or not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must lie in [0, 1)")
+
+        self.component_ltae = TrendStructureSharedLTAE(
+            in_channels=self.component_input_dim,
+            n_head=n_head,
+            d_k=d_k,
+            n_neurons=ltae_mlp,
+            dropout=dropout,
+            d_model=d_model,
+            time_reference=time_reference,
+            time_scale=time_scale,
+            max_initial_frequency=max_initial_frequency,
+        )
+        self.component_dim = ltae_mlp[-1]
+        self.quality_fusion = TwoScaleQualityFusion(
+            component_dim=self.component_dim,
+            shape_dim=self.shape_dim,
+            num_classes=self.num_classes,
+            domain_hidden_dim=quality_domain_hidden_dim,
+            eps=quality_eps,
+        )
+        self.fused_dim = 2 * self.component_dim + self.shape_dim
+        self.classifier = get_decoder(
+            [self.fused_dim, *classifier_hidden], self.num_classes
+        )
+
+    def forward(
+        self,
+        trend: Tensor,
+        structure: Tensor,
+        shape_feature: Tensor,
+        aligned_positions: Tensor,
+        *,
+        time_mask: Tensor | None = None,
+        shape_valid: Tensor,
+        domain_score_weight: float = 1.0,
+    ) -> PhaseAwareTwoScaleClassifierOutput:
+        if not isinstance(trend, Tensor) or trend.ndim != 3:
+            raise ValueError("trend and structure must have shape [B, L, D]")
+        batch_size, sequence_length = trend.shape[:2]
+        resolved_mask = _resolve_time_mask(
+            time_mask, batch_size, sequence_length, trend.device
+        )
+        trend_embedding, structure_embedding = self.component_ltae(
+            trend,
+            structure,
+            aligned_positions,
+            time_mask=resolved_mask,
+        )
+        component_valid = resolved_mask.any(dim=-1)
+        quality = self.quality_fusion(
+            trend_embedding,
+            structure_embedding,
+            shape_feature,
+            component_valid,
+            shape_valid,
+            domain_score_weight,
+        )
+        logits = self.classifier(quality.fused_feature)
+        return PhaseAwareTwoScaleClassifierOutput(
+            logits=logits,
+            fused_feature=quality.fused_feature,
+            trend_embedding=trend_embedding,
+            structure_embedding=structure_embedding,
+            shape_feature=quality.shape_feature,
+            quality=quality,
+            component_valid=component_valid,
+            shape_valid=shape_valid,
+            aligned_positions=aligned_positions,
+            time_mask=resolved_mask,
+        )
 
 
 class QualityAwareComponentClassifier(nn.Module):

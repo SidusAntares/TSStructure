@@ -10,10 +10,14 @@ paper: https://arxiv.org/abs/1706.03762
 code: github.com/jadore801120/attention-is-all-you-need-pytorch
 """
 
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import numpy as np
 import copy
+import math
+from collections.abc import Sequence
 
 from models.layers import LinearLayer, get_positional_encoding
 
@@ -255,6 +259,289 @@ class ComponentAwareSharedLTAE(nn.Module):
             stacked_positions + self.max_temporal_shift
         )
         encoded, _ = self.attention_heads(encoded, time_mask=stacked_mask)
+        encoded = self.dropout(self.shared_projection(encoded))
+        chunks = encoded.split(batch_size, dim=0)
+        sample_valid = resolved_mask.any(dim=-1)
+        outputs = []
+        for name, chunk in zip(self.component_names, chunks):
+            normalized = self.output_norms[name](chunk)
+            outputs.append(
+                torch.where(
+                    sample_valid.unsqueeze(-1),
+                    normalized,
+                    torch.zeros_like(normalized),
+                )
+            )
+        return tuple(outputs)
+
+
+class ContinuousTime2Vec(nn.Module):
+    """Learn a continuous linear-plus-periodic encoding of physical time."""
+
+    def __init__(
+        self,
+        output_dim: int,
+        *,
+        time_reference: float = 0.0,
+        time_scale: float = 366.0,
+        max_initial_frequency: float = 16.0,
+    ) -> None:
+        super().__init__()
+        if isinstance(output_dim, bool) or not isinstance(output_dim, int) or output_dim < 2:
+            raise ValueError("output_dim must be an integer at least 2")
+        for name, value in (
+            ("time_reference", time_reference),
+            ("time_scale", time_scale),
+            ("max_initial_frequency", max_initial_frequency),
+        ):
+            try:
+                converted = float(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{name} must be finite") from error
+            if not math.isfinite(converted):
+                raise ValueError(f"{name} must be finite")
+            if name == "time_scale" and converted <= 0:
+                raise ValueError("time_scale must be finite and greater than zero")
+            if name == "max_initial_frequency" and converted < 1:
+                raise ValueError(
+                    "max_initial_frequency must be finite and at least 1"
+                )
+        self.output_dim = output_dim
+        self.time_reference = float(time_reference)
+        self.time_scale = float(time_scale)
+        self.max_initial_frequency = float(max_initial_frequency)
+        self.linear_weight = nn.Parameter(torch.tensor(1.0))
+        self.linear_bias = nn.Parameter(torch.tensor(0.0))
+        self.frequencies = nn.Parameter(
+            torch.linspace(1.0, self.max_initial_frequency, output_dim - 1)
+        )
+        self.phase = nn.Parameter(torch.zeros(output_dim - 1))
+
+    def _resolve_inputs(
+        self, positions: torch.Tensor, time_mask: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not isinstance(positions, torch.Tensor):
+            raise ValueError("positions must be a torch.Tensor")
+        if not positions.is_floating_point() or positions.is_complex():
+            raise ValueError("positions must be a real floating-point tensor")
+        if positions.ndim == 1:
+            sequence_length = positions.shape[0]
+            if time_mask is not None and isinstance(time_mask, torch.Tensor) and time_mask.ndim == 2:
+                batch_size = time_mask.shape[0]
+            else:
+                batch_size = 1
+            resolved_positions = positions.unsqueeze(0).expand(batch_size, -1)
+        elif positions.ndim == 2:
+            batch_size, sequence_length = positions.shape
+            resolved_positions = positions
+        else:
+            raise ValueError("positions must have shape [L] or [B, L]")
+        resolved_mask = (
+            torch.ones(
+                batch_size,
+                sequence_length,
+                dtype=torch.bool,
+                device=positions.device,
+            )
+            if time_mask is None
+            else _resolve_time_mask(
+                time_mask,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                device=positions.device,
+            )
+        )
+        if resolved_positions.device != self.linear_weight.device:
+            raise ValueError("positions device must match module parameters")
+        if resolved_positions.dtype != self.linear_weight.dtype:
+            raise ValueError("positions dtype must match module parameters")
+        valid_positions = resolved_positions[resolved_mask]
+        if not torch.isfinite(valid_positions).all().item():
+            raise ValueError("valid positions must be finite")
+        normalized = (
+            valid_positions - self.time_reference
+        ) / self.time_scale
+        tolerance = 1e-6
+        if normalized.numel() and (
+            torch.any(normalized < -tolerance).item()
+            or torch.any(normalized > 1.0 + tolerance).item()
+        ):
+            raise ValueError("valid normalized positions must lie in [0, 1]")
+        return resolved_positions, resolved_mask
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        *,
+        time_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        resolved_positions, resolved_mask = self._resolve_inputs(
+            positions, time_mask
+        )
+        safe_positions = torch.where(
+            resolved_mask, resolved_positions, torch.zeros_like(resolved_positions)
+        )
+        normalized = (
+            (safe_positions - self.time_reference) / self.time_scale
+        ).clamp(0.0, 1.0)
+        linear = self.linear_weight * normalized + self.linear_bias
+        periodic = torch.sin(
+            2.0
+            * torch.pi
+            * (
+                normalized.unsqueeze(-1) * self.frequencies
+                + self.phase
+            )
+        )
+        encoding = torch.cat([linear.unsqueeze(-1), periodic], dim=-1)
+        encoding = torch.where(
+            resolved_mask.unsqueeze(-1), encoding, torch.zeros_like(encoding)
+        )
+        if not torch.isfinite(encoding).all().item():
+            raise ValueError("time encoding must contain only finite values")
+        return encoding
+
+
+class TrendStructureSharedLTAE(nn.Module):
+    """Encode trend and structure through private stems and one shared body."""
+
+    component_names = ("trend", "structure")
+
+    def __init__(
+        self,
+        in_channels: int = 128,
+        n_head: int = 16,
+        d_k: int = 8,
+        n_neurons: Sequence[int] = (256, 128),
+        dropout: float = 0.2,
+        d_model: int = 256,
+        *,
+        time_reference: float = 0.0,
+        time_scale: float = 366.0,
+        max_initial_frequency: float = 16.0,
+    ) -> None:
+        super().__init__()
+        integer_values = {
+            "in_channels": in_channels,
+            "n_head": n_head,
+            "d_k": d_k,
+            "d_model": d_model,
+        }
+        for name, value in integer_values.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        try:
+            neurons = tuple(n_neurons)
+        except TypeError as error:
+            raise ValueError("n_neurons must be a sequence") from error
+        if (
+            not neurons
+            or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in neurons)
+            or neurons[0] != d_model
+        ):
+            raise ValueError(
+                "n_neurons must be nonempty, positive, and start with d_model"
+            )
+        try:
+            dropout = float(dropout)
+        except (TypeError, ValueError) as error:
+            raise ValueError("dropout must lie in [0, 1)") from error
+        if not math.isfinite(dropout) or not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must lie in [0, 1)")
+        if d_model % n_head != 0:
+            raise ValueError("d_model must be divisible by n_head")
+
+        self.in_channels = in_channels
+        self.d_model = d_model
+        self.n_neurons = list(neurons)
+        self.component_dim = neurons[-1]
+        self.stems = nn.ModuleDict(
+            {
+                name: nn.Sequential(
+                    nn.Linear(in_channels, d_model, bias=False),
+                    nn.LayerNorm(d_model),
+                    nn.ReLU(),
+                )
+                for name in self.component_names
+            }
+        )
+        self.time_encoder = ContinuousTime2Vec(
+            d_model,
+            time_reference=time_reference,
+            time_scale=time_scale,
+            max_initial_frequency=max_initial_frequency,
+        )
+        self.attention_heads = MultiHeadAttention(
+            n_head=n_head, d_k=d_k, d_in=d_model
+        )
+        projection_layers = []
+        for input_dim, output_dim in zip(neurons[:-1], neurons[1:]):
+            projection_layers.extend(
+                [nn.Linear(input_dim, output_dim, bias=False), nn.ReLU()]
+            )
+        self.shared_projection = nn.Sequential(*projection_layers)
+        self.dropout = nn.Dropout(dropout)
+        self.output_norms = nn.ModuleDict(
+            {
+                name: nn.LayerNorm(self.component_dim)
+                for name in self.component_names
+            }
+        )
+
+    def forward(
+        self,
+        trend: torch.Tensor,
+        structure: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        time_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not isinstance(trend, torch.Tensor) or trend.ndim != 3:
+            raise ValueError("trend and structure must have shape [B, L, in_channels]")
+        if (
+            not isinstance(structure, torch.Tensor)
+            or structure.shape != trend.shape
+            or structure.dtype != trend.dtype
+            or structure.device != trend.device
+        ):
+            raise ValueError("trend and structure must have identical shape, dtype, and device")
+        if trend.shape[-1] != self.in_channels or not trend.is_floating_point():
+            raise ValueError("trend and structure must be floating point with in_channels features")
+        reference = next(self.parameters())
+        if trend.dtype != reference.dtype or trend.device != reference.device:
+            raise ValueError("components must match module dtype and device")
+        batch_size, sequence_length = trend.shape[:2]
+        resolved_mask = (
+            torch.ones(
+                batch_size,
+                sequence_length,
+                dtype=torch.bool,
+                device=trend.device,
+            )
+            if time_mask is None
+            else _resolve_time_mask(
+                time_mask,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                device=trend.device,
+            )
+        )
+        time_encoding = self.time_encoder(
+            positions, time_mask=resolved_mask
+        )
+        if time_encoding.shape[:2] != (batch_size, sequence_length):
+            raise ValueError("positions must have shape [L] or [B, L]")
+        stemmed = []
+        for name, component in zip(self.component_names, (trend, structure)):
+            safe = torch.where(
+                resolved_mask.unsqueeze(-1), component, torch.zeros_like(component)
+            )
+            if not torch.isfinite(safe).all().item():
+                raise ValueError("valid component values must be finite")
+            stemmed.append(self.stems[name](safe) + time_encoding)
+        stacked = torch.cat(stemmed, dim=0)
+        stacked_mask = torch.cat([resolved_mask, resolved_mask], dim=0)
+        encoded, _ = self.attention_heads(stacked, time_mask=stacked_mask)
         encoded = self.dropout(self.shared_projection(encoded))
         chunks = encoded.split(batch_size, dim=0)
         sample_valid = resolved_mask.any(dim=-1)

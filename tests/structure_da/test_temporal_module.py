@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -22,6 +22,11 @@ from methods.structure_da import (
     TrendStructureTemporalCore,
     TrendStructureTemporalCoreOutput,
 )
+from methods.structure_da.temporal_module import (
+    TrendStructureTaskFeatureModule,
+    TrendStructureTaskFeatureOutput,
+)
+from methods.structure_da.temporal_registration import invert_monotone_warp
 
 
 def _extractor(
@@ -106,6 +111,31 @@ def _joint_state_counters(core: TrendStructureTemporalCore):
         int(core.trend_template.num_updates.item()),
         int(core.structure_diagnostic_template.num_updates.item()),
     )
+
+
+def _task_module(**overrides) -> TrendStructureTaskFeatureModule:
+    values = dict(
+        feature_dim=2,
+        shape_output_dim=6,
+        trend_num_basis=6,
+        structure_num_basis=6,
+        canonical_grid_size=7,
+        roughness_grid_size=64,
+        min_mean_support=0.0,
+        min_dynamic_energy=0.0,
+        min_template_mean_support=0.0,
+        warp_hidden_dim=8,
+        warp_kernel_size=3,
+        warp_num_candidates=3,
+        num_shape_basis=4,
+        num_phase_basis=3,
+        attribute_projection_dim=3,
+        shape_hidden_dim=8,
+        shape_dropout=0.0,
+    )
+    values.update(overrides)
+    torch.manual_seed(174)
+    return TrendStructureTaskFeatureModule(**values)
 
 
 def test_joint_core_forward_shapes_dtype_and_single_warp_estimator() -> None:
@@ -913,3 +943,152 @@ def test_geometry_rejects_invalid_source_mask(source_mask) -> None:
 def test_extractor_rejects_invalid_constructor_arguments(overrides, match) -> None:
     with pytest.raises(ValueError, match=match):
         _extractor(**overrides)
+
+
+def test_task_feature_module_outputs_shapes_and_calls_core_once(monkeypatch) -> None:
+    module = _task_module()
+    trend, structure, positions, mask = _joint_inputs()
+    module.update_source_state(trend, structure, positions, mask)
+    calls = 0
+    original = module.core.forward
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module.core, "forward", counted)
+    output = module(trend, structure, positions, mask)
+
+    assert isinstance(output, TrendStructureTaskFeatureOutput)
+    assert calls == 1
+    assert output.aligned_structure_srvf.shape == (2, 7, 2)
+    assert output.aligned_structure_support.shape == (2, 7)
+    assert output.coordinates.shape_coordinates_fixed.shape == (2, 4, 2)
+    assert output.coordinates.shape_coordinates.shape == (2, 4, 3)
+    assert output.shape.feature.shape == (2, 6)
+    assert output.aligned_positions.shape == (2, 6)
+    assert output.aligned_positions.dtype == positions.dtype
+    assert not hasattr(module, "phase_encoder")
+
+
+def test_task_rebuilt_structure_matches_selection_but_preserves_only_s_gradient() -> None:
+    module = _task_module()
+    trend, structure, positions, mask = _joint_inputs()
+    module.update_source_state(trend, structure, positions, mask)
+    trend = trend.clone().requires_grad_()
+    structure = structure.clone().requires_grad_()
+
+    output = module(trend, structure, positions, mask)
+
+    torch.testing.assert_close(
+        output.aligned_structure_srvf,
+        output.core.selection.accepted_structure_registered_srvf,
+    )
+    output.shape.feature.square().sum().backward()
+    assert structure.grad is not None and torch.isfinite(structure.grad).all()
+    assert structure.grad[mask].abs().sum().item() > 0
+    for parameter in module.warp_parameters():
+        assert parameter.grad is None
+
+
+def test_aligned_positions_use_continuous_inverse_warp_and_mask_reference() -> None:
+    module = _task_module(time_reference=0.0, time_scale=366.0)
+    trend, structure, positions, mask = _joint_inputs()
+    module.update_source_state(trend, structure, positions, mask)
+    core = module.core(trend, structure, positions, mask)
+    warp = torch.tensor(
+        [0.0, 0.04, 0.16, 0.42, 0.69, 0.89, 1.0]
+    ).expand(2, -1).clone()
+    widths = warp[:, 1:] - warp[:, :-1]
+    speed = widths * 6
+    derivative = torch.cat(
+        [speed[:, :1], 0.5 * (speed[:, :-1] + speed[:, 1:]), speed[:, -1:]],
+        dim=-1,
+    )
+    accepted = replace(
+        core.selection.accepted_warp,
+        interval_widths=widths,
+        interval_logits=widths.log(),
+        warp=warp,
+        warp_derivative=derivative,
+    )
+    selection = replace(
+        core.selection,
+        accepted_warp=accepted,
+        phase_valid=torch.tensor([True, True]),
+    )
+    core = replace(core, selection=selection)
+
+    aligned, valid = module._align_positions(positions, mask, core)
+
+    resolved_positions = positions.unsqueeze(0).expand(2, -1)
+    safe_u = torch.where(mask, resolved_positions / 366.0, torch.zeros_like(resolved_positions))
+    expected = 366.0 * invert_monotone_warp(warp, query=safe_u, eps=module.eps)
+    expected = torch.where(mask, expected, torch.zeros_like(expected))
+    torch.testing.assert_close(aligned, expected)
+    assert not torch.allclose(aligned[0, 1:-1], positions[1:-1])
+    assert aligned.dtype.is_floating_point
+    assert torch.all(aligned[0, 1:] >= aligned[0, :-1])
+    assert torch.all(aligned[~mask] == module.time_reference)
+    assert valid.tolist() == [True, True]
+
+
+def test_identity_and_failure_aligned_position_semantics() -> None:
+    module = _task_module()
+    trend, structure, positions, mask = _joint_inputs()
+    module.update_source_state(trend, structure, positions, mask)
+    core = module.core(trend, structure, positions, mask)
+    identity = torch.linspace(0.0, 1.0, 7).expand(2, -1)
+    widths = torch.full((2, 6), 1.0 / 6)
+    accepted = replace(
+        core.selection.accepted_warp,
+        interval_logits=torch.zeros_like(widths),
+        interval_widths=widths,
+        warp=identity,
+        warp_derivative=torch.ones_like(identity),
+    )
+    valid_core = replace(
+        core,
+        selection=replace(core.selection, accepted_warp=accepted, phase_valid=torch.ones(2, dtype=torch.bool)),
+    )
+    failed_core = replace(
+        core,
+        selection=replace(core.selection, accepted_warp=accepted, phase_valid=torch.zeros(2, dtype=torch.bool)),
+    )
+
+    valid_positions, valid = module._align_positions(positions, mask, valid_core)
+    failed_positions, failed_valid = module._align_positions(positions, mask, failed_core)
+    expected = positions.unsqueeze(0).expand(2, -1).clone()
+    expected = torch.where(mask, expected, torch.zeros_like(expected))
+
+    torch.testing.assert_close(valid_positions, expected)
+    torch.testing.assert_close(failed_positions, expected)
+    assert valid.tolist() == [True, True]
+    assert failed_valid.tolist() == [False, False]
+
+
+def test_task_parameter_partition_state_dict_and_source_update_delegation(
+    monkeypatch,
+) -> None:
+    module = _task_module()
+    warp_ids = {id(parameter) for parameter in module.warp_parameters()}
+    non_warp_ids = {id(parameter) for parameter in module.non_warp_parameters()}
+    all_ids = {id(parameter) for parameter in module.parameters()}
+    assert not warp_ids & non_warp_ids
+    assert warp_ids | non_warp_ids == all_ids
+
+    trend, structure, positions, mask = _joint_inputs()
+    calls = []
+    monkeypatch.setattr(
+        module.core,
+        "update_source_state",
+        lambda *arguments: calls.append(arguments),
+    )
+    module.update_source_state(trend, structure, positions, mask)
+    assert calls == [(trend, structure, positions, mask)]
+
+    restored = _task_module()
+    restored.load_state_dict(module.state_dict())
+    for name, value in module.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], value)

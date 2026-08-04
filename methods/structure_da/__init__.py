@@ -1,5 +1,7 @@
 """Current structure-aware domain-adaptation building blocks."""
 
+from models.ltae import ContinuousTime2Vec, TrendStructureSharedLTAE
+
 from .backbone import StructureBackbone, StructureBackboneOutput
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
 from .diagnostics import (
@@ -47,9 +49,16 @@ from .quality_fusion import (
     QualityScoreOutput,
     QualityScorer,
     StructuralQualityBundle,
+    TwoScaleQualityFusion,
+    TwoScaleQualityLossOutput,
+    TwoScaleQualityObjective,
+    TwoScaleQualityOutput,
     concatenate_hierarchical_quality_outputs,
+    concatenate_two_scale_quality_outputs,
 )
 from .representation import (
+    PhaseAwareTwoScaleClassifier,
+    PhaseAwareTwoScaleClassifierOutput,
     PairedStructureFeatures,
     QualityAwareClassifierOutput,
     QualityAwareComponentClassifier,
@@ -57,6 +66,8 @@ from .representation import (
 from .temporal_coordinates import (
     TemporalCoordinateOutput,
     TemporalShapePhaseCoordinates,
+    TrendStructureCoordinateOutput,
+    TrendStructureCoordinates,
 )
 from .temporal_functional import (
     SourceRunningStandardizer,
@@ -71,6 +82,8 @@ from .temporal_geometry import (
 )
 from .temporal_head import (
     PhaseCoordinateEncoder,
+    ShapeFeatureEncoder,
+    ShapeFeatureOutput,
     ShapeCoordinateEncoder,
     TemporalStructureEncoder,
     TemporalStructureFeatureOutput,
@@ -85,6 +98,8 @@ from .temporal_module import (
     TemporalStructurePairOutput,
     TrendStructureTemporalCore,
     TrendStructureTemporalCoreOutput,
+    TrendStructureTaskFeatureModule,
+    TrendStructureTaskFeatureOutput,
 )
 from .temporal_registration import (
     MonotoneWarpCandidatesOutput,
@@ -111,6 +126,7 @@ from .temporal_srvf import (
 __all__ = [
     "ComponentQualityBundle",
     "ContributionDiagnostics",
+    "ContinuousTime2Vec",
     "DecompositionOutput",
     "DecompositionDiagnostics",
     "DiagnosticMoments",
@@ -129,6 +145,8 @@ __all__ = [
     "MonotoneWarpEstimator",
     "MonotoneWarpOutput",
     "PairedStructureFeatures",
+    "PhaseAwareTwoScaleClassifier",
+    "PhaseAwareTwoScaleClassifierOutput",
     "PhaseCoordinateEncoder",
     "PhaseTangentOutput",
     "QualityAwareClassifierOutput",
@@ -137,6 +155,8 @@ __all__ = [
     "QualityScoreOutput",
     "QualityScorer",
     "ShapeCoordinateEncoder",
+    "ShapeFeatureEncoder",
+    "ShapeFeatureOutput",
     "SharedTemporalStructureOperator",
     "SourceRunningSRVFTemplate",
     "SourceRunningStandardizer",
@@ -169,10 +189,20 @@ __all__ = [
     "TemporalStructurePairOutput",
     "TrendStructureTemporalCore",
     "TrendStructureTemporalCoreOutput",
+    "TrendStructureCoordinateOutput",
+    "TrendStructureCoordinates",
+    "TrendStructureSharedLTAE",
+    "TrendStructureTaskFeatureModule",
+    "TrendStructureTaskFeatureOutput",
     "TrendStructurePhaseSelectionOutput",
     "TrendStructureSelectionConfig",
     "WarmStartGradientReverseLayer",
+    "TwoScaleQualityFusion",
+    "TwoScaleQualityLossOutput",
+    "TwoScaleQualityObjective",
+    "TwoScaleQualityOutput",
     "concatenate_hierarchical_quality_outputs",
+    "concatenate_two_scale_quality_outputs",
     "compute_decomposition_diagnostics",
     "compute_structure_contribution_diagnostics",
     "create_joint_structure_da_train_loaders",
