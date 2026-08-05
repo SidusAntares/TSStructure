@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import random
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,8 @@ import torch
 from torch import Tensor, nn
 
 
+SNAPSHOT_SCHEMA_VERSION = 2
+NUM_PROJECTION_COMPONENTS = 2
 _SELECTED_FIELDS = {
     "sample_index",
     "domain",
@@ -22,12 +25,27 @@ _SELECTED_FIELDS = {
     "selection_seed",
     "samples_per_class",
 }
+_PROJECTION_FIELDS = {
+    "schema_version",
+    "fitted_epoch",
+    "num_components",
+    "pse_mean",
+    "pse_components",
+    "pse_explained_variance",
+    "pse_explained_variance_ratio",
+    "shape_mean",
+    "shape_components",
+    "shape_explained_variance",
+    "shape_explained_variance_ratio",
+}
 _EPOCH_FIELDS = {
     "epoch",
-    "pse_values",
+    "projection_fitted_epoch",
+    "schema_version",
+    "pse_pc_values",
     "pse_times",
     "pse_offsets",
-    "aligned_shape",
+    "aligned_shape_pc",
     "shape_grid",
     "shape_valid",
 }
@@ -67,6 +85,29 @@ class SelectedSamples:
 
 
 @dataclass(frozen=True)
+class PCAFit:
+    mean: np.ndarray
+    components: np.ndarray
+    explained_variance: np.ndarray
+    explained_variance_ratio: np.ndarray
+
+
+@dataclass(frozen=True)
+class ProjectionBasis:
+    schema_version: int
+    fitted_epoch: int
+    num_components: int
+    pse_mean: np.ndarray
+    pse_components: np.ndarray
+    pse_explained_variance: np.ndarray
+    pse_explained_variance_ratio: np.ndarray
+    shape_mean: np.ndarray
+    shape_components: np.ndarray
+    shape_explained_variance: np.ndarray
+    shape_explained_variance_ratio: np.ndarray
+
+
+@dataclass(frozen=True)
 class SnapshotCaptureResult:
     status: str
     path: Path | None
@@ -80,8 +121,9 @@ def deterministic_class_selection(
     samples_per_class: int,
     seed: int,
 ) -> np.ndarray:
-    """Return dataset positions sampled independently and reproducibly per class."""
+    """Select uniformly spaced parcels after stable parcel-index sorting."""
 
+    del seed  # Retained in the public interface and metadata for schema stability.
     labels = np.asarray(labels)
     parcel_indices = np.asarray(parcel_indices)
     if labels.ndim != 1 or parcel_indices.shape != labels.shape:
@@ -90,32 +132,83 @@ def deterministic_class_selection(
     for label in np.unique(labels):
         positions = np.flatnonzero(labels == label)
         positions = positions[np.argsort(parcel_indices[positions], kind="stable")]
-        rng = np.random.default_rng(np.random.SeedSequence([int(seed), int(label)]))
         count = min(samples_per_class, len(positions))
-        choice = rng.choice(len(positions), size=count, replace=False)
-        selected.append(positions[np.sort(choice)])
-    return np.concatenate(selected).astype(np.int64, copy=False) if selected else np.empty(0, np.int64)
+        uniform = np.linspace(0, len(positions) - 1, num=count).round().astype(np.int64)
+        selected.append(positions[uniform])
+    return (
+        np.concatenate(selected).astype(np.int64, copy=False)
+        if selected
+        else np.empty(0, np.int64)
+    )
+
+
+def fit_deterministic_pca(
+    values: np.ndarray, num_components: int = NUM_PROJECTION_COMPONENTS
+) -> PCAFit:
+    """Fit PCA with deterministic eigenvalue ordering and component signs."""
+
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] < 2:
+        raise ValueError("PCA requires at least two feature rows")
+    if values.shape[1] < num_components:
+        raise ValueError("feature dimension is smaller than requested PCA components")
+    if not np.isfinite(values).all():
+        raise ValueError("PCA input must be finite")
+    mean = values.mean(axis=0)
+    centered = values - mean
+    covariance = centered.T @ centered / float(values.shape[0] - 1)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    order = np.argsort(eigenvalues, kind="stable")[::-1]
+    explained = np.maximum(eigenvalues[order[:num_components]], 0.0)
+    components = eigenvectors[:, order[:num_components]].T
+    for component in components:
+        pivot = int(np.argmax(np.abs(component)))
+        if component[pivot] < 0:
+            component *= -1.0
+    total = np.maximum(eigenvalues, 0.0).sum()
+    ratio = explained / total if total > 0 else np.zeros_like(explained)
+    return PCAFit(
+        mean=mean.astype(np.float32),
+        components=components.astype(np.float32),
+        explained_variance=explained.astype(np.float32),
+        explained_variance_ratio=ratio.astype(np.float32),
+    )
+
+
+def project_features(values: np.ndarray, mean: np.ndarray, components: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    if values.ndim != 2 or values.shape[1] != mean.shape[0]:
+        raise ValueError("projection input feature dimension is invalid")
+    return (values - mean) @ components.T
 
 
 def _atomic_npz(path: Path, **arrays: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("wb") as stream:
-        np.savez_compressed(stream, **arrays)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    try:
+        with temporary.open("wb") as stream:
+            np.savez_compressed(stream, **arrays)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8", newline="\n") as stream:
-        json.dump(value, stream, indent=2, ensure_ascii=False)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(value, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def load_selected_samples(path: Path) -> SelectedSamples:
@@ -140,6 +233,59 @@ def load_selected_samples(path: Path) -> SelectedSamples:
             selection_seed=int(data["selection_seed"].item()),
             samples_per_class=int(data["samples_per_class"].item()),
         )
+
+
+def load_projection_basis(path: Path) -> ProjectionBasis:
+    with np.load(path, allow_pickle=False) as data:
+        if set(data.files) != _PROJECTION_FIELDS:
+            raise ValueError("projection basis fields are invalid")
+        schema_version = int(data["schema_version"].item())
+        fitted_epoch = int(data["fitted_epoch"].item())
+        num_components = int(data["num_components"].item())
+        if (
+            schema_version != SNAPSHOT_SCHEMA_VERSION
+            or num_components != NUM_PROJECTION_COMPONENTS
+            or fitted_epoch <= 0
+        ):
+            raise ValueError("projection basis schema is unsupported")
+        arrays = {name: data[name].copy() for name in _PROJECTION_FIELDS if name not in {
+            "schema_version", "fitted_epoch", "num_components"
+        }}
+    for prefix in ("pse", "shape"):
+        mean = arrays[f"{prefix}_mean"]
+        components = arrays[f"{prefix}_components"]
+        variance = arrays[f"{prefix}_explained_variance"]
+        ratio = arrays[f"{prefix}_explained_variance_ratio"]
+        if mean.dtype != np.float32 or mean.ndim != 1:
+            raise ValueError("projection mean is invalid")
+        if components.dtype != np.float32 or components.shape != (num_components, len(mean)):
+            raise ValueError("projection components are invalid")
+        if (
+            variance.dtype != np.float32
+            or ratio.dtype != np.float32
+            or variance.shape != (num_components,)
+            or ratio.shape != (num_components,)
+        ):
+            raise ValueError("projection variance fields are invalid")
+        if not all(np.all(np.isfinite(value)) for value in (mean, components, variance, ratio)):
+            raise ValueError("projection basis values must be finite")
+        if np.any(variance < 0) or np.any(ratio < 0) or np.any(ratio > 1):
+            raise ValueError("projection variance fields are outside their valid range")
+        if float(ratio.sum()) > 1.0 + 1e-5:
+            raise ValueError("projection explained variance ratios exceed one")
+        if not np.allclose(
+            components @ components.T,
+            np.eye(num_components, dtype=np.float32),
+            rtol=1e-4,
+            atol=1e-4,
+        ):
+            raise ValueError("projection components must be orthonormal")
+    return ProjectionBasis(
+        schema_version=schema_version,
+        fitted_epoch=fitted_epoch,
+        num_components=num_components,
+        **arrays,
+    )
 
 
 def _collate_snapshot_batch(
@@ -172,7 +318,7 @@ def _collate_snapshot_batch(
 
 
 class FeatureSnapshotManager:
-    """Capture selected training parcels without mutating model or optimizer state."""
+    """Capture fixed parcels and store only fixed-basis PC1/PC2 curves."""
 
     def __init__(
         self,
@@ -203,20 +349,48 @@ class FeatureSnapshotManager:
             raise ValueError("feature snapshot directory is not configured")
         return self.config.snapshot_dir
 
+    def _manifest(self, selected: SelectedSamples) -> dict[str, Any]:
+        source_classes = getattr(self.source_dataset, "classes", None)
+        target_classes = getattr(self.target_dataset, "classes", None)
+        class_names = (
+            [str(value) for value in source_classes]
+            if (
+                source_classes is not None
+                and target_classes is not None
+                and list(source_classes) == list(target_classes)
+            )
+            else None
+        )
+        return {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "snapshot_representation": "fixed_pca_projection",
+            "projection_fitted_epoch": self.config.interval,
+            "num_projection_components": NUM_PROJECTION_COMPONENTS,
+            "pse_saved_semantics": "pixel_set_encoder_tokens_projected_to_fixed_pc1_pc2",
+            "aligned_shape_saved_semantics": "aligned_structure_srvf_projected_to_fixed_pc1_pc2",
+            "raw_feature_dimension": int(self.model.backbone.feature_dim),
+            "raw_full_features_saved": False,
+            "pse_storage": "ragged",
+            "dtype": self.config.dtype,
+            "source_domain": self.source_domain,
+            "target_domain": self.target_domain,
+            "class_ids": [int(value) for value in np.unique(selected.label)],
+            "class_names": class_names,
+            "target_label_usage": "diagnostic_snapshot_and_offline_visualization_only",
+        }
+
     def _create_selection(self) -> tuple[SelectedSamples, np.ndarray, np.ndarray]:
         source_labels = np.asarray(self.source_dataset.get_labels())
         target_labels = np.asarray(self.target_dataset.get_labels())
         source_parcels = np.asarray(self.source_dataset.get_parcel_indices())
         target_parcels = np.asarray(self.target_dataset.get_parcel_indices())
         source_positions = deterministic_class_selection(
-            source_labels,
-            source_parcels,
+            source_labels, source_parcels,
             samples_per_class=self.config.samples_per_class,
             seed=self.config.selection_seed,
         )
         target_positions = deterministic_class_selection(
-            target_labels,
-            target_parcels,
+            target_labels, target_parcels,
             samples_per_class=self.config.samples_per_class,
             seed=self.config.selection_seed,
         )
@@ -239,17 +413,7 @@ class FeatureSnapshotManager:
             selection_seed=np.asarray(selected.selection_seed, dtype=np.int64),
             samples_per_class=np.asarray(selected.samples_per_class, dtype=np.int64),
         )
-        _atomic_json(
-            self.snapshot_dir / "manifest.json",
-            {
-                "aligned_shape_semantics": "aligned_structure_srvf",
-                "dtype": self.config.dtype,
-                "pse_storage": "ragged",
-                "source_domain": self.source_domain,
-                "target_domain": self.target_domain,
-                "target_label_usage": "diagnostic sample stratification and visualization only; never used by training or checkpoint selection",
-            },
-        )
+        _atomic_json(self.snapshot_dir / "manifest.json", self._manifest(selected))
         return selected, source_positions, target_positions
 
     def _load_or_create_selection(self) -> tuple[SelectedSamples, np.ndarray, np.ndarray]:
@@ -264,34 +428,154 @@ class FeatureSnapshotManager:
             or selected.samples_per_class != self.config.samples_per_class
         ):
             raise ValueError("existing selected samples do not match snapshot configuration")
+        manifest_path = self.snapshot_dir / "manifest.json"
+        expected_manifest = self._manifest(selected)
+        if not manifest_path.exists():
+            _atomic_json(manifest_path, expected_manifest)
+        else:
+            try:
+                existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError("existing snapshot manifest is unreadable") from error
+            if existing_manifest != expected_manifest:
+                raise ValueError("existing snapshot manifest does not match selected samples")
         positions: list[np.ndarray] = []
         for domain, dataset in ((0, self.source_dataset), (1, self.target_dataset)):
             lookup = {int(parcel): index for index, parcel in enumerate(dataset.get_parcel_indices())}
             try:
-                positions.append(np.asarray([lookup[int(parcel)] for parcel in selected.sample_index[selected.domain == domain]], dtype=np.int64))
+                positions.append(np.asarray([
+                    lookup[int(parcel)] for parcel in selected.sample_index[selected.domain == domain]
+                ], dtype=np.int64))
             except KeyError as error:
                 raise ValueError("selected sample is absent from the current dataset") from error
         return selected, positions[0], positions[1]
 
-    @staticmethod
-    def _validate_epoch(path: Path, expected_epoch: int, expected_samples: int) -> None:
+    def _validate_epoch(self, path: Path, expected_epoch: int, expected_samples: int) -> None:
         with np.load(path, allow_pickle=False) as data:
             if set(data.files) != _EPOCH_FIELDS:
                 raise ValueError("snapshot fields are invalid")
             if int(data["epoch"].item()) != expected_epoch:
                 raise ValueError("snapshot epoch is invalid")
+            if int(data["schema_version"].item()) != SNAPSHOT_SCHEMA_VERSION:
+                raise ValueError("snapshot schema version is invalid")
+            if int(data["projection_fitted_epoch"].item()) != self.config.interval:
+                raise ValueError("snapshot projection fitted epoch is invalid")
             offsets = data["pse_offsets"]
-            aligned = data["aligned_shape"]
+            aligned = data["aligned_shape_pc"]
             valid = data["shape_valid"]
             grid = data["shape_grid"]
-            values = data["pse_values"]
+            values = data["pse_pc_values"]
             times = data["pse_times"]
-            if offsets.shape != (expected_samples + 1,) or offsets[0] != 0 or offsets[-1] != len(values):
+            if (
+                offsets.dtype != np.int64
+                or offsets.shape != (expected_samples + 1,)
+                or offsets[0] != 0
+                or offsets[-1] != len(values)
+                or np.any(np.diff(offsets) < 0)
+            ):
                 raise ValueError("snapshot ragged offsets are invalid")
             if len(times) != len(values) or aligned.shape[0] != expected_samples or valid.shape != (expected_samples,):
                 raise ValueError("snapshot sample dimensions are invalid")
-            if aligned.ndim != 3 or grid.shape != (aligned.shape[1],):
+            if values.ndim != 2 or values.shape[1] != NUM_PROJECTION_COMPONENTS:
+                raise ValueError("snapshot PSE projection dimensions are invalid")
+            if aligned.ndim != 3 or aligned.shape[-1] != NUM_PROJECTION_COMPONENTS or grid.shape != (aligned.shape[1],):
                 raise ValueError("snapshot aligned-shape dimensions are invalid")
+            output_dtype = np.dtype(self.config.dtype)
+            if values.dtype != output_dtype or aligned.dtype != output_dtype:
+                raise ValueError("snapshot projection dtype is invalid")
+            if times.dtype != np.float32 or grid.dtype != np.float32 or valid.dtype != np.bool_:
+                raise ValueError("snapshot metadata dtypes are invalid")
+            if not all(np.all(np.isfinite(value)) for value in (values, times, aligned, grid)):
+                raise ValueError("snapshot arrays must be finite")
+
+    def _collect_features(
+        self, source_positions: np.ndarray, target_positions: np.ndarray
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[bool], np.ndarray]:
+        values: list[np.ndarray] = []
+        times: list[np.ndarray] = []
+        aligned: list[np.ndarray] = []
+        valid: list[bool] = []
+        module_training = [(module, module.training) for module in self.model.modules()]
+        python_rng = random.getstate()
+        numpy_rng = np.random.get_state()
+        torch_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None
+        try:
+            self.model.eval()
+            with torch.inference_mode():
+                for dataset, positions in (
+                    (self.source_dataset, source_positions),
+                    (self.target_dataset, target_positions),
+                ):
+                    for start in range(0, len(positions), self.batch_size):
+                        batch_positions = positions[start:start + self.batch_size]
+                        batch = _collate_snapshot_batch(
+                            [dataset[int(position)] for position in batch_positions], self.device
+                        )
+                        details = self.model.forward_details(
+                            batch["pixels"], batch["valid_pixels"], batch["positions"], batch.get("extra")
+                        )
+                        for sample_index in range(len(batch_positions)):
+                            mask = details.backbone.time_mask[sample_index]
+                            values.append(details.backbone.tokens[sample_index, mask].float().cpu().numpy())
+                            times.append(batch["positions"][sample_index, mask].float().cpu().numpy().astype(np.float32))
+                            shape_valid = bool(details.temporal.shape.valid[sample_index].item())
+                            shape = details.temporal.aligned_structure_srvf[sample_index].float().cpu().numpy()
+                            aligned.append(shape if shape_valid else np.zeros_like(shape))
+                            valid.append(shape_valid)
+            shape_grid = self.model.temporal_features.coordinates.canonical_grid.detach().float().cpu().numpy().astype(np.float32)
+            return values, times, aligned, valid, shape_grid
+        finally:
+            for module, training in module_training:
+                module.training = training
+            random.setstate(python_rng)
+            np.random.set_state(numpy_rng)
+            torch.set_rng_state(torch_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+
+    def _fit_or_load_basis(
+        self, epoch: int, values: list[np.ndarray], aligned: list[np.ndarray], valid: list[bool]
+    ) -> ProjectionBasis:
+        basis_path = self.snapshot_dir / "projection_basis.npz"
+        if basis_path.exists():
+            basis = load_projection_basis(basis_path)
+            if basis.fitted_epoch != self.config.interval:
+                raise ValueError("projection basis fitted epoch does not match snapshot interval")
+            print(
+                f"FEATURE_PROJECTION|epoch={epoch}|components={basis.num_components}"
+                f"|status=REUSED|path={basis_path}",
+                flush=True,
+            )
+            return basis
+        if epoch != self.config.interval:
+            raise ValueError("projection basis is missing before a later snapshot epoch")
+        pse_fit = fit_deterministic_pca(np.concatenate(values, axis=0))
+        shape_rows = np.stack(aligned)[np.asarray(valid, dtype=np.bool_)]
+        if not len(shape_rows):
+            raise ValueError("PCA requires at least one valid aligned Shape sample")
+        shape_fit = fit_deterministic_pca(shape_rows.reshape(-1, shape_rows.shape[-1]))
+        _atomic_npz(
+            basis_path,
+            schema_version=np.asarray(SNAPSHOT_SCHEMA_VERSION, dtype=np.int64),
+            fitted_epoch=np.asarray(epoch, dtype=np.int64),
+            num_components=np.asarray(NUM_PROJECTION_COMPONENTS, dtype=np.int64),
+            pse_mean=pse_fit.mean,
+            pse_components=pse_fit.components,
+            pse_explained_variance=pse_fit.explained_variance,
+            pse_explained_variance_ratio=pse_fit.explained_variance_ratio,
+            shape_mean=shape_fit.mean,
+            shape_components=shape_fit.components,
+            shape_explained_variance=shape_fit.explained_variance,
+            shape_explained_variance_ratio=shape_fit.explained_variance_ratio,
+        )
+        basis = load_projection_basis(basis_path)
+        print(
+            f"FEATURE_PROJECTION|epoch={epoch}|components={basis.num_components}"
+            f"|status=FITTED|path={basis_path}",
+            flush=True,
+        )
+        return basis
 
     def capture(self, epoch: int) -> SnapshotCaptureResult:
         if not self.config.should_capture(epoch):
@@ -303,58 +587,48 @@ class FeatureSnapshotManager:
             print(f"FEATURE_SNAPSHOT|epoch={epoch}|status=EXISTS|path={epoch_path}", flush=True)
             return SnapshotCaptureResult("EXISTS", epoch_path, len(selected.sample_index))
 
-        output_dtype = np.float16 if self.config.dtype == "float16" else np.float32
-        values: list[np.ndarray] = []
-        times: list[np.ndarray] = []
-        aligned: list[np.ndarray] = []
-        valid: list[bool] = []
-        was_training = self.model.training
         try:
-            self.model.eval()
-            with torch.inference_mode():
-                for dataset, positions in (
-                    (self.source_dataset, source_positions),
-                    (self.target_dataset, target_positions),
-                ):
-                    for start in range(0, len(positions), self.batch_size):
-                        batch_positions = positions[start:start + self.batch_size]
-                        batch = _collate_snapshot_batch(
-                            [dataset[int(position)] for position in batch_positions],
-                            self.device,
-                        )
-                        details = self.model.forward_details(
-                            batch["pixels"],
-                            batch["valid_pixels"],
-                            batch["positions"],
-                            batch.get("extra"),
-                        )
-                        for sample_index in range(len(batch_positions)):
-                            mask = details.backbone.time_mask[sample_index]
-                            values.append(details.backbone.tokens[sample_index, mask].float().cpu().numpy().astype(output_dtype))
-                            times.append(batch["positions"][sample_index, mask].float().cpu().numpy().astype(np.float32))
-                            shape_valid = bool(details.temporal.shape.valid[sample_index].item())
-                            shape = details.temporal.aligned_structure_srvf[sample_index].float().cpu().numpy()
-                            aligned.append((shape if shape_valid else np.zeros_like(shape)).astype(output_dtype))
-                            valid.append(shape_valid)
+            values, times, aligned, valid, shape_grid = self._collect_features(
+                source_positions, target_positions
+            )
+            basis = self._fit_or_load_basis(epoch, values, aligned, valid)
+            pse_full = np.concatenate(values, axis=0)
+            aligned_full = np.stack(aligned)
+            pse_pc = project_features(pse_full, basis.pse_mean, basis.pse_components)
+            shape_pc = project_features(
+                aligned_full.reshape(-1, aligned_full.shape[-1]),
+                basis.shape_mean,
+                basis.shape_components,
+            ).reshape(*aligned_full.shape[:-1], basis.num_components)
+            shape_pc[~np.asarray(valid, dtype=np.bool_)] = 0
+            output_dtype = np.float16 if self.config.dtype == "float16" else np.float32
             offsets = np.concatenate(([0], np.cumsum([len(value) for value in values]))).astype(np.int64)
-            shape_grid = self.model.temporal_features.coordinates.canonical_grid.detach().float().cpu().numpy().astype(np.float32)
             _atomic_npz(
                 epoch_path,
                 epoch=np.asarray(epoch, dtype=np.int64),
-                pse_values=np.concatenate(values, axis=0),
-                pse_times=np.concatenate(times, axis=0),
+                projection_fitted_epoch=np.asarray(basis.fitted_epoch, dtype=np.int64),
+                schema_version=np.asarray(SNAPSHOT_SCHEMA_VERSION, dtype=np.int64),
+                pse_pc_values=pse_pc.astype(output_dtype),
+                pse_times=np.concatenate(times).astype(np.float32),
                 pse_offsets=offsets,
-                aligned_shape=np.stack(aligned),
+                aligned_shape_pc=shape_pc.astype(output_dtype),
                 shape_grid=shape_grid,
                 shape_valid=np.asarray(valid, dtype=np.bool_),
             )
             self._validate_epoch(epoch_path, epoch, len(selected.sample_index))
         except Exception as error:
-            print(f"FEATURE_SNAPSHOT|epoch={epoch}|status=FAILED|error={type(error).__name__}:{error}", flush=True)
+            print(
+                f"FEATURE_SNAPSHOT|epoch={epoch}|status=FAILED"
+                f"|error={type(error).__name__}:{error}",
+                flush=True,
+            )
             raise
-        finally:
-            self.model.train(was_training)
-        print(f"FEATURE_SNAPSHOT|epoch={epoch}|status=SUCCESS|samples={len(selected.sample_index)}|path={epoch_path}", flush=True)
+        print(
+            f"FEATURE_SNAPSHOT|epoch={epoch}|samples={len(selected.sample_index)}"
+            f"|pse_points={len(pse_pc)}|shape_valid={int(np.count_nonzero(valid))}"
+            f"|components={basis.num_components}|status=SUCCESS|path={epoch_path}",
+            flush=True,
+        )
         return SnapshotCaptureResult("SUCCESS", epoch_path, len(selected.sample_index))
 
 
@@ -369,9 +643,7 @@ def create_feature_snapshot_manager(
 
     snapshot_config = FeatureSnapshotConfig(
         interval=int(getattr(config, "feature_snapshot_interval", 0)),
-        samples_per_class=int(
-            getattr(config, "feature_snapshot_samples_per_class", 32)
-        ),
+        samples_per_class=int(getattr(config, "feature_snapshot_samples_per_class", 32)),
         dtype=str(getattr(config, "feature_snapshot_dtype", "float16")),
         snapshot_dir=getattr(config, "feature_snapshot_dir", None),
         selection_seed=int(getattr(config, "seed", 1)),
@@ -393,9 +665,7 @@ def create_feature_snapshot_manager(
         with_extra=False,
         closed_set=config.closed_set,
         combine_spring_and_winter=config.combine_spring_and_winter,
-        time_coordinate_mode=getattr(
-            config, "time_coordinate_mode", "canonical_day_of_year"
-        ),
+        time_coordinate_mode=getattr(config, "time_coordinate_mode", "canonical_day_of_year"),
     )
     source_dataset = PixelSetData(
         dataset_name=config.source,

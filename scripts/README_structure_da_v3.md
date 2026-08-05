@@ -80,7 +80,10 @@ merged stdout/stderr log in `logs/${RUN_GROUP}/train_logs/`. Experiment-level
 PID, exit code, and completion state are recorded in `experiment_status.tsv`.
 Snapshots at epochs 25, 50, 75, and 100 are stored under
 `logs/${RUN_GROUP}/snapshots/<task_seed>/`. Checkpoints, metrics, and TensorBoard
-events remain under `outputs/${RUN_GROUP}/<task_seed>/`.
+events remain under `outputs/${RUN_GROUP}/<task_seed>/`. Each domain contributes
+at most eight fixed parcels per class. Epoch 25 fits one source+target PCA basis
+for PSE and a separate source+target basis for aligned Shape. Later epochs reuse
+those bases and store only PC1/PC2 curves.
 
 ## Offline snapshot plots
 
@@ -89,8 +92,15 @@ Training never invokes visualization. After snapshots exist:
 ```bash
 python scripts/visualize_structure_feature_snapshots.py \
     --snapshot-dir "logs/${RUN_GROUP}/snapshots/AT1_DK1_seed1" \
-    --output-dir "analysis_output/${RUN_GROUP}/AT1_DK1_seed1"
+    --output-dir "analysis_output/${RUN_GROUP}/AT1_DK1_seed1" \
+    --display-samples-per-class 8 \
+    --separation-samples-per-class 3 \
+    --components 1 2
 ```
+
+The visualizer also reads the previous full-dimensional snapshot schema. For
+legacy snapshots it fits one joint in-memory PCA per feature family across all
+four epochs and never modifies the source NPZ files.
 
 ## Stopping safely
 

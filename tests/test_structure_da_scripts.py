@@ -24,7 +24,7 @@ PILOT4_ANALYZER = SCRIPTS / "analyze_structure_da_pilot4.py"
 FORMAL = SCRIPTS / "run_structure_da_12tasks_4gpu_3seeds.sh"
 README = SCRIPTS / "README_structure_da_v3.md"
 SHELL_SCRIPTS = [COMMON, ENV_CHECK, SMOKE, DIAGNOSTIC, PILOT4, FORMAL]
-EXPECTED_VERSION = "structure_da_v3_compact_snapshots_no_fused_alignment_v1"
+EXPECTED_VERSION = "structure_da_v3_fixed_pca_snapshots_no_fused_alignment_v2"
 OBSOLETE_FLAGS = {
     "--structure_dim",
     "--lambda_task",
@@ -248,7 +248,7 @@ def test_formal_launcher_separates_logs_outputs_and_status_files() -> None:
         'SNAPSHOT_DIRECTORY="${GROUP_SNAPSHOT_DIRECTORY}/${run_name}"',
         'RUN_OUTPUT_DIRECTORY="${GROUP_OUTPUT_DIRECTORY}/${run_name}"',
         "--feature_snapshot_interval 25",
-        "--feature_snapshot_samples_per_class 32",
+        "--feature_snapshot_samples_per_class 8",
         "--feature_snapshot_dtype float16",
     ):
         assert fragment in source

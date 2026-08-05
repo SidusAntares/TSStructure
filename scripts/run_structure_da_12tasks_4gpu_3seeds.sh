@@ -103,7 +103,7 @@ run_worker() {
                 "${source_domain}" "${target_domain}" "${seed}" "${physical_gpu}" \
                 "${RUN_OUTPUT_DIRECTORY}" "${TASK_LOG_FILE}" \
                 --feature_snapshot_interval 25 \
-                --feature_snapshot_samples_per_class 32 \
+                --feature_snapshot_samples_per_class 8 \
                 --feature_snapshot_dtype float16 \
                 --feature_snapshot_dir "${SNAPSHOT_DIRECTORY}"
         then
