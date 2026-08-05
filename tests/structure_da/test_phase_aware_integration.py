@@ -11,6 +11,7 @@ from methods.structure_da.joint_trainer import (
     joint_structure_da_train_step,
     train_joint_structure_da,
 )
+from methods.structure_da.feature_snapshots import SnapshotCaptureResult
 from methods.structure_da.phase_aware_objective import (
     PhaseAwareTaskObjective,
 )
@@ -160,6 +161,27 @@ def test_one_epoch_joint_training_saves_phase_aware_checkpoint(tmp_path) -> None
     restored.load_state_dict(checkpoint["state_dict"])
 
 
+def test_snapshot_failure_does_not_stop_validation_or_checkpoint(tmp_path) -> None:
+    model = _model()
+    config = JointStructureDATrainingConfig(
+        epochs=1, steps_per_epoch=1, lr=1e-3, weight_decay=0.0,
+        progress_bar="off", log_step=1, classes=("a", "b", "c"),
+    )
+    checkpoint_path = tmp_path / "model.pt"
+
+    class FailedSnapshotRecorder:
+        def capture(self, epoch):
+            return SnapshotCaptureResult("FAILED", None, 6, "synthetic failure")
+
+    best = train_joint_structure_da(
+        model, [_sample(3, 5)], [_sample(3, 7, labels=False)], [_sample(3, 5)],
+        config, None, torch.device("cpu"), checkpoint_path, FailedSnapshotRecorder(),
+    )
+
+    assert torch.isfinite(torch.tensor(best))
+    assert checkpoint_path.is_file()
+
+
 def test_cli_exposes_only_phase_aware_high_level_options() -> None:
     result = subprocess.run(
         [sys.executable, "train.py", "--help"],
@@ -180,6 +202,7 @@ def test_cli_exposes_only_phase_aware_high_level_options() -> None:
         "--time_reference",
         "--time_scale",
         "--time_coordinate_mode",
+        "--feature_snapshot_batch_size",
     ):
         assert option in result.stdout
     for option in (

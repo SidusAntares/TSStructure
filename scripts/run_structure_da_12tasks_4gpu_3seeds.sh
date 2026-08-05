@@ -104,20 +104,27 @@ run_worker() {
                 "${RUN_OUTPUT_DIRECTORY}" "${TASK_LOG_FILE}" \
                 --feature_snapshot_interval 25 \
                 --feature_snapshot_samples_per_class 8 \
+                --feature_snapshot_batch_size 8 \
                 --feature_snapshot_dtype float16 \
                 --feature_snapshot_dir "${SNAPSHOT_DIRECTORY}"
         then
             exit_code=0
             printf '%s\t%s\n' "${run_name}" "${exit_code}" >> "${COMPLETED_FILE}"
-            echo "TASK_DONE|run=${run_name}|gpu=${physical_gpu}|exit_code=0"
+            if [[ -f "${SNAPSHOT_DIRECTORY}/SNAPSHOT_FAILED" ]]; then
+                task_status="COMPLETED_WITH_SNAPSHOT_FAILURE"
+            else
+                task_status="COMPLETED"
+            fi
+            echo "TASK_DONE|run=${run_name}|gpu=${physical_gpu}|exit_code=0|status=${task_status}"
         else
             exit_code=$?
+            task_status="FAILED"
             printf '%s\t%s\n' "${run_name}" "${exit_code}" >> "${FAILED_FILE}"
             echo "TASK_FAILED|run=${run_name}|gpu=${physical_gpu}|exit_code=${exit_code}" >&2
         fi
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$(date --iso-8601=seconds)" "${run_name}" "${physical_gpu}" \
-            "${LAST_TRAINING_PID:-}" "$([[ "${exit_code}" -eq 0 ]] && echo COMPLETED || echo FAILED)" \
+            "${LAST_TRAINING_PID:-}" "${task_status}" \
             "${exit_code}" >> "${STATUS_FILE}"
         echo "TASK_PROGRESS|completed_or_failed=$((job_index / 4 + 1))/9|worker=${worker_id}"
         ((job_index += 4))
@@ -141,10 +148,16 @@ done
 
 completed_count="$(($(wc -l < "${COMPLETED_FILE}") - 1))"
 failed_count="$(($(wc -l < "${FAILED_FILE}") - 1))"
-echo "EXPERIMENT_SUMMARY|total=${EXPECTED_RUNS}|completed=${completed_count}|failed=${failed_count}"
+snapshot_failure_count="$(grep -c $'\tCOMPLETED_WITH_SNAPSHOT_FAILURE\t' "${STATUS_FILE}" || true)"
+echo "EXPERIMENT_SUMMARY|total=${EXPECTED_RUNS}|completed=${completed_count}|failed=${failed_count}|snapshot_failed=${snapshot_failure_count}"
 if [[ "${failed_count}" -eq 0 && "${completed_count}" -eq "${EXPECTED_RUNS}" ]]; then
-    printf '%s\tEXPERIMENT\t-\t%s\tCOMPLETED\t0\n' \
-        "$(date --iso-8601=seconds)" "$$" >> "${STATUS_FILE}"
+    if [[ "${snapshot_failure_count}" -gt 0 ]]; then
+        experiment_status="COMPLETED_WITH_SNAPSHOT_FAILURE"
+    else
+        experiment_status="COMPLETED"
+    fi
+    printf '%s\tEXPERIMENT\t-\t%s\t%s\t0\n' \
+        "$(date --iso-8601=seconds)" "$$" "${experiment_status}" >> "${STATUS_FILE}"
     exit 0
 fi
 printf '%s\tEXPERIMENT\t-\t%s\tFAILED\t1\n' \

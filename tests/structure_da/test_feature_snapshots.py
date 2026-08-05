@@ -4,6 +4,8 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 import random
+from types import SimpleNamespace
+import weakref
 
 import numpy as np
 import pytest
@@ -62,6 +64,45 @@ class TinySnapshotDataset(Dataset):
             "extra": torch.zeros(4),
             "label": torch.tensor(self.labels[index]),
         }
+
+
+class _SnapshotDetails:
+    pass
+
+
+class RecordingSnapshotModel(torch.nn.Module):
+    def __init__(self, *, oom_above_batch_size: int | None = None, error: Exception | None = None):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+        self.backbone = SimpleNamespace(feature_dim=3)
+        self.temporal_features = SimpleNamespace(
+            coordinates=SimpleNamespace(canonical_grid=torch.linspace(0, 1, 4))
+        )
+        self.oom_above_batch_size = oom_above_batch_size
+        self.error = error
+        self.batch_sizes: list[int] = []
+        self.previous_details: weakref.ReferenceType | None = None
+
+    def forward_details(self, pixels, valid_pixels, positions, extra=None):
+        if self.previous_details is not None:
+            assert self.previous_details() is None, "previous batch details were retained"
+        batch_size = int(pixels.shape[0])
+        self.batch_sizes.append(batch_size)
+        if self.error is not None:
+            raise self.error
+        if self.oom_above_batch_size is not None and batch_size > self.oom_above_batch_size:
+            raise torch.cuda.OutOfMemoryError("synthetic snapshot OOM")
+        time_mask = valid_pixels.bool().any(dim=-1)
+        tokens = pixels.mean(dim=-1)
+        aligned = tokens[:, :4].clone()
+        details = _SnapshotDetails()
+        details.backbone = SimpleNamespace(tokens=tokens, time_mask=time_mask)
+        details.temporal = SimpleNamespace(
+            shape=SimpleNamespace(valid=torch.ones(batch_size, dtype=torch.bool)),
+            aligned_structure_srvf=aligned,
+        )
+        self.previous_details = weakref.ref(details)
+        return details
 
 
 def _tiny_model() -> StructureAwareDomainAdaptationModel:
@@ -134,6 +175,51 @@ def test_class_selection_is_deterministic_unique_and_bounded() -> None:
     assert len(np.unique(first)) == len(first)
     assert np.count_nonzero(labels[first] == 0) == 3
     assert np.count_nonzero(labels[first] == 1) == 2
+
+
+def test_snapshot_manager_uses_dedicated_batch_size_not_eval_batch_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dataset as dataset_module
+
+    datasets = {
+        "source": TinySnapshotDataset([0, 1], parcel_offset=0, length=5),
+        "target": TinySnapshotDataset([0, 1], parcel_offset=10, length=5),
+    }
+
+    def fake_dataset(*, dataset_name, **kwargs):
+        return datasets[dataset_name]
+
+    monkeypatch.setattr(dataset_module, "PixelSetData", fake_dataset)
+    config = SimpleNamespace(
+        feature_snapshot_interval=25,
+        feature_snapshot_samples_per_class=1,
+        feature_snapshot_batch_size=8,
+        feature_snapshot_dtype="float16",
+        feature_snapshot_dir=tmp_path,
+        seed=1,
+        data_root=tmp_path,
+        classes=["crop_0", "crop_1"],
+        source="source",
+        target="target",
+        closed_set=True,
+        combine_spring_and_winter=False,
+        time_coordinate_mode="canonical_day_of_year",
+        eval_batch_size=128,
+        batch_size=128,
+        amp=True,
+        amp_dtype="float16",
+    )
+    splits = {"source": {"train": [0, 1]}, "target": {"train": [0, 1]}}
+
+    manager = create_feature_snapshot_manager(
+        RecordingSnapshotModel(), config, splits, device=torch.device("cpu")
+    )
+
+    assert manager is not None
+    assert manager.batch_size == 8
+    assert manager.amp_enabled
+    assert manager.amp_dtype == "float16"
 
 
 def test_snapshot_fits_fixed_projection_once_and_persists_only_pc_curves(
@@ -331,8 +417,9 @@ def test_invalid_existing_epoch_snapshot_is_rejected(tmp_path: Path) -> None:
     )
     tmp_path.mkdir(exist_ok=True)
     np.savez(tmp_path / "epoch_0025.npz", epoch=np.asarray(25))
-    with pytest.raises(ValueError, match="snapshot fields"):
-        manager.capture(25)
+    result = manager.capture(25)
+    assert result.status == "FAILED"
+    assert "snapshot fields" in (result.error or "")
 
 
 def test_existing_selection_recreates_missing_manifest(tmp_path: Path) -> None:
@@ -373,8 +460,9 @@ def test_existing_selection_rejects_incompatible_manifest(tmp_path: Path) -> Non
     manager.capture(25)
     (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="manifest"):
-        manager.capture(25)
+    result = manager.capture(25)
+    assert result.status == "FAILED"
+    assert "manifest" in (result.error or "")
 
 
 def test_projection_basis_rejects_nonfinite_statistics(tmp_path: Path) -> None:
@@ -417,5 +505,101 @@ def test_existing_epoch_rejects_nonmonotonic_offsets(tmp_path: Path) -> None:
     fields["pse_offsets"][1] = fields["pse_offsets"][2] + 1
     np.savez_compressed(epoch_path, **fields)
 
-    with pytest.raises(ValueError, match="offsets"):
-        manager.capture(25)
+    result = manager.capture(25)
+    assert result.status == "FAILED"
+    assert "offsets" in (result.error or "")
+
+
+def test_640_selected_samples_are_forwarded_in_bounded_cpu_batches(tmp_path: Path) -> None:
+    source = TinySnapshotDataset([0] * 320, parcel_offset=0, length=5)
+    target = TinySnapshotDataset([0] * 320, parcel_offset=1000, length=5)
+    model = RecordingSnapshotModel()
+    manager = FeatureSnapshotManager(
+        model, source, target,
+        FeatureSnapshotConfig(25, 320, "float16", tmp_path, 1),
+        device=torch.device("cpu"), batch_size=8,
+        source_domain="source", target_domain="target",
+    )
+
+    values, times, aligned, valid, grid = manager._collect_features(
+        np.arange(320), np.arange(320), batch_size=8
+    )
+
+    assert len(values) == len(times) == len(aligned) == len(valid) == 640
+    assert len(model.batch_sizes) == 80
+    assert max(model.batch_sizes) == 8
+    assert all(isinstance(array, np.ndarray) for array in (*values, *times, *aligned, grid))
+    assert not any(torch.is_tensor(array) for array in (*values, *times, *aligned, grid))
+
+
+def test_cuda_oom_retries_8_to_4_to_2_to_1_and_then_writes_snapshot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = TinySnapshotDataset([0] * 8, parcel_offset=0, length=5)
+    target = TinySnapshotDataset([0] * 8, parcel_offset=100, length=5)
+    model = RecordingSnapshotModel(oom_above_batch_size=1)
+    manager = FeatureSnapshotManager(
+        model, source, target,
+        FeatureSnapshotConfig(25, 8, "float16", tmp_path, 1),
+        device=torch.device("cpu"), batch_size=8,
+        source_domain="source", target_domain="target",
+    )
+    fit_devices: list[str] = []
+    original_fit = feature_snapshots.fit_deterministic_pca
+
+    def assert_cpu_fit(values: np.ndarray, num_components: int = 2):
+        assert isinstance(values, np.ndarray)
+        fit_devices.append("cpu")
+        return original_fit(values, num_components)
+
+    monkeypatch.setattr(feature_snapshots, "fit_deterministic_pca", assert_cpu_fit)
+    result = manager.capture(25)
+
+    assert result.status == "SUCCESS"
+    assert model.batch_sizes[:4] == [8, 4, 2, 1]
+    assert fit_devices == ["cpu", "cpu"]
+    assert (tmp_path / "epoch_0025.npz").is_file()
+    assert not (tmp_path / "SNAPSHOT_FAILED").exists()
+    output = capsys.readouterr().out
+    for old, new in ((8, 4), (4, 2), (2, 1)):
+        assert f"old_batch_size={old}|new_batch_size={new}|reason=CUDA_OOM" in output
+
+
+def test_exhausted_cuda_oom_records_failure_without_partial_epoch(tmp_path: Path) -> None:
+    source = TinySnapshotDataset([0] * 8, parcel_offset=0, length=5)
+    target = TinySnapshotDataset([0] * 8, parcel_offset=100, length=5)
+    model = RecordingSnapshotModel(oom_above_batch_size=0)
+    manager = FeatureSnapshotManager(
+        model, source, target,
+        FeatureSnapshotConfig(25, 8, "float16", tmp_path, 1),
+        device=torch.device("cpu"), batch_size=8,
+        source_domain="source", target_domain="target",
+    )
+
+    result = manager.capture(25)
+
+    assert result.status == "FAILED"
+    assert "OutOfMemoryError" in (result.error or "")
+    assert model.batch_sizes == [8, 4, 2, 1]
+    assert (tmp_path / "SNAPSHOT_FAILED").is_file()
+    assert not (tmp_path / "epoch_0025.npz").exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_non_oom_snapshot_error_is_not_retried(tmp_path: Path, capsys) -> None:
+    source = TinySnapshotDataset([0] * 8, parcel_offset=0, length=5)
+    target = TinySnapshotDataset([0] * 8, parcel_offset=100, length=5)
+    model = RecordingSnapshotModel(error=RuntimeError("not an OOM"))
+    manager = FeatureSnapshotManager(
+        model, source, target,
+        FeatureSnapshotConfig(25, 8, "float16", tmp_path, 1),
+        device=torch.device("cpu"), batch_size=8,
+        source_domain="source", target_domain="target",
+    )
+
+    result = manager.capture(25)
+
+    assert result.status == "FAILED"
+    assert "RuntimeError:not an OOM" in (result.error or "")
+    assert model.batch_sizes == [8]
+    assert "FEATURE_SNAPSHOT_RETRY" not in capsys.readouterr().out

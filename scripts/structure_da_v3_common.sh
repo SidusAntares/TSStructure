@@ -7,7 +7,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs}"
 LOG_ROOT="${LOG_ROOT:-${PROJECT_ROOT}/logs}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-CODE_VERSION="${CODE_VERSION:-structure_da_v3_fixed_pca_snapshots_no_fused_alignment_v2}"
+CODE_VERSION="${CODE_VERSION:-structure_da_v3_batched_snapshots_no_fused_alignment_v3}"
 OVERWRITE="${OVERWRITE:-0}"
 
 require_command() {

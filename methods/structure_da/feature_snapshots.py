@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gc
 import json
 import os
 from pathlib import Path
@@ -112,6 +113,7 @@ class SnapshotCaptureResult:
     status: str
     path: Path | None
     samples: int
+    error: str | None = None
 
 
 def deterministic_class_selection(
@@ -203,6 +205,20 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         with temporary.open("w", encoding="utf-8", newline="\n") as stream:
             json.dump(value, stream, indent=2, ensure_ascii=False)
             stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _atomic_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(value)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
@@ -331,6 +347,8 @@ class FeatureSnapshotManager:
         batch_size: int,
         source_domain: str,
         target_domain: str,
+        amp_enabled: bool = False,
+        amp_dtype: str = "float16",
     ) -> None:
         self.model = model
         self.source_dataset = source_dataset
@@ -340,8 +358,12 @@ class FeatureSnapshotManager:
         self.batch_size = int(batch_size)
         self.source_domain = source_domain
         self.target_domain = target_domain
+        self.amp_enabled = bool(amp_enabled)
+        self.amp_dtype = str(amp_dtype)
         if self.batch_size <= 0:
             raise ValueError("feature snapshot batch size must be positive")
+        if self.amp_dtype not in {"float16", "bfloat16"}:
+            raise ValueError("feature snapshot AMP dtype must be float16 or bfloat16")
 
     @property
     def snapshot_dir(self) -> Path:
@@ -489,7 +511,11 @@ class FeatureSnapshotManager:
                 raise ValueError("snapshot arrays must be finite")
 
     def _collect_features(
-        self, source_positions: np.ndarray, target_positions: np.ndarray
+        self,
+        source_positions: np.ndarray,
+        target_positions: np.ndarray,
+        *,
+        batch_size: int,
     ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[bool], np.ndarray]:
         values: list[np.ndarray] = []
         times: list[np.ndarray] = []
@@ -507,22 +533,44 @@ class FeatureSnapshotManager:
                     (self.source_dataset, source_positions),
                     (self.target_dataset, target_positions),
                 ):
-                    for start in range(0, len(positions), self.batch_size):
-                        batch_positions = positions[start:start + self.batch_size]
+                    for start in range(0, len(positions), batch_size):
+                        batch_positions = positions[start:start + batch_size]
+                        samples = [dataset[int(position)] for position in batch_positions]
                         batch = _collate_snapshot_batch(
-                            [dataset[int(position)] for position in batch_positions], self.device
+                            samples, self.device
                         )
-                        details = self.model.forward_details(
-                            batch["pixels"], batch["valid_pixels"], batch["positions"], batch.get("extra")
+                        amp_dtype = getattr(torch, self.amp_dtype)
+                        use_autocast = self.amp_enabled and (
+                            self.device.type == "cuda" or amp_dtype == torch.bfloat16
                         )
+                        with torch.autocast(
+                            device_type=self.device.type,
+                            dtype=amp_dtype,
+                            enabled=use_autocast,
+                        ):
+                            details = self.model.forward_details(
+                                batch["pixels"],
+                                batch["valid_pixels"],
+                                batch["positions"],
+                                batch.get("extra"),
+                            )
+                        batch_mask = details.backbone.time_mask.detach().cpu().numpy().astype(bool)
+                        batch_values = details.backbone.tokens.detach().float().cpu().numpy()
+                        batch_times = batch["positions"].detach().float().cpu().numpy().astype(np.float32)
+                        batch_valid = details.temporal.shape.valid.detach().cpu().numpy().astype(bool)
+                        batch_aligned = (
+                            details.temporal.aligned_structure_srvf.detach().float().cpu().numpy()
+                        )
+                        del details, batch, samples
                         for sample_index in range(len(batch_positions)):
-                            mask = details.backbone.time_mask[sample_index]
-                            values.append(details.backbone.tokens[sample_index, mask].float().cpu().numpy())
-                            times.append(batch["positions"][sample_index, mask].float().cpu().numpy().astype(np.float32))
-                            shape_valid = bool(details.temporal.shape.valid[sample_index].item())
-                            shape = details.temporal.aligned_structure_srvf[sample_index].float().cpu().numpy()
+                            mask = batch_mask[sample_index]
+                            values.append(batch_values[sample_index, mask].copy())
+                            times.append(batch_times[sample_index, mask].copy())
+                            shape_valid = bool(batch_valid[sample_index])
+                            shape = batch_aligned[sample_index].copy()
                             aligned.append(shape if shape_valid else np.zeros_like(shape))
                             valid.append(shape_valid)
+                        del batch_mask, batch_values, batch_times, batch_valid, batch_aligned
             shape_grid = self.model.temporal_features.coordinates.canonical_grid.detach().float().cpu().numpy().astype(np.float32)
             return values, times, aligned, valid, shape_grid
         finally:
@@ -533,6 +581,55 @@ class FeatureSnapshotManager:
             torch.set_rng_state(torch_rng)
             if cuda_rng is not None:
                 torch.cuda.set_rng_state_all(cuda_rng)
+
+    def _collect_features_with_oom_retry(
+        self,
+        epoch: int,
+        source_positions: np.ndarray,
+        target_positions: np.ndarray,
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[bool], np.ndarray]:
+        batch_size = self.batch_size
+        while True:
+            oom_message: str | None = None
+            try:
+                return self._collect_features(
+                    source_positions,
+                    target_positions,
+                    batch_size=batch_size,
+                )
+            except torch.cuda.OutOfMemoryError as error:
+                oom_message = str(error)
+            gc.collect()
+            torch.cuda.empty_cache()
+            if batch_size == 1:
+                raise torch.cuda.OutOfMemoryError(oom_message or "feature snapshot CUDA OOM")
+            next_batch_size = max(1, batch_size // 2)
+            print(
+                f"FEATURE_SNAPSHOT_RETRY|epoch={epoch}|old_batch_size={batch_size}"
+                f"|new_batch_size={next_batch_size}|reason=CUDA_OOM",
+                flush=True,
+            )
+            batch_size = next_batch_size
+
+    def _record_failure(self, epoch: int, error: Exception) -> None:
+        try:
+            _atomic_text(
+                self.snapshot_dir / "SNAPSHOT_FAILED",
+                json.dumps(
+                    {
+                        "epoch": int(epoch),
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    },
+                    ensure_ascii=False,
+                ) + "\n",
+            )
+        except Exception as marker_error:
+            print(
+                f"FEATURE_SNAPSHOT_FAILURE_MARKER|epoch={epoch}|status=FAILED"
+                f"|error={type(marker_error).__name__}:{marker_error}",
+                flush=True,
+            )
 
     def _fit_or_load_basis(
         self, epoch: int, values: list[np.ndarray], aligned: list[np.ndarray], valid: list[bool]
@@ -580,16 +677,20 @@ class FeatureSnapshotManager:
     def capture(self, epoch: int) -> SnapshotCaptureResult:
         if not self.config.should_capture(epoch):
             return SnapshotCaptureResult("DISABLED", None, 0)
-        selected, source_positions, target_positions = self._load_or_create_selection()
-        epoch_path = self.snapshot_dir / f"epoch_{epoch:04d}.npz"
-        if epoch_path.exists():
-            self._validate_epoch(epoch_path, epoch, len(selected.sample_index))
-            print(f"FEATURE_SNAPSHOT|epoch={epoch}|status=EXISTS|path={epoch_path}", flush=True)
-            return SnapshotCaptureResult("EXISTS", epoch_path, len(selected.sample_index))
-
+        selected: SelectedSamples | None = None
         try:
-            values, times, aligned, valid, shape_grid = self._collect_features(
-                source_positions, target_positions
+            selected, source_positions, target_positions = self._load_or_create_selection()
+            epoch_path = self.snapshot_dir / f"epoch_{epoch:04d}.npz"
+            if epoch_path.exists():
+                self._validate_epoch(epoch_path, epoch, len(selected.sample_index))
+                print(
+                    f"FEATURE_SNAPSHOT|epoch={epoch}|status=EXISTS|path={epoch_path}",
+                    flush=True,
+                )
+                return SnapshotCaptureResult("EXISTS", epoch_path, len(selected.sample_index))
+
+            values, times, aligned, valid, shape_grid = self._collect_features_with_oom_retry(
+                epoch, source_positions, target_positions
             )
             basis = self._fit_or_load_basis(epoch, values, aligned, valid)
             pse_full = np.concatenate(values, axis=0)
@@ -617,12 +718,19 @@ class FeatureSnapshotManager:
             )
             self._validate_epoch(epoch_path, epoch, len(selected.sample_index))
         except Exception as error:
+            error_text = f"{type(error).__name__}:{error}"
             print(
                 f"FEATURE_SNAPSHOT|epoch={epoch}|status=FAILED"
-                f"|error={type(error).__name__}:{error}",
+                f"|error={error_text}",
                 flush=True,
             )
-            raise
+            self._record_failure(epoch, error)
+            return SnapshotCaptureResult(
+                "FAILED",
+                None,
+                0 if selected is None else len(selected.sample_index),
+                error_text,
+            )
         print(
             f"FEATURE_SNAPSHOT|epoch={epoch}|samples={len(selected.sample_index)}"
             f"|pse_points={len(pse_pc)}|shape_valid={int(np.count_nonzero(valid))}"
@@ -652,6 +760,9 @@ def create_feature_snapshot_manager(
         return None
     if snapshot_config.snapshot_dir is None:
         raise ValueError("--feature_snapshot_dir is required when snapshots are enabled")
+    snapshot_batch_size = int(getattr(config, "feature_snapshot_batch_size", 8))
+    if snapshot_batch_size <= 0:
+        raise ValueError("--feature_snapshot_batch_size must be positive")
 
     from dataset import PixelSetData
     from torchvision.transforms import transforms
@@ -683,7 +794,9 @@ def create_feature_snapshot_manager(
         target_dataset,
         snapshot_config,
         device=device,
-        batch_size=getattr(config, "eval_batch_size", None) or config.batch_size,
+        batch_size=snapshot_batch_size,
         source_domain=config.source,
         target_domain=config.target,
+        amp_enabled=bool(getattr(config, "amp", False)),
+        amp_dtype=str(getattr(config, "amp_dtype", "float16")),
     )

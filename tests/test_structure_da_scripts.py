@@ -24,7 +24,7 @@ PILOT4_ANALYZER = SCRIPTS / "analyze_structure_da_pilot4.py"
 FORMAL = SCRIPTS / "run_structure_da_12tasks_4gpu_3seeds.sh"
 README = SCRIPTS / "README_structure_da_v3.md"
 SHELL_SCRIPTS = [COMMON, ENV_CHECK, SMOKE, DIAGNOSTIC, PILOT4, FORMAL]
-EXPECTED_VERSION = "structure_da_v3_fixed_pca_snapshots_no_fused_alignment_v2"
+EXPECTED_VERSION = "structure_da_v3_batched_snapshots_no_fused_alignment_v3"
 OBSOLETE_FLAGS = {
     "--structure_dim",
     "--lambda_task",
@@ -249,6 +249,7 @@ def test_formal_launcher_separates_logs_outputs_and_status_files() -> None:
         'RUN_OUTPUT_DIRECTORY="${GROUP_OUTPUT_DIRECTORY}/${run_name}"',
         "--feature_snapshot_interval 25",
         "--feature_snapshot_samples_per_class 8",
+        "--feature_snapshot_batch_size 8",
         "--feature_snapshot_dtype float16",
     ):
         assert fragment in source
@@ -260,6 +261,12 @@ def test_formal_launcher_separates_logs_outputs_and_status_files() -> None:
     ):
         assert legacy not in source
     assert "run_structure_da_pilot4_4gpu.sh" not in source
+
+
+def test_formal_launcher_reports_completed_with_snapshot_failure() -> None:
+    source = FORMAL.read_text(encoding="utf-8")
+    assert "SNAPSHOT_FAILED" in source
+    assert "COMPLETED_WITH_SNAPSHOT_FAILURE" in source
 
 
 def test_readme_has_standard_nohup_workflow_without_pilot_gate() -> None:

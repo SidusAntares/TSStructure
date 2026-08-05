@@ -83,7 +83,10 @@ Snapshots at epochs 25, 50, 75, and 100 are stored under
 events remain under `outputs/${RUN_GROUP}/<task_seed>/`. Each domain contributes
 at most eight fixed parcels per class. Epoch 25 fits one source+target PCA basis
 for PSE and a separate source+target basis for aligned Shape. Later epochs reuse
-those bases and store only PC1/PC2 curves.
+those bases and store only PC1/PC2 curves. Snapshot inference uses an independent
+batch size of 8 and retries CUDA OOM failures with progressively smaller batches.
+Snapshot exhaustion is recorded as `SNAPSHOT_FAILED`; training continues and the
+launcher reports `COMPLETED_WITH_SNAPSHOT_FAILURE`.
 
 ## Offline snapshot plots
 

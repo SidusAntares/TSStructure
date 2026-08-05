@@ -592,6 +592,10 @@ if __name__ == '__main__':
         '--feature_snapshot_samples_per_class', default=32, type=int,
     )
     parser.add_argument(
+        '--feature_snapshot_batch_size', default=8, type=int,
+        help='snapshot inference batch size; CUDA OOM retries halve it down to 1',
+    )
+    parser.add_argument(
         '--feature_snapshot_dtype', default='float16', choices=['float16', 'float32'],
     )
     parser.add_argument('--feature_snapshot_dir', default=None)

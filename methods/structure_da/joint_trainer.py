@@ -1451,7 +1451,13 @@ def train_joint_structure_da(
                         f"train/decomposition/{domain}/{name}", value.item(), epoch
                     )
         if feature_snapshot_manager is not None:
-            feature_snapshot_manager.capture(epoch + 1)
+            snapshot_result = feature_snapshot_manager.capture(epoch + 1)
+            if (
+                writer is not None
+                and snapshot_result is not None
+                and snapshot_result.status == "FAILED"
+            ):
+                writer.add_scalar("diagnostics/feature_snapshot_failed", 1, epoch)
         model.eval()
         best_f1, metrics = _validation_with_structure_contributions(
             best_f1,
