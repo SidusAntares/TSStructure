@@ -64,8 +64,6 @@ def _model(dtype: torch.dtype = torch.float32, **overrides):
             "min_radius_samples": 2,
             "min_common_support": 0.0,
         },
-        alignment_hidden_dim=5,
-        grl_max_iters=10,
     )
     options.update(overrides)
     return StructureAwareDomainAdaptationModel(**options).to(dtype=dtype)
@@ -269,24 +267,18 @@ def test_target_shape_teacher_is_deterministic_no_grad_and_used_for_gating() -> 
     )
 
 
-def test_alignment_uses_final_fused_feature() -> None:
+def test_model_has_no_global_fused_feature_alignment() -> None:
     model = _model()
-    source = model.forward_details(*_inputs(length=5))
-    target = model.forward_details(*_inputs(length=7))
-    captured = {}
+    assert not hasattr(model, "alignment")
+    assert not hasattr(model, "align")
+    assert not any(name.startswith("alignment.") for name, _ in model.named_parameters())
+    assert hasattr(model.representation.quality_fusion.trend_quality, "domain_classifier")
+    assert hasattr(model.representation.quality_fusion.structure_quality, "domain_classifier")
 
-    def capture(_module, args):
-        captured["source"], captured["target"] = args
 
-    handle = model.alignment.register_forward_pre_hook(capture)
-    try:
-        result = model.align(source, target)
-    finally:
-        handle.remove()
-    assert model.alignment.feature_dim == model.representation.fused_dim == 12
-    assert captured["source"] is source.representation.fused_feature
-    assert captured["target"] is target.representation.fused_feature
-    assert torch.isfinite(result.loss)
+def test_default_model_parameter_count_excludes_removed_alignment_branch() -> None:
+    model = StructureAwareDomainAdaptationModel(num_classes=10)
+    assert sum(parameter.numel() for parameter in model.parameters()) == 345_508
 
 
 def test_geometry_uses_core_only_and_detaches_backbones() -> None:

@@ -16,14 +16,26 @@ from methods.structure_da import (
     JointStructureDATrainingConfig,
     StructureAwareDomainAdaptationModel,
     TrendStructureSelectionConfig,
+    create_feature_snapshot_manager,
     create_joint_structure_da_train_loaders,
-    resolve_grl_warmup_max_iters,
     resolve_steps_per_epoch,
     train_joint_structure_da,
 )
 from utils import label_utils
 from utils.metrics import overall_classification_report
 from utils.train_utils import bool_flag
+
+
+def load_structure_da_state_dict(model, state_dict):
+    """Load current checkpoints and reject removed global-alignment weights clearly."""
+
+    legacy_keys = sorted(key for key in state_dict if key.startswith("alignment."))
+    if legacy_keys:
+        raise RuntimeError(
+            "checkpoint is incompatible: it contains the removed global fused-feature "
+            "domain alignment branch (alignment.*); retrain with the current model"
+        )
+    model.load_state_dict(state_dict)
 
 
 
@@ -73,11 +85,7 @@ def main(config):
         training_config = None
         source_loader = None
         target_loader = None
-        if config.eval:
-            actual_grl_warmup_max_iters = (
-                getattr(config, "grl_warmup_max_iters", None) or 1
-            )
-        else:
+        if not config.eval:
             source_loader, target_loader = create_joint_structure_da_train_loaders(
                 config, splits
             )
@@ -91,7 +99,6 @@ def main(config):
                 quality_weight=config.lambda_quality,
                 source_shape_weight=config.lambda_source_shape,
                 source_raw_weight=config.lambda_source_raw,
-                global_domain_weight=config.lambda_global_domain,
                 target_semantic_weight=config.lambda_target_semantic,
                 quality_classification_weight=config.lambda_quality_cls,
                 quality_domain_weight=config.lambda_quality_domain,
@@ -118,18 +125,6 @@ def main(config):
             resolved_steps_per_epoch = resolve_steps_per_epoch(
                 training_config, source_loader, target_loader
             )
-            grl_fraction = getattr(config, "grl_warmup_fraction", None)
-            grl_override = getattr(config, "grl_warmup_max_iters", None)
-            actual_grl_warmup_max_iters = resolve_grl_warmup_max_iters(
-                config.epochs,
-                resolved_steps_per_epoch,
-                fraction=grl_fraction,
-                override=grl_override,
-            )
-            displayed_fraction = (
-                0.2 if grl_fraction is None and grl_override is None
-                else grl_fraction
-            )
             eval_batch_size = config.eval_batch_size or config.batch_size
             amp_enabled = bool(
                 training_config.amp
@@ -155,8 +150,6 @@ def main(config):
                 f"|phase_identity_tolerance={config.phase_identity_tolerance}"
                 "|phase_candidate_unique_tolerance="
                 f"{config.phase_candidate_unique_tolerance}"
-                f"|grl_warmup_fraction={displayed_fraction}"
-                f"|grl_warmup_max_iters={actual_grl_warmup_max_iters}"
                 "|quality_domain_score_warmup_epochs="
                 f"{config.quality_domain_score_warmup_epochs}"
                 f"|amp={str(amp_enabled).lower()}"
@@ -166,7 +159,6 @@ def main(config):
                 f"|lambda_quality={config.lambda_quality}"
                 f"|lambda_source_shape={config.lambda_source_shape}"
                 f"|lambda_source_raw={config.lambda_source_raw}"
-                f"|lambda_global_domain={config.lambda_global_domain}"
                 f"|lambda_target_semantic={config.lambda_target_semantic}"
             )
 
@@ -246,8 +238,6 @@ def main(config):
             prototype_options=prototype_options,
             prototype_weight_options=prototype_weight_options,
             geometry_objective_options=geometry_objective_options,
-            alignment_hidden_dim=config.domain_hidden_dim,
-            grl_max_iters=actual_grl_warmup_max_iters,
         )
         
         model.to(config.device)
@@ -268,15 +258,19 @@ def main(config):
             #         continue
 
             writer = SummaryWriter(log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0)
+            feature_snapshot_manager = create_feature_snapshot_manager(
+                model, config, splits, device=device
+            )
             train_joint_structure_da(
                 model, source_loader, target_loader, source_val_loader,
                 training_config, writer, device, best_model_path,
+                feature_snapshot_manager,
             )
 
         print('Restoring best model weights for testing...')
 
         state_dict = torch.load(best_model_path, weights_only=False)['state_dict']
-        model.load_state_dict(state_dict)
+        load_structure_da_state_dict(model, state_dict)
 
         test_metrics = evaluation(
             model,
@@ -590,6 +584,17 @@ if __name__ == '__main__':
     parser.add_argument('--input_dim', default=10, type=int, help='Number of channels of input sample')
     parser.add_argument('--with_extra', default=False, type=bool_flag, help='whether to input extra geometric features to the PSE')
     parser.add_argument('--tensorboard_log_dir', default='runs')
+    parser.add_argument(
+        '--feature_snapshot_interval', default=0, type=int,
+        help='epoch interval for compact PSE/aligned-shape snapshots; 0 disables',
+    )
+    parser.add_argument(
+        '--feature_snapshot_samples_per_class', default=32, type=int,
+    )
+    parser.add_argument(
+        '--feature_snapshot_dtype', default='float16', choices=['float16', 'float32'],
+    )
+    parser.add_argument('--feature_snapshot_dir', default=None)
     parser.add_argument('--steps_per_epoch', default=None, type=int)
     parser.add_argument('--shape_dim', default=128, type=int)
     parser.add_argument('--canonical_grid_size', default=64, type=int)
@@ -599,20 +604,6 @@ if __name__ == '__main__':
     parser.add_argument('--num_phase_basis', default=8, type=int)
     parser.add_argument('--shape_attribute_dim', default=8, type=int)
     parser.add_argument('--time2vec_max_frequency', default=16.0, type=float)
-    parser.add_argument('--domain_hidden_dim', default=128, type=int)
-    grl_warmup_group = parser.add_mutually_exclusive_group()
-    grl_warmup_group.add_argument(
-        '--grl_warmup_max_iters',
-        default=None,
-        type=int,
-        help='explicit GRL warm-up step override',
-    )
-    grl_warmup_group.add_argument(
-        '--grl_warmup_fraction',
-        default=None,
-        type=float,
-        help='GRL warm-up fraction; defaults to 0.20 unless an override is used',
-    )
     parser.add_argument('--amp', default=False, type=bool_flag)
     parser.add_argument(
         '--amp_dtype',
@@ -624,7 +615,6 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_quality', default=1.0, type=float)
     parser.add_argument('--lambda_source_shape', default=1.0, type=float)
     parser.add_argument('--lambda_source_raw', default=1.0, type=float)
-    parser.add_argument('--lambda_global_domain', default=1.0, type=float)
     parser.add_argument('--lambda_target_semantic', default=1.0, type=float)
     parser.add_argument('--lambda_quality_cls', default=1.0, type=float)
     parser.add_argument('--lambda_quality_domain', default=1.0, type=float)

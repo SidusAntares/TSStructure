@@ -55,6 +55,5 @@ def test_training_diagnostic_plots_cover_new_epoch_signals(tmp_path: Path):
         "quality_beta.png",
         "structure_valid_rates.png",
         "geometry_losses.png",
-        "domain_accuracy_and_grl.png",
     ):
         assert (training / filename).is_file()

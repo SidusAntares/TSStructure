@@ -20,12 +20,10 @@ def check_smoke(
 ) -> dict[str, object]:
     run_directory = Path(run_directory)
     log_directory = run_directory if log_directory is None else Path(log_directory)
-    log_path = log_directory / "train.log"
-    stderr_path = log_directory / "stderr.log"
+    log_path = log_directory / "smoke.log"
     checkpoint = run_directory / "fold_0" / "model.pt"
     metrics = sorted((run_directory / "fold_0").glob("test_metrics_*.json"))
     text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
-    stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.is_file() else ""
     task_success = _last_float(r"task_step_success_rate=([0-9.eE+-]+)", text)
     source_update = _last_float(r"source_state_update_rate=([0-9.eE+-]+)", text)
     numeric_losses = [
@@ -35,7 +33,7 @@ def check_smoke(
             text,
         )
     ]
-    combined = text + "\n" + stderr
+    combined = text
     failures: list[str] = []
     checks = {
         "checkpoint": checkpoint.is_file(),
@@ -63,9 +61,6 @@ def check_smoke(
         "checkpoint": str(checkpoint),
         "metrics_files": [str(path) for path in metrics],
     }
-    (log_directory / "smoke_check.json").write_text(
-        json.dumps(report, indent=2), encoding="utf-8"
-    )
     return report
 
 

@@ -23,15 +23,12 @@ class EpochRecord:
     quality_component_cls: float
     quality_component_domain: float
     geometry: float
-    alignment: float
     train_accuracy: float
-    domain_accuracy: float
     alpha_T: float
     alpha_D: float
     alpha_R: float
     beta_T_temp: float
     beta_D_temp: float
-    grl: float
     lr: float
     val_loss: Optional[float] = None
     val_accuracy: Optional[float] = None
@@ -247,17 +244,12 @@ def parse_task_log(path: Path | str) -> ParsedRun:
                 quality_component_cls=_float_field(values, "q_comp_cls"),
                 quality_component_domain=_float_field(values, "q_comp_dom"),
                 geometry=_float_field(values, "geometry"),
-                alignment=_float_field(values, "alignment", "sda"),
                 train_accuracy=_float_field(values, "train_acc"),
-                domain_accuracy=_float_field(
-                    values, "domain_acc", "domain_accuracy"
-                ),
                 alpha_T=_float_field(values, "alpha_T"),
                 alpha_D=_float_field(values, "alpha_D"),
                 alpha_R=_float_field(values, "alpha_R"),
                 beta_T_temp=_float_field(values, "beta_T_temp"),
                 beta_D_temp=_float_field(values, "beta_D_temp"),
-                grl=_float_field(values, "grl"),
                 lr=_float_field(values, "lr"),
             )
             epochs.append(pending)
@@ -285,15 +277,23 @@ def parse_task_log(path: Path | str) -> ParsedRun:
     class_metrics = [metric for name in classes if (metric := _find_class_metric(lines, name))]
     confusion = _parse_confusion(lines, classes) if classes else None
     failed_line = next((line for line in lines if line.startswith("TASK_FAILED|")), None)
-    if any(line.startswith("TASK_DONE|") for line in lines):
+    run_end = next(
+        (_pipe_fields(line) for line in reversed(lines) if line.startswith("RUN_END|")),
+        None,
+    )
+    if any(line.startswith("TASK_DONE|") for line in lines) or (
+        run_end is not None and int(run_end.get("exit_code", 1)) == 0
+    ):
         status = "completed"
-    elif failed_line is not None:
+    elif failed_line is not None or run_end is not None:
         status = "failed"
     else:
         status = "incomplete"
     failure_exit_code = None
     if failed_line:
         failure_exit_code = int(_pipe_fields(failed_line).get("exit_code", 0))
+    elif run_end is not None and int(run_end.get("exit_code", 0)) != 0:
+        failure_exit_code = int(run_end["exit_code"])
 
     return ParsedRun(
         path=path, run_name=run_name, source=source, target=target, seed=seed,

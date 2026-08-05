@@ -56,7 +56,6 @@ def _objectives(config):
             quality=config.quality_weight,
             source_shape=config.source_shape_weight,
             source_raw=config.source_raw_weight,
-            global_domain=config.global_domain_weight,
             target_semantic=config.target_semantic_weight,
         )
     )
@@ -91,7 +90,6 @@ def test_training_config_has_only_phase_aware_weights_and_validates_them() -> No
         "quality_weight",
         "source_shape_weight",
         "source_raw_weight",
-        "global_domain_weight",
         "target_semantic_weight",
         "quality_classification_weight",
         "quality_domain_weight",
@@ -99,6 +97,7 @@ def test_training_config_has_only_phase_aware_weights_and_validates_them() -> No
         "time_scale",
         "time_coordinate_mode",
     } <= names
+    assert "global_domain_weight" not in names
     assert not {
         "task_weight",
         "alignment_weight",
@@ -132,6 +131,10 @@ def test_joint_step_uses_new_losses_and_different_domain_lengths() -> None:
     expected = result.losses.task.total_loss + result.losses.geometry.total_loss
     torch.testing.assert_close(result.losses.reported_total_loss, expected)
     assert all(torch.isfinite(value) for value in result.diagnostics.scalars.values())
+    assert not hasattr(result, "alignment")
+    assert not {
+        "loss_global_domain", "domain_accuracy", "grl_coefficient"
+    } & set(result.diagnostics.scalars)
     assert all(parameter.grad is None for parameter in model.geometry_parameters())
 
 

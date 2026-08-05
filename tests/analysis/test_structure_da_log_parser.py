@@ -32,18 +32,18 @@ Test result for DK1_to_FR2_seed1: accuracy=0.6000, f1=0.5000
     return f"""TASK_START|gpu=0|source=DK1|target=FR2|seed=1|run=DK1_to_FR2_seed1
 DATE_START|2026-07-27T00:00:00+08:00
 GIT_HEAD|abc123
-Namespace(source='denmark/32VNH/2017', target='france/30TXT/2017', seed=1, epochs=2, batch_size=128, lr=0.001, weight_decay=0.0001, num_pixels=64, steps_per_epoch=None, grl_warmup_max_iters=250, lambda_task=1.0, lambda_geometry=1.0, lambda_alignment=1.0, lambda_structural_cls=1.0, lambda_structural_domain=1.0, lambda_component_cls=1.0, lambda_component_domain=1.0, time_scale=366.0, tau_fast_init=0.05, tau_slow_init=0.2, tau_min=0.0001, delta_tau_min=0.0001, structure_dim=128, domain_hidden_dim=128, input_dim=10, with_extra=False)
+Namespace(source='denmark/32VNH/2017', target='france/30TXT/2017', seed=1, epochs=2, batch_size=128, lr=0.001, weight_decay=0.0001, num_pixels=64, steps_per_epoch=None, lambda_geometry=1.0, time_scale=366.0, tau_fast_init=0.05, tau_slow_init=0.2, tau_min=0.0001, delta_tau_min=0.0001, input_dim=10, with_extra=False)
 CLOSED_SET_PROTOCOL|source=denmark/32VNH/2017|target=france/30TXT/2017|num_classes={num_classes}|classes={','.join(classes)}
 CLOSED_SET_COUNTS|source_total=10|target_total=20
-TRAIN_STEP|epoch=1/2|step=1/3|total=5.1000|task=2.1000|q_total=1.0000|geometry=0.7000|alignment=1.3000|train_acc=0.6000|domain_acc=0.5000|grl=0.100|lr=1.00e-03
-TRAIN_EPOCH|epoch=1/2|steps=3|total=5.0000|task=2.0000|q_total=1.0000|q_struct_cls=0.1000|q_struct_dom=0.2000|q_comp_cls=0.3000|q_comp_dom=0.4000|geometry=0.7000|alignment=1.3000|train_acc=0.6000|domain_acc=0.5000|grl=0.100|lr=1.00e-03
+TRAIN_STEP|epoch=1/2|step=1/3|total=5.1000|task=2.1000|q_total=1.0000|geometry=0.7000|train_acc=0.6000|lr=1.00e-03
+TRAIN_EPOCH|epoch=1/2|steps=3|total=5.0000|task=2.0000|q_total=1.0000|q_struct_cls=0.1000|q_struct_dom=0.2000|q_comp_cls=0.3000|q_comp_dom=0.4000|geometry=0.7000|train_acc=0.6000|lr=1.00e-03
 STRUCTURE_EPOCH|epoch=1|tau_fast=0.0500|tau_slow=0.2000|tau_gap=0.1500|energy_T_s=0.6000|energy_D_s=0.3000|energy_R_s=0.1000|energy_T_t=0.5000|energy_D_t=0.3500|energy_R_t=0.1500|reconstruction_s=0.0000|reconstruction_t=0.0000|temporal_T_valid_s=0.9000|temporal_T_valid_t=0.8000|raw_fusion_norm_s=1.1000|raw_fusion_norm_t=1.2000|temporal_fusion_norm_s=0.9000|temporal_fusion_norm_t=1.0000
 QUALITY_EPOCH|epoch=1|alpha_T_s=0.6000|alpha_T_t=0.5000|alpha_D_s=0.3000|alpha_D_t=0.3500|alpha_R_s=0.1000|alpha_R_t=0.1500|beta_T_temporal_s=0.7000|beta_T_temporal_t=0.6500|beta_D_temporal_s=0.6000|beta_D_temporal_t=0.5500
 GEOMETRY_EPOCH|epoch=1|T_align=0.1000|T_rough=0.2000|T_unsupported=0.3000|T_center=0.4000|D_align=0.5000|D_rough=0.6000|D_unsupported=0.7000|D_center=0.8000
 Validation result: loss=0.6000, acc=0.70, f1=0.4000
 Validation F1 improved from -inf to 0.4000!
-TRAIN_STEP|epoch=2/2|step=1/3|total=4.1000|task=1.1000|q_total=1.1000|geometry=0.7000|alignment=1.2000|train_acc=0.7000|domain_acc=0.5500|grl=0.200|lr=0.00e+00
-TRAIN_EPOCH|epoch=2/2|steps=3|total=4.0000|task=1.0000|q_total=1.1000|q_struct_cls=0.1100|q_struct_dom=0.2100|q_comp_cls=0.3100|q_comp_dom=0.4100|geometry=0.7000|alignment=1.2000|train_acc=0.7000|domain_acc=0.5500|grl=0.200|lr=0.00e+00
+TRAIN_STEP|epoch=2/2|step=1/3|total=4.1000|task=1.1000|q_total=1.1000|geometry=0.7000|train_acc=0.7000|lr=0.00e+00
+TRAIN_EPOCH|epoch=2/2|steps=3|total=4.0000|task=1.0000|q_total=1.1000|q_struct_cls=0.1100|q_struct_dom=0.2100|q_comp_cls=0.3100|q_comp_dom=0.4100|geometry=0.7000|train_acc=0.7000|lr=0.00e+00
 STRUCTURE_EPOCH|epoch=2|tau_fast=0.0510|tau_slow=0.2010|tau_gap=0.1500|energy_T_s=0.5500|energy_D_s=0.3500|energy_R_s=0.1000|energy_T_t=0.4800|energy_D_t=0.3600|energy_R_t=0.1600|reconstruction_s=0.0000|reconstruction_t=0.0000|temporal_T_valid_s=0.9100|temporal_T_valid_t=0.8100|raw_fusion_norm_s=1.1100|raw_fusion_norm_t=1.2100|temporal_fusion_norm_s=0.9100|temporal_fusion_norm_t=1.0100
 QUALITY_EPOCH|epoch=2|alpha_T_s=0.5500|alpha_T_t=0.4800|alpha_D_s=0.3500|alpha_D_t=0.3600|alpha_R_s=0.1000|alpha_R_t=0.1600|beta_T_temporal_s=0.6500|beta_T_temporal_t=0.6200|beta_D_temporal_s=0.5500|beta_D_temporal_t=0.5200
 GEOMETRY_EPOCH|epoch=2|T_align=0.1100|T_rough=0.2100|T_unsupported=0.3100|T_center=0.4100|D_align=0.5100|D_rough=0.6100|D_unsupported=0.7100|D_center=0.8100
@@ -65,7 +65,7 @@ def _legacy_log(num_classes: int) -> str:
             lines.append(
                 f"TRAIN_EPOCH|epoch={epoch}/2|steps=3|total={6 - epoch:.4f}"
                 f"|cls={3 - epoch:.4f}|qdom=8.0000|qcls=10.0000"
-                f"|div=-8.0000|sda=1.3000|rho=1.000|grl=1.000"
+                f"|div=-8.0000|rho=1.000"
                 f"|lr={1e-3 if epoch == 1 else 0.0:.2e}"
             )
         else:

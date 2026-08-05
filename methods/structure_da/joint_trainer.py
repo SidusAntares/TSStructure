@@ -30,7 +30,6 @@ from .diagnostics import (
     merge_decomposition_diagnostics,
     summarize_decomposition_diagnostics,
 )
-from .eden_alignment import EDENDomainAlignmentOutput
 from .full_model import StructureAwareDomainAdaptationModel
 from .phase_aware_objective import (
     PhaseAwareTaskLossOutput,
@@ -77,32 +76,6 @@ def resolve_domain_score_weight(epoch_index: int, warmup_epochs: int) -> float:
     return min(1.0, max(0.0, epoch_index / float(warmup_epochs - 1)))
 
 
-def resolve_grl_warmup_max_iters(
-    epochs: int,
-    steps_per_epoch: int,
-    *,
-    fraction: float | None = 0.2,
-    override: int | None = None,
-) -> int:
-    """Resolve an absolute GRL warm-up while preserving an explicit override."""
-
-    _positive_int("epochs", epochs)
-    _positive_int("steps_per_epoch", steps_per_epoch)
-    if fraction is not None and override is not None:
-        raise ValueError(
-            "grl_warmup_fraction and grl_warmup_max_iters cannot both be specified"
-        )
-    if override is not None:
-        _positive_int("grl_warmup_max_iters", override)
-        return override
-    resolved_fraction = 0.2 if fraction is None else _finite_nonnegative(
-        "grl_warmup_fraction", fraction
-    )
-    if resolved_fraction > 1:
-        raise ValueError("grl_warmup_fraction must lie in [0, 1]")
-    return max(1, round(epochs * steps_per_epoch * resolved_fraction))
-
-
 @dataclass(frozen=True)
 class JointStructureDALossOutput:
     reported_total_loss: Tensor
@@ -134,7 +107,6 @@ class JointStructureDADiagnostics:
 @dataclass(frozen=True)
 class JointStructureDATrainStepOutput:
     losses: JointStructureDALossOutput
-    alignment: EDENDomainAlignmentOutput
     quality: TwoScaleQualityLossOutput
     source_batch_size: int
     target_batch_size: int
@@ -157,7 +129,6 @@ class JointStructureDATrainingConfig:
     quality_weight: float = 1.0
     source_shape_weight: float = 1.0
     source_raw_weight: float = 1.0
-    global_domain_weight: float = 1.0
     target_semantic_weight: float = 1.0
     quality_classification_weight: float = 1.0
     quality_domain_weight: float = 1.0
@@ -203,7 +174,6 @@ class JointStructureDATrainingConfig:
             "quality_weight",
             "source_shape_weight",
             "source_raw_weight",
-            "global_domain_weight",
             "target_semantic_weight",
             "quality_classification_weight",
             "quality_domain_weight",
@@ -544,7 +514,7 @@ def _check_loss_scalars(**losses: Tensor) -> None:
         raise FloatingPointError("invalid scalar loss before backward: " + ", ".join(invalid))
 
 
-def _check_bounded_training_values(model, quality, alignment) -> None:
+def _check_bounded_training_values(quality) -> None:
     for name, value in (
         ("alpha_trend", quality.alpha_trend),
         ("alpha_structure", quality.alpha_structure),
@@ -555,13 +525,6 @@ def _check_bounded_training_values(model, quality, alignment) -> None:
             or not ((detached >= 0) & (detached <= 1)).all().item()
         ):
             raise FloatingPointError(f"{name} must contain finite values in [0, 1]")
-    coefficient = alignment.coefficient.detach()
-    if (
-        coefficient.ndim != 0
-        or not torch.isfinite(coefficient).item()
-        or not model.alignment.grl.low <= coefficient.item() <= model.alignment.grl.high
-    ):
-        raise FloatingPointError("GRL coefficient lies outside its configured bounds")
 
 
 @contextmanager
@@ -733,7 +696,6 @@ def _build_diagnostics(
     target_positions,
     source_labels,
     losses,
-    alignment,
     quality,
     domain_score_weight: float,
 ) -> JointStructureDADiagnostics:
@@ -757,7 +719,6 @@ def _build_diagnostics(
         "loss_source_raw": task.source_raw_loss,
         "loss_trend_proto": prototype.trend_proto_loss,
         "loss_structure_proto": prototype.structure_proto_loss,
-        "loss_global_domain": task.global_domain_loss,
         "loss_target_semantic": task.target_semantic_loss,
         "loss_q_to_z_target": prototype.q_to_z_target_loss,
         "loss_z_pull": prototype.z_pull_loss,
@@ -770,8 +731,6 @@ def _build_diagnostics(
         "source_train_accuracy": (
             source_output.representation.logits.argmax(-1) == source_labels
         ).float().mean(),
-        "domain_accuracy": alignment.accuracy,
-        "grl_coefficient": alignment.coefficient,
         "domain_score_weight": source_output.representation.logits.new_tensor(
             domain_score_weight
         ),
@@ -902,7 +861,6 @@ def joint_structure_da_train_step(
             quality_loss = quality_objective(
                 merged_quality, class_labels, domain_labels, source_mask
             )
-            alignment = model.align(source_output, target_output)
             prototype = model.prototype_losses(
                 source_output,
                 source_labels,
@@ -914,7 +872,6 @@ def joint_structure_da_train_step(
                 source_output.representation.logits,
                 source_labels,
                 quality_loss,
-                alignment,
                 prototype,
             )
         _check_loss_scalars(
@@ -923,7 +880,6 @@ def joint_structure_da_train_step(
             quality=task_loss.quality_loss,
             source_shape=task_loss.source_shape_loss,
             source_raw=task_loss.source_raw_loss,
-            global_domain=task_loss.global_domain_loss,
             target_semantic=task_loss.target_semantic_loss,
         )
         if task_scaler is not None and task_scaler.is_enabled():
@@ -957,7 +913,7 @@ def joint_structure_da_train_step(
         task_loss,
         geometry_output.loss,
     )
-    _check_bounded_training_values(model, merged_quality, alignment)
+    _check_bounded_training_values(merged_quality)
     diagnostics = _build_diagnostics(
         model,
         source_output,
@@ -966,7 +922,6 @@ def joint_structure_da_train_step(
         target_tensors[2],
         source_labels,
         losses,
-        alignment,
         quality_loss,
         domain_score_weight,
     )
@@ -1046,7 +1001,6 @@ def joint_structure_da_train_step(
         )
     return JointStructureDATrainStepOutput(
         losses=losses,
-        alignment=alignment,
         quality=quality_loss,
         source_batch_size=source_batch_size,
         target_batch_size=target_batch_size,
@@ -1275,7 +1229,7 @@ def _write_diagnostics(writer, step: int, diagnostics: Mapping[str, Tensor]) -> 
             group = "fusion/source"
         elif name.startswith("target_"):
             group = "fusion/target"
-        elif name in ("domain_accuracy", "grl_coefficient", "domain_score_weight"):
+        elif name == "domain_score_weight":
             group = "domain"
         else:
             group = "loss"
@@ -1300,6 +1254,7 @@ def train_joint_structure_da(
     writer,
     device,
     best_model_path,
+    feature_snapshot_manager=None,
 ):
     steps_per_epoch = _resolve_steps(training_config, source_loader, target_loader)
     model.to(device)
@@ -1337,7 +1292,6 @@ def train_joint_structure_da(
             quality=training_config.quality_weight,
             source_shape=training_config.source_shape_weight,
             source_raw=training_config.source_raw_weight,
-            global_domain=training_config.global_domain_weight,
             target_semantic=training_config.target_semantic_weight,
         )
     )
@@ -1404,13 +1358,10 @@ def train_joint_structure_da(
                     f"|quality={diagnostics['loss_quality_total'].item():.4f}"
                     f"|source_shape={diagnostics['loss_source_shape'].item():.4f}"
                     f"|source_raw={diagnostics['loss_source_raw'].item():.4f}"
-                    f"|global_da={diagnostics['loss_global_domain'].item():.4f}"
                     f"|target_semantic={diagnostics['loss_target_semantic'].item():.4f}"
                     f"|teacher_rate={diagnostics['target_teacher_rate'].item():.3f}"
                     f"|phase_valid_s={diagnostics['source_phase_valid_rate'].item():.3f}"
                     f"|phase_valid_t={diagnostics['target_phase_valid_rate'].item():.3f}"
-                    f"|domain_acc={diagnostics['domain_accuracy'].item():.3f}"
-                    f"|grl={diagnostics['grl_coefficient'].item():.3f}"
                     f"|q_dom_w={domain_score_weight:.3f}|lr={lr:.2e}"
                 )
             if global_step % training_config.log_step == 0:
@@ -1422,7 +1373,6 @@ def train_joint_structure_da(
                     total=f"{diagnostics['loss_reported_total'].item():.3f}",
                     task=f"{diagnostics['loss_task_total'].item():.3f}",
                     geometry=f"{diagnostics['loss_geometry_total'].item():.3f}",
-                    grl=f"{diagnostics['grl_coefficient'].item():.3f}",
                     lr=f"{lr:.2e}",
                 )
         if progress_disabled:
@@ -1436,7 +1386,6 @@ def train_joint_structure_da(
                 f"|quality={averages['loss_quality_total']:.4f}"
                 f"|source_shape={averages['loss_source_shape']:.4f}"
                 f"|source_raw={averages['loss_source_raw']:.4f}"
-                f"|global_da={averages['loss_global_domain']:.4f}"
                 f"|target_semantic={averages['loss_target_semantic']:.4f}"
                 f"|task_step_success_rate={averages['task_step_success_rate']:.3f}"
                 f"|task_step_skip_rate={averages['task_step_skip_rate']:.3f}"
@@ -1501,6 +1450,8 @@ def train_joint_structure_da(
                     writer.add_scalar(
                         f"train/decomposition/{domain}/{name}", value.item(), epoch
                     )
+        if feature_snapshot_manager is not None:
+            feature_snapshot_manager.capture(epoch + 1)
         model.eval()
         best_f1, metrics = _validation_with_structure_contributions(
             best_f1,

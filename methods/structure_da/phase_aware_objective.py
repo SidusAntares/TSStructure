@@ -10,7 +10,6 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .eden_alignment import EDENDomainAlignmentOutput
 from .quality_fusion import TwoScaleQualityLossOutput
 from .temporal_geometry import warp_to_identity_tangent
 from .temporal_selection import TrendStructurePhaseSelectionOutput
@@ -738,7 +737,6 @@ class PhaseAwareTaskLossWeights:
     quality: float = 1.0
     source_shape: float = 1.0
     source_raw: float = 1.0
-    global_domain: float = 1.0
     target_semantic: float = 1.0
 
     def __post_init__(self) -> None:
@@ -752,7 +750,6 @@ class PhaseAwareTaskLossOutput:
     quality_loss: Tensor
     source_shape_loss: Tensor
     source_raw_loss: Tensor
-    global_domain_loss: Tensor
     target_semantic_loss: Tensor
     prototype: PrototypeAlignmentLossOutput
 
@@ -764,13 +761,13 @@ class PhaseAwareTaskObjective(nn.Module):
         if not isinstance(self.weights, PhaseAwareTaskLossWeights):
             raise ValueError("weights must be PhaseAwareTaskLossWeights")
 
-    def forward(self, source_logits: Tensor, source_labels: Tensor, quality_loss: TwoScaleQualityLossOutput, alignment: EDENDomainAlignmentOutput, prototype: PrototypeAlignmentLossOutput) -> PhaseAwareTaskLossOutput:
+    def forward(self, source_logits: Tensor, source_labels: Tensor, quality_loss: TwoScaleQualityLossOutput, prototype: PrototypeAlignmentLossOutput) -> PhaseAwareTaskLossOutput:
         if source_logits.ndim != 2 or source_labels.dtype != torch.long or source_labels.shape != (source_logits.shape[0],):
             raise ValueError("source logits/labels have invalid shape")
         classification = F.cross_entropy(source_logits, source_labels)
-        losses = (classification, quality_loss.total_loss, prototype.source_shape_loss, prototype.source_raw_loss, alignment.loss, prototype.target_semantic_loss)
+        losses = (classification, quality_loss.total_loss, prototype.source_shape_loss, prototype.source_raw_loss, prototype.target_semantic_loss)
         if any(x.ndim != 0 or not torch.isfinite(x).item() for x in losses):
             raise FloatingPointError("all task losses must be finite scalar tensors")
         w = self.weights
-        total = w.classification * classification + w.quality * losses[1] + w.source_shape * losses[2] + w.source_raw * losses[3] + w.global_domain * losses[4] + w.target_semantic * losses[5]
+        total = w.classification * classification + w.quality * losses[1] + w.source_shape * losses[2] + w.source_raw * losses[3] + w.target_semantic * losses[4]
         return PhaseAwareTaskLossOutput(total, *losses, prototype)

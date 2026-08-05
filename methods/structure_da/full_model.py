@@ -10,7 +10,6 @@ import torch
 from torch import Tensor, nn
 
 from .backbone import StructureBackbone, StructureBackboneOutput
-from .eden_alignment import EDENDomainAlignmentOutput, EDENFusedFeatureAlignment
 from .phase_aware_objective import (
     PhaseAwarePrototypeAlignment,
     PhaseAwareSemanticFeatures,
@@ -90,10 +89,6 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         prototype_options: Mapping[str, Any] | None = None,
         prototype_weight_options: Mapping[str, Any] | None = None,
         geometry_objective_options: Mapping[str, Any] | None = None,
-        alignment_hidden_dim: int = 128,
-        grl_alpha: float = 1.0,
-        grl_max_iters: int = 250,
-        grl_weight: float = 1.0,
     ) -> None:
         super().__init__()
         if isinstance(num_classes, bool) or not isinstance(num_classes, int) or num_classes < 2:
@@ -157,13 +152,6 @@ class StructureAwareDomainAdaptationModel(nn.Module):
         expected_fused_dim = 2 * self.representation.component_dim + shape_dim
         if self.representation.fused_dim != expected_fused_dim:
             raise RuntimeError("phase-aware fused dimension is inconsistent")
-        self.alignment = EDENFusedFeatureAlignment(
-            feature_dim=self.representation.fused_dim,
-            hidden_dim=alignment_hidden_dim,
-            grl_alpha=grl_alpha,
-            grl_max_iters=grl_max_iters,
-            grl_weight=grl_weight,
-        )
 
     def _parameter_partition(self) -> tuple[tuple[nn.Parameter, ...], tuple[nn.Parameter, ...]]:
         geometry = tuple(
@@ -423,17 +411,3 @@ class StructureAwareDomainAdaptationModel(nn.Module):
             pixels, valid_pixels, positions, extra, time_mask=time_mask
         )
         self.update_source_state_from_output(output, positions, source_labels)
-
-    def align(
-        self,
-        source_output: StructureAwareForwardOutput,
-        target_output: StructureAwareForwardOutput,
-    ) -> EDENDomainAlignmentOutput:
-        if not isinstance(source_output, StructureAwareForwardOutput) or not isinstance(
-            target_output, StructureAwareForwardOutput
-        ):
-            raise ValueError("source_output and target_output must be StructureAwareForwardOutput")
-        return self.alignment(
-            source_output.representation.fused_feature,
-            target_output.representation.fused_feature,
-        )

@@ -13,7 +13,7 @@ fail_check() {
 
 require_directory "${PROJECT_ROOT}" || fail_check "project_root"
 require_file "${PROJECT_ROOT}/train.py" || fail_check "train_py"
-activate_environment || fail_check "python_environment"
+require_command "${PYTHON_BIN}" || fail_check "python_environment"
 
 if [[ "${failed}" -eq 0 ]]; then
     (cd "${PROJECT_ROOT}" && "${PYTHON_BIN}" -c 'import torch, numpy, sklearn, zarr, tensorboard; import train, dataset, evaluation; print("DEPENDENCY_IMPORTS=PASS")') \

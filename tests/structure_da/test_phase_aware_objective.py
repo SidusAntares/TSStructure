@@ -7,7 +7,6 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from methods.structure_da.eden_alignment import EDENDomainAlignmentOutput
 from methods.structure_da.phase_aware_objective import (
     PhaseAwarePrototypeAlignment,
     PhaseAwareSemanticFeatures,
@@ -546,30 +545,24 @@ def _prototype_loss(**overrides) -> PrototypeAlignmentLossOutput:
     return PrototypeAlignmentLossOutput(**values)
 
 
-def test_task_objective_applies_six_weights_and_rejects_nonfinite_losses() -> None:
+def test_task_objective_applies_five_weights_and_rejects_nonfinite_losses() -> None:
     logits = torch.tensor([[2.0, 0.0], [0.0, 2.0]], requires_grad=True)
     labels = torch.tensor([0, 1])
     qloss = TwoScaleQualityLossOutput(*[torch.tensor(2.0, requires_grad=True)] * 5)
-    alignment_loss = torch.tensor(3.0, requires_grad=True)
-    alignment = EDENDomainAlignmentOutput(
-        alignment_loss, torch.zeros(2, 2), torch.zeros(2, dtype=torch.long),
-        torch.tensor(0.0), torch.tensor(0.0), 1, 1,
-    )
     prototype = _prototype_loss(
         source_shape_loss=torch.tensor(4.0, requires_grad=True),
         source_raw_loss=torch.tensor(5.0, requires_grad=True),
         target_semantic_loss=torch.tensor(6.0, requires_grad=True),
     )
-    weights = PhaseAwareTaskLossWeights(1, 2, 3, 4, 5, 6)
-    output = PhaseAwareTaskObjective(weights)(logits, labels, qloss, alignment, prototype)
-    expected = F.cross_entropy(logits, labels) + 4 + 12 + 20 + 15 + 36
+    weights = PhaseAwareTaskLossWeights(1, 2, 3, 4, 6)
+    output = PhaseAwareTaskObjective(weights)(logits, labels, qloss, prototype)
+    expected = F.cross_entropy(logits, labels) + 4 + 12 + 20 + 36
     torch.testing.assert_close(output.total_loss, expected)
     output.total_loss.backward()
     assert logits.grad is not None
     assert qloss.total_loss.grad is not None
-    assert alignment_loss.grad is not None
     assert prototype.target_semantic_loss.grad is not None
 
     bad = _prototype_loss(target_semantic_loss=torch.tensor(float("nan")))
     with pytest.raises(FloatingPointError):
-        PhaseAwareTaskObjective()(logits.detach(), labels, qloss, alignment, bad)
+        PhaseAwareTaskObjective()(logits.detach(), labels, qloss, bad)

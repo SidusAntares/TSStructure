@@ -110,7 +110,6 @@ def test_checkpoint_roundtrip_restores_state_and_eval_logits() -> None:
     assert restored.prototype_alignment.q_update_count.equal(
         model.prototype_alignment.q_update_count
     )
-    assert restored.alignment.grl.iteration.equal(model.alignment.grl.iteration)
 
 
 def test_one_epoch_joint_training_saves_phase_aware_checkpoint(tmp_path) -> None:
@@ -128,6 +127,14 @@ def test_one_epoch_joint_training_saves_phase_aware_checkpoint(tmp_path) -> None
     source_loader = [_sample(3, 5)]
     target_loader = [_sample(3, 7, labels=False)]
     val_loader = [_sample(3, 5)]
+    class SnapshotRecorder:
+        def __init__(self):
+            self.epochs = []
+
+        def capture(self, epoch):
+            self.epochs.append(epoch)
+
+    snapshots = SnapshotRecorder()
     best = train_joint_structure_da(
         model,
         source_loader,
@@ -137,7 +144,9 @@ def test_one_epoch_joint_training_saves_phase_aware_checkpoint(tmp_path) -> None
         None,
         torch.device("cpu"),
         checkpoint_path,
+        snapshots,
     )
+    assert snapshots.epochs == [1]
     assert torch.isfinite(torch.tensor(best))
     checkpoint = torch.load(checkpoint_path, weights_only=False)
     assert checkpoint["training_config"]["classification_weight"] == 1.0

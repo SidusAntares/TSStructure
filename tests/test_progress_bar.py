@@ -47,9 +47,6 @@ def _current_config(**overrides):
         num_phase_basis=8,
         shape_attribute_dim=8,
         time2vec_max_frequency=16.0,
-        domain_hidden_dim=128,
-        grl_warmup_max_iters=250,
-        grl_warmup_fraction=None,
         tensorboard_log_dir="runs",
         epochs=1,
         batch_size=2,
@@ -62,7 +59,6 @@ def _current_config(**overrides):
         lambda_quality=1.0,
         lambda_source_shape=1.0,
         lambda_source_raw=1.0,
-        lambda_global_domain=1.0,
         lambda_target_semantic=1.0,
         lambda_quality_cls=1.0,
         lambda_quality_domain=1.0,
@@ -342,11 +338,13 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         check=True,
     )
     for option in (
-        "--shape_dim", "--domain_hidden_dim", "--grl_warmup_max_iters",
+        "--shape_dim",
         "--lambda_geometry", "--lambda_cls", "--lambda_quality",
         "--candidate_init_warp_amplitude", "--phase_identity_tolerance",
         "--phase_candidate_unique_tolerance", "--quality_domain_score_warmup_epochs",
-        "--eval_batch_size", "--grl_warmup_fraction", "--amp", "--amp_dtype",
+        "--eval_batch_size", "--amp", "--amp_dtype",
+        "--feature_snapshot_interval", "--feature_snapshot_samples_per_class",
+        "--feature_snapshot_dtype", "--feature_snapshot_dir",
         "--balance-source", "--no-balance-source",
     ):
         assert option in result.stdout
@@ -359,12 +357,14 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         "--quality_" + "warmup_steps", "--grl_gamma", "--lambda_qdom",
         "--lambda_qcls", "--lambda_" + "div", "--lambda_" + "sda",
         "--quality_hidden_cap", "--quality_eta", "--sda_hidden_dim",
+        "--domain_hidden_dim", "--grl_warmup_max_iters",
+        "--grl_warmup_fraction", "--lambda_global_domain",
     ):
         assert option not in result.stdout
     assert "--num_blocks" not in result.stdout
 
 
-def test_grl_fraction_and_absolute_override_are_cli_conflicts():
+def test_removed_global_alignment_cli_arguments_are_rejected():
     result = subprocess.run(
         [
             sys.executable,
@@ -379,4 +379,4 @@ def test_grl_fraction_and_absolute_override_are_cli_conflicts():
     )
 
     assert result.returncode == 2
-    assert "not allowed with argument" in result.stderr
+    assert "unrecognized arguments" in result.stderr

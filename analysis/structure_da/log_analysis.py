@@ -61,14 +61,13 @@ def build_analysis_tables(runs: Iterable[ParsedRun]) -> dict[str, pd.DataFrame]:
                 "quality_structural_domain": epoch.quality_structural_domain,
                 "quality_component_cls": epoch.quality_component_cls,
                 "quality_component_domain": epoch.quality_component_domain,
-                "geometry": epoch.geometry, "alignment": epoch.alignment,
+                "geometry": epoch.geometry,
                 "train_accuracy": epoch.train_accuracy,
-                "domain_accuracy": epoch.domain_accuracy,
                 "alpha_T": epoch.alpha_T, "alpha_D": epoch.alpha_D,
                 "alpha_R": epoch.alpha_R,
                 "beta_T_temp": epoch.beta_T_temp,
                 "beta_D_temp": epoch.beta_D_temp,
-                "grl": epoch.grl, "lr": epoch.lr, "val_loss": epoch.val_loss,
+                "lr": epoch.lr, "val_loss": epoch.val_loss,
                 "val_accuracy": epoch.val_accuracy, "val_macro_f1": epoch.val_macro_f1,
             })
         if run.status == "completed" and run.target_macro_f1 is not None:
@@ -93,7 +92,7 @@ def build_analysis_tables(runs: Iterable[ParsedRun]) -> dict[str, pd.DataFrame]:
                         getattr(epoch, name) for epoch in run.epochs
                     ])
                     for name in (
-                        "task", "quality", "geometry", "alignment",
+                        "task", "quality", "geometry",
                     )
                 }
                 loss_row = {"run_name": run.run_name}

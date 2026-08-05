@@ -67,8 +67,6 @@ def _model(device: torch.device) -> StructureAwareDomainAdaptationModel:
             "min_radius_samples": 2,
             "min_common_support": 0.0,
         },
-        alignment_hidden_dim=5,
-        grl_max_iters=10,
     )
     return model.to(device=device).train()
 
@@ -148,7 +146,6 @@ def _run(
             quality=config.quality_weight,
             source_shape=config.source_shape_weight,
             source_raw=config.source_raw_weight,
-            global_domain=config.global_domain_weight,
             target_semantic=config.target_semantic_weight,
         )
     )

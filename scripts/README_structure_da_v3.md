@@ -1,124 +1,99 @@
 # TSStructure V3 offline server workflow
 
-The server uses local code, its existing Python environment, and the dataset
-path already configured as the `train.py` default. No data-path environment
-variable is required. `DATA_ROOT` is only an optional explicit override.
-These scripts perform no source-control operation, network access, download,
-or package installation.
+The server uses the already active Python environment, local code, and the
+dataset path configured by `train.py`. The scripts do not activate Conda, use
+Git, access a network, download files, or install packages. `DATA_ROOT`,
+`PYTHON_BIN`, `OUTPUT_ROOT`, and `LOG_ROOT` remain optional overrides.
 
-## 1. Environment check
-
-From the repository root:
+## Environment check
 
 ```bash
 bash scripts/check_server_env.sh
 ```
 
-## 2. Smoke run
+## Smoke run
 
-The smoke is fixed to AT1 → DK1, seed 1, GPU 0, one epoch and two steps. It
-checks execution and artifacts; its metrics are not a DA performance result.
+The smoke is fixed to AT1 -> DK1, seed 1, GPU 0, one epoch and two steps.
+Feature snapshots are explicitly disabled. It verifies a complete training
+step, validation, checkpoint restoration, final evaluation, and the disabled
+snapshot path.
 
 ```bash
-cd /path/to/TSStructure
+cd /data/user/TSStructure
 
-mkdir -p logs/smoke_structure_da_v3
+mkdir -p \
+    logs/smoke_structure_da_v3/train_logs \
+    logs/smoke_structure_da_v3/snapshots
 
 nohup bash scripts/smoke_structure_da_v3.sh \
-    > logs/smoke_structure_da_v3/nohup.log \
+    > logs/smoke_structure_da_v3/train_logs/nohup.log \
     2>&1 < /dev/null &
 
-echo $! > logs/smoke_structure_da_v3/launcher.pid
+echo $! > logs/smoke_structure_da_v3/train_logs/launcher.pid
 ```
 
-View the launcher log:
+Monitor it with:
 
 ```bash
-tail -f logs/smoke_structure_da_v3/nohup.log
+tail -f logs/smoke_structure_da_v3/train_logs/nohup.log
+tail -f logs/smoke_structure_da_v3/train_logs/smoke.log
 ```
 
-View the detailed training log:
+Training artifacts stay in `outputs/smoke_structure_da_v3/`. The smoke log is
+the only per-task log and ends with `SMOKE_RESULT|status=SUCCESS` or
+`SMOKE_RESULT|status=FAILED`.
+
+## Formal 12-task x 3-seed experiment
+
+Run this only after reviewing a successful smoke:
 
 ```bash
-tail -f logs/smoke_structure_da_v3/train.log
-```
-
-Smoke results are written to `outputs/smoke_structure_da_v3/`; text logs,
-the command, environment record, PID and smoke status are written to
-`logs/smoke_structure_da_v3/`.
-
-## 3. Formal 12-task × 3-seed experiment
-
-After the smoke succeeds, the standard next step is the complete 36-run
-experiment. No diagnostic or four-task pilot is a prerequisite.
-
-```bash
-cd /path/to/TSStructure
+cd /data/user/TSStructure
 
 RUN_GROUP="structure_da_v3_12tasks_3seeds_$(date +%Y%m%d_%H%M%S)"
 
-mkdir -p "logs/${RUN_GROUP}"
+mkdir -p \
+    "logs/${RUN_GROUP}/train_logs" \
+    "logs/${RUN_GROUP}/snapshots"
 
 nohup env \
     RUN_GROUP="${RUN_GROUP}" \
     GPU0=0 GPU1=1 GPU2=2 GPU3=3 \
     bash scripts/run_structure_da_12tasks_4gpu_3seeds.sh \
-    > "logs/${RUN_GROUP}/nohup.log" \
+    > "logs/${RUN_GROUP}/train_logs/nohup.log" \
     2>&1 < /dev/null &
 
-echo $! > "logs/${RUN_GROUP}/launcher.pid"
-
-echo "RUN_GROUP=${RUN_GROUP}"
-echo "PID=$(cat "logs/${RUN_GROUP}/launcher.pid")"
+echo $! > "logs/${RUN_GROUP}/train_logs/launcher.pid"
+echo "${RUN_GROUP}"
 ```
 
-View overall scheduling:
+Monitor scheduling, one task, and GPUs:
 
 ```bash
-tail -f "logs/${RUN_GROUP}/nohup.log"
-```
-
-View one detailed task log:
-
-```bash
-tail -f "logs/${RUN_GROUP}/AT1_DK1_seed1/train.log"
-```
-
-View GPU use:
-
-```bash
+tail -f "logs/${RUN_GROUP}/train_logs/nohup.log"
+tail -f "logs/${RUN_GROUP}/train_logs/AT1_DK1_seed1.log"
 watch -n 5 nvidia-smi
 ```
 
-Training artifacts are stored under `outputs/${RUN_GROUP}/<task_seed>/`.
-All launcher and per-task text logs are stored under
-`logs/${RUN_GROUP}/`. Each of the four GPU workers runs nine jobs
-sequentially, so a physical GPU has at most one training process.
+The four GPU workers each run nine jobs sequentially. Each task has exactly one
+merged stdout/stderr log in `logs/${RUN_GROUP}/train_logs/`. Experiment-level
+PID, exit code, and completion state are recorded in `experiment_status.tsv`.
+Snapshots at epochs 25, 50, 75, and 100 are stored under
+`logs/${RUN_GROUP}/snapshots/<task_seed>/`. Checkpoints, metrics, and TensorBoard
+events remain under `outputs/${RUN_GROUP}/<task_seed>/`.
+
+## Offline snapshot plots
+
+Training never invokes visualization. After snapshots exist:
+
+```bash
+python scripts/visualize_structure_feature_snapshots.py \
+    --snapshot-dir "logs/${RUN_GROUP}/snapshots/AT1_DK1_seed1" \
+    --output-dir "analysis_output/${RUN_GROUP}/AT1_DK1_seed1"
+```
 
 ## Stopping safely
 
-只 kill launcher PID 不一定会终止已经启动的训练子进程。
-
-First inspect every recorded child PID and its command:
-
-```bash
-find "logs/${RUN_GROUP}" -name train.pid -type f -print | while read -r pid_file; do
-    child_pid="$(cat "${pid_file}")"
-    ps -fp "${child_pid}"
-done
-```
-
-After confirming that each process belongs to this experiment group, stop the
-recorded children explicitly, then stop the launcher:
-
-```bash
-find "logs/${RUN_GROUP}" -name train.pid -type f -print | while read -r pid_file; do
-    child_pid="$(cat "${pid_file}")"
-    kill "${child_pid}"
-done
-kill "$(cat "logs/${RUN_GROUP}/launcher.pid")"
-```
-
-Existing experiment output is not overwritten by default. `OVERWRITE=1`
-must be intentional; it preserves the active `nohup.log` and `launcher.pid`
-while replacing earlier experiment artifacts.
+Killing only the launcher PID may leave already-started training children. Use
+`experiment_status.tsv` to identify recorded task PIDs, inspect them with
+`ps -fp <PID>`, and only then terminate the confirmed experiment processes.

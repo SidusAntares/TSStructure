@@ -21,11 +21,14 @@ if [[ ! "${RUN_GROUP}" =~ ^[A-Za-z0-9_-]+$ ]]; then
     exit 1
 fi
 
-GROUP_LOG_DIRECTORY="${LOG_ROOT}/${RUN_GROUP}"
+GROUP_LOG_ROOT="${LOG_ROOT}/${RUN_GROUP}"
+GROUP_TRAIN_LOG_DIRECTORY="${GROUP_LOG_ROOT}/train_logs"
+GROUP_SNAPSHOT_DIRECTORY="${GROUP_LOG_ROOT}/snapshots"
 GROUP_OUTPUT_DIRECTORY="${OUTPUT_ROOT}/${RUN_GROUP}"
-MANIFEST_FILE="${GROUP_LOG_DIRECTORY}/manifest.tsv"
-COMPLETED_FILE="${GROUP_LOG_DIRECTORY}/completed.tsv"
-FAILED_FILE="${GROUP_LOG_DIRECTORY}/failed.tsv"
+MANIFEST_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/manifest.tsv"
+COMPLETED_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/completed.tsv"
+FAILED_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/failed.tsv"
+STATUS_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/experiment_status.tsv"
 
 TASKS=(
     "AT1|austria/33UVP/2017|DK1|denmark/32VNH/2017"
@@ -54,13 +57,14 @@ if [[ "${#JOBS[@]}" -ne "${EXPECTED_RUNS}" ]]; then
     exit 1
 fi
 
-activate_environment
-prepare_run_group "${GROUP_OUTPUT_DIRECTORY}" "${GROUP_LOG_DIRECTORY}"
-printf '%s\n' "$$" > "${GROUP_LOG_DIRECTORY}/launcher.pid"
-printf 'run_name\tsource\ttarget\tseed\tgpu\toutput_directory\tlog_directory\n' \
+
+prepare_run_group "${GROUP_OUTPUT_DIRECTORY}" "${GROUP_LOG_ROOT}"
+printf '%s\n' "$$" > "${GROUP_TRAIN_LOG_DIRECTORY}/launcher.pid"
+printf 'run_name\tsource\ttarget\tseed\tgpu\toutput_directory\tlog_file\tsnapshot_directory\n' \
     > "${MANIFEST_FILE}"
 printf 'run_name\texit_code\n' > "${COMPLETED_FILE}"
 printf 'run_name\texit_code\n' > "${FAILED_FILE}"
+printf 'time\trun_name\tgpu\tpid\tstatus\texit_code\n' > "${STATUS_FILE}"
 
 for job_index in "${!JOBS[@]}"; do
     IFS='|' read -r source_short source_domain target_short target_domain seed \
@@ -69,10 +73,12 @@ for job_index in "${!JOBS[@]}"; do
     worker_id=$((job_index % 4))
     physical_gpu="${PHYSICAL_GPUS[$worker_id]}"
     run_output_directory="${GROUP_OUTPUT_DIRECTORY}/${run_name}"
-    run_log_directory="${GROUP_LOG_DIRECTORY}/${run_name}"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    task_log_file="${GROUP_TRAIN_LOG_DIRECTORY}/${run_name}.log"
+    snapshot_directory="${GROUP_SNAPSHOT_DIRECTORY}/${run_name}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "${run_name}" "${source_domain}" "${target_domain}" "${seed}" \
-        "${physical_gpu}" "${run_output_directory}" "${run_log_directory}" \
+        "${physical_gpu}" "${run_output_directory}" "${task_log_file}" \
+        "${snapshot_directory}" \
         >> "${MANIFEST_FILE}"
 done
 
@@ -86,27 +92,33 @@ run_worker() {
             <<< "${JOBS[$job_index]}"
         local run_name="${source_short}_${target_short}_seed${seed}"
         local RUN_OUTPUT_DIRECTORY="${GROUP_OUTPUT_DIRECTORY}/${run_name}"
-        local RUN_LOG_DIRECTORY="${GROUP_LOG_DIRECTORY}/${run_name}"
+        local TASK_LOG_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/${run_name}.log"
+        local SNAPSHOT_DIRECTORY="${GROUP_SNAPSHOT_DIRECTORY}/${run_name}"
         local exit_code=0
+        LAST_TRAINING_PID=""
 
         echo "TASK_START|run=${run_name}|gpu=${physical_gpu}|worker=${worker_id}"
-        if make_run_directories "${RUN_OUTPUT_DIRECTORY}" "${RUN_LOG_DIRECTORY}" && \
+        if make_run_output_directory "${RUN_OUTPUT_DIRECTORY}" && \
             run_training \
                 "${source_domain}" "${target_domain}" "${seed}" "${physical_gpu}" \
-                "${RUN_OUTPUT_DIRECTORY}" "${RUN_LOG_DIRECTORY}"
+                "${RUN_OUTPUT_DIRECTORY}" "${TASK_LOG_FILE}" \
+                --feature_snapshot_interval 25 \
+                --feature_snapshot_samples_per_class 32 \
+                --feature_snapshot_dtype float16 \
+                --feature_snapshot_dir "${SNAPSHOT_DIRECTORY}"
         then
             exit_code=0
-            : > "${RUN_LOG_DIRECTORY}/TASK_DONE"
             printf '%s\t%s\n' "${run_name}" "${exit_code}" >> "${COMPLETED_FILE}"
             echo "TASK_DONE|run=${run_name}|gpu=${physical_gpu}|exit_code=0"
         else
             exit_code=$?
-            mkdir -p "${RUN_LOG_DIRECTORY}"
-            : > "${RUN_LOG_DIRECTORY}/TASK_FAILED"
             printf '%s\t%s\n' "${run_name}" "${exit_code}" >> "${FAILED_FILE}"
             echo "TASK_FAILED|run=${run_name}|gpu=${physical_gpu}|exit_code=${exit_code}" >&2
         fi
-        printf '%s\n' "${exit_code}" > "${RUN_LOG_DIRECTORY}/exit_code.txt"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(date --iso-8601=seconds)" "${run_name}" "${physical_gpu}" \
+            "${LAST_TRAINING_PID:-}" "$([[ "${exit_code}" -eq 0 ]] && echo COMPLETED || echo FAILED)" \
+            "${exit_code}" >> "${STATUS_FILE}"
         echo "TASK_PROGRESS|completed_or_failed=$((job_index / 4 + 1))/9|worker=${worker_id}"
         ((job_index += 4))
     done
@@ -131,8 +143,10 @@ completed_count="$(($(wc -l < "${COMPLETED_FILE}") - 1))"
 failed_count="$(($(wc -l < "${FAILED_FILE}") - 1))"
 echo "EXPERIMENT_SUMMARY|total=${EXPECTED_RUNS}|completed=${completed_count}|failed=${failed_count}"
 if [[ "${failed_count}" -eq 0 && "${completed_count}" -eq "${EXPECTED_RUNS}" ]]; then
-    : > "${GROUP_LOG_DIRECTORY}/EXPERIMENT_DONE"
+    printf '%s\tEXPERIMENT\t-\t%s\tCOMPLETED\t0\n' \
+        "$(date --iso-8601=seconds)" "$$" >> "${STATUS_FILE}"
     exit 0
 fi
-: > "${GROUP_LOG_DIRECTORY}/EXPERIMENT_FAILED"
+printf '%s\tEXPERIMENT\t-\t%s\tFAILED\t1\n' \
+    "$(date --iso-8601=seconds)" "$$" >> "${STATUS_FILE}"
 exit 1

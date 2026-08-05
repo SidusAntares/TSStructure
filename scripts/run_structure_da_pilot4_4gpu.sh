@@ -24,7 +24,6 @@ TASKS=(
     "DK1|denmark/32VNH/2017|FR2|france/30TXT/2017|1|${GPU3}"
 )
 
-activate_environment
 if [[ -e "${PILOT_ROOT}" ]]; then
     if [[ "${OVERWRITE}" != "1" ]]; then
         echo "Pilot root exists; set OVERWRITE=1 to replace it: ${PILOT_ROOT}" >&2
@@ -50,7 +49,8 @@ run_one() {
     echo "TASK_START|gpu=${physical_gpu}|source=${source_short}|target=${target_short}|seed=${seed}"
     if CUDA_VISIBLE_DEVICES="${physical_gpu}" run_training \
         "${source_domain}" "${target_domain}" "${seed}" "${physical_gpu}" \
-        "${PILOT_EPOCHS}" "${run_directory}"
+        "${run_directory}" "${run_directory}/train.log" \
+        --epochs "${PILOT_EPOCHS}" --feature_snapshot_interval 0
     then
         exit_code=0
         "${PYTHON_BIN}" "${SCRIPT_DIR}/analyze_structure_da_diagnostic.py" \

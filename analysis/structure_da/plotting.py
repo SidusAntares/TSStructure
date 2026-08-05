@@ -126,7 +126,6 @@ def _training_figures(run: ParsedRun, root: Path) -> None:
             ("quality component cls", np.asarray([item.quality_component_cls for item in run.epochs])),
             ("quality component domain", np.asarray([item.quality_component_domain for item in run.epochs])),
             ("geometry", np.asarray([item.geometry for item in run.epochs])),
-            ("alignment", np.asarray([item.alignment for item in run.epochs])),
         ],
         run_dir / "losses.png",
         f"{run.run_name}: training losses",
@@ -142,17 +141,6 @@ def _training_figures(run: ParsedRun, root: Path) -> None:
         f"{run.run_name}: source training and validation",
         "Percent",
     )
-    _plot_lines(
-        epochs,
-        [
-            ("domain accuracy", np.asarray([item.domain_accuracy for item in run.epochs])),
-            ("GRL coefficient", np.asarray([item.grl for item in run.epochs])),
-        ],
-        run_dir / "domain_accuracy_and_grl.png",
-        f"{run.run_name}: domain accuracy and GRL",
-        "Value",
-    )
-
     structure = run.structure_diagnostics
     if structure:
         structure_epochs = _record_series(structure, "epoch")

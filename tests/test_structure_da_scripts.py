@@ -24,7 +24,7 @@ PILOT4_ANALYZER = SCRIPTS / "analyze_structure_da_pilot4.py"
 FORMAL = SCRIPTS / "run_structure_da_12tasks_4gpu_3seeds.sh"
 README = SCRIPTS / "README_structure_da_v3.md"
 SHELL_SCRIPTS = [COMMON, ENV_CHECK, SMOKE, DIAGNOSTIC, PILOT4, FORMAL]
-EXPECTED_VERSION = "a7751523794b48813ae9f294303889eed62ea2e7"
+EXPECTED_VERSION = "structure_da_v3_compact_snapshots_no_fused_alignment_v1"
 OBSOLETE_FLAGS = {
     "--structure_dim",
     "--lambda_task",
@@ -100,23 +100,30 @@ def test_common_configuration_uses_current_v3_cli_and_fixed_version() -> None:
     source = COMMON.read_text(encoding="utf-8")
     assert EXPECTED_VERSION in source
     for name in (
-        "PROJECT_ROOT", "DATA_ROOT", "OUTPUT_ROOT", "LOG_ROOT", "CONDA_ENV",
+        "PROJECT_ROOT", "DATA_ROOT", "OUTPUT_ROOT", "LOG_ROOT",
         "PYTHON_BIN", "NUM_WORKERS", "CODE_VERSION", "V3_COMMON_ARGS",
     ):
         assert name in source
     for function in (
         "require_command", "require_file", "require_directory",
-        "activate_environment", "print_run_header", "make_run_directory",
-        "run_training",
+        "make_run_directory", "run_training",
     ):
         assert re.search(rf"(?m)^{function}\(\)", source)
+    assert "CONDA_ENV" not in source
+    assert "activate_environment" not in source
+    assert "conda activate" not in source
     for required in (
         "--balance-source", "--amp true", "--time_coordinate_mode",
         "--warp_num_candidates", "--shape_dim", "--lambda_cls",
-        "--lambda_quality", "--lambda_global_domain",
+        "--lambda_quality",
         "--lambda_target_semantic", "--progress_bar auto",
     ):
         assert required in source
+    for removed in (
+        "--domain_hidden_dim", "--grl_warmup_max_iters",
+        "--grl_warmup_fraction", "--lambda_global_domain",
+    ):
+        assert removed not in source
     assert "CMD=(" in source
     assert "printf '%q '" in source
     assert 'DATA_ROOT="${DATA_ROOT:-}"' in source
@@ -136,10 +143,11 @@ def test_data_root_is_only_appended_when_explicitly_set() -> None:
         r'CMD\+=\(--data_root "\$\{DATA_ROOT\}"\)\s*fi',
         source,
     )
-    assert '> "${run_log_directory}/train.log"' in source
-    assert '2> "${run_log_directory}/stderr.log"' in source
-    assert 'tee "${run_log_directory}/train.log"' not in source
-    assert '| tee "${environment_file}"' not in source
+    assert '> "${task_log_file}" 2>&1' in source
+    for legacy in ("stderr.log", "command.txt", "train.pid", "exit_code.txt"):
+        assert legacy not in source
+    for marker in ("RUN_START|", "RUN_COMMAND|", "RUN_END|"):
+        assert marker in source
 
 
 def test_every_common_training_flag_exists_in_train_help() -> None:
@@ -169,17 +177,23 @@ def test_smoke_is_short_fixed_and_checked() -> None:
         'SMOKE_EPOCHS="${SMOKE_EPOCHS:-1}"',
         'SMOKE_STEPS_PER_EPOCH="${SMOKE_STEPS_PER_EPOCH:-2}"',
         'RUN_OUTPUT_DIRECTORY="${OUTPUT_ROOT}/smoke_structure_da_v3"',
-        'RUN_LOG_DIRECTORY="${LOG_ROOT}/smoke_structure_da_v3"',
+        'SMOKE_LOG_ROOT="${LOG_ROOT}/smoke_structure_da_v3"',
+        'SMOKE_TRAIN_LOG_DIRECTORY="${SMOKE_LOG_ROOT}/train_logs"',
+        'SMOKE_SNAPSHOT_DIRECTORY="${SMOKE_LOG_ROOT}/snapshots"',
+        'SMOKE_LOG_FILE="${SMOKE_TRAIN_LOG_DIRECTORY}/smoke.log"',
         "check_structure_da_smoke.py", "--log-directory",
-        "SMOKE_SUCCESS", "SMOKE_FAILED",
+        "--feature_snapshot_interval 0",
+        "SMOKE_RESULT|status=SUCCESS", "SMOKE_RESULT|status=FAILED",
     ):
         assert fragment in source
+    assert "SMOKE_SUCCESS" not in source
+    assert "SMOKE_FAILED" not in source
 
 
 def test_smoke_checker_supports_separate_output_and_log_directories() -> None:
     source = SMOKE_CHECKER.read_text(encoding="utf-8")
     assert 'parser.add_argument("--log-directory"' in source
-    assert "log_directory / \"train.log\"" in source
+    assert "log_directory / \"smoke.log\"" in source
     assert "run_directory / \"fold_0\" / \"model.pt\"" in source
 
 
@@ -224,27 +238,39 @@ def test_formal_launcher_requires_run_group_and_uses_four_sequential_workers() -
 def test_formal_launcher_separates_logs_outputs_and_status_files() -> None:
     source = FORMAL.read_text(encoding="utf-8")
     for fragment in (
-        'GROUP_LOG_DIRECTORY="${LOG_ROOT}/${RUN_GROUP}"',
+        'GROUP_LOG_ROOT="${LOG_ROOT}/${RUN_GROUP}"',
+        'GROUP_TRAIN_LOG_DIRECTORY="${GROUP_LOG_ROOT}/train_logs"',
+        'GROUP_SNAPSHOT_DIRECTORY="${GROUP_LOG_ROOT}/snapshots"',
         'GROUP_OUTPUT_DIRECTORY="${OUTPUT_ROOT}/${RUN_GROUP}"',
         "launcher.pid", "manifest.tsv", "completed.tsv", "failed.tsv",
-        "EXPERIMENT_DONE", "EXPERIMENT_FAILED",
-        'RUN_LOG_DIRECTORY="${GROUP_LOG_DIRECTORY}/${run_name}"',
+        "experiment_status.tsv",
+        'TASK_LOG_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/${run_name}.log"',
+        'SNAPSHOT_DIRECTORY="${GROUP_SNAPSHOT_DIRECTORY}/${run_name}"',
         'RUN_OUTPUT_DIRECTORY="${GROUP_OUTPUT_DIRECTORY}/${run_name}"',
+        "--feature_snapshot_interval 25",
+        "--feature_snapshot_samples_per_class 32",
+        "--feature_snapshot_dtype float16",
     ):
         assert fragment in source
-    assert "train.pid" in COMMON.read_text(encoding="utf-8")
+    for legacy in (
+        '"${RUN_LOG_DIRECTORY}/TASK_DONE"',
+        '"${RUN_LOG_DIRECTORY}/TASK_FAILED"',
+        "EXPERIMENT_DONE", "EXPERIMENT_FAILED", "stderr.log", "command.txt",
+        "train.pid", "exit_code.txt",
+    ):
+        assert legacy not in source
     assert "run_structure_da_pilot4_4gpu.sh" not in source
 
 
 def test_readme_has_standard_nohup_workflow_without_pilot_gate() -> None:
     source = README.read_text(encoding="utf-8")
     for fragment in (
-        "logs/smoke_structure_da_v3/nohup.log",
-        "logs/smoke_structure_da_v3/train.log",
+        "logs/smoke_structure_da_v3/train_logs/nohup.log",
+        "logs/smoke_structure_da_v3/train_logs/smoke.log",
         'RUN_GROUP="structure_da_v3_12tasks_3seeds_$(date +%Y%m%d_%H%M%S)"',
         "run_structure_da_12tasks_4gpu_3seeds.sh",
-        'logs/${RUN_GROUP}/AT1_DK1_seed1/train.log',
-        "只 kill launcher PID 不一定会终止已经启动的训练子进程",
+        'logs/${RUN_GROUP}/train_logs/AT1_DK1_seed1.log',
+        "Killing only the launcher PID may leave already-started training children",
     ):
         assert fragment in source
     assert "PASS_FOR_PILOT4" not in source
