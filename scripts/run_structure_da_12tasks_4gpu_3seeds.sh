@@ -110,7 +110,15 @@ run_worker() {
         then
             exit_code=0
             printf '%s\t%s\n' "${run_name}" "${exit_code}" >> "${COMPLETED_FILE}"
-            if [[ -f "${SNAPSHOT_DIRECTORY}/SNAPSHOT_FAILED" ]]; then
+            if [[ -f "${SNAPSHOT_DIRECTORY}/snapshot_status.json" ]]; then
+                if grep -q '"has_failures"[[:space:]]*:[[:space:]]*true' \
+                    "${SNAPSHOT_DIRECTORY}/snapshot_status.json"
+                then
+                    task_status="COMPLETED_WITH_SNAPSHOT_FAILURE"
+                else
+                    task_status="COMPLETED"
+                fi
+            elif [[ -f "${SNAPSHOT_DIRECTORY}/SNAPSHOT_FAILED" ]]; then
                 task_status="COMPLETED_WITH_SNAPSHOT_FAILURE"
             else
                 task_status="COMPLETED"

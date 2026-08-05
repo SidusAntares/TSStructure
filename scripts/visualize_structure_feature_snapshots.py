@@ -29,10 +29,16 @@ from methods.structure_da.feature_snapshots import (
 )
 
 
-COMPACT_FIELDS = {
+SCHEMA2_FIELDS = {
     "epoch", "projection_fitted_epoch", "schema_version",
     "pse_pc_values", "pse_times", "pse_offsets",
     "aligned_shape_pc", "shape_grid", "shape_valid",
+}
+SCHEMA3_FIELDS = {
+    "epoch", "projection_fitted_epoch", "schema_version",
+    "pse_pc_values", "pse_times", "pse_offsets",
+    "unaligned_shape_pc", "aligned_shape_pc", "shape_grid", "shape_valid",
+    "phase_status", "accepted_warp",
 }
 LEGACY_FIELDS = {
     "epoch", "pse_values", "pse_times", "pse_offsets",
@@ -60,8 +66,11 @@ class ProjectedEpoch:
     pse_times: np.ndarray
     pse_offsets: np.ndarray
     aligned_shape_pc: np.ndarray
+    unaligned_shape_pc: np.ndarray | None
     shape_grid: np.ndarray
     shape_valid: np.ndarray
+    phase_status: np.ndarray | None
+    accepted_warp: np.ndarray | None
 
 
 def _read_npz(path: Path) -> dict[str, np.ndarray]:
@@ -70,9 +79,25 @@ def _read_npz(path: Path) -> dict[str, np.ndarray]:
 
 
 def _epoch_paths(snapshot_dir: Path) -> list[Path]:
-    paths = sorted(snapshot_dir.glob("epoch_*.npz"))
+    discovered: list[tuple[int, Path]] = []
+    for path in snapshot_dir.glob("epoch_*.npz"):
+        match = re.fullmatch(r"epoch_(\d+)\.npz", path.name)
+        if match is None:
+            continue
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                epoch = int(data["epoch"].item())
+        except Exception as error:
+            raise ValueError(f"corrupt epoch snapshot {path.name}: {error}") from error
+        if epoch != int(match.group(1)):
+            raise ValueError(f"epoch field disagrees with filename for {path.name}")
+        discovered.append((epoch, path))
+    discovered.sort(key=lambda item: item[0])
+    paths = [path for _, path in discovered]
     if not paths:
         raise ValueError("no epoch snapshots found")
+    if len({epoch for epoch, _ in discovered}) != len(discovered):
+        raise ValueError("snapshot epochs must be unique")
     return paths
 
 
@@ -91,8 +116,8 @@ def _validate_common(snapshot: dict[str, np.ndarray], count: int, *, compact: bo
         raise ValueError("snapshot Shape sample dimensions are invalid")
     if snapshot["shape_grid"].shape != (shape.shape[1],):
         raise ValueError("snapshot Shape grid is invalid")
-    if compact and (pse.shape[-1] != 2 or shape.shape[-1] != 2):
-        raise ValueError("compact snapshots must contain exactly components 1 and 2")
+    if compact and (pse.ndim != 2 or pse.shape[-1] != shape.shape[-1]):
+        raise ValueError("compact snapshot projection dimensions disagree")
 
 
 def _load_projected_epochs(
@@ -100,37 +125,68 @@ def _load_projected_epochs(
 ) -> tuple[str, str, list[ProjectedEpoch]]:
     raw = [_read_npz(path) for path in _epoch_paths(snapshot_dir)]
     first_fields = set(raw[0])
-    if first_fields == COMPACT_FIELDS:
-        if any(set(snapshot) != COMPACT_FIELDS for snapshot in raw):
+    if first_fields in (SCHEMA2_FIELDS, SCHEMA3_FIELDS):
+        expected_fields = first_fields
+        if any(set(snapshot) != expected_fields for snapshot in raw):
             raise ValueError("snapshot epochs mix incompatible schemas")
         basis = load_projection_basis(snapshot_dir / "projection_basis.npz")
-        if basis.fitted_epoch != 25:
-            raise ValueError("compact snapshots require a projection basis fitted at epoch 25")
+        schema_version = 2 if first_fields == SCHEMA2_FIELDS else 3
         projected: list[ProjectedEpoch] = []
         for snapshot in raw:
             _validate_common(snapshot, count, compact=True)
-            if int(snapshot["schema_version"].item()) != 2:
+            if int(snapshot["schema_version"].item()) != schema_version:
                 raise ValueError("compact snapshot schema version is invalid")
             if int(snapshot["projection_fitted_epoch"].item()) != basis.fitted_epoch:
                 raise ValueError("compact snapshot projection epoch is inconsistent")
+            if snapshot["pse_pc_values"].shape[-1] != basis.num_components:
+                raise ValueError("snapshot component count disagrees with projection basis")
+            unaligned = (
+                snapshot["unaligned_shape_pc"].astype(np.float32)
+                if schema_version == 3 else None
+            )
+            phase_status = (
+                snapshot["phase_status"].astype(np.uint8)
+                if schema_version == 3 else None
+            )
+            accepted_warp = (
+                snapshot["accepted_warp"].astype(np.float32)
+                if schema_version == 3 else None
+            )
+            if schema_version == 3 and (
+                unaligned.shape != snapshot["aligned_shape_pc"].shape
+                or phase_status.shape != (count,)
+                or accepted_warp.shape != (count, len(snapshot["shape_grid"]))
+                or np.any(phase_status > 2)
+            ):
+                raise ValueError("schema 3 phase diagnostic dimensions are invalid")
             projected.append(ProjectedEpoch(
                 epoch=int(snapshot["epoch"].item()),
                 pse_pc_values=snapshot["pse_pc_values"].astype(np.float32),
                 pse_times=snapshot["pse_times"].astype(np.float32),
                 pse_offsets=snapshot["pse_offsets"].astype(np.int64),
                 aligned_shape_pc=snapshot["aligned_shape_pc"].astype(np.float32),
+                unaligned_shape_pc=unaligned,
                 shape_grid=snapshot["shape_grid"].astype(np.float32),
                 shape_valid=snapshot["shape_valid"].astype(bool),
+                phase_status=phase_status,
+                accepted_warp=accepted_warp,
             ))
-        return "compact_fixed_pca", "stored_fixed_epoch25_basis", projected
+        return (
+            "compact_fixed_pca" if schema_version == 2 else "schema_3_fixed_pca",
+            f"stored_fixed_epoch{basis.fitted_epoch}_basis",
+            projected,
+        )
 
     if first_fields != LEGACY_FIELDS or any(set(snapshot) != LEGACY_FIELDS for snapshot in raw):
         raise ValueError("snapshot schema is unsupported")
     for snapshot in raw:
         _validate_common(snapshot, count, compact=False)
-    pse_fit = fit_deterministic_pca(np.concatenate([
-        snapshot["pse_values"].astype(np.float32) for snapshot in raw
-    ], axis=0))
+    pse_fit = fit_deterministic_pca(
+        np.concatenate([
+            snapshot["pse_values"].astype(np.float32) for snapshot in raw
+        ], axis=0),
+        num_components=2,
+    )
     shape_rows = [
         snapshot["aligned_shape"][snapshot["shape_valid"].astype(bool)].reshape(
             -1, snapshot["aligned_shape"].shape[-1]
@@ -140,7 +196,9 @@ def _load_projected_epochs(
     nonempty_shape_rows = [values for values in shape_rows if len(values)]
     if not nonempty_shape_rows:
         raise ValueError("legacy snapshots contain no valid aligned Shape")
-    shape_fit = fit_deterministic_pca(np.concatenate(nonempty_shape_rows, axis=0))
+    shape_fit = fit_deterministic_pca(
+        np.concatenate(nonempty_shape_rows, axis=0), num_components=2
+    )
     projected = []
     for snapshot in raw:
         shape = snapshot["aligned_shape"].astype(np.float32)
@@ -156,8 +214,11 @@ def _load_projected_epochs(
             pse_times=snapshot["pse_times"].astype(np.float32),
             pse_offsets=snapshot["pse_offsets"].astype(np.int64),
             aligned_shape_pc=shape_pc.astype(np.float32),
+            unaligned_shape_pc=None,
             shape_grid=snapshot["shape_grid"].astype(np.float32),
             shape_valid=snapshot["shape_valid"].astype(bool),
+            phase_status=None,
+            accepted_warp=None,
         ))
     return "legacy_full_features", "joint_all_epochs_in_memory", projected
 
@@ -287,7 +348,7 @@ def _plot_class_evolution(
         )
         for row, (domain_id, domain_name) in enumerate(DOMAINS):
             fixed_indices = _uniform_sample_indices(
-                selected.sample_index, selected.domain, selected.label,
+                selected.parcel_index, selected.domain, selected.label,
                 domain_id, label, display_samples,
             )
             for column, snapshot in enumerate(snapshots):
@@ -341,7 +402,7 @@ def _plot_class_separation(
             figure, axis = plt.subplots(figsize=(8.5, 5), constrained_layout=True)
             for label in classes:
                 indices = _uniform_sample_indices(
-                    selected.sample_index, selected.domain, selected.label,
+                    selected.parcel_index, selected.domain, selected.label,
                     domain_id, label, samples_per_class,
                 )
                 class_count = 0
@@ -404,7 +465,7 @@ def _outlier_rows(
                         "domain": domain_name,
                         "class_id": label,
                         "class_name": names.get(label, ""),
-                        "parcel_index": int(selected.sample_index[sample]),
+                        "parcel_index": int(selected.parcel_index[sample]),
                         "component": component,
                         "max_abs_pc": f"{float(np.max(np.abs(projected))):.8g}",
                         "outside_robust_fraction": f"{float(np.mean(outside)):.8g}",
@@ -412,12 +473,169 @@ def _outlier_rows(
     return rows
 
 
-def _write_tsv(path: Path, rows: list[dict[str, object]]) -> None:
+def _write_tsv(
+    path: Path,
+    rows: list[dict[str, object]],
+    fields: tuple[str, ...] = OUTLIER_FIELDS,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=OUTLIER_FIELDS, delimiter="\t")
+        writer = csv.DictWriter(stream, fieldnames=fields, delimiter="\t")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _plot_shape_alignment(
+    output_dir: Path,
+    snapshots: list[ProjectedEpoch],
+    selected,
+    names: dict[int, str],
+    colors: dict[int, object],
+    domain_id: int,
+    domain_name: str,
+    label: int,
+    component: int,
+    display_samples: int,
+    lower: float,
+    upper: float,
+    dpi: int,
+) -> int:
+    fixed = _uniform_sample_indices(
+        selected.parcel_index, selected.domain, selected.label,
+        domain_id, label, display_samples,
+    )
+    all_values: list[np.ndarray] = []
+    for snapshot in snapshots:
+        if snapshot.unaligned_shape_pc is None:
+            continue
+        for values in (
+            snapshot.unaligned_shape_pc[fixed, :, component - 1],
+            snapshot.aligned_shape_pc[fixed, :, component - 1],
+        ):
+            finite = values[np.isfinite(values)]
+            if len(finite):
+                all_values.append(finite)
+    if not all_values:
+        return 0
+    ranges = _limits(np.concatenate(all_values), lower, upper)
+    count = 0
+    for range_name, y_limits in ranges.items():
+        figure, axes = plt.subplots(
+            2, len(snapshots),
+            figsize=(3.1 * len(snapshots), 5.5),
+            sharex=True, sharey=True, squeeze=False, constrained_layout=True,
+        )
+        for column, snapshot in enumerate(snapshots):
+            for row, (title, array) in enumerate((
+                ("unaligned Shape", snapshot.unaligned_shape_pc),
+                ("aligned Shape", snapshot.aligned_shape_pc),
+            )):
+                axis = axes[row, column]
+                for sample in fixed:
+                    if not snapshot.shape_valid[sample]:
+                        continue
+                    axis.plot(
+                        snapshot.shape_grid,
+                        array[sample, :, component - 1],
+                        color=colors[label], linewidth=0.8, alpha=0.65,
+                    )
+                    count = max(count, 1)
+                axis.set_title(f"{title}, epoch {snapshot.epoch}")
+                axis.set_ylim(*y_limits)
+                if row == 1:
+                    axis.set_xlabel("canonical grid")
+                if column == 0:
+                    axis.set_ylabel(f"PC{component}")
+        path = output_dir / "shape_alignment" / (
+            f"{domain_name}_{_class_stem(label, names)}_pc{component}_{range_name}.png"
+        )
+        _save_figure(figure, path, dpi)
+    return count
+
+
+PHASE_STATUS_FIELDS = (
+    "epoch", "domain", "class_id", "class_name", "num_samples",
+    "failure_count", "identity_count", "nonidentity_count",
+    "failure_rate", "identity_rate", "nonidentity_rate",
+)
+
+
+def _phase_status_rows(
+    snapshots: list[ProjectedEpoch], selected, names: dict[int, str]
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for snapshot in snapshots:
+        if snapshot.phase_status is None:
+            continue
+        for domain_id, domain_name in DOMAINS:
+            for label in np.unique(selected.label[selected.domain == domain_id]):
+                indices = np.flatnonzero(
+                    (selected.domain == domain_id) & (selected.label == label)
+                )
+                status = snapshot.phase_status[indices]
+                count = len(status)
+                failure = int(np.count_nonzero(status == 0))
+                identity = int(np.count_nonzero(status == 1))
+                nonidentity = int(np.count_nonzero(status == 2))
+                rows.append({
+                    "epoch": snapshot.epoch,
+                    "domain": domain_name,
+                    "class_id": int(label),
+                    "class_name": names.get(int(label), ""),
+                    "num_samples": count,
+                    "failure_count": failure,
+                    "identity_count": identity,
+                    "nonidentity_count": nonidentity,
+                    "failure_rate": f"{failure / count:.8g}",
+                    "identity_rate": f"{identity / count:.8g}",
+                    "nonidentity_rate": f"{nonidentity / count:.8g}",
+                })
+    return rows
+
+
+def _plot_warp_evolution(
+    output_dir: Path,
+    snapshots: list[ProjectedEpoch],
+    selected,
+    names: dict[int, str],
+    domain_id: int,
+    domain_name: str,
+    label: int,
+    dpi: int,
+) -> None:
+    fixed = _uniform_sample_indices(
+        selected.parcel_index, selected.domain, selected.label,
+        domain_id, label, 3,
+    )
+    figure, axes = plt.subplots(
+        1, len(snapshots), figsize=(3.1 * len(snapshots), 3.2),
+        squeeze=False, sharex=True, sharey=True, constrained_layout=True,
+    )
+    for column, snapshot in enumerate(snapshots):
+        axis = axes[0, column]
+        valid_count = 0
+        for sample in fixed:
+            if snapshot.phase_status[sample] == 0:
+                continue
+            axis.plot(
+                snapshot.shape_grid, snapshot.accepted_warp[sample],
+                linewidth=0.9, alpha=0.75,
+            )
+            valid_count += 1
+        axis.plot(
+            snapshot.shape_grid, snapshot.shape_grid,
+            color="black", linestyle="--", linewidth=1.0,
+        )
+        axis.set_title(f"epoch {snapshot.epoch}, valid={valid_count}")
+        axis.set_xlabel("identity grid")
+        if column == 0:
+            axis.set_ylabel("accepted gamma")
+    _save_figure(
+        figure,
+        output_dir / "warp_evolution" /
+        f"{domain_name}_{_class_stem(label, names)}.png",
+        dpi,
+    )
 
 
 def visualize_snapshots(
@@ -435,8 +653,8 @@ def visualize_snapshots(
     if display_samples_per_class <= 0 or separation_samples_per_class <= 0:
         raise ValueError("sample display limits must be positive")
     components = tuple(int(value) for value in components)
-    if not components or any(value not in (1, 2) for value in components):
-        raise ValueError("only projection components 1 and 2 are available")
+    if not components or any(value <= 0 for value in components):
+        raise ValueError("projection components must be positive")
     if len(set(components)) != len(components):
         raise ValueError("projection components must be unique")
     if not 0 <= robust_lower_percentile < robust_upper_percentile <= 100:
@@ -449,8 +667,16 @@ def visualize_snapshots(
         snapshot_dir, len(selected.sample_index)
     )
     epochs = [snapshot.epoch for snapshot in snapshots]
-    if epochs != [25, 50, 75, 100]:
-        raise ValueError("visualization requires epoch snapshots 25, 50, 75, and 100")
+    available_components = int(snapshots[0].pse_pc_values.shape[-1])
+    if any(value > available_components for value in components):
+        raise ValueError(
+            f"requested component exceeds available PC1-PC{available_components}"
+        )
+    basis_path = snapshot_dir / "projection_basis.npz"
+    fitted_epoch = (
+        load_projection_basis(basis_path).fitted_epoch
+        if basis_path.exists() else None
+    )
     names = _load_class_names(snapshot_dir, selected.label)
     classes = [int(value) for value in np.unique(selected.label)]
     colors = _class_colors(classes)
@@ -484,6 +710,40 @@ def visualize_snapshots(
                     legend_labels = labels
                 figure_count += len(snapshots) * 2
 
+    shape_alignment_status = "SKIPPED"
+    if all(snapshot.unaligned_shape_pc is not None for snapshot in snapshots):
+        shape_alignment_status = "GENERATED"
+        for component in components:
+            for domain_id, domain_name in DOMAINS:
+                for label in classes:
+                    _plot_shape_alignment(
+                        output_dir, snapshots, selected, names, colors,
+                        domain_id, domain_name, label, component,
+                        display_samples_per_class,
+                        robust_lower_percentile, robust_upper_percentile, dpi,
+                    )
+                    figure_count += 2
+        phase_rows = _phase_status_rows(snapshots, selected, names)
+        _write_tsv(
+            output_dir / "phase_status_summary.tsv",
+            phase_rows,
+            PHASE_STATUS_FIELDS,
+        )
+        for domain_id, domain_name in DOMAINS:
+            for label in classes:
+                _plot_warp_evolution(
+                    output_dir, snapshots, selected, names,
+                    domain_id, domain_name, label, dpi,
+                )
+                figure_count += 1
+    else:
+        reason = (
+            "schema_2_has_no_unaligned_shape"
+            if schema == "compact_fixed_pca"
+            else "schema_1_has_no_unaligned_shape"
+        )
+        print(f"SKIPPED|reason={reason}", flush=True)
+
     pse_outliers = _outlier_rows(
         snapshots, selected, names, "pse", components,
         robust_lower_percentile, robust_upper_percentile,
@@ -502,6 +762,8 @@ def visualize_snapshots(
         "epochs": epochs,
         "classes": classes,
         "components": list(components),
+        "projection_fitted_epoch": fitted_epoch,
+        "shape_alignment_status": shape_alignment_status,
         "figures": figure_count,
         "pse_outliers": len(pse_outliers),
         "shape_outliers": len(shape_outliers),

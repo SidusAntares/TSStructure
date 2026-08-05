@@ -81,12 +81,15 @@ PID, exit code, and completion state are recorded in `experiment_status.tsv`.
 Snapshots at epochs 25, 50, 75, and 100 are stored under
 `logs/${RUN_GROUP}/snapshots/<task_seed>/`. Checkpoints, metrics, and TensorBoard
 events remain under `outputs/${RUN_GROUP}/<task_seed>/`. Each domain contributes
-at most eight fixed parcels per class. Epoch 25 fits one source+target PCA basis
-for PSE and a separate source+target basis for aligned Shape. Later epochs reuse
-those bases and store only PC1/PC2 curves. Snapshot inference uses an independent
-batch size of 8 and retries CUDA OOM failures with progressively smaller batches.
-Snapshot exhaustion is recorded as `SNAPSHOT_FAILED`; training continues and the
-launcher reports `COMPLETED_WITH_SNAPSHOT_FAILURE`.
+at most eight fixed parcels per class. Stable per-parcel indices select exactly
+`num_pixels` pixels with the same sampling/padding semantics as training, and all
+epochs reuse those indices. The first successful scheduled snapshot fits one
+parcel-weighted source+target PCA basis for PSE and a separate joint basis for
+unaligned/aligned Shape. Later epochs reuse those bases and store only PC1-PC8
+curves. Snapshot inference uses an independent batch size of 8 and retries CUDA
+OOM failures with progressively smaller batches. Per-epoch outcomes are recorded
+atomically in `snapshot_status.json`; training continues and the launcher reports
+`COMPLETED_WITH_SNAPSHOT_FAILURE` only while the current status has failures.
 
 ## Offline snapshot plots
 
@@ -101,9 +104,11 @@ python scripts/visualize_structure_feature_snapshots.py \
     --components 1 2
 ```
 
-The visualizer also reads the previous full-dimensional snapshot schema. For
-legacy snapshots it fits one joint in-memory PCA per feature family across all
-four epochs and never modifies the source NPZ files.
+The visualizer discovers every available epoch, supports PC1-PC8 for schema 3,
+and adds unaligned/aligned Shape, phase-status, and accepted-warp diagnostics.
+It also reads schema 1 full-dimensional and schema 2 compact snapshots. Schema 2
+cannot fabricate unaligned Shape and reports that diagnostic as skipped. Source
+NPZ files are never modified.
 
 ## Stopping safely
 

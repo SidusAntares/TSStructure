@@ -24,7 +24,7 @@ PILOT4_ANALYZER = SCRIPTS / "analyze_structure_da_pilot4.py"
 FORMAL = SCRIPTS / "run_structure_da_12tasks_4gpu_3seeds.sh"
 README = SCRIPTS / "README_structure_da_v3.md"
 SHELL_SCRIPTS = [COMMON, ENV_CHECK, SMOKE, DIAGNOSTIC, PILOT4, FORMAL]
-EXPECTED_VERSION = "structure_da_v3_batched_snapshots_no_fused_alignment_v3"
+EXPECTED_VERSION = "structure_da_v3_snapshot_schema3_no_fused_alignment_v4"
 OBSOLETE_FLAGS = {
     "--structure_dim",
     "--lambda_task",
@@ -265,6 +265,8 @@ def test_formal_launcher_separates_logs_outputs_and_status_files() -> None:
 
 def test_formal_launcher_reports_completed_with_snapshot_failure() -> None:
     source = FORMAL.read_text(encoding="utf-8")
+    assert "snapshot_status.json" in source
+    assert '"has_failures"' in source
     assert "SNAPSHOT_FAILED" in source
     assert "COMPLETED_WITH_SNAPSHOT_FAILURE" in source
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import json
 from pathlib import Path
 import random
 from types import SimpleNamespace
@@ -74,13 +75,14 @@ class RecordingSnapshotModel(torch.nn.Module):
     def __init__(self, *, oom_above_batch_size: int | None = None, error: Exception | None = None):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()))
-        self.backbone = SimpleNamespace(feature_dim=3)
+        self.backbone = SimpleNamespace(feature_dim=8)
         self.temporal_features = SimpleNamespace(
             coordinates=SimpleNamespace(canonical_grid=torch.linspace(0, 1, 4))
         )
         self.oom_above_batch_size = oom_above_batch_size
         self.error = error
         self.batch_sizes: list[int] = []
+        self.pixel_widths: list[int] = []
         self.previous_details: weakref.ReferenceType | None = None
 
     def forward_details(self, pixels, valid_pixels, positions, extra=None):
@@ -88,18 +90,29 @@ class RecordingSnapshotModel(torch.nn.Module):
             assert self.previous_details() is None, "previous batch details were retained"
         batch_size = int(pixels.shape[0])
         self.batch_sizes.append(batch_size)
+        self.pixel_widths.append(int(pixels.shape[-1]))
         if self.error is not None:
             raise self.error
         if self.oom_above_batch_size is not None and batch_size > self.oom_above_batch_size:
             raise torch.cuda.OutOfMemoryError("synthetic snapshot OOM")
         time_mask = valid_pixels.bool().any(dim=-1)
-        tokens = pixels.mean(dim=-1)
+        base = pixels.mean(dim=-1)
+        tokens = torch.cat((base, base[..., :2], base[..., :3]), dim=-1)
         aligned = tokens[:, :4].clone()
         details = _SnapshotDetails()
         details.backbone = SimpleNamespace(tokens=tokens, time_mask=time_mask)
         details.temporal = SimpleNamespace(
             shape=SimpleNamespace(valid=torch.ones(batch_size, dtype=torch.bool)),
             aligned_structure_srvf=aligned,
+            core=SimpleNamespace(
+                structure_srvf=SimpleNamespace(srvf=aligned + 0.25),
+                selection=SimpleNamespace(
+                    phase_status=torch.full((batch_size,), 2, dtype=torch.long),
+                    accepted_warp=SimpleNamespace(
+                        warp=torch.linspace(0, 1, 4).repeat(batch_size, 1)
+                    ),
+                ),
+            ),
         )
         self.previous_details = weakref.ref(details)
         return details
@@ -111,7 +124,7 @@ def _tiny_model() -> StructureAwareDomainAdaptationModel:
         input_dim=3,
         mlp1=[3, 4],
         pooling="mean_std",
-        mlp2=[8, 6],
+        mlp2=[8, 8],
         with_extra=False,
         shape_dim=5,
         temporal_options={
@@ -235,7 +248,8 @@ def test_snapshot_fits_fixed_projection_once_and_persists_only_pc_curves(
         samples_per_class=2,
         dtype="float16",
         snapshot_dir=tmp_path,
-        selection_seed=3,
+        pixel_selection_seed=3,
+        num_pixels=4,
     )
     manager = FeatureSnapshotManager(
         model,
@@ -251,27 +265,30 @@ def test_snapshot_fits_fixed_projection_once_and_persists_only_pc_curves(
     original_fit = feature_snapshots.fit_deterministic_pca
     fit_calls: list[tuple[int, int]] = []
 
-    def counted_fit(values: np.ndarray, num_components: int = 2):
+    def counted_fit(values: np.ndarray, num_components: int = 8, **kwargs):
         fit_calls.append(values.shape)
-        return original_fit(values, num_components)
+        return original_fit(values, num_components, **kwargs)
 
     monkeypatch.setattr(feature_snapshots, "fit_deterministic_pca", counted_fit)
     result = manager.capture(25)
     assert result.status == "SUCCESS"
     selected = load_selected_samples(tmp_path / "selected_samples.npz")
     assert selected.sample_index.dtype == np.int64
+    assert selected.parcel_index.dtype == np.int64
     assert selected.domain.dtype == np.uint8
     assert selected.label.dtype == np.int16
+    assert selected.pixel_indices.shape == (8, 4)
+    assert selected.num_pixels == 4
     assert len(selected.sample_index) == 8
 
     basis_path = tmp_path / "projection_basis.npz"
     basis = load_projection_basis(basis_path)
     assert len(fit_calls) == 2
-    assert fit_calls[0] == (104, 6)
-    assert fit_calls[1] == (64, 6)
+    assert fit_calls[0] == (104, 8)
+    assert fit_calls[1] == (128, 8)
     assert basis.fitted_epoch == 25
-    assert basis.pse_components.shape == (2, 6)
-    assert basis.shape_components.shape == (2, 6)
+    assert basis.pse_components.shape == (8, 8)
+    assert basis.shape_components.shape == (8, 8)
     assert not np.array_equal(basis.pse_components, basis.shape_components)
     for components in (basis.pse_components, basis.shape_components):
         for component in components:
@@ -283,20 +300,25 @@ def test_snapshot_fits_fixed_projection_once_and_persists_only_pc_curves(
         assert set(data.files) == {
             "epoch", "projection_fitted_epoch", "schema_version",
             "pse_pc_values", "pse_times", "pse_offsets",
-            "aligned_shape_pc", "shape_grid", "shape_valid",
+            "unaligned_shape_pc", "aligned_shape_pc", "shape_grid", "shape_valid",
+            "phase_status", "accepted_warp",
         }
         assert data["epoch"].item() == 25
         assert data["projection_fitted_epoch"].item() == 25
-        assert data["schema_version"].item() == 2
+        assert data["schema_version"].item() == 3
         assert data["pse_pc_values"].dtype == np.float16
         assert data["aligned_shape_pc"].dtype == np.float16
         assert data["pse_times"].dtype == np.float32
         assert data["pse_offsets"].shape == (9,)
         assert data["pse_offsets"][-1] == 4 * 12 + 4 * 14
-        assert data["pse_pc_values"].shape == (104, 2)
-        assert data["aligned_shape_pc"].shape == (8, 8, 2)
+        assert data["pse_pc_values"].shape == (104, 8)
+        assert data["unaligned_shape_pc"].shape == (8, 8, 8)
+        assert data["aligned_shape_pc"].shape == (8, 8, 8)
         assert data["shape_grid"].shape == (8,)
         assert data["shape_valid"].shape == (8,)
+        assert data["phase_status"].dtype == np.uint8
+        assert set(np.unique(data["phase_status"])).issubset({0, 1, 2})
+        assert data["accepted_warp"].shape == (8, 8)
         assert not ({"sample_index", "domain", "label"} & set(data.files))
         assert "pse_values" not in data.files
         assert "aligned_shape" not in data.files
@@ -319,21 +341,63 @@ def test_snapshot_fits_fixed_projection_once_and_persists_only_pc_curves(
     np.testing.assert_array_equal(reused_basis.shape_components, basis.shape_components)
     for epoch in (50, 75, 100):
         with np.load(tmp_path / f"epoch_{epoch:04d}.npz", allow_pickle=False) as data:
-            assert data["pse_pc_values"].shape[-1] == 2
-            assert data["aligned_shape_pc"].shape[-1] == 2
+            assert data["pse_pc_values"].shape[-1] == 8
+            assert data["unaligned_shape_pc"].shape[-1] == 8
+            assert data["aligned_shape_pc"].shape[-1] == 8
 
     order = selected.sample_index.copy()
+    fixed_pixel_indices = selected.pixel_indices.copy()
     exists = manager.capture(25)
     assert exists.status == "EXISTS"
     np.testing.assert_array_equal(
         load_selected_samples(tmp_path / "selected_samples.npz").sample_index,
         order,
     )
+    np.testing.assert_array_equal(
+        load_selected_samples(tmp_path / "selected_samples.npz").pixel_indices,
+        fixed_pixel_indices,
+    )
     manifest = (tmp_path / "manifest.json").read_text(encoding="utf-8")
-    assert '"schema_version": 2' in manifest
-    assert '"snapshot_representation": "fixed_pca_projection"' in manifest
+    assert '"schema_version": 3' in manifest
+    assert '"snapshot_representation": "fixed_weighted_pca_projection"' in manifest
     assert '"class_names"' in manifest
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_projection_basis_recovers_at_next_epoch_after_initial_fit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = TinySnapshotDataset([0, 1], parcel_offset=10, length=5)
+    target = TinySnapshotDataset([0, 1], parcel_offset=20, length=6)
+    model = _tiny_model()
+    _force_valid_shape(model)
+    manager = FeatureSnapshotManager(
+        model, source, target,
+        FeatureSnapshotConfig(25, 1, "float16", tmp_path, 1, 4),
+        device=torch.device("cpu"), batch_size=2,
+        source_domain="source", target_domain="target",
+    )
+    original = feature_snapshots.fit_deterministic_pca
+    calls = 0
+
+    def fail_first(values, num_components=8, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic first-basis failure")
+        return original(values, num_components, **kwargs)
+
+    monkeypatch.setattr(feature_snapshots, "fit_deterministic_pca", fail_first)
+    assert manager.capture(25).status == "FAILED"
+    assert not (tmp_path / "epoch_0025.npz").exists()
+    assert manager.capture(50).status == "SUCCESS"
+    basis = load_projection_basis(tmp_path / "projection_basis.npz")
+    assert basis.fitted_epoch == 50
+    assert manager.capture(75).status == "SUCCESS"
+    assert load_projection_basis(tmp_path / "projection_basis.npz").fitted_epoch == 50
+    status = json.loads((tmp_path / "snapshot_status.json").read_text(encoding="utf-8"))
+    assert status["epochs"]["25"]["status"] == "FAILED"
+    assert status["epochs"]["50"]["status"] == "SUCCESS"
 
 
 def test_snapshot_forward_is_read_only_and_restores_training_state(tmp_path: Path) -> None:
@@ -441,7 +505,7 @@ def test_existing_selection_recreates_missing_manifest(tmp_path: Path) -> None:
 
     assert result.status == "EXISTS"
     assert manifest_path.is_file()
-    assert '"snapshot_representation": "fixed_pca_projection"' in manifest_path.read_text(
+    assert '"snapshot_representation": "fixed_weighted_pca_projection"' in manifest_path.read_text(
         encoding="utf-8"
     )
 
@@ -521,13 +585,18 @@ def test_640_selected_samples_are_forwarded_in_bounded_cpu_batches(tmp_path: Pat
         source_domain="source", target_domain="target",
     )
 
-    values, times, aligned, valid, grid = manager._collect_features(
-        np.arange(320), np.arange(320), batch_size=8
+    collected = manager._collect_features(
+        np.arange(320), np.arange(320),
+        np.tile(np.arange(64), (320, 1)) % 5,
+        np.tile(np.arange(64), (320, 1)) % 5,
+        batch_size=8,
     )
+    values, times, unaligned, aligned, valid, status, warp, grid = collected
 
-    assert len(values) == len(times) == len(aligned) == len(valid) == 640
+    assert len(values) == len(times) == len(unaligned) == len(aligned) == len(valid) == 640
     assert len(model.batch_sizes) == 80
     assert max(model.batch_sizes) == 8
+    assert set(model.pixel_widths) == {64}
     assert all(isinstance(array, np.ndarray) for array in (*values, *times, *aligned, grid))
     assert not any(torch.is_tensor(array) for array in (*values, *times, *aligned, grid))
 
@@ -547,10 +616,10 @@ def test_cuda_oom_retries_8_to_4_to_2_to_1_and_then_writes_snapshot(
     fit_devices: list[str] = []
     original_fit = feature_snapshots.fit_deterministic_pca
 
-    def assert_cpu_fit(values: np.ndarray, num_components: int = 2):
+    def assert_cpu_fit(values: np.ndarray, num_components: int = 8, **kwargs):
         assert isinstance(values, np.ndarray)
         fit_devices.append("cpu")
-        return original_fit(values, num_components)
+        return original_fit(values, num_components, **kwargs)
 
     monkeypatch.setattr(feature_snapshots, "fit_deterministic_pca", assert_cpu_fit)
     result = manager.capture(25)
@@ -560,6 +629,8 @@ def test_cuda_oom_retries_8_to_4_to_2_to_1_and_then_writes_snapshot(
     assert fit_devices == ["cpu", "cpu"]
     assert (tmp_path / "epoch_0025.npz").is_file()
     assert not (tmp_path / "SNAPSHOT_FAILED").exists()
+    status = json.loads((tmp_path / "snapshot_status.json").read_text(encoding="utf-8"))
+    assert status["has_failures"] is False
     output = capsys.readouterr().out
     for old, new in ((8, 4), (4, 2), (2, 1)):
         assert f"old_batch_size={old}|new_batch_size={new}|reason=CUDA_OOM" in output
@@ -581,7 +652,10 @@ def test_exhausted_cuda_oom_records_failure_without_partial_epoch(tmp_path: Path
     assert result.status == "FAILED"
     assert "OutOfMemoryError" in (result.error or "")
     assert model.batch_sizes == [8, 4, 2, 1]
-    assert (tmp_path / "SNAPSHOT_FAILED").is_file()
+    status = json.loads((tmp_path / "snapshot_status.json").read_text(encoding="utf-8"))
+    assert status["epochs"]["25"]["status"] == "FAILED"
+    assert status["has_failures"] is True
+    assert not (tmp_path / "SNAPSHOT_FAILED").exists()
     assert not (tmp_path / "epoch_0025.npz").exists()
     assert not list(tmp_path.glob("*.tmp"))
 
