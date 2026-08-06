@@ -1,72 +1,39 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 import torch
 
-from methods.structure_da.backbone import StructureBackbone, StructureBackboneOutput
-from methods.structure_da.full_model import (
-    StructureAwareDomainAdaptationModel,
-    StructureAwareForwardOutput,
+from methods.structure_da import (
+    FunctionalGeometryOutput,
+    TSStructureForwardOutput,
+    TSStructureModel,
 )
-from methods.structure_da.phase_aware_objective import (
-    PhaseAwarePrototypeAlignment,
-    TrendLedGeometryObjective,
-)
-from methods.structure_da.representation import (
-    PhaseAwareTwoScaleClassifier,
-)
-from methods.structure_da.temporal_module import (
-    TrendStructureTaskFeatureModule,
-)
-from models.ltae import TrendStructureSharedLTAE
 
 
-def _model(dtype: torch.dtype = torch.float32, **overrides):
-    warp_num_candidates = overrides.pop("warp_num_candidates", 3)
+def _model(**overrides) -> TSStructureModel:
     options = dict(
         num_classes=3,
         input_dim=2,
         mlp1=(2, 4, 4),
         mlp2=(8, 4),
-        shape_dim=4,
         time_reference=0.0,
         time_scale=365.0,
-        temporal_options={
-            "trend_num_basis": 4,
-            "structure_num_basis": 4,
-            "canonical_grid_size": 5,
-            "roughness_grid_size": 64,
-            "min_mean_support": 0.0,
-            "min_dynamic_energy": 0.0,
-            "min_template_mean_support": 0.0,
-            "warp_hidden_dim": 6,
-            "warp_kernel_size": 3,
-            "warp_num_candidates": warp_num_candidates,
-            "num_shape_basis": 3,
-            "num_phase_basis": 2,
-            "attribute_projection_dim": 2,
-            "shape_hidden_dim": 6,
-            "shape_dropout": 0.0,
-        },
-        representation_options={
-            "n_head": 1,
-            "d_k": 2,
-            "d_model": 8,
-            "ltae_mlp": (8, 4),
-            "dropout": 0.0,
-            "classifier_hidden": (4,),
-            "quality_domain_hidden_dim": 5,
-        },
-        prototype_options={
-            "radius_buffer_size": 8,
-            "min_radius_samples": 2,
-            "min_common_support": 0.0,
-        },
+        trend_num_basis=4,
+        structure_num_basis=4,
+        canonical_grid_size=5,
+        roughness_grid_size=64,
+        trend_smoothing=1e-2,
+        structure_smoothing=1e-3,
+        n_head=1,
+        d_k=2,
+        d_model=8,
+        ltae_mlp=(8, 4),
+        dropout=0.0,
+        classifier_hidden=(4,),
+        max_initial_frequency=4.0,
     )
     options.update(overrides)
-    return StructureAwareDomainAdaptationModel(**options).to(dtype=dtype)
+    return TSStructureModel(**options)
 
 
 def _inputs(batch: int = 3, length: int = 5, dtype=torch.float32):
@@ -77,297 +44,208 @@ def _inputs(batch: int = 3, length: int = 5, dtype=torch.float32):
     return pixels, valid, positions
 
 
-@torch.no_grad()
-def _initialize_temporal_source_state(model, inputs) -> None:
-    backbone = model.forward_backbone(*inputs)
-    trend, structure = model._trend_and_structure(backbone)
-    model.temporal_features.update_source_state(
-        trend.detach().float(),
-        structure.detach().float(),
-        model._task_positions(inputs[2], backbone).float(),
-        backbone.time_mask,
-    )
-
-
-def test_model_contains_only_phase_aware_high_level_modules() -> None:
-    model = _model()
-    assert isinstance(model.backbone, StructureBackbone)
-    assert isinstance(model.temporal_features, TrendStructureTaskFeatureModule)
-    assert isinstance(model.representation, PhaseAwareTwoScaleClassifier)
-    assert isinstance(model.prototype_alignment, PhaseAwarePrototypeAlignment)
-    assert isinstance(model.geometry_objective, TrendLedGeometryObjective)
-    estimator = model.temporal_features.core.warp_estimator
-    assert estimator.candidate_init_warp_amplitude == pytest.approx(0.015)
-    assert estimator.candidate_base_logits.shape == (3, 4)
-    assert sum(isinstance(module, TrendStructureSharedLTAE) for module in model.modules()) == 1
-
-
-def test_trend_structure_and_forward_output_have_exact_final_semantics() -> None:
+def test_model_forward_output_shapes_and_types() -> None:
     model = _model().eval()
     pixels, valid, positions = _inputs()
-    backbone = model.forward_backbone(pixels, valid, positions)
-    trend, structure = model._trend_and_structure(backbone)
-    torch.testing.assert_close(trend, backbone.decomposition.trend)
-    torch.testing.assert_close(
-        structure,
-        backbone.decomposition.trend + backbone.decomposition.dynamics,
-    )
+    output = model(pixels, valid, positions, return_geometry=True)
 
-    output = model.forward_from_backbone(backbone, positions)
-    assert isinstance(output, StructureAwareForwardOutput)
-    assert set(output.__dataclass_fields__) == {
-        "backbone", "temporal", "representation", "semantic"
-    }
-    assert model.representation.fused_dim == 2 * model.representation.component_dim + 4
-    expected_fused = torch.cat(
-        [
-            output.representation.quality.weighted_trend,
-            output.representation.quality.weighted_structure,
-            output.representation.shape_feature,
-        ],
-        dim=-1,
-    )
-    torch.testing.assert_close(output.representation.fused_feature, expected_fused)
-    torch.testing.assert_close(
-        output.semantic.aligned_structure_srvf,
-        output.temporal.aligned_structure_srvf,
-    )
-    torch.testing.assert_close(
-        output.semantic.trend_embedding, output.representation.trend_embedding
-    )
-    torch.testing.assert_close(
-        output.semantic.structure_embedding,
-        output.representation.structure_embedding,
-    )
-    assert output.representation.aligned_positions.is_floating_point()
-    assert model(pixels, valid, positions).shape == (3, 3)
+    assert isinstance(output, TSStructureForwardOutput)
+    assert output.trend.shape == (3, 5, 4)
+    assert output.structure.shape == (3, 5, 4)
+    assert output.latent.shape == (3, 5, 4)
+    assert output.trend_repr.shape == (3, 4)
+    assert output.structure_repr.shape == (3, 4)
+    assert output.fused_repr.shape == (3, 8)
+    assert output.logits.shape == (3, 3)
+    assert output.mask.shape == (3, 5)
+    assert output.positions.shape == (3, 5)
+    assert output.dynamics.shape == (3, 5, 4)
+    assert output.residual.shape == (3, 5, 4)
+
+    geometry = output.geometry
+    assert isinstance(geometry, FunctionalGeometryOutput)
+    assert geometry.trend_srvf.shape == (3, 5, 4)
+    assert geometry.structure_srvf.shape == (3, 5, 4)
+    assert geometry.trend_support.shape == (3, 5)
+    assert geometry.structure_support.shape == (3, 5)
+    assert geometry.canonical_grid.shape == (5,)
+    assert geometry.trend_valid.shape == (3,)
+    assert geometry.structure_valid.shape == (3,)
+    assert geometry.trend_valid.dtype == torch.bool
 
 
-def test_backbone_normalizes_physical_positions_exactly_once() -> None:
+def test_fused_repr_is_exact_concat_of_components() -> None:
+    model = _model().eval()
+    pixels, valid, positions = _inputs()
+    output = model(pixels, valid, positions, return_geometry=False)
+
+    torch.testing.assert_close(
+        output.fused_repr,
+        torch.cat([output.trend_repr, output.structure_repr], dim=-1),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_raw_path_uses_normalized_physical_positions() -> None:
     model = _model().eval()
     pixels, valid, _ = _inputs(length=3)
-    physical_positions = torch.tensor([0.0, 182.5, 365.0])
+    physical = torch.tensor([0.0, 182.5, 365.0])
 
-    backbone = model.forward_backbone(pixels, valid, physical_positions)
+    output = model(pixels, valid, physical, return_geometry=False)
 
     expected = torch.tensor([0.0, 0.5, 1.0]).expand(3, -1)
-    torch.testing.assert_close(backbone.normalized_positions, expected)
-    torch.testing.assert_close(
-        model._task_positions(physical_positions, backbone), expected
-    )
+    torch.testing.assert_close(output.positions, expected)
+    assert output.geometry is None
 
 
-def test_backbone_rejects_nonincreasing_and_out_of_contract_physical_time() -> None:
-    model = _model().eval()
-    pixels, valid, _ = _inputs(length=3)
-
-    with pytest.raises(ValueError, match="strictly increasing"):
-        model.forward_backbone(
-            pixels, valid, torch.tensor([0.0, 182.5, 182.5])
-        )
-    with pytest.raises(ValueError, match=r"\[0, 1\]"):
-        model.forward_backbone(
-            pixels, valid, torch.tensor([-1.0, 182.5, 365.0])
-        )
-
-
-def test_task_loss_updates_time_encoder_and_shared_ltae_but_not_warp() -> None:
+def test_shared_ltae_parameter_identity() -> None:
     model = _model()
-    inputs = _inputs()
-    _initialize_temporal_source_state(model, inputs)
-
-    output = model.forward_details(*inputs)
-    output.representation.logits.square().mean().backward()
-
-    ltae = model.representation.component_ltae
-    for module in (
-        ltae.shared_time_encoder,
-        ltae.shared_input_projection,
-        ltae.attention_heads,
-    ):
-        gradients = [parameter.grad for parameter in module.parameters()]
-        assert any(
-            gradient is not None
-            and torch.isfinite(gradient).all()
-            and gradient.abs().sum() > 0
-            for gradient in gradients
-        )
-    assert all(parameter.grad is None for parameter in model.geometry_parameters())
-
-
-def test_residual_is_not_an_independent_task_branch() -> None:
-    model = _model().eval()
-    pixels, valid, positions = _inputs()
-    backbone = model.forward_backbone(pixels, valid, positions)
-    changed = StructureBackboneOutput(
-        tokens=backbone.tokens,
-        time_mask=backbone.time_mask,
-        normalized_positions=backbone.normalized_positions,
-        decomposition=replace(
-            backbone.decomposition,
-            residual=backbone.decomposition.residual + 1000,
-        ),
-    )
-    original_output = model.forward_from_backbone(backbone, positions)
-    changed_output = model.forward_from_backbone(changed, positions)
-    torch.testing.assert_close(
-        original_output.representation.logits,
-        changed_output.representation.logits,
-    )
-
-
-def test_target_shape_da_detaches_coordinates_but_updates_shape_encoder() -> None:
-    model = _model()
-    inputs = _inputs()
-    _initialize_temporal_source_state(model, inputs)
-    output = model.forward_details(*inputs)
-    coordinates = output.temporal.coordinates.shape_coordinates
-    coordinates.retain_grad()
-    feature = model.forward_target_shape_feature_da(output)
-    feature.sum().backward()
-    assert feature.shape == (3, 4)
-    assert coordinates.grad is None
-    assert any(
-        parameter.grad is not None and parameter.grad.abs().sum() > 0
-        for parameter in model.temporal_features.shape_encoder.parameters()
-    )
-    assert all(parameter.grad is None for parameter in model.geometry_parameters())
-    assert torch.equal(
-        feature[~output.temporal.coordinates.shape_valid],
-        torch.zeros_like(feature[~output.temporal.coordinates.shape_valid]),
-    )
-
-
-def test_target_shape_teacher_is_deterministic_no_grad_and_used_for_gating() -> None:
-    model = _model().train()
-    inputs = _inputs()
-    _initialize_temporal_source_state(model, inputs)
-    source = model.forward_details(*inputs)
-    target = model.forward_details(*inputs)
-
-    torch.manual_seed(1)
-    first = model.forward_target_shape_teacher_feature(target)
-    torch.manual_seed(999)
-    second = model.forward_target_shape_teacher_feature(target)
-    torch.testing.assert_close(first, second)
-    assert not first.requires_grad
-    assert model.training
-
-    captured = {}
-    def capture_target(_module, args):
-        captured["target"] = args[2]
-
-    handle = model.prototype_alignment.register_forward_pre_hook(capture_target)
-    student = model.forward_target_shape_feature_da(target)
-    model.prototype_losses(source, torch.tensor([0, 1, 2]), target, student, first)
-    handle.remove()
-    torch.testing.assert_close(captured["target"].shape_feature, first)
-    torch.testing.assert_close(
-        target.semantic.shape_feature, target.representation.shape_feature
-    )
-
-
-def test_model_has_no_global_fused_feature_alignment() -> None:
-    model = _model()
-    assert not hasattr(model, "alignment")
-    assert not hasattr(model, "align")
-    assert not any(name.startswith("alignment.") for name, _ in model.named_parameters())
-    assert hasattr(model.representation.quality_fusion.trend_quality, "domain_classifier")
-    assert hasattr(model.representation.quality_fusion.structure_quality, "domain_classifier")
-
-
-def test_default_model_parameter_count_excludes_removed_alignment_branch() -> None:
-    model = StructureAwareDomainAdaptationModel(num_classes=10)
-    assert sum(parameter.numel() for parameter in model.parameters()) == 345_508
-
-
-def test_geometry_uses_core_only_and_detaches_backbones() -> None:
-    model = _model()
-    source_inputs = _inputs(length=5)
-    target_inputs = _inputs(length=7)
-    source_backbone = model.forward_backbone(*source_inputs)
-    target_backbone = model.forward_backbone(*target_inputs)
-
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("task encoder must not run during geometry forward")
-
-    model.representation.component_ltae.forward = forbidden
-    model.temporal_features.shape_encoder.forward = forbidden
-    geometry = model.forward_geometry_from_backbones(
-        source_backbone,
-        source_inputs[2],
-        target_backbone,
-        target_inputs[2],
-    )
-    assert torch.isfinite(geometry.total_loss)
-    geometry.total_loss.backward()
-    assert any(parameter.grad is not None for parameter in model.geometry_parameters())
-    assert all(parameter.grad is None for parameter in model.backbone.parameters())
-
-
-def test_parameter_partition_is_disjoint_exhaustive_and_excludes_state_modules() -> None:
-    model = _model()
-    geometry = tuple(model.geometry_parameters())
-    task = tuple(model.task_parameters())
-    assert geometry
-    assert {id(parameter) for parameter in geometry}.isdisjoint(
-        {id(parameter) for parameter in task}
-    )
-    assert {id(parameter) for parameter in (*geometry, *task)} == {
-        id(parameter) for parameter in model.parameters() if parameter.requires_grad
-    }
-    assert not tuple(model.prototype_alignment.parameters())
-    assert not tuple(model.geometry_objective.parameters())
-
-
-def test_source_state_update_updates_temporal_and_semantic_state_once() -> None:
-    model = _model()
-    inputs = _inputs()
-    labels = torch.tensor([0, 1, 2])
-    _initialize_temporal_source_state(model, inputs)
-    output = model.forward_details(*inputs)
-    trend_before = model.temporal_features.core.trend_template.num_updates.clone()
-    structure_before = (
-        model.temporal_features.core.structure_diagnostic_template.num_updates.clone()
-    )
-    model.update_source_state_from_output(output, inputs[2], labels)
-    assert model.prototype_alignment.q_update_count.sum() == 3
-    assert model.prototype_alignment.z_update_count.sum() == 3
-    assert model.prototype_alignment.trend_update_count.sum() == 3
-    assert model.prototype_alignment.structure_update_count.sum() == 3
-    assert model.temporal_features.core.trend_template.num_updates > trend_before
+    ltae = model.temporal_module.raw_encoder.shared_ltae
+    assert model.temporal_module.raw_encoder.shared_ltae is ltae
+    assert ltae.trend_input_norm is not ltae.structure_input_norm
+    assert ltae.trend_output_norm is not ltae.structure_output_norm
     assert (
-        model.temporal_features.core.structure_diagnostic_template.num_updates
-        > structure_before
+        ltae.trend_input_projection is ltae.structure_input_projection
     )
-    assert not hasattr(model, "update_target_state")
-    state_keys = model.state_dict()
-    assert "prototype_alignment.q_prototype" in state_keys
-    assert "prototype_alignment.q_distance_index" in state_keys
-    assert "prototype_alignment.q_radius_inner" in state_keys
+    assert hasattr(ltae, "shared_time_encoder")
+    assert hasattr(ltae, "attention_heads")
+    assert hasattr(ltae, "shared_projection")
 
 
-def test_convenience_state_update_requires_labels_and_with_extra_reaches_pse() -> None:
-    model = _model(with_extra=True)
+def test_geometry_is_differentiable_to_backbone_and_decomposition() -> None:
+    model = _model()
     pixels, valid, positions = _inputs()
+    output = model(pixels, valid, positions, return_geometry=True)
+    valid_mask = output.geometry.structure_valid
+    assert valid_mask.any().item()
+    model.zero_grad()
+    output.geometry.structure_srvf[valid_mask].sum().backward()
+
+    pse_params = list(model.backbone.pixel_set_encoder.parameters())
+    decomp_params = list(model.backbone.decomposition.parameters())
+    assert any(
+        parameter.grad is not None
+        and parameter.grad.abs().sum().item() > 0
+        for parameter in pse_params
+    )
+    assert any(
+        parameter.grad is not None
+        and parameter.grad.abs().sum().item() > 0
+        for parameter in decomp_params
+    )
+    # Fixed B-spline basis must not be registered as trainable parameters.
+    assert not any(
+        "canonical_basis" in name or "knots" in name
+        for name, _ in model.named_parameters()
+    )
+
+
+def test_ce_backpropagates_to_all_raw_path_components() -> None:
+    model = _model()
+    pixels, valid, positions = _inputs()
+    output = model(pixels, valid, positions, return_geometry=False)
     labels = torch.tensor([0, 1, 2])
-    extra = torch.randn(3, 4)
-    output = model.forward_details(pixels, valid, positions, extra)
-    changed_extra = extra.clone()
-    changed_extra[0, 0] += 2
-    changed = model.forward_details(pixels, valid, positions, changed_extra)
-    assert not torch.allclose(output.backbone.tokens, changed.backbone.tokens)
-    model.update_source_state(pixels, valid, positions, labels, extra)
+    model.zero_grad()
+    torch.nn.functional.cross_entropy(output.logits, labels).backward()
+
+    def has_grad(module) -> bool:
+        return any(
+            parameter.grad is not None and parameter.grad.abs().sum().item() > 0
+            for parameter in module.parameters()
+        )
+
+    assert has_grad(model.backbone.pixel_set_encoder)
+    assert has_grad(model.backbone.decomposition)
+    ltae = model.temporal_module.raw_encoder.shared_ltae
+    assert has_grad(ltae.shared_time_encoder)
+    assert has_grad(ltae.shared_input_projection)
+    assert has_grad(ltae.attention_heads)
+    assert has_grad(ltae.trend_input_norm)
+    assert has_grad(ltae.structure_input_norm)
+    assert has_grad(ltae.trend_output_norm)
+    assert has_grad(ltae.structure_output_norm)
+    assert has_grad(model.classifier)
 
 
-@pytest.mark.parametrize(
-    ("option_name", "conflict"),
-    [
-        ("temporal_options", {"feature_dim": 9}),
-        ("representation_options", {"shape_dim": 9}),
-        ("prototype_options", {"raw_dim": 9}),
-    ],
-)
-def test_fixed_dimensions_cannot_be_overridden(option_name, conflict) -> None:
-    with pytest.raises(ValueError, match="conflicts"):
-        _model(**{option_name: conflict})
+def test_padding_and_mask_do_not_change_valid_outputs() -> None:
+    model = _model().eval()
+    pixels, valid, positions = _inputs(batch=2)
+    mask = torch.tensor(
+        [[True, True, True, False, False], [True, True, True, True, False]],
+        dtype=torch.bool,
+    )
+    changed_pixels = pixels.clone()
+    changed_pixels = torch.where(
+        mask[:, :, None, None], changed_pixels, torch.full_like(changed_pixels, 999.0)
+    )
+    changed_positions = positions.clone().float()
+    changed_positions = torch.where(
+        mask, changed_positions, torch.full_like(changed_positions, -1e9)
+    )
+
+    baseline = model(pixels, valid, positions.float(), time_mask=mask, return_geometry=False)
+    changed = model(
+        changed_pixels, valid, changed_positions, time_mask=mask, return_geometry=False
+    )
+
+    torch.testing.assert_close(changed.logits, baseline.logits, rtol=0, atol=0)
+    torch.testing.assert_close(
+        changed.fused_repr, baseline.fused_repr, rtol=0, atol=0
+    )
+
+
+def test_model_state_contains_no_old_components() -> None:
+    model = _model()
+    state_keys = set(model.state_dict())
+    forbidden = (
+        "warp",
+        "candidate_base",
+        "shape_encoder",
+        "z_shape",
+        "quality",
+        "domain_discriminator",
+        "running_srvf",
+        "running_support",
+        "accepted_gamma",
+        "phase_center",
+    )
+    assert not any(name in key for key in state_keys for name in forbidden)
+    # Ensure a legitimate component name is not falsely flagged.
+    assert "decomposition" in "|".join(state_keys)
+
+
+def test_return_geometry_false_skips_functional_fit(monkeypatch) -> None:
+    model = _model()
+    pixels, valid, positions = _inputs()
+    calls = 0
+    original = model.temporal_module.trend_geometry.forward
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model.temporal_module.trend_geometry, "forward", counted)
+    model(pixels, valid, positions, return_geometry=False)
+    assert calls == 0
+
+    model(pixels, valid, positions, return_geometry=True)
+    assert calls == 1
+
+
+def test_encode_geometry_returns_only_geometry() -> None:
+    model = _model().eval()
+    pixels, valid, positions = _inputs()
+    geometry = model.encode_geometry(pixels, valid, positions)
+    assert isinstance(geometry, FunctionalGeometryOutput)
+    assert geometry.structure_srvf.shape == (3, 5, 4)
+
+
+def test_forward_accepts_no_domain_arguments() -> None:
+    model = _model()
+    pixels, valid, positions = _inputs()
+    with pytest.raises(TypeError):
+        model(pixels, valid, positions, source_labels=torch.zeros(3, dtype=torch.long))
+    with pytest.raises(TypeError):
+        model(pixels, valid, positions, domain_score_weight=1.0)

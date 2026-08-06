@@ -6,6 +6,7 @@ data/
 /runs/
 /logs/
 /analysis_outputs/
+/analysis_output/
 .vim/
 .ipynb_checkpoints
 .vscode/

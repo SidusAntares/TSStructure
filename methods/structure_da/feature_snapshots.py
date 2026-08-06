@@ -2,20 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import gc
 import hashlib
 import json
 import os
-from pathlib import Path
 import random
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 from torch import Tensor, nn
-
 
 SNAPSHOT_SCHEMA_VERSION = 3
 NUM_PROJECTION_COMPONENTS = 8
@@ -170,7 +169,7 @@ def deterministic_class_selection(
 
 
 def _stable_pixel_seed(pixel_seed: int, domain: str, parcel_index: int) -> int:
-    payload = f"{int(pixel_seed)}\0{domain}\0{int(parcel_index)}".encode("utf-8")
+    payload = f"{int(pixel_seed)}\0{domain}\0{int(parcel_index)}".encode()
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big", signed=False)
 
 
@@ -803,6 +802,7 @@ class FeatureSnapshotManager:
         valid: list[bool] = []
         phase_status: list[int] = []
         accepted_warp: list[np.ndarray] = []
+        shape_grid: np.ndarray | None = None
         module_training = [(module, module.training) for module in self.model.modules()]
         python_rng = random.getstate()
         numpy_rng = np.random.get_state()
@@ -837,29 +837,32 @@ class FeatureSnapshotManager:
                             dtype=amp_dtype,
                             enabled=use_autocast,
                         ):
-                            details = self.model.forward_details(
+                            output = self.model.forward(
                                 batch["pixels"],
                                 batch["valid_pixels"],
                                 batch["positions"],
                                 batch.get("extra"),
+                                return_geometry=True,
                             )
-                        batch_mask = details.backbone.time_mask.detach().cpu().numpy().astype(bool)
-                        batch_values = details.backbone.tokens.detach().float().cpu().numpy()
+                        batch_mask = output.mask.detach().cpu().numpy().astype(bool)
+                        batch_values = output.latent.detach().float().cpu().numpy()
                         batch_times = batch["positions"].detach().float().cpu().numpy().astype(np.float32)
-                        batch_valid = details.temporal.shape.valid.detach().cpu().numpy().astype(bool)
+                        geometry = output.geometry
+                        batch_valid = geometry.structure_valid.detach().cpu().numpy().astype(bool)
                         batch_unaligned = (
-                            details.temporal.core.structure_srvf.srvf.detach().float().cpu().numpy()
+                            geometry.structure_srvf.detach().float().cpu().numpy()
                         )
-                        batch_aligned = (
-                            details.temporal.aligned_structure_srvf.detach().float().cpu().numpy()
-                        )
+                        batch_aligned = batch_unaligned
                         batch_status = (
-                            details.temporal.core.selection.phase_status.detach().cpu().numpy().astype(np.uint8)
+                            torch.ones(batch_valid.shape[0], dtype=torch.long, device=self.device)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .astype(np.uint8)
                         )
-                        batch_warp = (
-                            details.temporal.core.selection.accepted_warp.warp.detach().float().cpu().numpy()
-                        )
-                        del details, batch, samples
+                        shape_grid = geometry.canonical_grid.detach().float().cpu().numpy()
+                        batch_warp = np.repeat(shape_grid[None, :], batch_valid.shape[0], axis=0)
+                        del output, batch, samples
                         for sample_index in range(len(batch_positions)):
                             mask = batch_mask[sample_index]
                             values.append(batch_values[sample_index, mask].copy())
@@ -876,7 +879,7 @@ class FeatureSnapshotManager:
                             batch_mask, batch_values, batch_times, batch_valid,
                             batch_unaligned, batch_aligned, batch_status, batch_warp,
                         )
-            shape_grid = self.model.temporal_features.coordinates.canonical_grid.detach().float().cpu().numpy().astype(np.float32)
+            shape_grid = geometry.canonical_grid.detach().float().cpu().numpy().astype(np.float32)
             accepted = normalize_accepted_warp(
                 np.asarray(phase_status, dtype=np.uint8),
                 np.stack(accepted_warp),

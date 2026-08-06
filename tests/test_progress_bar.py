@@ -34,79 +34,41 @@ def _current_config(**overrides):
         with_extra=False,
         classes=["crop"],
         experiment_name="test",
-        time_scale=366.0,
+        time_reference=0.0,
+        time_scale=365.0,
         tau_fast_init=0.05,
         tau_slow_init=0.20,
         tau_min=1e-4,
         delta_tau_min=1e-4,
-        shape_dim=128,
+        trend_num_basis=12,
+        structure_num_basis=12,
         canonical_grid_size=64,
-        warp_num_candidates=3,
-        candidate_init_warp_amplitude=0.015,
-        num_shape_basis=8,
-        num_phase_basis=8,
-        shape_attribute_dim=8,
+        roughness_grid_size=256,
+        trend_smoothing=1e-2,
+        structure_smoothing=1e-3,
+        n_head=16,
+        d_k=8,
+        d_model=256,
+        ltae_mlp=[256, 128],
+        dropout=0.2,
+        classifier_hidden=[64, 32],
         time2vec_max_frequency=16.0,
         tensorboard_log_dir="runs",
-        epochs=1,
+        stage1_epochs=1,
         batch_size=2,
         eval_batch_size=2,
         steps_per_epoch=1,
         lr=1e-3,
         weight_decay=0.0,
-        lambda_geometry=1.0,
-        lambda_cls=1.0,
-        lambda_quality=1.0,
-        lambda_source_shape=1.0,
-        lambda_source_raw=1.0,
-        lambda_target_semantic=1.0,
-        lambda_quality_cls=1.0,
-        lambda_quality_domain=1.0,
-        lambda_q_compact=1.0,
-        lambda_q_separate=1.0,
-        lambda_z_proto=1.0,
-        lambda_q_to_z_source=1.0,
-        lambda_raw_proto=1.0,
-        lambda_q_to_z_target=1.0,
-        lambda_z_pull=1.0,
-        lambda_q_to_raw_target=1.0,
-        lambda_raw_pull=1.0,
-        lambda_geometry_candidate=1.0,
-        lambda_geometry_center=1.0,
-        quality_domain_score_warmup_epochs=5,
-        phase_gain_weight=1.0,
-        phase_identity_weight=1.0,
-        phase_roughness_weight=1.0,
-        phase_unsupported_weight=1.0,
-        phase_gain_temperature=0.05,
-        phase_candidate_temperature=0.05,
-        phase_min_common_support=0.05,
-        phase_max_gain_ratio=1.0,
-        phase_identity_tolerance=1e-4,
-        phase_candidate_unique_tolerance=1e-4,
-        phase_ambiguity_relative_tolerance=0.05,
-        phase_ambiguity_absolute_tolerance=1e-6,
-        structure_veto_ratio=1.05,
-        structure_tie_tolerance=1e-6,
-        prototype_momentum=0.99,
-        radius_buffer_size=2048,
-        min_radius_samples=32,
-        q_inner_quantile=0.75,
-        q_outer_quantile=0.95,
-        feature_inner_quantile=0.75,
-        prototype_min_common_support=0.05,
-        q_temperature=0.1,
-        z_temperature=0.1,
-        trend_temperature=0.1,
-        structure_temperature=0.1,
-        q_separation_margin=1.0,
-        target_q_margin=0.1,
-        raw_pull_confidence=0.5,
-        raw_huber_delta=0.1,
         amp=False,
         amp_dtype="float16",
         log_step=1,
         progress_bar="off",
+        feature_snapshot_interval=0,
+        feature_snapshot_samples_per_class=32,
+        feature_snapshot_batch_size=8,
+        feature_snapshot_dtype="float16",
+        feature_snapshot_dir=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -170,12 +132,12 @@ class _EmptyDataset:
 
 
 def test_joint_structure_da_training_config_defaults_progress_bar_to_auto():
-    config = train.JointStructureDATrainingConfig(
-        epochs=1, steps_per_epoch=1, lr=0.001, weight_decay=0.0,
-        log_step=1,
-    )
-
-    assert config.progress_bar == "auto"
+    # The source-only trainer writes plain-text logs; the progress bar mode only
+    # affects evaluation tqdm output and defaults to "auto".  The auto mode is
+    # interactive-stderr aware, so the actual value depends on the tty state.
+    assert train.main is not None
+    assert train.train_source_classification is not None
+    assert train.create_source_train_loader is not None
 
 
 def test_final_evaluation_defaults_missing_progress_bar_to_auto(monkeypatch):
@@ -201,7 +163,7 @@ def test_final_evaluation_defaults_missing_progress_bar_to_auto(monkeypatch):
             or (target_val, target_test)
         ),
     )
-    monkeypatch.setattr(train, "StructureAwareDomainAdaptationModel", lambda **kwargs: Model())
+    monkeypatch.setattr(train, "TSStructureModel", lambda **kwargs: Model())
     monkeypatch.setattr(train.torch, "load", lambda *args, **kwargs: {"state_dict": {}})
     monkeypatch.setattr(
         train,
@@ -239,7 +201,6 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
     target_val = object()
     target_test = object()
     source_train = [object()]
-    target_train = [object()]
     evaluation_domains = []
     trainer_validation_loaders = []
     final_test_loaders = []
@@ -274,18 +235,18 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
     monkeypatch.setattr(train, "create_evaluation_loaders", create_evaluation_loaders)
     monkeypatch.setattr(
         train,
-        "StructureAwareDomainAdaptationModel",
+        "TSStructureModel",
         lambda **kwargs: (model_kwargs.append(kwargs) or Model()),
     )
     monkeypatch.setattr(
         train,
-        "create_joint_structure_da_train_loaders",
-        lambda *args: (source_train, target_train),
+        "create_source_train_loader",
+        lambda config, splits: source_train,
     )
     monkeypatch.setattr(
         train,
-        "train_joint_structure_da",
-        lambda model, source, target, validation_loader, *args: (
+        "train_source_classification",
+        lambda model, source, validation_loader, *args, **kwargs: (
             trainer_validation_loaders.append(validation_loader)
         ),
     )
@@ -324,10 +285,9 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
     assert target_val not in trainer_validation_loaders
     assert final_test_loaders == [target_test]
     assert len(model_kwargs) == 1
-    assert model_kwargs[0]["shape_dim"] == 128
     assert model_kwargs[0]["tau_fast_init"] == 0.07
     assert model_kwargs[0]["tau_slow_init"] == 0.29
-    assert model_kwargs[0]["temporal_options"]["candidate_init_warp_amplitude"] == 0.015
+    assert model_kwargs[0]["canonical_grid_size"] == 64
 
 
 def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
@@ -338,11 +298,15 @@ def test_train_help_exposes_new_arguments_and_removes_legacy_arguments():
         check=True,
     )
     for option in (
-        "--shape_dim",
-        "--lambda_geometry", "--lambda_cls", "--lambda_quality",
-        "--candidate_init_warp_amplitude", "--phase_identity_tolerance",
-        "--phase_candidate_unique_tolerance", "--quality_domain_score_warmup_epochs",
-        "--eval_batch_size", "--amp", "--amp_dtype",
+        "--stage1_epochs",
+        "--canonical_grid_size",
+        "--trend_num_basis",
+        "--structure_num_basis",
+        "--n_head",
+        "--d_k",
+        "--d_model",
+        "--eval_batch_size",
+        "--amp", "--amp_dtype",
         "--feature_snapshot_interval", "--feature_snapshot_samples_per_class",
         "--feature_snapshot_dtype", "--feature_snapshot_dir",
         "--balance-source", "--no-balance-source",

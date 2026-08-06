@@ -63,9 +63,10 @@ def evaluation(
 
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
         if temporal_shift is not None:
-            logits = model.forward(pixels, valid_pixels, positions + temporal_shift, extra)
+            output = model.forward(pixels, valid_pixels, positions + temporal_shift, extra, return_geometry=False)
         else:
-            logits = model.forward(pixels, valid_pixels, positions, extra)
+            output = model.forward(pixels, valid_pixels, positions, extra, return_geometry=False)
+        logits = output.logits
 
         predictions = logits.argmax(dim=1)
 

@@ -7,8 +7,6 @@ import pytest
 import torch
 
 import dataset
-from methods.structure_da import joint_trainer as structure_da_trainer
-
 import train
 
 
@@ -351,15 +349,14 @@ def test_closed_set_is_propagated_to_structure_da_and_evaluation_loaders(
     }
 
     _LoaderDataset.calls = []
-    monkeypatch.setattr(structure_da_trainer, "PixelSetData", _LoaderDataset)
+    monkeypatch.setattr(train, "PixelSetData", _LoaderDataset)
     calls = []
-    monkeypatch.setattr(structure_da_trainer, "BalancedBatchSampler", lambda labels, batch_size, seed=None: ("balanced", seed))
-    monkeypatch.setattr(structure_da_trainer, "DataLoader", lambda **kwargs: calls.append(kwargs) or kwargs)
-    monkeypatch.setattr(structure_da_trainer, "create_train_loader", lambda *args, **kwargs: calls.append((args, kwargs)) or "target")
-    source_loader, target_loader = structure_da_trainer.create_joint_structure_da_train_loaders(config, splits)
-    assert _LoaderDataset.calls == [(True, True), (True, True)]
+    monkeypatch.setattr(train, "BalancedBatchSampler", lambda labels, batch_size, seed=None: ("balanced", seed))
+    monkeypatch.setattr(train, "DataLoader", lambda **kwargs: calls.append(kwargs) or kwargs)
+    monkeypatch.setattr(train, "create_train_loader", lambda *args, **kwargs: calls.append((args, kwargs)) or "target")
+    source_loader = train.create_source_train_loader(config, splits)
+    assert _LoaderDataset.calls == [(True, True)]
     assert source_loader["batch_sampler"] == ("balanced", 7)
-    assert target_loader == "target"
 
     _LoaderDataset.calls = []
     monkeypatch.setattr(dataset, "PixelSetData", _LoaderDataset)

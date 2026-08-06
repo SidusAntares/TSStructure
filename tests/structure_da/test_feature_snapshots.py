@@ -31,7 +31,7 @@ def test_disabled_snapshot_path_does_not_construct_datasets() -> None:
     assert create_feature_snapshot_manager(
         object(), Config(), {}, device=torch.device("cpu")
     ) is None
-from methods.structure_da.full_model import StructureAwareDomainAdaptationModel
+from methods.structure_da import TSStructureModel
 
 
 class TinySnapshotDataset(Dataset):
@@ -85,7 +85,7 @@ class RecordingSnapshotModel(torch.nn.Module):
         self.pixel_widths: list[int] = []
         self.previous_details: weakref.ReferenceType | None = None
 
-    def forward_details(self, pixels, valid_pixels, positions, extra=None):
+    def forward(self, pixels, valid_pixels, positions, extra=None, *, return_geometry=True):
         if self.previous_details is not None:
             assert self.previous_details() is None, "previous batch details were retained"
         batch_size = int(pixels.shape[0])
@@ -100,73 +100,65 @@ class RecordingSnapshotModel(torch.nn.Module):
         tokens = torch.cat((base, base[..., :2], base[..., :3]), dim=-1)
         aligned = tokens[:, :4].clone()
         details = _SnapshotDetails()
-        details.backbone = SimpleNamespace(tokens=tokens, time_mask=time_mask)
-        details.temporal = SimpleNamespace(
-            shape=SimpleNamespace(valid=torch.ones(batch_size, dtype=torch.bool)),
-            aligned_structure_srvf=aligned,
-            core=SimpleNamespace(
-                structure_srvf=SimpleNamespace(srvf=aligned + 0.25),
-                selection=SimpleNamespace(
-                    phase_status=torch.full((batch_size,), 2, dtype=torch.long),
-                    accepted_warp=SimpleNamespace(
-                        warp=torch.linspace(0, 1, 4).repeat(batch_size, 1)
-                    ),
-                ),
-            ),
+        details.mask = time_mask
+        details.latent = tokens
+        geometry = SimpleNamespace(
+            structure_srvf=aligned + 0.25,
+            trend_srvf=aligned,
+            structure_support=torch.ones(batch_size, 4),
+            trend_support=torch.ones(batch_size, 4),
+            canonical_grid=torch.linspace(0, 1, 4),
+            structure_valid=torch.ones(batch_size, dtype=torch.bool),
+            trend_valid=torch.ones(batch_size, dtype=torch.bool),
         )
+        details.geometry = geometry
         self.previous_details = weakref.ref(details)
         return details
 
 
-def _tiny_model() -> StructureAwareDomainAdaptationModel:
-    return StructureAwareDomainAdaptationModel(
+def _tiny_model() -> TSStructureModel:
+    return TSStructureModel(
         num_classes=2,
         input_dim=3,
         mlp1=[3, 4],
         pooling="mean_std",
         mlp2=[8, 8],
         with_extra=False,
-        shape_dim=5,
-        temporal_options={
-            "canonical_grid_size": 8,
-            "roughness_grid_size": 64,
-            "trend_num_basis": 5,
-            "structure_num_basis": 5,
-            "num_shape_basis": 3,
-            "num_phase_basis": 3,
-            "attribute_projection_dim": 3,
-            "shape_hidden_dim": 8,
-            "warp_hidden_dim": 6,
-            "warp_num_candidates": 2,
-        },
-        representation_options={
-            "n_head": 2,
-            "d_k": 2,
-            "d_model": 8,
-            "ltae_mlp": (8, 4),
-            "classifier_hidden": (6,),
-            "quality_domain_hidden_dim": 6,
-            "dropout": 0.0,
-        },
-        prototype_options={"radius_buffer_size": 8, "min_radius_samples": 2},
+        canonical_grid_size=8,
+        roughness_grid_size=64,
+        trend_num_basis=5,
+        structure_num_basis=5,
+        n_head=2,
+        d_k=2,
+        d_model=8,
+        ltae_mlp=(8, 4),
+        classifier_hidden=(6,),
+        dropout=0.0,
     )
 
 
-def _force_valid_shape(model: StructureAwareDomainAdaptationModel) -> None:
-    original_forward_details = model.forward_details
+def _force_valid_shape(model: TSStructureModel) -> None:
+    original_forward_details = model.forward
 
     def forward_details(*args, **kwargs):
         output = original_forward_details(*args, **kwargs)
-        temporal = replace(
-            output.temporal,
-            shape=replace(
-                output.temporal.shape,
-                valid=torch.ones_like(output.temporal.shape.valid),
-            ),
-        )
-        return replace(output, temporal=temporal)
+        geometry = output.geometry
+        from methods.structure_da.representation import FunctionalGeometryOutput
+        import dataclasses
 
-    model.forward_details = forward_details
+        valid = torch.ones_like(geometry.trend_valid)
+        replacement = FunctionalGeometryOutput(
+            trend_srvf=geometry.trend_srvf,
+            structure_srvf=geometry.structure_srvf,
+            trend_support=geometry.trend_support,
+            structure_support=geometry.structure_support,
+            canonical_grid=geometry.canonical_grid,
+            trend_valid=valid,
+            structure_valid=valid,
+        )
+        return dataclasses.replace(output, geometry=replacement)
+
+    model.forward = forward_details
 
 
 def test_snapshot_interval_triggers_only_positive_multiples() -> None:

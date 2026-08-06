@@ -1,165 +1,82 @@
-"""Shape-only feature encoding for the V3 temporal path."""
+"""Raw T/S temporal encoding with a shared LTAE body and private norms.
+
+The trend and structure branches share one ContinuousTime2Vec, one input
+projection Linear and one LTAE attention/projection body. Only the input and
+output LayerNorms are branch-private. The final representation is the plain
+concatenation ``[r_T | r_S]``.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import math
-from numbers import Real
+from collections.abc import Sequence
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
-def _positive_integer(name: str, value: int) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
+from models.ltae import TrendStructureSharedLTAE
+
+from .representation import RawTemporalRepresentation
 
 
-def _dropout_probability(value: float) -> float:
-    if (
-        not isinstance(value, Real)
-        or isinstance(value, bool)
-        or not math.isfinite(float(value))
-    ):
-        raise ValueError("dropout must be a finite number in [0, 1)")
-    converted = float(value)
-    if not 0.0 <= converted < 1.0:
-        raise ValueError("dropout must be in [0, 1)")
-    return converted
-
-
-def _validate_valid_mask(
-    valid: Tensor,
-    *,
-    batch_size: int,
-    device: torch.device,
-) -> None:
-    if (
-        not isinstance(valid, Tensor)
-        or valid.dtype != torch.bool
-        or valid.shape != (batch_size,)
-    ):
-        raise ValueError("valid must be a boolean tensor with shape [B]")
-    if valid.device != device:
-        raise ValueError("valid device must match coordinate device")
-
-
-def _autocast_enabled_for(device: torch.device) -> bool:
-    if device.type == "cuda":
-        return torch.is_autocast_enabled()
-    if device.type == "cpu":
-        return torch.is_autocast_cpu_enabled()
-    return False
-
-
-def _validate_floating_tensor(
-    name: str,
-    tensor: Tensor,
-    *,
-    expected_tail: tuple[int, ...],
-    parameter: Tensor,
-) -> None:
-    expected_ndim = len(expected_tail) + 1
-    if not isinstance(tensor, Tensor) or tensor.ndim != expected_ndim:
-        shape = ", ".join(["B", *(str(value) for value in expected_tail)])
-        raise ValueError(f"{name} must have shape [{shape}]")
-    if tensor.shape[1:] != expected_tail:
-        shape = ", ".join(["B", *(str(value) for value in expected_tail)])
-        raise ValueError(f"{name} must have shape [{shape}]")
-    if not tensor.is_floating_point():
-        raise ValueError(f"{name} must use a floating-point dtype")
-    if tensor.device != parameter.device:
-        raise ValueError(f"{name} device must match module parameter device")
-    if tensor.dtype != parameter.dtype:
-        if not _autocast_enabled_for(tensor.device):
-            raise ValueError(
-                f"{name} dtype must match module parameter dtype when "
-                "autocast is disabled"
-            )
-        if parameter.dtype != torch.float32:
-            raise ValueError(
-                f"{name} mixed-precision input requires float32 master "
-                "parameters"
-            )
-        if tensor.dtype not in (
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        ):
-            raise ValueError(f"{name} uses an unsupported autocast dtype")
-    if not torch.isfinite(tensor).all().item():
-        raise ValueError(f"{name} must contain only finite values")
-
-
-@dataclass(frozen=True)
-class ShapeFeatureOutput:
-    feature: Tensor
-    valid: Tensor
-
-
-class ShapeFeatureEncoder(nn.Module):
-    """Encode Shape-only coordinates directly into the final shape feature."""
+class SharedTrendStructureLTAE(nn.Module):
+    """Encode trend and structure into one shared LTAE representation."""
 
     def __init__(
         self,
-        num_shape_basis: int,
-        attribute_projection_dim: int,
-        output_dim: int,
-        hidden_dim: int = 128,
-        dropout: float = 0.1,
+        in_channels: int,
+        n_head: int = 16,
+        d_k: int = 8,
+        n_neurons: Sequence[int] = (256, 128),
+        dropout: float = 0.2,
+        d_model: int = 256,
+        *,
+        time_reference: float = 0.0,
+        time_scale: float = 365.0,
+        max_initial_frequency: float = 16.0,
     ) -> None:
         super().__init__()
-        self.num_shape_basis = _positive_integer(
-            "num_shape_basis", num_shape_basis
+        self.shared_ltae = TrendStructureSharedLTAE(
+            in_channels=in_channels,
+            n_head=n_head,
+            d_k=d_k,
+            n_neurons=n_neurons,
+            dropout=dropout,
+            d_model=d_model,
+            time_reference=time_reference,
+            time_scale=time_scale,
+            max_initial_frequency=max_initial_frequency,
         )
-        self.attribute_projection_dim = _positive_integer(
-            "attribute_projection_dim", attribute_projection_dim
-        )
-        self.output_dim = _positive_integer("output_dim", output_dim)
-        self.hidden_dim = _positive_integer("hidden_dim", hidden_dim)
-        self.dropout = _dropout_probability(dropout)
-        self.network = nn.Sequential(
-            nn.Linear(
-                self.num_shape_basis * self.attribute_projection_dim,
-                self.hidden_dim,
-            ),
-            nn.GELU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_dim, self.output_dim),
-        )
+        self.component_dim = self.shared_ltae.component_dim
 
     def forward(
         self,
-        shape_coordinates: Tensor,
-        valid: Tensor,
-        *,
-        deterministic: bool = False,
-    ) -> ShapeFeatureOutput:
-        _validate_floating_tensor(
-            "shape_coordinates",
-            shape_coordinates,
-            expected_tail=(
-                self.num_shape_basis,
-                self.attribute_projection_dim,
-            ),
-            parameter=self.network[0].weight,
+        trend: Tensor,
+        structure: Tensor,
+        positions: Tensor,
+        mask: Tensor,
+    ) -> RawTemporalRepresentation:
+        """Return raw T/S embeddings for normalized physical positions.
+
+        Args:
+            trend: Temporal trend tokens with shape ``[B, L, D]``.
+            structure: Temporal structure tokens with shape ``[B, L, D]``.
+            positions: Backbone-normalized shared physical positions ``[B, L]``.
+            mask: Boolean validity mask with shape ``[B, L]`` (True = valid).
+        """
+        trend_repr, structure_repr = self.shared_ltae(
+            trend,
+            structure,
+            positions,
+            time_mask=mask,
         )
-        _validate_valid_mask(
-            valid,
-            batch_size=shape_coordinates.shape[0],
-            device=shape_coordinates.device,
+        if positions.ndim == 1:
+            resolved_positions = positions.unsqueeze(0).expand(trend.shape[0], -1)
+        else:
+            resolved_positions = positions
+        fused_repr = torch.cat([trend_repr, structure_repr], dim=-1)
+        return RawTemporalRepresentation(
+            trend_repr=trend_repr,
+            structure_repr=structure_repr,
+            fused_repr=fused_repr,
+            positions_used=resolved_positions,
         )
-        flattened = shape_coordinates.reshape(shape_coordinates.shape[0], -1)
-        feature = self.network[0](flattened)
-        feature = self.network[1](feature)
-        feature = F.dropout(
-            feature,
-            p=self.dropout,
-            training=self.training and not deterministic,
-        )
-        feature = self.network[3](feature)
-        feature = torch.where(
-            valid.unsqueeze(-1), feature, torch.zeros_like(feature)
-        )
-        return ShapeFeatureOutput(feature=feature, valid=valid)

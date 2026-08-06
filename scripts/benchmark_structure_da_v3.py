@@ -1,4 +1,4 @@
-"""Benchmark the current V3 synthetic training step without real data."""
+"""Benchmark the current two-stage source-only training step without real data."""
 
 from __future__ import annotations
 
@@ -15,58 +15,30 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from methods.structure_da.full_model import StructureAwareDomainAdaptationModel
-from methods.structure_da.joint_trainer import (
-    JointStructureDATrainingConfig,
-    joint_structure_da_train_step,
-)
-from methods.structure_da.phase_aware_objective import (
-    PhaseAwareTaskLossWeights,
-    PhaseAwareTaskObjective,
-)
-from methods.structure_da.quality_fusion import TwoScaleQualityObjective
+from methods.structure_da import SourceClassificationTrainer, TSStructureModel
 
 
-def _model(device: torch.device) -> StructureAwareDomainAdaptationModel:
-    model = StructureAwareDomainAdaptationModel(
+def _model(device: torch.device) -> TSStructureModel:
+    model = TSStructureModel(
         num_classes=3,
         input_dim=2,
         mlp1=(2, 4, 4),
         mlp2=(8, 4),
-        shape_dim=4,
         time_reference=0.0,
         time_scale=365.0,
-        temporal_options={
-            "trend_num_basis": 4,
-            "structure_num_basis": 4,
-            "canonical_grid_size": 5,
-            "roughness_grid_size": 64,
-            "min_mean_support": 0.0,
-            "min_dynamic_energy": 0.0,
-            "min_template_mean_support": 0.0,
-            "warp_hidden_dim": 6,
-            "warp_kernel_size": 3,
-            "warp_num_candidates": 3,
-            "num_shape_basis": 3,
-            "num_phase_basis": 2,
-            "attribute_projection_dim": 2,
-            "shape_hidden_dim": 6,
-            "shape_dropout": 0.0,
-        },
-        representation_options={
-            "n_head": 1,
-            "d_k": 2,
-            "d_model": 8,
-            "ltae_mlp": (8, 4),
-            "dropout": 0.0,
-            "classifier_hidden": (4,),
-            "quality_domain_hidden_dim": 5,
-        },
-        prototype_options={
-            "radius_buffer_size": 8,
-            "min_radius_samples": 2,
-            "min_common_support": 0.0,
-        },
+        trend_num_basis=4,
+        structure_num_basis=4,
+        canonical_grid_size=5,
+        roughness_grid_size=64,
+        trend_smoothing=1e-2,
+        structure_smoothing=1e-3,
+        n_head=1,
+        d_k=2,
+        d_model=8,
+        ltae_mlp=(8, 4),
+        dropout=0.0,
+        classifier_hidden=(4,),
+        max_initial_frequency=4.0,
     )
     return model.to(device=device).train()
 
@@ -127,34 +99,15 @@ def _run(
 ) -> dict[str, object]:
     torch.manual_seed(1701)
     model = _model(device)
-    config = JointStructureDATrainingConfig(
-        epochs=1,
-        steps_per_epoch=1,
-        lr=1e-3,
-        weight_decay=0.0,
-        log_step=1,
-        progress_bar="off",
-        classes=("a", "b", "c"),
-    )
-    quality_objective = TwoScaleQualityObjective(
-        config.quality_classification_weight,
-        config.quality_domain_weight,
-    )
-    task_objective = PhaseAwareTaskObjective(
-        PhaseAwareTaskLossWeights(
-            classification=config.classification_weight,
-            quality=config.quality_weight,
-            source_shape=config.source_shape_weight,
-            source_raw=config.source_raw_weight,
-            target_semantic=config.target_semantic_weight,
-        )
-    )
-    task_optimizer = torch.optim.Adam(model.task_parameters(), lr=config.lr)
-    geometry_optimizer = torch.optim.Adam(
-        model.geometry_parameters(), lr=config.lr
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = SourceClassificationTrainer(
+        model,
+        optimizer,
+        device=device,
+        amp_enabled=False,
+        amp_dtype="float16",
     )
     source = _sample(3, 5, device, labels=True)
-    target = _sample(2, 7, device, labels=False)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -162,23 +115,13 @@ def _run(
     for iteration in range(warmup + iterations):
         _synchronize(device)
         started = time.perf_counter()
-        joint_structure_da_train_step(
-            model,
-            source,
-            target,
-            task_optimizer,
-            geometry_optimizer,
-            quality_objective,
-            task_objective,
-            config,
-            device,
-        )
+        trainer.train_step(source)
         _synchronize(device)
         if iteration >= warmup:
             elapsed_ms.append((time.perf_counter() - started) * 1000.0)
 
     return {
-        "benchmark_mode": "synthetic_training_step_with_state_updates",
+        "benchmark_mode": "synthetic_source_only_ce_step",
         "device": str(device),
         "warmup": warmup,
         "iterations": iterations,

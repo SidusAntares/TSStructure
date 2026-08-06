@@ -1,26 +1,31 @@
 import argparse
-from collections import defaultdict
-from copy import deepcopy
-from distutils.util import strtobool
 import json
 import os
 import pickle as pkl
 import random
+from collections import defaultdict
+from copy import deepcopy
 
 import numpy as np
 import torch
 import torch.backends.cudnn
-from dataset import PixelSetData, create_evaluation_loaders
+from torch.utils.data import DataLoader
+from torchvision.transforms import transforms
+
+from dataset import (
+    BalancedBatchSampler,
+    PixelSetData,
+    create_evaluation_loaders,
+    create_train_loader,
+    worker_init_fn,
+)
 from evaluation import evaluation
 from methods.structure_da import (
-    JointStructureDATrainingConfig,
-    StructureAwareDomainAdaptationModel,
-    TrendStructureSelectionConfig,
+    SourceClassificationTrainer,
+    TSStructureModel,
     create_feature_snapshot_manager,
-    create_joint_structure_da_train_loaders,
-    resolve_steps_per_epoch,
-    train_joint_structure_da,
 )
+from transforms import Normalize, RandomSamplePixels, ToTensor
 from utils import label_utils
 from utils.metrics import overall_classification_report
 from utils.train_utils import bool_flag
@@ -37,6 +42,52 @@ def load_structure_da_state_dict(model, state_dict):
         )
     model.load_state_dict(state_dict)
 
+
+def create_source_train_loader(config, splits):
+    """Create the labelled source training loader, balanced when requested."""
+
+    source_transform = transforms.Compose(
+        [RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()]
+    )
+    source_dataset = PixelSetData(
+        data_root=config.data_root,
+        dataset_name=config.source,
+        classes=config.classes,
+        transform=source_transform,
+        indices=splits[config.source]["train"],
+        with_extra=False,
+        closed_set=config.closed_set,
+        combine_spring_and_winter=config.combine_spring_and_winter,
+        time_coordinate_mode=getattr(
+            config, "time_coordinate_mode", "canonical_day_of_year"
+        ),
+    )
+    if getattr(config, "balance_source", True):
+        return DataLoader(
+            dataset=source_dataset,
+            batch_sampler=BalancedBatchSampler(
+                source_dataset.get_labels(), config.batch_size, seed=config.seed
+            ),
+            num_workers=config.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            worker_init_fn=worker_init_fn,
+        )
+    return create_train_loader(source_dataset, config.batch_size, config.num_workers)
+
+
+def _comma_separated_ints(value: str) -> list[int]:
+    if isinstance(value, str):
+        items = [int(part) for part in value.split(",") if part]
+        if not items:
+            raise argparse.ArgumentTypeError("expected a comma-separated integer list")
+        return items
+    raise argparse.ArgumentTypeError("expected a comma-separated integer list")
+
+
+def _int_list(value):
+    if isinstance(value, list):
+        return value
+    return _comma_separated_ints(value)
 
 
 def main(config):
@@ -82,55 +133,15 @@ def main(config):
                 config.target, splits, config, sample_pixels_val
             )
 
-        training_config = None
         source_loader = None
-        target_loader = None
         if not config.eval:
-            source_loader, target_loader = create_joint_structure_da_train_loaders(
-                config, splits
-            )
-            training_config = JointStructureDATrainingConfig(
-                epochs=config.epochs,
-                steps_per_epoch=config.steps_per_epoch,
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-                geometry_weight=config.lambda_geometry,
-                classification_weight=config.lambda_cls,
-                quality_weight=config.lambda_quality,
-                source_shape_weight=config.lambda_source_shape,
-                source_raw_weight=config.lambda_source_raw,
-                target_semantic_weight=config.lambda_target_semantic,
-                quality_classification_weight=config.lambda_quality_cls,
-                quality_domain_weight=config.lambda_quality_domain,
-                quality_domain_score_warmup_epochs=(
-                    config.quality_domain_score_warmup_epochs
-                ),
-                candidate_init_warp_amplitude=config.candidate_init_warp_amplitude,
-                phase_identity_tolerance=config.phase_identity_tolerance,
-                phase_candidate_unique_tolerance=(
-                    config.phase_candidate_unique_tolerance
-                ),
-                time_reference=getattr(config, "time_reference", 0.0),
-                time_scale=config.time_scale,
-                time_coordinate_mode=getattr(
-                    config, "time_coordinate_mode", "canonical_day_of_year"
-                ),
-                amp=getattr(config, "amp", False),
-                amp_dtype=getattr(config, "amp_dtype", "float16"),
-                log_step=config.log_step,
-                progress_bar=config.progress_bar,
-                classes=tuple(config.classes),
-                balance_source=getattr(config, "balance_source", True),
-            )
-            resolved_steps_per_epoch = resolve_steps_per_epoch(
-                training_config, source_loader, target_loader
-            )
+            source_loader = create_source_train_loader(config, splits)
             eval_batch_size = config.eval_batch_size or config.batch_size
             amp_enabled = bool(
-                training_config.amp
+                getattr(config, "amp", False)
                 and (
                     device.type == "cuda"
-                    or training_config.amp_dtype == "bfloat16"
+                    or getattr(config, "amp_dtype", "float16") == "bfloat16"
                 )
             )
             print(
@@ -138,108 +149,35 @@ def main(config):
                 f"batch_size={config.batch_size}"
                 f"|eval_batch_size={eval_batch_size}"
                 f"|source_loader_steps={len(source_loader)}"
-                f"|target_loader_steps={len(target_loader)}"
-                f"|resolved_steps_per_epoch={resolved_steps_per_epoch}"
-                f"|epochs={config.epochs}"
-                f"|total_steps={config.epochs * resolved_steps_per_epoch}"
-                f"|shape_dim={config.shape_dim}"
-                f"|canonical_grid_size={config.canonical_grid_size}"
-                f"|warp_num_candidates={config.warp_num_candidates}"
-                "|candidate_init_warp_amplitude="
-                f"{config.candidate_init_warp_amplitude}"
-                f"|phase_identity_tolerance={config.phase_identity_tolerance}"
-                "|phase_candidate_unique_tolerance="
-                f"{config.phase_candidate_unique_tolerance}"
-                "|quality_domain_score_warmup_epochs="
-                f"{config.quality_domain_score_warmup_epochs}"
+                f"|epochs={config.stage1_epochs}"
                 f"|amp={str(amp_enabled).lower()}"
-                f"|amp_dtype={training_config.amp_dtype}"
-                f"|lambda_geometry={config.lambda_geometry}"
-                f"|lambda_cls={config.lambda_cls}"
-                f"|lambda_quality={config.lambda_quality}"
-                f"|lambda_source_shape={config.lambda_source_shape}"
-                f"|lambda_source_raw={config.lambda_source_raw}"
-                f"|lambda_target_semantic={config.lambda_target_semantic}"
+                f"|amp_dtype={getattr(config, 'amp_dtype', 'float16')}"
             )
 
-        selection_config = TrendStructureSelectionConfig(
-            gain_weight=config.phase_gain_weight,
-            identity_weight=config.phase_identity_weight,
-            roughness_weight=config.phase_roughness_weight,
-            unsupported_weight=config.phase_unsupported_weight,
-            gain_temperature=config.phase_gain_temperature,
-            candidate_temperature=config.phase_candidate_temperature,
-            min_common_support=config.phase_min_common_support,
-            max_gain_ratio=config.phase_max_gain_ratio,
-            ambiguity_relative_tolerance=config.phase_ambiguity_relative_tolerance,
-            ambiguity_absolute_tolerance=config.phase_ambiguity_absolute_tolerance,
-            structure_veto_ratio=config.structure_veto_ratio,
-            structure_tie_tolerance=config.structure_tie_tolerance,
-            identity_tolerance=config.phase_identity_tolerance,
-            candidate_unique_tolerance=config.phase_candidate_unique_tolerance,
-        )
-        temporal_options = {
-            "canonical_grid_size": config.canonical_grid_size,
-            "warp_num_candidates": config.warp_num_candidates,
-            "candidate_init_warp_amplitude": config.candidate_init_warp_amplitude,
-            "num_shape_basis": config.num_shape_basis,
-            "num_phase_basis": config.num_phase_basis,
-            "attribute_projection_dim": config.shape_attribute_dim,
-            "selection_config": selection_config,
-        }
-        representation_options = {
-            "max_initial_frequency": config.time2vec_max_frequency,
-        }
-        prototype_options = {
-            "prototype_momentum": config.prototype_momentum,
-            "radius_buffer_size": config.radius_buffer_size,
-            "min_radius_samples": config.min_radius_samples,
-            "q_inner_quantile": config.q_inner_quantile,
-            "q_outer_quantile": config.q_outer_quantile,
-            "feature_inner_quantile": config.feature_inner_quantile,
-            "min_common_support": config.prototype_min_common_support,
-            "q_temperature": config.q_temperature,
-            "z_temperature": config.z_temperature,
-            "trend_temperature": config.trend_temperature,
-            "structure_temperature": config.structure_temperature,
-            "q_separation_margin": config.q_separation_margin,
-            "target_q_margin": config.target_q_margin,
-            "raw_pull_confidence": config.raw_pull_confidence,
-            "raw_huber_delta": config.raw_huber_delta,
-        }
-        prototype_weight_options = {
-            "q_compact": config.lambda_q_compact,
-            "q_separate": config.lambda_q_separate,
-            "z_proto": config.lambda_z_proto,
-            "q_to_z_source": config.lambda_q_to_z_source,
-            "raw_proto": config.lambda_raw_proto,
-            "q_to_z_target": config.lambda_q_to_z_target,
-            "z_pull": config.lambda_z_pull,
-            "q_to_raw_target": config.lambda_q_to_raw_target,
-            "raw_pull": config.lambda_raw_pull,
-        }
-        geometry_objective_options = {
-            "candidate_weight": config.lambda_geometry_candidate,
-            "center_weight": config.lambda_geometry_center,
-        }
-        model = StructureAwareDomainAdaptationModel(
+        model = TSStructureModel(
             num_classes=config.num_classes,
             input_dim=config.input_dim,
             with_extra=config.with_extra,
-            shape_dim=config.shape_dim,
             time_reference=getattr(config, "time_reference", 0.0),
             time_scale=config.time_scale,
             tau_fast_init=config.tau_fast_init,
             tau_slow_init=config.tau_slow_init,
             tau_min=config.tau_min,
             delta_tau_min=config.delta_tau_min,
-            temporal_options=temporal_options,
-            representation_options=representation_options,
-            prototype_options=prototype_options,
-            prototype_weight_options=prototype_weight_options,
-            geometry_objective_options=geometry_objective_options,
+            trend_num_basis=config.trend_num_basis,
+            structure_num_basis=config.structure_num_basis,
+            canonical_grid_size=config.canonical_grid_size,
+            roughness_grid_size=config.roughness_grid_size,
+            trend_smoothing=config.trend_smoothing,
+            structure_smoothing=config.structure_smoothing,
+            n_head=config.n_head,
+            d_k=config.d_k,
+            d_model=config.d_model,
+            ltae_mlp=_int_list(config.ltae_mlp),
+            dropout=config.dropout,
+            classifier_hidden=_int_list(config.classifier_hidden),
+            max_initial_frequency=config.time2vec_max_frequency,
         )
-        
         model.to(config.device)
 
         best_model_path = os.path.join(config.fold_dir, 'model.pt')
@@ -250,20 +188,13 @@ def main(config):
             print(model)
             print('Number of trainable parameters:', get_num_trainable_params(model))
 
-            # if os.path.isfile(best_model_path):
-            #     answer = input(f'Model already exists at {best_model_path}! Override y/[n]? ')
-            #     override = strtobool(answer) if len(answer) > 0 else False
-            #     if not override:
-            #         print('Skipping fold', fold_num)
-            #         continue
-
             writer = SummaryWriter(log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0)
             feature_snapshot_manager = create_feature_snapshot_manager(
                 model, config, splits, device=device
             )
-            train_joint_structure_da(
-                model, source_loader, target_loader, source_val_loader,
-                training_config, writer, device, best_model_path,
+            train_source_classification(
+                model, source_loader, source_val_loader,
+                config, writer, device, best_model_path,
                 feature_snapshot_manager,
             )
 
@@ -288,6 +219,124 @@ def main(config):
         save_results(test_metrics, config)
 
     overall_performance(config)
+
+
+def train_source_classification(
+    model,
+    source_loader,
+    source_val_loader,
+    config,
+    writer,
+    device,
+    best_model_path,
+    feature_snapshot_manager=None,
+):
+    epochs = config.stage1_epochs
+    steps_per_epoch = getattr(config, "steps_per_epoch", None)
+    if steps_per_epoch is None or steps_per_epoch <= 0:
+        steps_per_epoch = len(source_loader)
+    if isinstance(steps_per_epoch, bool) or steps_per_epoch < 1:
+        raise ValueError("--steps_per_epoch must be a positive integer or None")
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs * steps_per_epoch, eta_min=0
+    )
+    amp_enabled = bool(
+        getattr(config, "amp", False)
+        and (
+            device.type == "cuda"
+            or getattr(config, "amp_dtype", "float16") == "bfloat16"
+        )
+    )
+    trainer = SourceClassificationTrainer(
+        model,
+        optimizer,
+        device=device,
+        amp_enabled=amp_enabled,
+        amp_dtype=getattr(config, "amp_dtype", "float16"),
+    )
+    best_f1 = float("-inf")
+    for epoch in range(epochs):
+        model.train()
+        meters = defaultdict(float)
+        steps = 0
+        for batch in source_loader:
+            if steps >= steps_per_epoch:
+                break
+            metrics = trainer.train_step(batch)
+            for name, value in metrics.items():
+                meters[name] += value
+            steps += 1
+            if steps % config.log_step == 0:
+                avg = {name: value / steps for name, value in meters.items()}
+                print(
+                    f"TRAIN_STEP|epoch={epoch + 1}/{epochs}|step={steps}/{steps_per_epoch}"
+                    f"|loss={avg['loss']:.4f}|cls={avg['classification_loss']:.4f}"
+                    f"|accuracy={avg['accuracy']:.4f}"
+                )
+        if steps == 0:
+            raise RuntimeError("source training loader produced no batches")
+        averages = {name: value / steps for name, value in meters.items()}
+        print(
+            f"TRAIN_EPOCH|epoch={epoch + 1}/{epochs}|steps={steps}"
+            f"|loss={averages['loss']:.4f}|cls={averages['classification_loss']:.4f}"
+            f"|accuracy={averages['accuracy']:.4f}"
+        )
+        for name, value in averages.items():
+            writer.add_scalar(f"train/{name}", value, epoch)
+        scheduler.step()
+        if feature_snapshot_manager is not None:
+            snapshot_result = feature_snapshot_manager.capture(epoch + 1)
+            if (
+                writer is not None
+                and snapshot_result is not None
+                and snapshot_result.status == "FAILED"
+            ):
+                writer.add_scalar("diagnostics/feature_snapshot_failed", 1, epoch)
+
+        model.eval()
+        best_f1, metrics = _source_validation(
+            best_f1, best_model_path, config, device, epoch, model, source_val_loader, writer
+        )
+    return best_f1
+
+
+def _source_validation(
+    best_f1, best_model_path, config, device, epoch, model, val_loader, writer
+):
+    val_metrics = evaluation(
+        model,
+        val_loader,
+        device,
+        config.classes,
+        torch.nn.CrossEntropyLoss(),
+        mode='val',
+        progress_bar=getattr(config, "progress_bar", "auto"),
+    )
+    val_loss, val_acc, val_f1, val_kappa = (
+        val_metrics['loss'],
+        val_metrics['accuracy'],
+        val_metrics['macro_f1'],
+        val_metrics['kappa'],
+    )
+    writer.add_scalar('val/loss', val_loss, global_step=epoch)
+    writer.add_scalar('val/accuracy', val_acc, global_step=epoch)
+    writer.add_scalar('val/f1', val_f1, global_step=epoch)
+    writer.add_scalar('val/kappa', val_kappa, global_step=epoch)
+    print(f"Validation result: loss={val_loss:.4f}, acc={val_acc:.2f}, f1={val_f1:.4f}")
+    if val_f1 > best_f1:
+        print(f'Validation F1 improved from {best_f1:.4f} to {val_f1:.4f}!')
+        best_f1 = val_f1
+        if best_model_path is not None:
+            print(f'Saving best model to {best_model_path}')
+            torch.save({'epoch': epoch, 'state_dict': model.state_dict(), 'best_f1': best_f1}, best_model_path)
+    else:
+        print(f'Validation F1 did not improve from {best_f1:.4f}.')
+    return best_f1, val_metrics
 
 
 def prepare_data_protocol(config):
@@ -435,9 +484,11 @@ def print_closed_set_counts(config, eligible_indices, splits):
 def get_num_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+
 def get_dataset_size(data_root, dataset):
     dir = os.path.join(data_root, dataset)
     return len([name for name in os.listdir(os.path.join(dir, 'data')) if name.endswith('.zarr')])
+
 
 def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1, test_ratio=0.2):
     folds = []
@@ -499,7 +550,7 @@ def overall_performance(config):
         cm = pkl.load(open(os.path.join(fold_dir, f'conf_mat_{target_name}.pkl'), 'rb'))
         cms.append(cm)
 
-    for i,row in enumerate(np.mean(cms, axis=0)):
+    for i, row in enumerate(np.mean(cms, axis=0)):
         print(config.classes[i], row.astype(int))
 
     print(f'Overall result across {config.num_folds} folds:')
@@ -525,11 +576,11 @@ if __name__ == '__main__':
     source_balance = parser.add_mutually_exclusive_group()
     source_balance.add_argument(
         '--balance-source', dest='balance_source', action='store_true',
-        help='balance source-domain classes in V3 training batches (default)',
+        help='balance source-domain classes in training batches (default)',
     )
     source_balance.add_argument(
         '--no-balance-source', dest='balance_source', action='store_false',
-        help='disable source-domain class-balanced V3 batches',
+        help='disable source-domain class-balanced batches',
     )
     parser.set_defaults(balance_source=True)
 
@@ -569,7 +620,7 @@ if __name__ == '__main__':
     )
 
     # Training configuration
-    parser.add_argument('--epochs', default=100, type=int, help='Number of epochs per fold')
+    parser.add_argument('--stage1_epochs', default=100, type=int, help='Number of source-only epochs')
     parser.add_argument('--batch_size', default=128, type=int, help='Batch size')
     parser.add_argument(
         '--eval_batch_size',
@@ -586,7 +637,7 @@ if __name__ == '__main__':
     parser.add_argument('--tensorboard_log_dir', default='runs')
     parser.add_argument(
         '--feature_snapshot_interval', default=0, type=int,
-        help='epoch interval for compact PSE/aligned-shape snapshots; 0 disables',
+        help='epoch interval for compact PSE/geometry snapshots; 0 disables',
     )
     parser.add_argument(
         '--feature_snapshot_samples_per_class', default=32, type=int,
@@ -599,44 +650,30 @@ if __name__ == '__main__':
         '--feature_snapshot_dtype', default='float16', choices=['float16', 'float32'],
     )
     parser.add_argument('--feature_snapshot_dir', default=None)
-    parser.add_argument('--steps_per_epoch', default=None, type=int)
-    parser.add_argument('--shape_dim', default=128, type=int)
+    parser.add_argument('--steps_per_epoch', default=None, type=int,
+                        help='limit the number of training steps per epoch; default uses the full source loader')
+
+    # Model hyperparameters
     parser.add_argument('--canonical_grid_size', default=64, type=int)
-    parser.add_argument('--warp_num_candidates', default=3, type=int)
-    parser.add_argument('--candidate_init_warp_amplitude', default=0.015, type=float)
-    parser.add_argument('--num_shape_basis', default=8, type=int)
-    parser.add_argument('--num_phase_basis', default=8, type=int)
-    parser.add_argument('--shape_attribute_dim', default=8, type=int)
+    parser.add_argument('--roughness_grid_size', default=256, type=int)
+    parser.add_argument('--trend_num_basis', default=12, type=int)
+    parser.add_argument('--structure_num_basis', default=12, type=int)
+    parser.add_argument('--trend_smoothing', default=1e-2, type=float)
+    parser.add_argument('--structure_smoothing', default=1e-3, type=float)
+    parser.add_argument('--n_head', default=16, type=int)
+    parser.add_argument('--d_k', default=8, type=int)
+    parser.add_argument('--d_model', default=256, type=int)
+    parser.add_argument('--ltae_mlp', default='256,128', type=_comma_separated_ints)
+    parser.add_argument('--dropout', default=0.2, type=float)
+    parser.add_argument('--classifier_hidden', default='64,32', type=_comma_separated_ints)
     parser.add_argument('--time2vec_max_frequency', default=16.0, type=float)
+
+    # Optimization / precision
     parser.add_argument('--amp', default=False, type=bool_flag)
     parser.add_argument(
         '--amp_dtype',
         default='float16',
         choices=['float16', 'bfloat16'],
-    )
-    parser.add_argument('--lambda_geometry', default=1.0, type=float)
-    parser.add_argument('--lambda_cls', default=1.0, type=float)
-    parser.add_argument('--lambda_quality', default=1.0, type=float)
-    parser.add_argument('--lambda_source_shape', default=1.0, type=float)
-    parser.add_argument('--lambda_source_raw', default=1.0, type=float)
-    parser.add_argument('--lambda_target_semantic', default=1.0, type=float)
-    parser.add_argument('--lambda_quality_cls', default=1.0, type=float)
-    parser.add_argument('--lambda_quality_domain', default=1.0, type=float)
-    parser.add_argument('--lambda_q_compact', default=1.0, type=float)
-    parser.add_argument('--lambda_q_separate', default=1.0, type=float)
-    parser.add_argument('--lambda_z_proto', default=1.0, type=float)
-    parser.add_argument('--lambda_q_to_z_source', default=1.0, type=float)
-    parser.add_argument('--lambda_raw_proto', default=1.0, type=float)
-    parser.add_argument('--lambda_q_to_z_target', default=1.0, type=float)
-    parser.add_argument('--lambda_z_pull', default=1.0, type=float)
-    parser.add_argument('--lambda_q_to_raw_target', default=1.0, type=float)
-    parser.add_argument('--lambda_raw_pull', default=1.0, type=float)
-    parser.add_argument('--lambda_geometry_candidate', default=1.0, type=float)
-    parser.add_argument('--lambda_geometry_center', default=1.0, type=float)
-    parser.add_argument(
-        '--quality_domain_score_warmup_epochs',
-        default=5,
-        type=int,
     )
     parser.add_argument('--time_reference', default=0.0, type=float)
     parser.add_argument('--time_scale', default=365.0, type=float)
@@ -649,40 +686,8 @@ if __name__ == '__main__':
     parser.add_argument('--tau_slow_init', default=0.20, type=float)
     parser.add_argument('--tau_min', default=1e-4, type=float)
     parser.add_argument('--delta_tau_min', default=1e-4, type=float)
-    parser.add_argument('--phase_gain_weight', default=1.0, type=float)
-    parser.add_argument('--phase_identity_weight', default=1.0, type=float)
-    parser.add_argument('--phase_roughness_weight', default=1.0, type=float)
-    parser.add_argument('--phase_unsupported_weight', default=1.0, type=float)
-    parser.add_argument('--phase_gain_temperature', default=0.05, type=float)
-    parser.add_argument('--phase_candidate_temperature', default=0.05, type=float)
-    parser.add_argument('--phase_min_common_support', default=0.05, type=float)
-    parser.add_argument('--phase_max_gain_ratio', default=1.0, type=float)
-    parser.add_argument('--phase_identity_tolerance', default=1e-4, type=float)
-    parser.add_argument(
-        '--phase_candidate_unique_tolerance', default=1e-4, type=float
-    )
-    parser.add_argument('--phase_ambiguity_relative_tolerance', default=0.05, type=float)
-    parser.add_argument('--phase_ambiguity_absolute_tolerance', default=1e-6, type=float)
-    parser.add_argument('--structure_veto_ratio', default=1.05, type=float)
-    parser.add_argument('--structure_tie_tolerance', default=1e-6, type=float)
-    parser.add_argument('--prototype_momentum', default=0.99, type=float)
-    parser.add_argument('--radius_buffer_size', default=2048, type=int)
-    parser.add_argument('--min_radius_samples', default=32, type=int)
-    parser.add_argument('--q_inner_quantile', default=0.75, type=float)
-    parser.add_argument('--q_outer_quantile', default=0.95, type=float)
-    parser.add_argument('--feature_inner_quantile', default=0.75, type=float)
-    parser.add_argument('--prototype_min_common_support', default=0.05, type=float)
-    parser.add_argument('--q_temperature', default=0.10, type=float)
-    parser.add_argument('--z_temperature', default=0.10, type=float)
-    parser.add_argument('--trend_temperature', default=0.10, type=float)
-    parser.add_argument('--structure_temperature', default=0.10, type=float)
-    parser.add_argument('--q_separation_margin', default=1.0, type=float)
-    parser.add_argument('--target_q_margin', default=0.10, type=float)
-    parser.add_argument('--raw_pull_confidence', default=0.50, type=float)
-    parser.add_argument('--raw_huber_delta', default=0.10, type=float)
 
     cfg = parser.parse_args()
-
 
     # Setup folders based on name
     if cfg.experiment_name is not None:
@@ -691,8 +696,7 @@ if __name__ == '__main__':
 
     os.makedirs(cfg.output_dir, exist_ok=True)
     for fold in range(cfg.num_folds):
-        os.makedirs(os.path.join(cfg.output_dir, 'fold_{}'.format(fold)), exist_ok=True)
-
+        os.makedirs(os.path.join(cfg.output_dir, f'fold_{fold}'), exist_ok=True)
 
     # write training config to file
     if not cfg.eval:

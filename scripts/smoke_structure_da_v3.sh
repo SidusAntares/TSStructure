@@ -24,7 +24,7 @@ status=0
 if run_training \
     "${SOURCE_DOMAIN}" "${TARGET_DOMAIN}" "${SEED}" "${CUDA_DEVICE}" \
     "${RUN_OUTPUT_DIRECTORY}" "${SMOKE_LOG_FILE}" \
-    --epochs "${SMOKE_EPOCHS}" \
+    --stage1_epochs "${SMOKE_EPOCHS}" \
     --steps_per_epoch "${SMOKE_STEPS_PER_EPOCH}" --log_step 1 \
     --feature_snapshot_interval 0
 then

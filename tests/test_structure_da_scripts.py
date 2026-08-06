@@ -114,14 +114,15 @@ def test_common_configuration_uses_current_v3_cli_and_fixed_version() -> None:
     assert "conda activate" not in source
     for required in (
         "--balance-source", "--amp true", "--time_coordinate_mode",
-        "--warp_num_candidates", "--shape_dim", "--lambda_cls",
-        "--lambda_quality",
-        "--lambda_target_semantic", "--progress_bar auto",
+        "--trend_num_basis", "--structure_num_basis", "--canonical_grid_size",
+        "--d_model", "--progress_bar auto",
     ):
         assert required in source
     for removed in (
         "--domain_hidden_dim", "--grl_warmup_max_iters",
         "--grl_warmup_fraction", "--lambda_global_domain",
+        "--warp_num_candidates", "--shape_dim", "--lambda_cls",
+        "--lambda_quality", "--lambda_target_semantic",
     ):
         assert removed not in source
     assert "CMD=(" in source

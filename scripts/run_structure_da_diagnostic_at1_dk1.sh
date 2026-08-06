@@ -18,7 +18,7 @@ make_run_directory "${RUN_DIRECTORY}"
 if ! run_training \
     "${SOURCE_DOMAIN}" "${TARGET_DOMAIN}" "${SEED}" "${CUDA_DEVICE}" \
     "${RUN_DIRECTORY}" "${RUN_DIRECTORY}/train.log" \
-    --epochs "${DIAGNOSTIC_EPOCHS}" --feature_snapshot_interval 0
+    --stage1_epochs "${DIAGNOSTIC_EPOCHS}" --feature_snapshot_interval 0
 then
     : > "${RUN_DIRECTORY}/PILOT_FAILED"
     exit 1

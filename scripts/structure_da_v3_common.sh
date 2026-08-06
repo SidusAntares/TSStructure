@@ -127,36 +127,21 @@ V3_COMMON_ARGS=(
     --weight_decay 0.0001
     --input_dim 10
     --with_extra false
-    --shape_dim 128
     --canonical_grid_size 64
-    --warp_num_candidates 3
-    --candidate_init_warp_amplitude 0.015
-    --num_shape_basis 8
-    --num_phase_basis 8
-    --shape_attribute_dim 8
+    --roughness_grid_size 256
+    --trend_num_basis 12
+    --structure_num_basis 12
+    --trend_smoothing 0.01
+    --structure_smoothing 0.001
+    --n_head 16
+    --d_k 8
+    --d_model 256
+    --ltae_mlp 256,128
+    --dropout 0.2
+    --classifier_hidden 64,32
     --time2vec_max_frequency 16.0
     --amp true
     --amp_dtype float16
-    --lambda_geometry 1
-    --lambda_cls 1
-    --lambda_quality 1
-    --lambda_source_shape 1
-    --lambda_source_raw 1
-    --lambda_target_semantic 1
-    --lambda_quality_cls 1
-    --lambda_quality_domain 1
-    --lambda_q_compact 1
-    --lambda_q_separate 1
-    --lambda_z_proto 1
-    --lambda_q_to_z_source 1
-    --lambda_raw_proto 1
-    --lambda_q_to_z_target 1
-    --lambda_z_pull 1
-    --lambda_q_to_raw_target 1
-    --lambda_raw_pull 1
-    --lambda_geometry_candidate 1
-    --lambda_geometry_center 1
-    --quality_domain_score_warmup_epochs 5
     --time_reference 0
     --time_scale 365
     --time_coordinate_mode canonical_day_of_year
@@ -164,35 +149,6 @@ V3_COMMON_ARGS=(
     --tau_slow_init 0.20
     --tau_min 0.0001
     --delta_tau_min 0.0001
-    --phase_gain_weight 1
-    --phase_identity_weight 1
-    --phase_roughness_weight 1
-    --phase_unsupported_weight 1
-    --phase_gain_temperature 0.05
-    --phase_candidate_temperature 0.05
-    --phase_min_common_support 0.05
-    --phase_max_gain_ratio 1
-    --phase_identity_tolerance 0.0001
-    --phase_candidate_unique_tolerance 0.0001
-    --phase_ambiguity_relative_tolerance 0.05
-    --phase_ambiguity_absolute_tolerance 0.000001
-    --structure_veto_ratio 1.05
-    --structure_tie_tolerance 0.000001
-    --prototype_momentum 0.99
-    --radius_buffer_size 2048
-    --min_radius_samples 32
-    --q_inner_quantile 0.75
-    --q_outer_quantile 0.95
-    --feature_inner_quantile 0.75
-    --prototype_min_common_support 0.05
-    --q_temperature 0.10
-    --z_temperature 0.10
-    --trend_temperature 0.10
-    --structure_temperature 0.10
-    --q_separation_margin 1
-    --target_q_margin 0.10
-    --raw_pull_confidence 0.50
-    --raw_huber_delta 0.10
     --progress_bar auto
     --log_step 10
 )

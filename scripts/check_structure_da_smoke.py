@@ -24,12 +24,10 @@ def check_smoke(
     checkpoint = run_directory / "fold_0" / "model.pt"
     metrics = sorted((run_directory / "fold_0").glob("test_metrics_*.json"))
     text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
-    task_success = _last_float(r"task_step_success_rate=([0-9.eE+-]+)", text)
-    source_update = _last_float(r"source_state_update_rate=([0-9.eE+-]+)", text)
     numeric_losses = [
         float(value)
         for value in re.findall(
-            r"(?:total|task|geometry|cls|quality)=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
+            r"(?:loss|cls)=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
             text,
         )
     ]
@@ -38,15 +36,13 @@ def check_smoke(
     checks = {
         "checkpoint": checkpoint.is_file(),
         "metrics": bool(metrics),
-        "geometry_step": bool(re.search(r"TRAIN_STEP\|.*\|geometry=", text)),
-        "task_step": bool(re.search(r"TRAIN_STEP\|.*\|task=", text)),
+        "train_step": bool(re.search(r"TRAIN_STEP\|", text)),
+        "train_epoch": bool(re.search(r"TRAIN_EPOCH\|", text)),
         "validation": "Validation result:" in text,
         "finite_losses": bool(numeric_losses) and all(math.isfinite(value) for value in numeric_losses),
-        "optimizer_stepped": task_success is not None and task_success > 0,
-        "source_state_updated": source_update is not None and source_update > 0,
         "no_oom": re.search(r"out of memory|cuda oom", combined, re.IGNORECASE) is None,
         "no_nonfinite_marker": re.search(
-            r"(?:loss|total|task|geometry|quality)=(?:nan|[+-]?inf)",
+            r"(?:loss|cls)=([+-]?(?:nan|[+-]?inf))",
             combined,
             re.IGNORECASE,
         ) is None,
@@ -56,8 +52,6 @@ def check_smoke(
         "status": "PASS" if not failures else "FAIL",
         "checks": checks,
         "failures": failures,
-        "task_optimizer_success_rate": task_success,
-        "source_state_update_rate": source_update,
         "checkpoint": str(checkpoint),
         "metrics_files": [str(path) for path in metrics],
     }

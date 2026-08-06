@@ -1,4 +1,4 @@
-"""Current V3 structure-aware domain-adaptation building blocks."""
+"""Two-stage structure model: source-only CE backbone for Round 1."""
 
 from models.ltae import ContinuousTime2Vec, TrendStructureSharedLTAE
 
@@ -16,11 +16,6 @@ from .diagnostics import (
     summarize_contribution_diagnostics,
     summarize_decomposition_diagnostics,
 )
-from .full_model import (
-    StructureAwareDomainAdaptationModel,
-    StructureAwareForwardOutput,
-    StructureAwareGeometryOutput,
-)
 from .feature_snapshots import (
     FeatureSnapshotConfig,
     FeatureSnapshotManager,
@@ -29,77 +24,21 @@ from .feature_snapshots import (
     deterministic_class_selection,
     load_selected_samples,
 )
-from .joint_trainer import (
-    JointStructureDADiagnostics,
-    JointStructureDALossOutput,
-    JointStructureDATrainStepOutput,
-    JointStructureDATrainingConfig,
-    PerClassPhaseDiagnosticsAccumulator,
-    create_joint_structure_da_train_loaders,
-    joint_structure_da_train_step,
-    resolve_domain_score_weight,
-    resolve_steps_per_epoch,
-    train_joint_structure_da,
-    validation_structure_contributions,
-)
-from .phase_aware_objective import (
-    PhaseAwarePrototypeAlignment,
-    PhaseAwareSemanticFeatures,
-    PhaseAwareTaskLossOutput,
-    PhaseAwareTaskLossWeights,
-    PhaseAwareTaskObjective,
-    PrototypeAlignmentConfig,
-    PrototypeAlignmentLossOutput,
-    PrototypeAlignmentWeights,
-    TrendLedGeometryLossOutput,
-    TrendLedGeometryObjective,
-    cosine_prototype_distance,
-    support_weighted_srvf_distance,
-)
-from .quality_fusion import (
-    QualityScoreOutput,
-    QualityScorer,
-    TwoScaleQualityFusion,
-    TwoScaleQualityLossOutput,
-    TwoScaleQualityObjective,
-    TwoScaleQualityOutput,
-    concatenate_two_scale_quality_outputs,
-)
+from .full_model import TSStructureModel
 from .representation import (
-    PhaseAwareTwoScaleClassifier,
-    PhaseAwareTwoScaleClassifierOutput,
+    FunctionalGeometryOutput,
+    RawTemporalRepresentation,
+    TSStructureForwardOutput,
 )
-from .temporal_coordinates import (
-    TrendStructureCoordinateOutput,
-    TrendStructureCoordinates,
-)
+from .source_trainer import SourceClassificationTrainer, SourceTrainStepOutput
 from .temporal_functional import (
     SourceRunningStandardizer,
     TemporalFunctionalLift,
     TemporalFunctionalOutput,
 )
 from .temporal_geometry import PhaseTangentOutput, warp_to_identity_tangent
-from .temporal_head import ShapeFeatureEncoder, ShapeFeatureOutput
-from .temporal_module import (
-    TrendStructureTemporalCore,
-    TrendStructureTemporalCoreOutput,
-    TrendStructureTaskFeatureModule,
-    TrendStructureTaskFeatureOutput,
-)
-from .temporal_registration import (
-    MonotoneWarpCandidatesOutput,
-    MonotoneWarpEstimator,
-    MonotoneWarpOutput,
-    SourceRunningSRVFTemplate,
-    SourceSRVFTemplateOutput,
-    invert_monotone_warp,
-    select_warp_candidate,
-)
-from .temporal_selection import (
-    TrendStructurePhaseSelectionOutput,
-    TrendStructureSelectionConfig,
-    select_trend_structure_phase,
-)
+from .temporal_head import SharedTrendStructureLTAE
+from .temporal_module import TrendStructureTemporalModule
 from .temporal_srvf import (
     SourceRunningSupportScale,
     TemporalSRVFExtractor,
@@ -107,87 +46,42 @@ from .temporal_srvf import (
 )
 
 __all__ = [
-    "ContributionDiagnostics",
     "ContinuousTime2Vec",
+    "ContributionDiagnostics",
     "DecompositionDiagnostics",
     "DecompositionOutput",
     "DiagnosticMoments",
     "DiagnosticStat",
     "FeatureSnapshotConfig",
     "FeatureSnapshotManager",
-    "JointStructureDADiagnostics",
-    "JointStructureDALossOutput",
-    "JointStructureDATrainStepOutput",
-    "JointStructureDATrainingConfig",
-    "MonotoneWarpCandidatesOutput",
-    "MonotoneWarpEstimator",
-    "MonotoneWarpOutput",
-    "PerClassPhaseDiagnosticsAccumulator",
-    "PhaseAwarePrototypeAlignment",
-    "PhaseAwareSemanticFeatures",
-    "PhaseAwareTaskLossOutput",
-    "PhaseAwareTaskLossWeights",
-    "PhaseAwareTaskObjective",
-    "PhaseAwareTwoScaleClassifier",
-    "PhaseAwareTwoScaleClassifierOutput",
+    "FunctionalGeometryOutput",
     "PhaseTangentOutput",
-    "PrototypeAlignmentConfig",
-    "PrototypeAlignmentLossOutput",
-    "PrototypeAlignmentWeights",
-    "QualityScoreOutput",
-    "QualityScorer",
-    "ShapeFeatureEncoder",
-    "ShapeFeatureOutput",
-    "SourceRunningSRVFTemplate",
+    "RawTemporalRepresentation",
+    "SharedTrendStructureLTAE",
+    "SnapshotCaptureResult",
+    "SourceClassificationTrainer",
     "SourceRunningStandardizer",
     "SourceRunningSupportScale",
-    "SourceSRVFTemplateOutput",
-    "SnapshotCaptureResult",
-    "StructureAwareDomainAdaptationModel",
-    "StructureAwareForwardOutput",
-    "StructureAwareGeometryOutput",
+    "SourceTrainStepOutput",
     "StructureBackbone",
     "StructureBackboneOutput",
     "SymmetricTimeKernelDecomposition",
+    "TSStructureForwardOutput",
+    "TSStructureModel",
     "TemporalFunctionalLift",
     "TemporalFunctionalOutput",
     "TemporalSRVFExtractor",
     "TemporalSRVFOutput",
-    "TrendLedGeometryLossOutput",
-    "TrendLedGeometryObjective",
-    "TrendStructureCoordinateOutput",
-    "TrendStructureCoordinates",
-    "TrendStructurePhaseSelectionOutput",
-    "TrendStructureSelectionConfig",
     "TrendStructureSharedLTAE",
-    "TrendStructureTaskFeatureModule",
-    "TrendStructureTaskFeatureOutput",
-    "TrendStructureTemporalCore",
-    "TrendStructureTemporalCoreOutput",
-    "TwoScaleQualityFusion",
-    "TwoScaleQualityLossOutput",
-    "TwoScaleQualityObjective",
-    "TwoScaleQualityOutput",
+    "TrendStructureTemporalModule",
     "compute_decomposition_diagnostics",
     "compute_structure_contribution_diagnostics",
-    "concatenate_two_scale_quality_outputs",
-    "cosine_prototype_distance",
-    "create_joint_structure_da_train_loaders",
     "create_feature_snapshot_manager",
     "deterministic_class_selection",
-    "invert_monotone_warp",
-    "joint_structure_da_train_step",
     "load_selected_samples",
     "merge_contribution_diagnostics",
     "merge_decomposition_diagnostics",
-    "resolve_domain_score_weight",
-    "resolve_steps_per_epoch",
-    "select_trend_structure_phase",
-    "select_warp_candidate",
     "summarize_contribution_diagnostics",
     "summarize_decomposition_diagnostics",
-    "support_weighted_srvf_distance",
-    "train_joint_structure_da",
-    "validation_structure_contributions",
     "warp_to_identity_tangent",
 ]

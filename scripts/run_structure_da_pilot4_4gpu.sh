@@ -50,7 +50,7 @@ run_one() {
     if CUDA_VISIBLE_DEVICES="${physical_gpu}" run_training \
         "${source_domain}" "${target_domain}" "${seed}" "${physical_gpu}" \
         "${run_directory}" "${run_directory}/train.log" \
-        --epochs "${PILOT_EPOCHS}" --feature_snapshot_interval 0
+        --stage1_epochs "${PILOT_EPOCHS}" --feature_snapshot_interval 0
     then
         exit_code=0
         "${PYTHON_BIN}" "${SCRIPT_DIR}/analyze_structure_da_diagnostic.py" \
