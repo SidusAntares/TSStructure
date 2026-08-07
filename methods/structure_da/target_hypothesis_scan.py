@@ -1,7 +1,7 @@
 """Full target class-conditioned phase hypothesis scan.
 
 For each target sample the scan caches its K_reg trend geometry and K_shape
-Shape geometry once (O(N_target)), then runs one DP2 registration against each
+Shape geometry once (O(N_target)), then runs one curve-DP registration against each
 ready source class (O(N_target x C)). The returned gamma is resampled to the
 Shape grid, applied to the target S-SRVF, and scored against the Stage-1
 source Shape prototypes. The score is turned into a percentile through the
@@ -24,7 +24,7 @@ from .phase_evidence import (
     empirical_cdf,
 )
 from .phase_registration import (
-    FdasrsfDP2RegistrationAdapter,
+    FdasrsfCurveRegistrationAdapter,
     check_gamma_legality,
     resample_gamma,
     warp_q_gamma,
@@ -43,13 +43,12 @@ from .temporal_srvf import TemporalSRVFExtractor
 class PhaseHypothesisScanConfig:
     """Thresholds and constants for the hypothesis scan.
 
-    Only the structural constants are frozen: ``k_reg=128``, ``method=DP2``,
-    ``penalty=roughness`` and ``class_hypothesis_max=2``. The experimental
+    Only the structural constants are frozen: ``k_reg=128``, ``method=DP``
+    (curve registration) and ``class_hypothesis_max=2``. The experimental
     thresholds are passed explicitly by tests and frozen in a later round.
     """
 
     registration_lambda: float
-    registration_dp_grid_dim: int
 
     registration_gain_ratio_max: float
     registration_min_common_support: float
@@ -192,13 +191,13 @@ def _process_pairwise_candidates(
     stage1_bank: SourcePrototypeBank,
     source_reg_bank: SourceRegistrationPrototypeBank,
     config: PhaseHypothesisScanConfig,
-    adapter: FdasrsfDP2RegistrationAdapter,
+    adapter: FdasrsfCurveRegistrationAdapter,
     device: torch.device,
     integration_reg: Tensor,
     integration_shape: Tensor,
     solver_diagnostics: list,
 ) -> list[PairwisePhaseCandidate]:
-    """Run DP2 against every ready source class for one target sample."""
+    """Run curve DP against every ready source class for one target sample."""
     candidates: list[PairwisePhaseCandidate] = []
     reg_grid = cache.registration_grid.to(device=device)
     target_trend = cache.trend_srvf_reg[sample_index].to(device=device)
@@ -219,9 +218,9 @@ def _process_pairwise_candidates(
             solver_diagnostics.append("pre_support")
             continue
 
-        # DP2: single solver call per sample-class pair.
+        # Curve DP: single solver call per sample-class pair.
         try:
-            gamma = adapter.register(source_trend, target_trend, reg_grid)
+            gamma = adapter.register(source_trend, target_trend)
         except Exception as error:  # solver isolation per pair
             solver_diagnostics.append(f"solver_error:{type(error).__name__}")
             continue
@@ -248,7 +247,6 @@ def _process_pairwise_candidates(
             target_support=target_trend_support,
             integration_weights=integration_reg,
             registration_grid=reg_grid,
-            adapter=adapter,
         )
         candidates.append(
             PairwisePhaseCandidate(
@@ -329,7 +327,7 @@ def scan_target_class_phase_hypotheses(
     device: torch.device,
     shape_extractor: TemporalSRVFExtractor,
     reg_extractor: TemporalSRVFExtractor,
-    adapter: FdasrsfDP2RegistrationAdapter | None = None,
+    adapter: FdasrsfCurveRegistrationAdapter | None = None,
 ) -> TargetHypothesisScanResult:
     """Run the full target class-conditioned phase hypothesis scan.
 
@@ -337,9 +335,8 @@ def scan_target_class_phase_hypotheses(
     target batch labels does not change the result.
     """
     if adapter is None:
-        adapter = FdasrsfDP2RegistrationAdapter(
+        adapter = FdasrsfCurveRegistrationAdapter(
             registration_lambda=config.registration_lambda,
-            registration_dp_grid_dim=config.registration_dp_grid_dim,
         )
     shape_grid = shape_extractor.functional_lift.canonical_grid.detach().cpu()
     was_training = model.training

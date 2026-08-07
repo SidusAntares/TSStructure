@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from methods.structure_da import (
-    FdasrsfDP2RegistrationAdapter,
+    FdasrsfCurveRegistrationAdapter,
     PhaseHypothesisScanConfig,
     SourcePrototypeBank,
     SourceRegistrationPrototypeBank,
@@ -66,7 +66,6 @@ def _model(**overrides) -> TSStructureModel:
 def _scan_config(**overrides) -> PhaseHypothesisScanConfig:
     values = dict(
         registration_lambda=0.0,
-        registration_dp_grid_dim=7,
         registration_gain_ratio_max=2.0,
         registration_min_common_support=1e-4,
         registration_max_roughness=1e6,
@@ -216,15 +215,15 @@ def test_solver_failure_isolated_to_one_pair() -> None:
     shape_extractor, reg_extractor = _extractors(model)
     loader = DataLoader(TinyParcelDataset(n=4, labels=False), batch_size=2)
 
-    class _FlakyAdapter(FdasrsfDP2RegistrationAdapter):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
+    class _FlakyAdapter(FdasrsfCurveRegistrationAdapter):
+        def __init__(self):
+            super().__init__(registration_lambda=0.0)
             self.calls = 0
-        def register(self, source, target, grid):
+        def register(self, source, target):
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("synthetic solver failure")
-            return super().register(source, target, grid)
+            return super().register(source, target)
 
     adapter = _FlakyAdapter()
     result = scan_target_class_phase_hypotheses(

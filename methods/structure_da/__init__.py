@@ -25,11 +25,33 @@ from .feature_snapshots import (
     load_selected_samples,
 )
 from .full_model import TSStructureModel
+from .phase_evidence import (
+    GammaDiagnostics,
+    PairwisePhaseCandidate,
+    compute_gamma_diagnostics,
+    empirical_cdf,
+    shape_distance_to_prototype,
+)
+from .phase_registration import (
+    FdasrsfCurveRegistrationAdapter,
+    GammaLegalityOutput,
+    build_source_registration_prototypes,
+    check_gamma_legality,
+    resample_gamma,
+    warp_q_gamma,
+    warp_support_gamma,
+)
 from .prototype_bank import (
     QUANTILE_LEVELS,
     SourcePrototypeBank,
     SupportAwareDistanceOutput,
     support_aware_q_distance,
+)
+from .registration_geometry import (
+    RegistrationGeometryOutput,
+    SourceRegistrationPrototypeBank,
+    TargetGeometryCache,
+    evaluate_registration_geometry,
 )
 from .representation import (
     FunctionalGeometryOutput,
@@ -42,6 +64,12 @@ from .source_prototype_scanner import (
 )
 from .source_trainer import SourceClassificationTrainer, SourceTrainStepOutput
 from .stage1_objective import Stage1LossOutput, Stage1Objective
+from .target_hypothesis_scan import (
+    PhaseHypothesisScanConfig,
+    TargetClassPhaseHypothesis,
+    TargetHypothesisScanResult,
+    scan_target_class_phase_hypotheses,
+)
 from .temporal_functional import (
     SourceRunningStandardizer,
     TemporalFunctionalLift,
@@ -55,43 +83,16 @@ from .temporal_srvf import (
     TemporalSRVFExtractor,
     TemporalSRVFOutput,
 )
-from .registration_geometry import (
-    RegistrationGeometryOutput,
-    SourceRegistrationPrototypeBank,
-    TargetGeometryCache,
-    evaluate_registration_geometry,
-)
-from .phase_registration import (
-    FdasrsfDP2RegistrationAdapter,
-    GammaLegalityOutput,
-    build_source_registration_prototypes,
-    check_gamma_legality,
-    resample_gamma,
-    warp_q_gamma,
-    warp_support_gamma,
-)
-from .phase_evidence import (
-    GammaDiagnostics,
-    PairwisePhaseCandidate,
-    compute_gamma_diagnostics,
-    empirical_cdf,
-    shape_distance_to_prototype,
-)
-from .target_hypothesis_scan import (
-    PhaseHypothesisScanConfig,
-    TargetClassPhaseHypothesis,
-    TargetHypothesisScanResult,
-    scan_target_class_phase_hypotheses,
-)
 
 __all__ = [
+    "QUANTILE_LEVELS",
     "ContinuousTime2Vec",
     "ContributionDiagnostics",
     "DecompositionDiagnostics",
     "DecompositionOutput",
     "DiagnosticMoments",
     "DiagnosticStat",
-    "FdasrsfDP2RegistrationAdapter",
+    "FdasrsfCurveRegistrationAdapter",
     "FeatureSnapshotConfig",
     "FeatureSnapshotManager",
     "FunctionalGeometryOutput",
@@ -100,7 +101,6 @@ __all__ = [
     "PairwisePhaseCandidate",
     "PhaseHypothesisScanConfig",
     "PhaseTangentOutput",
-    "QUANTILE_LEVELS",
     "RawTemporalRepresentation",
     "RegistrationGeometryOutput",
     "SharedTrendStructureLTAE",

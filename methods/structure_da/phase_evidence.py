@@ -2,8 +2,8 @@
 
 This module holds the per-sample-per-class candidate record, the empirical CDF
 over the Stage-1 source intra-class Shape distances, and the pure helpers that
-turn a DP2 gamma plus Shape geometry into hypothesis evidence. Everything here
-is a statistical diagnostic: no gradient, no trainable parameters, no
+turn a curve-DP gamma plus Shape geometry into hypothesis evidence. Everything
+here is a statistical diagnostic: no gradient, no trainable parameters, no
 classifier and no target labels.
 """
 
@@ -19,7 +19,7 @@ from .prototype_bank import support_aware_q_distance
 
 @dataclass(frozen=True)
 class PairwisePhaseCandidate:
-    """One ``sample_id x class_id`` DP2 registration candidate.
+    """One ``sample_id x class_id`` curve-DP registration candidate.
 
     A rejected candidate carries ``legal=False`` and a ``reject_reason`` and
     is never promoted to a Shape/CDF-filtered hypothesis.
@@ -95,7 +95,6 @@ def compute_gamma_diagnostics(
     target_support: Tensor,
     integration_weights: Tensor,
     registration_grid: Tensor,
-    adapter,
     eps: float = 1e-8,
 ) -> GammaDiagnostics:
     """Fairly compare identity vs registered T error on one common support.

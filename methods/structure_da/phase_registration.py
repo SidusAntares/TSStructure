@@ -1,8 +1,10 @@
-"""DP2-based T registration adapter and gamma utility helpers.
+"""Curve-DP T registration adapter and gamma utility helpers.
 
-Round 3 delegates the class-conditioned T registration to the mature
-``fdasrsf`` package. ``optimum_reparam(q1=source, time, q2=target, ...)``
-returns the warp that aligns q2 (target) to q1 (source), i.e.
+Round 3.5 delegates the class-conditioned T registration of a vector-valued
+T-SRVF to ``fdasrsf.curve_functions.optimum_reparam_curve``. That API takes a
+single ``n``-dimensional curve SRVF as ``[n, T]`` (for this project ``[D,
+K_reg]``) and returns one shared gamma ``[K_reg]`` via ``method="DP"``. The
+solver aligns q2 (target) to q1 (source):
 
     gamma(u_source) = u_target
 
@@ -28,51 +30,38 @@ from .temporal_registration import _warp_sequence
 from .temporal_srvf import TemporalSRVFExtractor
 
 
-def _to_numpy_float64(tensor: Tensor) -> object:
-    if not isinstance(tensor, Tensor):
-        raise ValueError("input must be a torch.Tensor")
-    return tensor.detach().cpu().contiguous().to(torch.float64).numpy()
+class FdasrsfCurveRegistrationAdapter(nn.Module):
+    """Wrap ``fdasrsf.curve_functions.optimum_reparam_curve`` with the DP solver.
 
-
-class FdasrsfDP2RegistrationAdapter(nn.Module):
-    """Wrap ``fdasrsf.utility_functions.optimum_reparam`` with the DP2 solver.
-
-    The adapter is deliberately narrow: it computes exactly one gamma per
-    call, with the target SRVF as q2. It never computes Shape distances,
-    empirical CDFs, class selection or phase groups.
+    The adapter is deliberately narrow: it computes exactly one shared gamma
+    per call for a vector-valued curve, with the target SRVF as q2. It never
+    computes Shape distances, empirical CDFs, class selection or phase groups.
     """
 
     def __init__(
         self,
-        *,
-        registration_lambda: float = 0.0,
-        registration_dp_grid_dim: int = 7,
-        endpoint_tolerance: float = 1e-6,
+        registration_lambda: float,
     ) -> None:
         super().__init__()
         self.registration_lambda = float(registration_lambda)
-        self.registration_dp_grid_dim = int(registration_dp_grid_dim)
-        self.endpoint_tolerance = float(endpoint_tolerance)
         try:
-            from fdasrsf import utility_functions as uf
+            from fdasrsf import curve_functions as cf
         except ImportError as error:  # pragma: no cover - import guard
             raise RuntimeError(
-                "fdasrsf is required for DP2 registration; install it first"
+                "fdasrsf is required for curve registration; install it first"
             ) from error
-        self._uf = uf
+        self._cf = cf
 
     def register(
         self,
         source_trend_srvf: Tensor,
         target_trend_srvf: Tensor,
-        registration_grid: Tensor,
     ) -> Tensor:
-        """Return the DP2 gamma aligning the target T-SRVF to the source one.
+        """Return the curve-DP gamma aligning the target T-SRVF to the source one.
 
         Args:
             source_trend_srvf: Class source T prototype, ``[K_reg, D]``.
             target_trend_srvf: Target sample T-SRVF, ``[K_reg, D]``.
-            registration_grid: ``[K_reg]`` time grid in ``[0, 1]``.
 
         Returns:
             gamma ``[K_reg]`` (requires_grad=False). The direction is
@@ -82,33 +71,32 @@ class FdasrsfDP2RegistrationAdapter(nn.Module):
             raise ValueError("SRVFs must have shape [K_reg, D]")
         if source_trend_srvf.shape != target_trend_srvf.shape:
             raise ValueError("source and target SRVFs must share shape")
-        if registration_grid.ndim != 1 or registration_grid.shape[0] != source_trend_srvf.shape[0]:
-            raise ValueError("registration_grid must have shape [K_reg]")
 
-        q1 = _to_numpy_float64(source_trend_srvf)
-        q2 = _to_numpy_float64(target_trend_srvf)
-        time = _to_numpy_float64(registration_grid)
-        # fdasrsf's ``[N, M]`` convention treats M as independent curves. A
-        # vector-valued T-SRVF is a single curve with D channels, so we pass
-        # ``[N, D]`` to the multivariate DP2 solver and take the shared gamma
-        # as the mean over channels (each channel is aligned by the same
-        # temporal warp when the curve is a coherent function of time).
-        gamma_np = self._uf.optimum_reparam(
-            q1=q1,
-            time=time,
-            q2=q2,
-            method="DP2",
+        source_np = (
+            source_trend_srvf.detach()
+            .to(device="cpu", dtype=torch.float64)
+            .contiguous()
+            .numpy()
+            .T
+        )  # [D, K_reg]
+        target_np = (
+            target_trend_srvf.detach()
+            .to(device="cpu", dtype=torch.float64)
+            .contiguous()
+            .numpy()
+            .T
+        )  # [D, K_reg]
+        gamma_np = self._cf.optimum_reparam_curve(
+            q1=source_np,
+            q2=target_np,
             lam=self.registration_lambda,
-            penalty="roughness",
-            grid_dim=self.registration_dp_grid_dim,
+            method="DP",
         )
-        if gamma_np.ndim == 2:
-            gamma_np = gamma_np.mean(axis=1)
-        gamma = torch.as_tensor(
-            gamma_np.reshape(-1),
-            device=source_trend_srvf.device,
-            dtype=torch.float64,
-        ).to(torch.float32)
+        gamma = torch.as_tensor(gamma_np, dtype=torch.float64, device="cpu")
+        if gamma.ndim != 1:
+            raise ValueError(
+                "curve DP must return a single one-dimensional gamma"
+            )
         return gamma.contiguous()
 
 
@@ -123,6 +111,7 @@ def warp_q_gamma(q: Tensor, gamma: Tensor) -> Tensor:
     batch, grid, _dim = q.shape
     if gamma.ndim == 1:
         gamma = gamma.unsqueeze(0).expand(batch, -1)
+    gamma = gamma.to(dtype=q.dtype, device=q.device)
     if gamma.shape != (batch, grid):
         raise ValueError("gamma must have shape [K] or [B, K]")
     delta = gamma[:, 1:] - gamma[:, :-1]
@@ -151,6 +140,7 @@ def warp_support_gamma(support: Tensor, gamma: Tensor, grid: Tensor) -> Tensor:
         raise ValueError("gamma must have shape [K] matching support")
     if grid.ndim != 1 or grid.shape != support.shape:
         raise ValueError("grid must have shape [K] matching support")
+    gamma = gamma.to(dtype=support.dtype, device=support.device)
     # Monotone linear resampling of support onto gamma(u).
     support_2d = support.unsqueeze(0).unsqueeze(-1)  # [1, K, 1]
     gamma_2d = gamma.unsqueeze(0)                    # [1, K]
@@ -169,6 +159,7 @@ def resample_gamma(gamma_reg: Tensor, reg_grid: Tensor, target_grid: Tensor) -> 
     # points gives the resampled gamma.
     from .temporal_registration import invert_monotone_warp
 
+    gamma_reg = gamma_reg.to(device=target_grid.device, dtype=target_grid.dtype)
     return invert_monotone_warp(gamma_reg, query=target_grid)
 
 
@@ -194,10 +185,12 @@ def check_gamma_legality(
     registration_max_roughness: float = 1e4,
     registration_max_deviation: float = 2.0,
 ) -> GammaLegalityOutput:
-    """Validate a DP2 gamma and compute its diagnostic statistics.
+    """Validate a curve-DP gamma and compute its diagnostic statistics.
 
-    Roughness uses the stable log-speed finite-difference definition and the
-    phase deviation is the L2 norm ``sqrt(mean((gamma-u)^2))``.
+    Roughness uses the stable log-speed finite-difference definition applied
+    as an external gate after the solver (curve DP does not expose a roughness
+    penalty); the phase deviation is the L2 norm
+    ``sqrt(mean((gamma-u)^2))``.
     """
     if not isinstance(gamma, Tensor) or not torch.isfinite(gamma).all().item():
         return GammaLegalityOutput(
