@@ -263,3 +263,69 @@ def test_train_source_classification_builds_bank_at_warmup_boundary(
         assert support_shape == (6, 5)
         assert valid_shape == (6,)
         assert weight_shape == (5,)
+
+
+def test_full_scan_loaders_group_variable_pixel_widths_before_collate(monkeypatch) -> None:
+    """Full source/target scans must not stack parcels with different pixel widths."""
+
+    pytest.importorskip("zarr")
+    import numpy as np
+    import train as train_module
+    from dataset import PixelSetData as RealPixelSetData
+
+    class VariableWidthPixelSetData(RealPixelSetData):
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            self.widths = (3, 4, 3, 4, 5)
+
+        def __len__(self) -> int:
+            return len(self.widths)
+
+        def get_shapes(self):
+            return [(5, 2, width) for width in self.widths]
+
+        def __getitem__(self, index: int):
+            width = self.widths[index]
+            return {
+                "index": index,
+                "parcel_index": index,
+                "pixels": torch.full((5, 2, width), float(index)),
+                "valid_pixels": torch.ones(5, width),
+                "positions": torch.arange(5, dtype=torch.float32),
+                "extra": torch.zeros(4),
+                "label": index % 3,
+            }
+
+        def get_labels(self):
+            return np.asarray([index % 3 for index in range(len(self))])
+
+    monkeypatch.setattr(train_module, "PixelSetData", VariableWidthPixelSetData)
+
+    config = SimpleNamespace(
+        data_root="unused",
+        source="source/domain/2017",
+        target="target/domain/2017",
+        classes=("a", "b", "c"),
+        closed_set=True,
+        combine_spring_and_winter=False,
+        time_coordinate_mode="canonical_day_of_year",
+        eval_batch_size=4,
+        batch_size=4,
+        num_workers=0,
+    )
+    splits = {
+        config.source: {"train": list(range(5))},
+        config.target: {"train": list(range(5))},
+    }
+
+    for loader in (
+        train_module.create_source_scan_loader(config, splits),
+        train_module.create_target_statistics_loader(config, splits),
+    ):
+        seen = []
+        for batch in loader:
+            # Reaching this point is the regression check: default_collate can
+            # stack the batch only because every parcel has the same width.
+            seen.extend(batch["parcel_index"].tolist())
+            assert batch["pixels"].shape[-1] in {3, 4, 5}
+        assert sorted(seen) == list(range(5))

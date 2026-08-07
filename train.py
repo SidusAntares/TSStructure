@@ -121,7 +121,7 @@ def create_source_scan_loader(config, splits):
     return DataLoader(
         dataset=scan_dataset,
         batch_sampler=GroupByShapesBatchSampler(
-            scan_dataset, scan_batch_size, by_pixel_dim=False
+            scan_dataset, scan_batch_size, by_pixel_dim=True
         ),
         num_workers=config.num_workers,
         pin_memory=torch.cuda.is_available(),
@@ -151,7 +151,7 @@ def create_target_statistics_loader(config, splits):
     return DataLoader(
         dataset=scan_dataset,
         batch_sampler=GroupByShapesBatchSampler(
-            scan_dataset, scan_batch_size, by_pixel_dim=False
+            scan_dataset, scan_batch_size, by_pixel_dim=True
         ),
         num_workers=config.num_workers,
         pin_memory=torch.cuda.is_available(),
