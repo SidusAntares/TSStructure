@@ -181,10 +181,21 @@ class StructureBackbone(nn.Module):
             sequence_length,
             pixels.device,
         )
+        # Keep physical time coordinates out of low-precision autocast.
+        # The decomposition path intentionally promotes fp16/bf16 activations
+        # to float32 for stable temporal geometry, and the raw LTAE consumes
+        # those float32 T/S components with a float32 ContinuousTime2Vec.
+        # Letting positions inherit an autocast token dtype would therefore
+        # create an artificial dtype mismatch at the shared time encoder.
+        position_dtype = (
+            torch.float32
+            if tokens.dtype in (torch.float16, torch.bfloat16)
+            else tokens.dtype
+        )
         normalized_positions = self._normalize_positions(
             positions,
             resolved_time_mask,
-            dtype=tokens.dtype,
+            dtype=position_dtype,
             device=tokens.device,
         )
         decomposition = self.decomposition(

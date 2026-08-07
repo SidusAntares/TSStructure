@@ -101,3 +101,20 @@ def test_source_trainer_requires_model_type() -> None:
             device=torch.device("cpu"),
             amp_enabled=False,
         )
+
+
+def test_source_trainer_cpu_bfloat16_amp_smoke() -> None:
+    model = _model()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    trainer = SourceClassificationTrainer(
+        model,
+        optimizer,
+        device=torch.device("cpu"),
+        amp_enabled=True,
+        amp_dtype="bfloat16",
+    )
+
+    metrics = trainer.train_step(_batch(), warmup=True)
+
+    assert torch.isfinite(torch.tensor(metrics["loss"])).item()
+    assert model.training

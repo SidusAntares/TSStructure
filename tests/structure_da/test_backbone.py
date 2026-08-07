@@ -189,3 +189,15 @@ def test_input_channel_count_must_match_configured_input_dim() -> None:
         _make_backbone(input_dim=4)(
             pixels, valid_pixels, positions, extra=None
         )
+
+
+def test_autocast_keeps_normalized_positions_in_temporal_compute_dtype() -> None:
+    pixels, valid_pixels, positions = _make_inputs()
+    backbone = _make_backbone()
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = backbone(pixels, valid_pixels, positions, extra=None)
+
+    assert output.tokens.dtype == torch.bfloat16
+    assert output.normalized_positions.dtype == torch.float32
+    assert output.decomposition.trend.dtype == torch.float32
