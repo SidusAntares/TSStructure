@@ -22,10 +22,14 @@ from dataset import (
 from evaluation import evaluation
 from methods.structure_da import (
     SourceClassificationTrainer,
+    SourcePrototypeBank,
+    Stage1Objective,
     TSStructureModel,
+    build_source_prototype_bank,
     create_feature_snapshot_manager,
+    finalize_distance_statistics,
 )
-from transforms import Normalize, RandomSamplePixels, ToTensor
+from transforms import Identity, Normalize, RandomSamplePixels, ToTensor
 from utils import label_utils
 from utils.metrics import overall_classification_report
 from utils.train_utils import bool_flag
@@ -73,6 +77,43 @@ def create_source_train_loader(config, splits):
             worker_init_fn=worker_init_fn,
         )
     return create_train_loader(source_dataset, config.batch_size, config.num_workers)
+
+
+def create_source_scan_loader(config, splits):
+    """Deterministic full-source loader for prototype scans.
+
+    Unlike the training loader this uses no random pixel sampling, no shuffle,
+    no balancing and no drop-last, so every source training sample is seen
+    exactly once in a fixed order. Batches are grouped by parcel pixel
+    dimension so variable-width pixel sets still collate.
+    """
+
+    from dataset import GroupByShapesBatchSampler
+
+    scan_transform = transforms.Compose([Identity(), Normalize(), ToTensor()])
+    scan_dataset = PixelSetData(
+        data_root=config.data_root,
+        dataset_name=config.source,
+        classes=config.classes,
+        transform=scan_transform,
+        indices=splits[config.source]["train"],
+        with_extra=False,
+        closed_set=config.closed_set,
+        combine_spring_and_winter=config.combine_spring_and_winter,
+        time_coordinate_mode=getattr(
+            config, "time_coordinate_mode", "canonical_day_of_year"
+        ),
+    )
+    scan_batch_size = getattr(config, "eval_batch_size", None) or config.batch_size
+    return DataLoader(
+        dataset=scan_dataset,
+        batch_sampler=GroupByShapesBatchSampler(
+            scan_dataset, scan_batch_size, by_pixel_dim=False
+        ),
+        num_workers=config.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        worker_init_fn=worker_init_fn,
+    )
 
 
 def _comma_separated_ints(value: str) -> list[int]:
@@ -134,8 +175,10 @@ def main(config):
             )
 
         source_loader = None
+        source_scan_loader = None
         if not config.eval:
             source_loader = create_source_train_loader(config, splits)
+            source_scan_loader = create_source_scan_loader(config, splits)
             eval_batch_size = config.eval_batch_size or config.batch_size
             amp_enabled = bool(
                 getattr(config, "amp", False)
@@ -150,6 +193,7 @@ def main(config):
                 f"|eval_batch_size={eval_batch_size}"
                 f"|source_loader_steps={len(source_loader)}"
                 f"|epochs={config.stage1_epochs}"
+                f"|warmup_epochs={config.source_warmup_epochs}"
                 f"|amp={str(amp_enabled).lower()}"
                 f"|amp_dtype={getattr(config, 'amp_dtype', 'float16')}"
             )
@@ -196,6 +240,7 @@ def main(config):
                 model, source_loader, source_val_loader,
                 config, writer, device, best_model_path,
                 feature_snapshot_manager,
+                source_scan_loader=source_scan_loader,
             )
 
         print('Restoring best model weights for testing...')
@@ -230,13 +275,17 @@ def train_source_classification(
     device,
     best_model_path,
     feature_snapshot_manager=None,
+    source_scan_loader=None,
 ):
     epochs = config.stage1_epochs
+    warmup_epochs = config.source_warmup_epochs
+    refresh_interval = getattr(config, "prototype_refresh_interval", 1)
     steps_per_epoch = getattr(config, "steps_per_epoch", None)
     if steps_per_epoch is None or steps_per_epoch <= 0:
         steps_per_epoch = len(source_loader)
     if isinstance(steps_per_epoch, bool) or steps_per_epoch < 1:
         raise ValueError("--steps_per_epoch must be a positive integer or None")
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config.lr,
@@ -252,22 +301,39 @@ def train_source_classification(
             or getattr(config, "amp_dtype", "float16") == "bfloat16"
         )
     )
+    objective = Stage1Objective(
+        num_classes=config.num_classes,
+        lambda_q=config.lambda_q,
+        lambda_f=config.lambda_f,
+        lambda_q_to_cls=config.lambda_q_to_cls,
+        margin_q=config.margin_q,
+        margin_f=config.margin_f,
+        tau_q=config.tau_q,
+    )
     trainer = SourceClassificationTrainer(
         model,
         optimizer,
         device=device,
         amp_enabled=amp_enabled,
         amp_dtype=getattr(config, "amp_dtype", "float16"),
+        objective=objective,
     )
+
     best_f1 = float("-inf")
+    bank: SourcePrototypeBank | None = None
+    bank_version = 0
+    stage1_dir = config.fold_dir
+    tmp_best_path = os.path.join(stage1_dir, "stage1_best_model_tmp.pt")
+
     for epoch in range(epochs):
+        warmup = epoch < warmup_epochs
         model.train()
         meters = defaultdict(float)
         steps = 0
         for batch in source_loader:
             if steps >= steps_per_epoch:
                 break
-            metrics = trainer.train_step(batch)
+            metrics = trainer.train_step(batch, warmup=warmup, bank=bank)
             for name, value in metrics.items():
                 meters[name] += value
             steps += 1
@@ -275,19 +341,32 @@ def train_source_classification(
                 avg = {name: value / steps for name, value in meters.items()}
                 print(
                     f"TRAIN_STEP|epoch={epoch + 1}/{epochs}|step={steps}/{steps_per_epoch}"
+                    f"|warmup={str(warmup).lower()}"
                     f"|loss={avg['loss']:.4f}|cls={avg['classification_loss']:.4f}"
-                    f"|accuracy={avg['accuracy']:.4f}"
+                    f"|q_proto={avg['q_proto_loss']:.4f}|f_proto={avg['f_proto_loss']:.4f}"
+                    f"|q_to_cls={avg['q_to_cls_loss']:.4f}|accuracy={avg['accuracy']:.4f}"
                 )
         if steps == 0:
             raise RuntimeError("source training loader produced no batches")
         averages = {name: value / steps for name, value in meters.items()}
         print(
             f"TRAIN_EPOCH|epoch={epoch + 1}/{epochs}|steps={steps}"
+            f"|warmup={str(warmup).lower()}"
             f"|loss={averages['loss']:.4f}|cls={averages['classification_loss']:.4f}"
+            f"|q_proto={averages['q_proto_loss']:.4f}|f_proto={averages['f_proto_loss']:.4f}"
+            f"|q_to_cls={averages['q_to_cls_loss']:.4f}"
+            f"|q_valid={int(averages['q_valid_count'])}"
+            f"|f_valid={int(averages['f_valid_count'])}"
+            f"|consistency_valid={int(averages['consistency_valid_count'])}"
             f"|accuracy={averages['accuracy']:.4f}"
         )
         for name, value in averages.items():
             writer.add_scalar(f"train/{name}", value, epoch)
+        ready_classes = 0 if bank is None else len(bank.ready_classes())
+        print(
+            f"STAGE1_EPOCH|epoch={epoch + 1}/{epochs}|warmup={str(warmup).lower()}"
+            f"|prototype_ready_classes={ready_classes}|prototype_version={bank_version}"
+        )
         scheduler.step()
         if feature_snapshot_manager is not None:
             snapshot_result = feature_snapshot_manager.capture(epoch + 1)
@@ -302,7 +381,160 @@ def train_source_classification(
         best_f1, metrics = _source_validation(
             best_f1, best_model_path, config, device, epoch, model, source_val_loader, writer
         )
+        if metrics["macro_f1"] >= best_f1:
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "state_dict": model.state_dict(),
+                    "best_f1": best_f1,
+                    "source_val": {
+                        "accuracy": metrics["accuracy"],
+                        "macro_f1": metrics["macro_f1"],
+                    },
+                },
+                tmp_best_path,
+            )
+
+        if not warmup and epoch < epochs - 1 and (epoch + 1) % refresh_interval == 0:
+            if source_scan_loader is None:
+                raise RuntimeError("source_scan_loader is required for prototype refresh")
+            print(f"PROTOTYPE_REFRESH|epoch={epoch + 1}")
+            bank = build_source_prototype_bank(
+                model,
+                source_scan_loader,
+                config.num_classes,
+                device=device,
+            )
+            bank_version += 1
+            print(
+                f"PROTOTYPE_READY|epoch={epoch + 1}|version={bank_version}"
+                f"|ready_classes={len(bank.ready_classes())}"
+            )
+
+    _finalize_stage1_checkpoints(
+        model,
+        optimizer,
+        scheduler,
+        trainer.scaler,
+        config,
+        device,
+        tmp_best_path,
+        source_scan_loader,
+    )
     return best_f1
+
+
+def _finalize_stage1_checkpoints(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    config,
+    device,
+    tmp_best_path,
+    source_scan_loader,
+):
+    """Produce stage1_best.pt and stage1_last.pt with full prototype state."""
+
+    def emit_checkpoint(path: str, state: dict, epoch: int) -> None:
+        torch.save(state, path)
+        print(f"STAGE1_CHECKPOINT|path={path}|epoch={epoch}")
+
+    def build_prototype_state(model_state: dict, epoch: int, source_val: dict) -> dict:
+        model.load_state_dict(model_state)
+        model.to(device)
+        model.eval()
+        bank = build_source_prototype_bank(
+            model, source_scan_loader, config.num_classes, device=device
+        )
+        bank, examples = finalize_distance_statistics(
+            model, source_scan_loader, bank, device=device
+        )
+        return {
+            "stage": "stage1",
+            "epoch": epoch,
+            "model_state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "source_val": {
+                "accuracy": source_val.get("accuracy", 0.0),
+                "macro_f1": source_val.get("macro_f1", 0.0),
+            },
+            "prototype_bank": {
+                "trend_srvf": bank.trend_srvf.detach().cpu(),
+                "shape_srvf": bank.shape_srvf.detach().cpu(),
+                "trend_support": bank.trend_support.detach().cpu(),
+                "shape_support": bank.shape_support.detach().cpu(),
+                "fused": bank.fused.detach().cpu(),
+                "class_counts": bank.class_counts.detach().cpu(),
+                "ready": bank.ready.detach().cpu(),
+                "q_distance_samples": tuple(v.detach().cpu() for v in bank.q_distance_samples),
+                "f_distance_samples": tuple(v.detach().cpu() for v in bank.f_distance_samples),
+                "q_quantiles": bank.q_quantiles.detach().cpu(),
+                "f_quantiles": bank.f_quantiles.detach().cpu(),
+                "version": bank.version,
+            },
+            "shape_examples": _to_cpu_examples(examples),
+            "stage1_config": _stage1_config_dict(config),
+        }
+
+    stage1_dir = config.fold_dir
+    last_path = os.path.join(stage1_dir, "stage1_last.pt")
+    best_path = os.path.join(stage1_dir, "stage1_best.pt")
+
+    if os.path.isfile(tmp_best_path):
+        best_state = torch.load(tmp_best_path, weights_only=False)
+        best_checkpoint = build_prototype_state(
+            best_state["state_dict"],
+            best_state["epoch"],
+            best_state["source_val"],
+        )
+        emit_checkpoint(best_path, best_checkpoint, best_state["epoch"])
+
+    last_state = {
+        "epoch": config.stage1_epochs - 1,
+        "state_dict": model.state_dict(),
+        "best_f1": 0.0,
+        "source_val": {"accuracy": 0.0, "macro_f1": 0.0},
+    }
+    last_checkpoint = build_prototype_state(
+        last_state["state_dict"],
+        last_state["epoch"],
+        last_state["source_val"],
+    )
+    emit_checkpoint(last_path, last_checkpoint, last_state["epoch"])
+
+    if os.path.isfile(tmp_best_path):
+        os.remove(tmp_best_path)
+
+
+def _to_cpu_examples(examples: list[dict]) -> list[dict]:
+    out = []
+    for example in examples:
+        item = dict(example)
+        for key in ("q_shape", "support", "canonical_grid", "original_positions"):
+            value = item.get(key)
+            if isinstance(value, torch.Tensor):
+                item[key] = value.detach().cpu()
+        out.append(item)
+    return out
+
+
+def _stage1_config_dict(config) -> dict:
+    names = (
+        "stage1_epochs",
+        "source_warmup_epochs",
+        "lambda_q",
+        "lambda_f",
+        "lambda_q_to_cls",
+        "margin_q",
+        "margin_f",
+        "tau_q",
+        "num_classes",
+        "canonical_grid_size",
+    )
+    return {name: getattr(config, name, None) for name in names}
 
 
 def _source_validation(
@@ -652,6 +884,22 @@ if __name__ == '__main__':
     parser.add_argument('--feature_snapshot_dir', default=None)
     parser.add_argument('--steps_per_epoch', default=None, type=int,
                         help='limit the number of training steps per epoch; default uses the full source loader')
+
+    # Stage-1 prototype supervision
+    parser.add_argument('--source_warmup_epochs', default=5, type=int,
+                        help='epochs of CE-only warmup before prototype supervision starts')
+    parser.add_argument('--lambda_q', default=0.1, type=float,
+                        help='weight of the Shape prototype relative-margin loss')
+    parser.add_argument('--lambda_f', default=0.1, type=float,
+                        help='weight of the fused-feature prototype relative-margin loss')
+    parser.add_argument('--lambda_q_to_cls', default=0.1, type=float,
+                        help='weight of the q-to-classifier consistency KL')
+    parser.add_argument('--margin_q', default=0.1, type=float,
+                        help='relative margin for the Shape prototype loss')
+    parser.add_argument('--margin_f', default=0.1, type=float,
+                        help='relative margin for the fused-feature prototype loss')
+    parser.add_argument('--tau_q', default=0.1, type=float,
+                        help='temperature for the Shape geometry class distribution')
 
     # Model hyperparameters
     parser.add_argument('--canonical_grid_size', default=64, type=int)

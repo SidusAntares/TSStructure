@@ -21,6 +21,7 @@ def _current_config(**overrides):
         device="cpu",
         source="source",
         target="target",
+        data_root="data",
         num_folds=1,
         val_ratio=0.1,
         test_ratio=0.2,
@@ -55,6 +56,13 @@ def _current_config(**overrides):
         time2vec_max_frequency=16.0,
         tensorboard_log_dir="runs",
         stage1_epochs=1,
+        source_warmup_epochs=0,
+        lambda_q=0.1,
+        lambda_f=0.1,
+        lambda_q_to_cls=0.1,
+        margin_q=0.1,
+        margin_f=0.1,
+        tau_q=0.1,
         batch_size=2,
         eval_batch_size=2,
         steps_per_epoch=1,
@@ -241,6 +249,11 @@ def test_training_selects_checkpoint_on_source_validation_and_tests_target(
     monkeypatch.setattr(
         train,
         "create_source_train_loader",
+        lambda config, splits: source_train,
+    )
+    monkeypatch.setattr(
+        train,
+        "create_source_scan_loader",
         lambda config, splits: source_train,
     )
     monkeypatch.setattr(

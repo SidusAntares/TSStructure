@@ -46,10 +46,17 @@ def test_source_trainer_step_updates_parameters_without_target() -> None:
     )
     before = {name: value.clone() for name, value in model.state_dict().items()}
 
-    metrics = trainer.train_step(_batch())
+    metrics = trainer.train_step(_batch(), warmup=True)
 
-    assert set(metrics) == {"loss", "classification_loss", "accuracy"}
+    assert set(metrics) == {
+        "loss", "classification_loss", "accuracy",
+        "q_proto_loss", "f_proto_loss", "q_to_cls_loss",
+        "q_valid_count", "f_valid_count", "consistency_valid_count",
+    }
     assert torch.isfinite(torch.tensor(metrics["loss"])).item()
+    assert metrics["q_proto_loss"] == 0.0
+    assert metrics["f_proto_loss"] == 0.0
+    assert metrics["q_to_cls_loss"] == 0.0
     after = model.state_dict()
     changed = [name for name in before if not torch.equal(before[name], after[name])]
     assert changed, "no parameter was updated by the source CE step"
@@ -70,7 +77,7 @@ def test_source_trainer_skips_functional_fit(monkeypatch) -> None:
         return original(*args, **kwargs)
 
     monkeypatch.setattr(model.temporal_module.trend_geometry, "forward", counted)
-    trainer.train_step(_batch())
+    trainer.train_step(_batch(), warmup=True)
     assert calls == 0
 
 
@@ -81,7 +88,7 @@ def test_source_trainer_cpu_smoke_without_amp() -> None:
         model, optimizer, device=torch.device("cpu"), amp_enabled=False
     )
     for _ in range(3):
-        metrics = trainer.train_step(_batch())
+        metrics = trainer.train_step(_batch(), warmup=True)
         assert torch.isfinite(torch.tensor(metrics["loss"])).item()
     assert model.training
 

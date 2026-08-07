@@ -115,7 +115,7 @@ def _run(
     for iteration in range(warmup + iterations):
         _synchronize(device)
         started = time.perf_counter()
-        trainer.train_step(source)
+        trainer.train_step(source, warmup=True)
         _synchronize(device)
         if iteration >= warmup:
             elapsed_ms.append((time.perf_counter() - started) * 1000.0)
