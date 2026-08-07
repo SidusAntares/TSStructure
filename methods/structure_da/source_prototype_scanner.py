@@ -372,3 +372,83 @@ def _select_shape_examples(
             ("prototype_nearest", "class_median", "outer_representative"),
         )
     ]
+
+@torch.no_grad()
+@torch.no_grad()
+def refresh_source_fused_statistics(
+    model: TSStructureModel,
+    source_scan_loader,
+    bank: SourcePrototypeBank,
+    *,
+    device: torch.device,
+) -> SourcePrototypeBank:
+    """Refresh only source fused-feature statistics with a frozen geometry bank.
+
+    Stage 2 changes the raw Time2Vec/LTAE/classifier path but permanently freezes
+    PSE, decomposition and functional geometry.  This helper therefore performs
+    one deterministic EMA-teacher source scan, recomputes per-class fused means
+    and empirical fused-distance distributions, and copies every geometry field
+    from ``bank`` unchanged.  ``bank.version`` is intentionally preserved: it is
+    the source-geometry version used to validate the cached target registration
+    hypotheses.
+    """
+    if not isinstance(bank, SourcePrototypeBank):
+        raise TypeError("bank must be a SourcePrototypeBank")
+    num_classes = int(bank.ready.numel())
+    fused_rows: list[list[Tensor]] = [[] for _ in range(num_classes)]
+    was_training = model.training
+    try:
+        model.eval()
+        for batch in source_scan_loader:
+            extra = batch.get("extra")
+            if isinstance(extra, Tensor):
+                extra = extra.to(device=device)
+            output = model(
+                batch["pixels"].to(device=device),
+                batch["valid_pixels"].to(device=device),
+                batch["positions"].to(device=device),
+                extra,
+                return_geometry=False,
+            )
+            labels = batch["label"].to(device=device, dtype=torch.long)
+            for class_id in range(num_classes):
+                mask = labels == class_id
+                if torch.any(mask).item():
+                    fused_rows[class_id].append(output.fused_repr[mask].detach())
+    finally:
+        model.train(was_training)
+
+    fused = bank.fused.detach().to(device=device).clone()
+    f_samples: list[Tensor] = []
+    f_quantiles = bank.f_quantiles.detach().to(device=device).clone()
+    for class_id in range(num_classes):
+        if not fused_rows[class_id]:
+            f_samples.append(bank.f_distance_samples[class_id].detach().to(device=device))
+            continue
+        rows = torch.cat(fused_rows[class_id], dim=0)
+        center = rows.mean(dim=0)
+        fused[class_id] = center.to(dtype=fused.dtype)
+        distances = 1.0 - torch.nn.functional.cosine_similarity(
+            rows,
+            center.unsqueeze(0).expand_as(rows),
+            dim=-1,
+        )
+        distances = torch.sort(distances.detach()).values
+        f_samples.append(distances)
+        for level_index, level in enumerate(QUANTILE_LEVELS):
+            f_quantiles[class_id, level_index] = torch.quantile(distances, level)
+
+    return SourcePrototypeBank(
+        trend_srvf=bank.trend_srvf.detach(),
+        shape_srvf=bank.shape_srvf.detach(),
+        trend_support=bank.trend_support.detach(),
+        shape_support=bank.shape_support.detach(),
+        fused=fused.detach(),
+        class_counts=bank.class_counts.detach(),
+        ready=bank.ready.detach(),
+        q_distance_samples=tuple(item.detach() for item in bank.q_distance_samples),
+        f_distance_samples=tuple(item.detach() for item in f_samples),
+        q_quantiles=bank.q_quantiles.detach(),
+        f_quantiles=f_quantiles.detach(),
+        version=bank.version,
+    )

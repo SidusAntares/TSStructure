@@ -9,6 +9,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 CODE_VERSION="${CODE_VERSION:-structure_da_v3_snapshot_schema3_no_fused_alignment_v4}"
 OVERWRITE="${OVERWRITE:-0}"
+STAGE2_CONFIG="${STAGE2_CONFIG:-}"
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || {
@@ -169,6 +170,11 @@ run_training() {
     fi
     require_directory "${run_output_directory}"
     require_directory "$(dirname "${task_log_file}")"
+    local stage2_config_path=""
+    if [[ -n "${STAGE2_CONFIG}" ]]; then
+        require_file "${STAGE2_CONFIG}"
+        stage2_config_path="$(cd "$(dirname "${STAGE2_CONFIG}")" && pwd)/$(basename "${STAGE2_CONFIG}")"
+    fi
     cd "${PROJECT_ROOT}"
 
     CMD=(
@@ -184,6 +190,9 @@ run_training() {
     )
     if [[ -n "${DATA_ROOT}" ]]; then
         CMD+=(--data_root "${DATA_ROOT}")
+    fi
+    if [[ -n "${stage2_config_path}" ]]; then
+        CMD+=(--stage2_config "${stage2_config_path}")
     fi
 
     {

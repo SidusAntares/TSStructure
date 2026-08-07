@@ -12,6 +12,12 @@ GPU2="${GPU2:-2}"
 GPU3="${GPU3:-3}"
 EXPECTED_RUNS=36
 
+if [[ -z "${STAGE2_CONFIG}" ]]; then
+    echo "STAGE2_CONFIG=/path/to/stage2_config.json is required; scientific Stage-2 thresholds have no launcher defaults." >&2
+    exit 1
+fi
+require_file "${STAGE2_CONFIG}"
+
 if [[ -z "${RUN_GROUP}" ]]; then
     echo "RUN_GROUP is required." >&2
     exit 1

@@ -11,12 +11,19 @@ SEED="${SEED:-1}"
 CUDA_DEVICE="${CUDA_DEVICE:-0}"
 SMOKE_EPOCHS="${SMOKE_EPOCHS:-1}"
 SMOKE_STEPS_PER_EPOCH="${SMOKE_STEPS_PER_EPOCH:-2}"
+SMOKE_STAGE2_EPOCHS="${SMOKE_STAGE2_EPOCHS:-1}"
+SMOKE_STAGE2_STEPS_PER_EPOCH="${SMOKE_STAGE2_STEPS_PER_EPOCH:-1}"
 RUN_OUTPUT_DIRECTORY="${OUTPUT_ROOT}/smoke_structure_da_v3"
 SMOKE_LOG_ROOT="${LOG_ROOT}/smoke_structure_da_v3"
 SMOKE_TRAIN_LOG_DIRECTORY="${SMOKE_LOG_ROOT}/train_logs"
 SMOKE_SNAPSHOT_DIRECTORY="${SMOKE_LOG_ROOT}/snapshots"
 SMOKE_LOG_FILE="${SMOKE_TRAIN_LOG_DIRECTORY}/smoke.log"
 
+if [[ -z "${STAGE2_CONFIG}" ]]; then
+    echo "STAGE2_CONFIG=/path/to/stage2_config.json is required for the V3 smoke." >&2
+    exit 1
+fi
+require_file "${STAGE2_CONFIG}"
 
 prepare_run_group "${RUN_OUTPUT_DIRECTORY}" "${SMOKE_LOG_ROOT}"
 
@@ -26,6 +33,9 @@ if run_training \
     "${RUN_OUTPUT_DIRECTORY}" "${SMOKE_LOG_FILE}" \
     --stage1_epochs "${SMOKE_EPOCHS}" \
     --steps_per_epoch "${SMOKE_STEPS_PER_EPOCH}" --log_step 1 \
+    --stage2_epochs "${SMOKE_STAGE2_EPOCHS}" \
+    --stage2_block_epochs "${SMOKE_STAGE2_EPOCHS}" \
+    --stage2_steps_per_epoch "${SMOKE_STAGE2_STEPS_PER_EPOCH}" \
     --feature_snapshot_interval 0
 then
     status=0

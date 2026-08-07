@@ -21,13 +21,26 @@ from dataset import (
 )
 from evaluation import evaluation
 from methods.structure_da import (
+    DeviceBatchLoader,
+    DomainPhaseConfig,
+    DomainShapeConfig,
+    PhaseHypothesisScanConfig,
     SourceClassificationTrainer,
     SourcePrototypeBank,
+    StableLabelConfig,
     Stage1Objective,
+    Stage2EMATeacher,
+    Stage2ObjectiveConfig,
+    Stage2Trainer,
+    Stage2TrainerConfig,
     TSStructureModel,
     build_source_prototype_bank,
+    build_source_registration_prototypes,
+    build_stage2_registration_extractor,
+    configure_stage2_parameter_policy,
     create_feature_snapshot_manager,
     finalize_distance_statistics,
+    run_stage2_training,
 )
 from transforms import Identity, Normalize, RandomSamplePixels, ToTensor
 from utils import label_utils
@@ -116,6 +129,169 @@ def create_source_scan_loader(config, splits):
     )
 
 
+def create_target_statistics_loader(config, splits):
+    """Deterministic full target-train loader for Stage-2 statistics only."""
+    from dataset import GroupByShapesBatchSampler
+
+    scan_transform = transforms.Compose([Identity(), Normalize(), ToTensor()])
+    scan_dataset = PixelSetData(
+        data_root=config.data_root,
+        dataset_name=config.target,
+        classes=config.classes,
+        transform=scan_transform,
+        indices=splits[config.target]["train"],
+        with_extra=False,
+        closed_set=config.closed_set,
+        combine_spring_and_winter=config.combine_spring_and_winter,
+        time_coordinate_mode=getattr(
+            config, "time_coordinate_mode", "canonical_day_of_year"
+        ),
+    )
+    scan_batch_size = getattr(config, "eval_batch_size", None) or config.batch_size
+    return DataLoader(
+        dataset=scan_dataset,
+        batch_sampler=GroupByShapesBatchSampler(
+            scan_dataset, scan_batch_size, by_pixel_dim=False
+        ),
+        num_workers=config.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        worker_init_fn=worker_init_fn,
+    )
+
+
+def _apply_stage2_config_file(config) -> None:
+    path = getattr(config, "stage2_config", None)
+    if not path:
+        return
+    with open(path, "r", encoding="utf-8") as handle:
+        values = json.load(handle)
+    if not isinstance(values, dict):
+        raise ValueError("--stage2_config must contain a JSON object")
+    allowed = {name for name in vars(config) if name.startswith("stage2_")}
+    unknown = sorted(set(values) - allowed)
+    if unknown:
+        raise ValueError(
+            "unknown Stage-2 configuration keys: " + ", ".join(unknown)
+        )
+    for name, value in values.items():
+        if getattr(config, name) is None:
+            setattr(config, name, value)
+
+
+def _missing_stage2_configuration(config) -> list[str]:
+    required = (
+        "stage2_registration_lambda",
+        "stage2_registration_gain_ratio_max",
+        "stage2_registration_min_common_support",
+        "stage2_registration_max_roughness",
+        "stage2_registration_min_increment",
+        "stage2_registration_max_local_speed",
+        "stage2_registration_max_deviation",
+        "stage2_class_hypothesis_margin",
+        "stage2_phase_min_samples_per_class",
+        "stage2_phase_class_dispersion_max",
+        "stage2_phase_class_diameter_max",
+        "stage2_phase_group_dispersion_max",
+        "stage2_phase_group_diameter_max",
+        "stage2_phase_group_core_separation",
+        "stage2_phase_global_radius",
+        "stage2_phase_confirmation_patience",
+        "stage2_phase_center_drift_max",
+        "stage2_stable_tau_f",
+        "stage2_stable_tau_q",
+        "stage2_shape_min_valid_classes",
+        "stage2_shape_min_samples_per_class",
+        "stage2_shape_shared_ratio_min",
+        "stage2_shape_leave_one_out_drift_max",
+        "stage2_shape_center_drift_max",
+        "stage2_shape_effect_norm_max",
+        "stage2_shape_confirmation_patience",
+        "stage2_lambda_src_proto",
+        "stage2_lambda_src_cons",
+        "stage2_lambda_syn",
+        "stage2_lambda_syn_cons",
+        "stage2_objective_tau_q",
+        "stage2_fused_margin",
+        "stage2_ema_decay",
+        "stage2_lambda_delta",
+    )
+    missing = [name for name in required if getattr(config, name, None) is None]
+    gate_pairs = (
+        ("classifier gate", "stage2_cls_confidence_min", "stage2_cls_margin_min"),
+        ("fused gate", "stage2_fused_confidence_min", "stage2_fused_margin_min"),
+        ("q gate", "stage2_q_confidence_min", "stage2_q_margin_min"),
+    )
+    for label, confidence, margin in gate_pairs:
+        if getattr(config, confidence, None) is None and getattr(config, margin, None) is None:
+            missing.append(label + f" ({confidence} or {margin})")
+    return missing
+
+
+def build_stage2_config(config) -> Stage2TrainerConfig:
+    missing = _missing_stage2_configuration(config)
+    if missing:
+        raise ValueError(
+            "missing Stage-2 statistical configuration: " + ", ".join(missing)
+        )
+    return Stage2TrainerConfig(
+        phase_scan=PhaseHypothesisScanConfig(
+            registration_lambda=config.stage2_registration_lambda,
+            registration_gain_ratio_max=config.stage2_registration_gain_ratio_max,
+            registration_min_common_support=config.stage2_registration_min_common_support,
+            registration_max_roughness=config.stage2_registration_max_roughness,
+            registration_min_increment=config.stage2_registration_min_increment,
+            registration_max_local_speed=config.stage2_registration_max_local_speed,
+            registration_max_deviation=config.stage2_registration_max_deviation,
+            class_hypothesis_margin=config.stage2_class_hypothesis_margin,
+        ),
+        phase=DomainPhaseConfig(
+            phase_min_samples_per_class=config.stage2_phase_min_samples_per_class,
+            phase_class_dispersion_max=config.stage2_phase_class_dispersion_max,
+            phase_class_diameter_max=config.stage2_phase_class_diameter_max,
+            phase_group_dispersion_max=config.stage2_phase_group_dispersion_max,
+            phase_group_diameter_max=config.stage2_phase_group_diameter_max,
+            phase_group_core_separation=config.stage2_phase_group_core_separation,
+            phase_global_radius=config.stage2_phase_global_radius,
+            phase_confirmation_patience=config.stage2_phase_confirmation_patience,
+            phase_center_drift_max=config.stage2_phase_center_drift_max,
+        ),
+        stable_labels=StableLabelConfig(
+            tau_f=config.stage2_stable_tau_f,
+            tau_q=config.stage2_stable_tau_q,
+            cls_confidence_min=config.stage2_cls_confidence_min,
+            cls_margin_min=config.stage2_cls_margin_min,
+            fused_confidence_min=config.stage2_fused_confidence_min,
+            fused_margin_min=config.stage2_fused_margin_min,
+            q_confidence_min=config.stage2_q_confidence_min,
+            q_margin_min=config.stage2_q_margin_min,
+        ),
+        shape=DomainShapeConfig(
+            shape_min_valid_classes=config.stage2_shape_min_valid_classes,
+            shape_min_samples_per_class=config.stage2_shape_min_samples_per_class,
+            shape_shared_ratio_min=config.stage2_shape_shared_ratio_min,
+            shape_leave_one_out_drift_max=config.stage2_shape_leave_one_out_drift_max,
+            shape_center_drift_max=config.stage2_shape_center_drift_max,
+            shape_effect_norm_max=config.stage2_shape_effect_norm_max,
+            shape_confirmation_patience=config.stage2_shape_confirmation_patience,
+        ),
+        objective=Stage2ObjectiveConfig(
+            lambda_src_proto=config.stage2_lambda_src_proto,
+            lambda_src_cons=config.stage2_lambda_src_cons,
+            lambda_syn=config.stage2_lambda_syn,
+            lambda_syn_cons=config.stage2_lambda_syn_cons,
+            tau_q=config.stage2_objective_tau_q,
+            fused_margin=config.stage2_fused_margin,
+        ),
+        ema_decay=config.stage2_ema_decay,
+        lambda_delta=config.stage2_lambda_delta,
+        total_epochs=config.stage2_epochs,
+        adaptation_block_epochs=config.stage2_block_epochs,
+        steps_per_epoch=config.stage2_steps_per_epoch,
+        amp_enabled=bool(getattr(config, "amp", False)),
+        amp_dtype=getattr(config, "amp_dtype", "float16"),
+    )
+
+
 def _comma_separated_ints(value: str) -> list[int]:
     if isinstance(value, str):
         items = [int(part) for part in value.split(",") if part]
@@ -151,6 +327,9 @@ def main(config):
         overall_performance(config)
         return
 
+    stage2_runtime_config = None if config.eval else build_stage2_config(config)
+    all_folds_have_formal_test = True
+
     for fold_num, splits in enumerate(folds):
         print(f'Starting fold {fold_num}...')
 
@@ -166,19 +345,26 @@ def main(config):
                 config.target, splits, config, sample_pixels_val
             )
             source_val_loader = None
+            target_val_loader = None
+            target_statistics_loader = None
         else:
             source_val_loader, _ = create_evaluation_loaders(
                 config.source, splits, config, sample_pixels_val
             )
-            _, target_test_loader = create_evaluation_loaders(
+            target_val_loader, target_test_loader = create_evaluation_loaders(
                 config.target, splits, config, sample_pixels_val
+            )
+            target_statistics_loader = DeviceBatchLoader(
+                create_target_statistics_loader(config, splits), device
             )
 
         source_loader = None
         source_scan_loader = None
         if not config.eval:
             source_loader = create_source_train_loader(config, splits)
-            source_scan_loader = create_source_scan_loader(config, splits)
+            source_scan_loader = DeviceBatchLoader(
+                create_source_scan_loader(config, splits), device
+            )
             eval_batch_size = config.eval_batch_size or config.batch_size
             amp_enabled = bool(
                 getattr(config, "amp", False)
@@ -192,7 +378,9 @@ def main(config):
                 f"batch_size={config.batch_size}"
                 f"|eval_batch_size={eval_batch_size}"
                 f"|source_loader_steps={len(source_loader)}"
-                f"|epochs={config.stage1_epochs}"
+                f"|stage1_epochs={config.stage1_epochs}"
+                f"|stage2_epochs={config.stage2_epochs}"
+                f"|stage2_block_epochs={config.stage2_block_epochs}"
                 f"|warmup_epochs={config.source_warmup_epochs}"
                 f"|amp={str(amp_enabled).lower()}"
                 f"|amp_dtype={getattr(config, 'amp_dtype', 'float16')}"
@@ -222,48 +410,165 @@ def main(config):
             classifier_hidden=_int_list(config.classifier_hidden),
             max_initial_frequency=config.time2vec_max_frequency,
         )
-        model.to(config.device)
+        model.to(device)
 
+        if config.eval:
+            stage2_last = os.path.join(config.fold_dir, "stage2_last_ema.pt")
+            fallback = os.path.join(config.fold_dir, "model.pt")
+            checkpoint_path = stage2_last if os.path.isfile(stage2_last) else fallback
+            print(f"Restoring evaluation model from {checkpoint_path}...")
+            state_dict = torch.load(checkpoint_path, weights_only=False)["state_dict"]
+            load_structure_da_state_dict(model, state_dict)
+            test_metrics = evaluation(
+                model,
+                target_test_loader,
+                device,
+                config.classes,
+                criterion=torch.nn.CrossEntropyLoss(),
+                mode='test',
+                progress_bar=getattr(config, "progress_bar", "auto"),
+            )
+            save_results(test_metrics, config)
+            continue
+
+        from torch.utils.tensorboard import SummaryWriter
+
+        assert source_loader is not None
+        assert source_scan_loader is not None
+        assert source_val_loader is not None
+        assert target_statistics_loader is not None
+        assert target_val_loader is not None
+        assert stage2_runtime_config is not None
+
+        print(model)
+        print('Number of Stage-1 trainable parameters:', get_num_trainable_params(model))
+        writer = SummaryWriter(
+            log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0
+        )
+        feature_snapshot_manager = create_feature_snapshot_manager(
+            model, config, splits, device=device
+        )
         best_model_path = os.path.join(config.fold_dir, 'model.pt')
-
-        if not config.eval:
-            from torch.utils.tensorboard import SummaryWriter
-
-            print(model)
-            print('Number of trainable parameters:', get_num_trainable_params(model))
-
-            writer = SummaryWriter(log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0)
-            feature_snapshot_manager = create_feature_snapshot_manager(
-                model, config, splits, device=device
-            )
-            train_source_classification(
-                model, source_loader, source_val_loader,
-                config, writer, device, best_model_path,
-                feature_snapshot_manager,
-                source_scan_loader=source_scan_loader,
-            )
-
-        print('Restoring best model weights for testing...')
-
-        state_dict = torch.load(best_model_path, weights_only=False)['state_dict']
-        load_structure_da_state_dict(model, state_dict)
-
-        test_metrics = evaluation(
-            model,
-            target_test_loader,
-            device,
-            config.classes,
-            criterion=torch.nn.CrossEntropyLoss(),
-            mode='test',
-            progress_bar=getattr(config, "progress_bar", "auto"),
+        train_source_classification(
+            model, source_loader, source_val_loader,
+            config, writer, device, best_model_path,
+            feature_snapshot_manager,
+            source_scan_loader=source_scan_loader,
         )
 
-        print(f"Test result for {config.experiment_name}: accuracy={test_metrics['accuracy']:.4f}, f1={test_metrics['macro_f1']:.4f}")
-        print(test_metrics['classification_report'])
+        # Formal Stage-1 -> Stage-2 boundary: select source-val best, then
+        # recompute the final frozen full-source geometry/statistics once.
+        stage1_best_path = os.path.join(config.fold_dir, "stage1_best.pt")
+        stage1_checkpoint = torch.load(stage1_best_path, weights_only=False)
+        load_structure_da_state_dict(model, stage1_checkpoint["model_state_dict"])
+        model.to(device)
+        model.eval()
+        source_bank = build_source_prototype_bank(
+            model, source_scan_loader, config.num_classes, device=device
+        )
+        source_bank, _ = finalize_distance_statistics(
+            model, source_scan_loader, source_bank, device=device
+        )
+        reg_extractor = build_stage2_registration_extractor(
+            model, device=device, k_reg=stage2_runtime_config.phase_scan.k_reg
+        )
+        source_registration_bank = build_source_registration_prototypes(
+            model,
+            source_scan_loader,
+            config.num_classes,
+            device=device,
+            reg_extractor=reg_extractor,
+        )
 
-        save_results(test_metrics, config)
+        policy = configure_stage2_parameter_policy(model)
+        named_parameters = dict(model.named_parameters())
+        stage2_parameters = [
+            named_parameters[name] for name in policy.trainable_parameter_names
+        ]
+        stage2_optimizer = torch.optim.Adam(
+            stage2_parameters,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+        )
+        ema_teacher = Stage2EMATeacher.from_student(
+            model, policy, decay=stage2_runtime_config.ema_decay
+        )
+        stage2_trainer = Stage2Trainer(
+            student=model,
+            policy=policy,
+            ema_teacher=ema_teacher,
+            optimizer=stage2_optimizer,
+            source_loader=source_loader,
+            source_scan_loader=source_scan_loader,
+            target_statistics_loader=target_statistics_loader,
+            source_prototype_bank=source_bank,
+            source_registration_bank=source_registration_bank,
+            reg_extractor=reg_extractor,
+            config=stage2_runtime_config,
+            device=device,
+            output_dir=config.fold_dir,
+            runtime_config=dict(vars(config)),
+            writer=writer,
+        )
 
-    overall_performance(config)
+        def evaluate_target_val(teacher_model, epoch):
+            metrics = evaluation(
+                teacher_model,
+                target_val_loader,
+                device,
+                config.classes,
+                criterion=torch.nn.CrossEntropyLoss(),
+                mode='val',
+                progress_bar=getattr(config, "progress_bar", "auto"),
+            )
+            writer.add_scalar("stage2/target_val_accuracy", metrics["accuracy"], epoch)
+            writer.add_scalar("stage2/target_val_macro_f1", metrics["macro_f1"], epoch)
+            print(
+                f"STAGE2_TARGET_VAL|epoch={epoch}|accuracy={metrics['accuracy']:.4f}"
+                f"|macro_f1={metrics['macro_f1']:.4f}"
+            )
+            return metrics
+
+        def evaluate_target_test(teacher_model, epoch):
+            metrics = evaluation(
+                teacher_model,
+                target_test_loader,
+                device,
+                config.classes,
+                criterion=torch.nn.CrossEntropyLoss(),
+                mode='test',
+                progress_bar=getattr(config, "progress_bar", "auto"),
+            )
+            print(
+                f"DIAGNOSTIC_TARGET_TEST|epoch={epoch}|accuracy={metrics['accuracy']:.4f}"
+                f"|macro_f1={metrics['macro_f1']:.4f}"
+            )
+            return metrics
+
+        stage2_result = run_stage2_training(
+            stage2_trainer,
+            evaluate_target_val=evaluate_target_val,
+            evaluate_target_test=evaluate_target_test,
+        )
+        writer.close()
+
+        if stage2_result.final_diagnostic_target_test is not None:
+            test_metrics = stage2_result.final_diagnostic_target_test
+            print(
+                f"Final diagnostic test for {config.experiment_name}: "
+                f"accuracy={test_metrics['accuracy']:.4f}, "
+                f"f1={test_metrics['macro_f1']:.4f}"
+            )
+            print(test_metrics['classification_report'])
+            save_results(test_metrics, config)
+        else:
+            all_folds_have_formal_test = False
+            print(
+                "STAGE2_SMOKE_COMPLETE|no formal epoch-20/40/60 target test was run"
+            )
+
+    if all_folds_have_formal_test:
+        overall_performance(config)
 
 
 def train_source_classification(
@@ -482,6 +787,9 @@ def _finalize_stage1_checkpoints(
     stage1_dir = config.fold_dir
     last_path = os.path.join(stage1_dir, "stage1_last.pt")
     best_path = os.path.join(stage1_dir, "stage1_best.pt")
+    last_model_state = {
+        key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+    }
 
     if os.path.isfile(tmp_best_path):
         best_state = torch.load(tmp_best_path, weights_only=False)
@@ -494,7 +802,7 @@ def _finalize_stage1_checkpoints(
 
     last_state = {
         "epoch": config.stage1_epochs - 1,
-        "state_dict": model.state_dict(),
+        "state_dict": last_model_state,
         "best_f1": 0.0,
         "source_val": {"accuracy": 0.0, "macro_f1": 0.0},
     }
@@ -901,6 +1209,58 @@ if __name__ == '__main__':
     parser.add_argument('--tau_q', default=0.1, type=float,
                         help='temperature for the Shape geometry class distribution')
 
+    # Stage-2 orchestration. Scientific thresholds/weights intentionally have
+    # no defaults; provide them explicitly or through --stage2_config JSON.
+    parser.add_argument('--stage2_config', default=None, type=str)
+    parser.add_argument('--stage2_epochs', default=60, type=int)
+    parser.add_argument('--stage2_block_epochs', default=20, type=int)
+    parser.add_argument('--stage2_steps_per_epoch', default=None, type=int)
+
+    parser.add_argument('--stage2_registration_lambda', default=None, type=float)
+    parser.add_argument('--stage2_registration_gain_ratio_max', default=None, type=float)
+    parser.add_argument('--stage2_registration_min_common_support', default=None, type=float)
+    parser.add_argument('--stage2_registration_max_roughness', default=None, type=float)
+    parser.add_argument('--stage2_registration_min_increment', default=None, type=float)
+    parser.add_argument('--stage2_registration_max_local_speed', default=None, type=float)
+    parser.add_argument('--stage2_registration_max_deviation', default=None, type=float)
+    parser.add_argument('--stage2_class_hypothesis_margin', default=None, type=float)
+
+    parser.add_argument('--stage2_phase_min_samples_per_class', default=None, type=float)
+    parser.add_argument('--stage2_phase_class_dispersion_max', default=None, type=float)
+    parser.add_argument('--stage2_phase_class_diameter_max', default=None, type=float)
+    parser.add_argument('--stage2_phase_group_dispersion_max', default=None, type=float)
+    parser.add_argument('--stage2_phase_group_diameter_max', default=None, type=float)
+    parser.add_argument('--stage2_phase_group_core_separation', default=None, type=float)
+    parser.add_argument('--stage2_phase_global_radius', default=None, type=float)
+    parser.add_argument('--stage2_phase_confirmation_patience', default=None, type=int)
+    parser.add_argument('--stage2_phase_center_drift_max', default=None, type=float)
+
+    parser.add_argument('--stage2_stable_tau_f', default=None, type=float)
+    parser.add_argument('--stage2_stable_tau_q', default=None, type=float)
+    parser.add_argument('--stage2_cls_confidence_min', default=None, type=float)
+    parser.add_argument('--stage2_cls_margin_min', default=None, type=float)
+    parser.add_argument('--stage2_fused_confidence_min', default=None, type=float)
+    parser.add_argument('--stage2_fused_margin_min', default=None, type=float)
+    parser.add_argument('--stage2_q_confidence_min', default=None, type=float)
+    parser.add_argument('--stage2_q_margin_min', default=None, type=float)
+
+    parser.add_argument('--stage2_shape_min_valid_classes', default=None, type=int)
+    parser.add_argument('--stage2_shape_min_samples_per_class', default=None, type=int)
+    parser.add_argument('--stage2_shape_shared_ratio_min', default=None, type=float)
+    parser.add_argument('--stage2_shape_leave_one_out_drift_max', default=None, type=float)
+    parser.add_argument('--stage2_shape_center_drift_max', default=None, type=float)
+    parser.add_argument('--stage2_shape_effect_norm_max', default=None, type=float)
+    parser.add_argument('--stage2_shape_confirmation_patience', default=None, type=int)
+
+    parser.add_argument('--stage2_lambda_src_proto', default=None, type=float)
+    parser.add_argument('--stage2_lambda_src_cons', default=None, type=float)
+    parser.add_argument('--stage2_lambda_syn', default=None, type=float)
+    parser.add_argument('--stage2_lambda_syn_cons', default=None, type=float)
+    parser.add_argument('--stage2_objective_tau_q', default=None, type=float)
+    parser.add_argument('--stage2_fused_margin', default=None, type=float)
+    parser.add_argument('--stage2_ema_decay', default=None, type=float)
+    parser.add_argument('--stage2_lambda_delta', default=None, type=float)
+
     # Model hyperparameters
     parser.add_argument('--canonical_grid_size', default=64, type=int)
     parser.add_argument('--roughness_grid_size', default=256, type=int)
@@ -936,6 +1296,7 @@ if __name__ == '__main__':
     parser.add_argument('--delta_tau_min', default=1e-4, type=float)
 
     cfg = parser.parse_args()
+    _apply_stage2_config_file(cfg)
 
     # Setup folders based on name
     if cfg.experiment_name is not None:

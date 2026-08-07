@@ -21,8 +21,9 @@ def check_smoke(
     run_directory = Path(run_directory)
     log_directory = run_directory if log_directory is None else Path(log_directory)
     log_path = log_directory / "smoke.log"
-    checkpoint = run_directory / "fold_0" / "model.pt"
-    metrics = sorted((run_directory / "fold_0").glob("test_metrics_*.json"))
+    legacy_checkpoint = run_directory / "fold_0" / "model.pt"
+    stage1_checkpoint = run_directory / "fold_0" / "stage1_best.pt"
+    stage2_checkpoint = run_directory / "fold_0" / "stage2_last_ema.pt"
     text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
     numeric_losses = [
         float(value)
@@ -34,11 +35,14 @@ def check_smoke(
     combined = text
     failures: list[str] = []
     checks = {
-        "checkpoint": checkpoint.is_file(),
-        "metrics": bool(metrics),
-        "train_step": bool(re.search(r"TRAIN_STEP\|", text)),
-        "train_epoch": bool(re.search(r"TRAIN_EPOCH\|", text)),
-        "validation": "Validation result:" in text,
+        "stage1_checkpoint": stage1_checkpoint.is_file(),
+        "stage2_checkpoint": stage2_checkpoint.is_file(),
+        "stage1_train_step": bool(re.search(r"TRAIN_STEP\|", text)),
+        "stage1_validation": "Validation result:" in text,
+        "stage2_statistics": "STAGE2_INIT_COMPLETE|statistics_ready=true" in text,
+        "stage2_train_step": bool(re.search(r"STAGE2_TRAIN\|", text)),
+        "stage2_ema_step": bool(re.search(r"optimizer_step_success=(?:1(?:\.0+)?|0\.[1-9]\d*)", text)),
+        "stage2_validation": bool(re.search(r"STAGE2_TARGET_VAL\|", text)),
         "finite_losses": bool(numeric_losses) and all(math.isfinite(value) for value in numeric_losses),
         "no_oom": re.search(r"out of memory|cuda oom", combined, re.IGNORECASE) is None,
         "no_nonfinite_marker": re.search(
@@ -52,8 +56,9 @@ def check_smoke(
         "status": "PASS" if not failures else "FAIL",
         "checks": checks,
         "failures": failures,
-        "checkpoint": str(checkpoint),
-        "metrics_files": [str(path) for path in metrics],
+        "legacy_stage1_model_checkpoint": str(legacy_checkpoint),
+        "stage1_checkpoint": str(stage1_checkpoint),
+        "stage2_checkpoint": str(stage2_checkpoint),
     }
     return report
 

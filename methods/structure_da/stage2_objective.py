@@ -204,8 +204,6 @@ class Stage2Objective(nn.Module):
                 "synthetic_q": synthetic_q,
                 "synthetic_q_support": synthetic_q_support,
                 "synthetic_q_valid": synthetic_q_valid,
-                "domain_shape_state": domain_shape_state,
-                "lambda_delta": lambda_delta,
             }
             missing = [name for name, value in required.items() if value is None]
             if missing:
@@ -216,18 +214,29 @@ class Stage2Objective(nn.Module):
             assert synthetic_q is not None
             assert synthetic_q_support is not None
             assert synthetic_q_valid is not None
-            assert domain_shape_state is not None
-            assert lambda_delta is not None
             if synthetic_labels.shape != (synthetic_count,) or synthetic_labels.dtype != torch.long:
                 raise ValueError("synthetic_labels must be torch.long with shape [B_syn]")
             # These are source true labels. No target-label or StableTargetLabel
             # object is accepted anywhere in this objective.
             synthetic_cls = F.cross_entropy(synthetic_logits, synthetic_labels)
-            target_bank = _target_style_bank(
-                source_prototype_bank,
-                domain_shape_state,
-                lambda_delta,
-            )
+            if (
+                domain_shape_state is not None
+                and domain_shape_state.status is DomainShapeStatus.CONFIRMED
+            ):
+                if lambda_delta is None:
+                    raise ValueError(
+                        "confirmed Domain Shape synthetic inputs require lambda_delta"
+                    )
+                target_bank = _target_style_bank(
+                    source_prototype_bank,
+                    domain_shape_state,
+                    lambda_delta,
+                )
+            else:
+                # Phase-only synthesis leaves q unchanged.  Its q->classifier
+                # consistency therefore uses the frozen source q prototypes;
+                # this does not fabricate a confirmed Delta=0 Shape state.
+                target_bank = bank
             synthetic_consistency, synthetic_consistency_count = (
                 self._stage1_geometry._q_to_classifier_loss(
                     synthetic_q,

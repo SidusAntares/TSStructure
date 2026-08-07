@@ -90,9 +90,20 @@ from .representation import (
 from .source_prototype_scanner import (
     build_source_prototype_bank,
     finalize_distance_statistics,
+    refresh_source_fused_statistics,
 )
 from .source_trainer import SourceClassificationTrainer, SourceTrainStepOutput
 from .stage1_objective import Stage1LossOutput, Stage1Objective
+from .stage2_trainer import (
+    DeviceBatchLoader,
+    Stage2RunResult,
+    Stage2StatisticsSnapshot,
+    Stage2Trainer,
+    Stage2TrainerConfig,
+    TargetHypothesisCache,
+    build_stage2_registration_extractor,
+    run_stage2_training,
+)
 from .stage2_parameter_policy import (
     Stage2ParameterPolicy,
     configure_stage2_parameter_policy,
@@ -106,6 +117,7 @@ from .shape_transport import (
     SyntheticSourceDiagnostics,
     SyntheticSourceExample,
     apply_domain_shape_effect,
+    build_phase_only_synthetic_source_example,
     build_synthetic_source_example,
     correct_target_shape_to_source,
     evaluate_synthetic_source_diagnostics,
@@ -249,4 +261,14 @@ __all__ = [
     "update_domain_phase_state",
     "update_domain_shape_state",
     "align_target_positions_to_source",
+    "build_phase_only_synthetic_source_example",
+    "build_stage2_registration_extractor",
+    "DeviceBatchLoader",
+    "refresh_source_fused_statistics",
+    "run_stage2_training",
+    "Stage2RunResult",
+    "Stage2StatisticsSnapshot",
+    "Stage2Trainer",
+    "Stage2TrainerConfig",
+    "TargetHypothesisCache",
 ]

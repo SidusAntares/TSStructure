@@ -294,6 +294,51 @@ def _frozen_slow_curve(
     return output.trend.squeeze(0).detach()
 
 
+def build_phase_only_synthetic_source_example(
+    *,
+    source_sample_id: int,
+    class_id: int,
+    source_trend_tokens: Tensor,
+    source_structure_tokens: Tensor,
+    source_q_shape: Tensor,
+    source_q_support: Tensor,
+    source_positions: Tensor,
+    mask: Tensor,
+    phase_state: DomainPhaseState,
+) -> SyntheticSourceExample | None:
+    """Construct a confirmed-phase target-style source without Shape transport.
+
+    T/S token values and q geometry are copied unchanged.  Only the temporal
+    coordinate is relabelled by the confirmed domain phase center in the
+    source-to-target direction ``gamma(source_position)``.  G0, provisional
+    groups and M=0 return ``None``.
+    """
+    group = _confirmed_group_for_class(phase_state, class_id)
+    if group is None:
+        return None
+    if source_trend_tokens.ndim != 2 or source_structure_tokens.shape != source_trend_tokens.shape:
+        raise ValueError("source trend/structure tokens must share shape [L,D]")
+    if source_q_shape.ndim != 2 or source_q_support.shape != source_q_shape.shape[:1]:
+        raise ValueError("source q/support must have shape [K,D] and [K]")
+    if source_positions.ndim != 1 or mask.dtype != torch.bool or mask.shape != source_positions.shape:
+        raise ValueError("source positions/mask must have shape [L]")
+    target_style_positions = map_source_positions_to_target(
+        source_positions.detach(), mask.detach(), group.center_gamma
+    )
+    return SyntheticSourceExample(
+        source_sample_id=int(source_sample_id),
+        class_id=int(class_id),
+        group_id=int(group.group_id),
+        trend_tokens=source_trend_tokens.detach(),
+        structure_tokens=source_structure_tokens.detach(),
+        target_style_positions=target_style_positions,
+        mask=mask.detach(),
+        q_shape=source_q_shape.detach(),
+        q_support=source_q_support.detach(),
+        lambda_delta=0.0,
+    )
+
+
 def build_synthetic_source_example(
     *,
     source_sample_id: int,
