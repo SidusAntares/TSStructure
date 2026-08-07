@@ -1,0 +1,434 @@
+"""Three-way confirmed-phase evidence scan for stable target labels."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from .confirmed_phase_view import (
+    ConfirmedPhaseView,
+    build_confirmed_class_to_group_map,
+    build_confirmed_phase_view,
+)
+from .domain_phase_state import DomainPhaseState, PhaseGroup
+from .ema_teacher import Stage2EMATeacher
+from .prototype_bank import SourcePrototypeBank, support_aware_q_distance
+from .target_hypothesis_scan import TargetHypothesisScanResult
+
+
+@dataclass(frozen=True)
+class StableLabelConfig:
+    tau_f: float
+    tau_q: float
+    cls_confidence_min: float | None
+    cls_margin_min: float | None
+    fused_confidence_min: float | None
+    fused_margin_min: float | None
+    q_confidence_min: float | None
+    q_margin_min: float | None
+
+    def __post_init__(self) -> None:
+        for name in ("tau_f", "tau_q"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and greater than zero")
+        for branch, confidence, margin in (
+            ("classifier", self.cls_confidence_min, self.cls_margin_min),
+            ("fused", self.fused_confidence_min, self.fused_margin_min),
+            ("q", self.q_confidence_min, self.q_margin_min),
+        ):
+            if confidence is None and margin is None:
+                raise ValueError(f"{branch} requires a confidence or margin gate")
+            for name, value in (("confidence", confidence), ("margin", margin)):
+                if value is not None and (
+                    not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+                ):
+                    raise ValueError(f"{branch} {name} gate must lie in [0,1]")
+
+
+@dataclass(frozen=True)
+class StableTargetCandidate:
+    sample_id: int
+    class_id: int
+    group_id: int
+    cls_confidence: float
+    cls_margin: float
+    fused_distance: float
+    fused_confidence: float
+    fused_margin: float
+    q_distance: float
+    q_confidence: float
+    q_margin: float
+    q_common_support: float
+    passed_classifier: bool
+    passed_fused: bool
+    passed_q: bool
+    accepted: bool
+    reject_reason: str | None
+
+
+@dataclass(frozen=True)
+class StableTargetLabel:
+    sample_id: int
+    class_id: int
+    group_id: int
+    aligned_q_shape: Tensor
+    aligned_q_support: Tensor
+    fused_repr: Tensor
+    confidence_summary: float
+
+
+@dataclass(frozen=True)
+class StableTargetLabelScanResult:
+    candidates: tuple[StableTargetCandidate, ...]
+    stable_labels: tuple[StableTargetLabel, ...]
+    num_samples: int
+    num_without_confirmed_phase: int
+    num_candidate_views: int
+    num_classifier_pass: int
+    num_fused_pass: int
+    num_q_pass: int
+    num_stable_labels: int
+    num_ambiguous_rejected: int
+    stable_class_counts: tuple[int, ...]
+
+
+def _passes_gate(
+    confidence: float,
+    margin: float,
+    confidence_min: float | None,
+    margin_min: float | None,
+) -> bool:
+    return (
+        (confidence_min is None or confidence >= confidence_min)
+        and (margin_min is None or margin >= margin_min)
+    )
+
+
+def _probability_margin(probabilities: Tensor, candidate_index: int) -> tuple[float, float]:
+    candidate = float(probabilities[candidate_index].item())
+    others = torch.cat(
+        (probabilities[:candidate_index], probabilities[candidate_index + 1 :])
+    )
+    if others.numel() == 0:
+        return candidate, float("nan")
+    return candidate, candidate - float(others.max().item())
+
+
+def _integration_weights(grid_size: int, *, device, dtype) -> Tensor:
+    weights = torch.ones(grid_size, device=device, dtype=dtype)
+    weights[[0, -1]] *= 0.5
+    return weights / weights.sum()
+
+
+@torch.no_grad()
+def evaluate_stable_target_candidate(
+    *,
+    view: ConfirmedPhaseView,
+    view_index: int,
+    class_id: int,
+    source_prototype_bank: SourcePrototypeBank,
+    config: StableLabelConfig,
+) -> StableTargetCandidate:
+    sample_id = int(view.sample_ids[view_index].item())
+    if class_id not in view.member_classes:
+        return StableTargetCandidate(
+            sample_id, class_id, view.group_id,
+            float("nan"), float("nan"), float("nan"), float("nan"), float("nan"),
+            float("nan"), float("nan"), float("nan"), float("nan"),
+            False, False, False, False, "class_not_in_confirmed_group",
+        )
+
+    probabilities = view.probabilities[view_index]
+    cls_confidence, cls_margin = _probability_margin(probabilities, class_id)
+    passed_classifier = (
+        int(probabilities.argmax().item()) == class_id
+        and _passes_gate(
+            cls_confidence,
+            cls_margin,
+            config.cls_confidence_min,
+            config.cls_margin_min,
+        )
+    )
+
+    bank = source_prototype_bank
+    ready = bank.ready.to(device=view.fused_repr.device)
+    ready_indices = torch.nonzero(ready, as_tuple=False).flatten()
+    fused_distance = fused_confidence = fused_margin = float("nan")
+    passed_fused = False
+    if (
+        0 <= class_id < ready.numel()
+        and bool(ready[class_id].item())
+        and ready_indices.numel() >= 2
+        and bank.f_distance_samples[class_id] is not None
+        and bank.f_distance_samples[class_id].numel() > 0
+        and math.isfinite(float(bank.f_quantiles[class_id, 2].item()))
+    ):
+        query = view.fused_repr[view_index].unsqueeze(0)
+        prototypes = bank.fused.to(device=query.device, dtype=query.dtype)[ready_indices]
+        distances = 1.0 - F.cosine_similarity(query, prototypes, dim=-1)
+        fused_probabilities = torch.softmax(-distances / config.tau_f, dim=0)
+        local = int(torch.nonzero(ready_indices == class_id, as_tuple=False)[0].item())
+        fused_distance = float(distances[local].item())
+        fused_confidence, fused_margin = _probability_margin(fused_probabilities, local)
+        passed_fused = (
+            int(fused_probabilities.argmax().item()) == local
+            and fused_distance <= float(bank.f_quantiles[class_id, 2].item())
+            and _passes_gate(
+                fused_confidence,
+                fused_margin,
+                config.fused_confidence_min,
+                config.fused_margin_min,
+            )
+        )
+
+    q_distance = q_confidence = q_margin = q_common_support = float("nan")
+    passed_q = False
+    if 0 <= class_id < ready.numel() and bool(view.q_valid[view_index].item()):
+        q_query = view.aligned_q_shape[view_index : view_index + 1]
+        support_query = view.aligned_q_support[view_index : view_index + 1]
+        q_prototypes = bank.shape_srvf.to(device=q_query.device, dtype=q_query.dtype)[ready_indices]
+        support_prototypes = bank.shape_support.to(
+            device=q_query.device, dtype=q_query.dtype
+        )[ready_indices]
+        distances = support_aware_q_distance(
+            q_query,
+            q_prototypes,
+            support_query,
+            support_prototypes,
+            _integration_weights(q_query.shape[1], device=q_query.device, dtype=q_query.dtype),
+        )
+        valid_local = distances.valid[0]
+        candidate_positions = torch.nonzero(
+            ready_indices == class_id, as_tuple=False
+        ).flatten()
+        if candidate_positions.numel() and valid_local.sum().item() >= 2:
+            local = int(candidate_positions[0].item())
+            if (
+                bool(valid_local[local].item())
+                and bank.q_distance_samples[class_id] is not None
+                and bank.q_distance_samples[class_id].numel() > 0
+                and math.isfinite(float(bank.q_quantiles[class_id, 2].item()))
+            ):
+                valid_indices = torch.nonzero(valid_local, as_tuple=False).flatten()
+                valid_distances_sq = distances.distance_sq[0, valid_indices]
+                q_probabilities = torch.softmax(-valid_distances_sq / config.tau_q, dim=0)
+                candidate_valid_position = int(
+                    torch.nonzero(valid_indices == local, as_tuple=False)[0].item()
+                )
+                q_distance = float(distances.distance[0, local].item())
+                q_common_support = float(distances.common_support[0, local].item())
+                q_confidence, q_margin = _probability_margin(
+                    q_probabilities, candidate_valid_position
+                )
+                passed_q = (
+                    int(q_probabilities.argmax().item()) == candidate_valid_position
+                    and q_distance <= float(bank.q_quantiles[class_id, 2].item())
+                    and _passes_gate(
+                        q_confidence,
+                        q_margin,
+                        config.q_confidence_min,
+                        config.q_margin_min,
+                    )
+                )
+
+    accepted = passed_classifier and passed_fused and passed_q
+    reject_reason = None
+    if not accepted:
+        failed = []
+        if not passed_classifier:
+            failed.append("classifier")
+        if not passed_fused:
+            failed.append("fused")
+        if not passed_q:
+            failed.append("q")
+        reject_reason = "+".join(failed)
+    return StableTargetCandidate(
+        sample_id=sample_id,
+        class_id=class_id,
+        group_id=view.group_id,
+        cls_confidence=cls_confidence,
+        cls_margin=cls_margin,
+        fused_distance=fused_distance,
+        fused_confidence=fused_confidence,
+        fused_margin=fused_margin,
+        q_distance=q_distance,
+        q_confidence=q_confidence,
+        q_margin=q_margin,
+        q_common_support=q_common_support,
+        passed_classifier=passed_classifier,
+        passed_fused=passed_fused,
+        passed_q=passed_q,
+        accepted=accepted,
+        reject_reason=reject_reason,
+    )
+
+
+def _empty_result(num_samples: int, num_classes: int) -> StableTargetLabelScanResult:
+    return StableTargetLabelScanResult(
+        candidates=(),
+        stable_labels=(),
+        num_samples=num_samples,
+        num_without_confirmed_phase=num_samples,
+        num_candidate_views=0,
+        num_classifier_pass=0,
+        num_fused_pass=0,
+        num_q_pass=0,
+        num_stable_labels=0,
+        num_ambiguous_rejected=0,
+        stable_class_counts=(0,) * num_classes,
+    )
+
+
+def _subset_batch(batch: dict, rows: list[int], batch_size: int) -> dict:
+    subset = {}
+    index = torch.tensor(rows, dtype=torch.long)
+    for name in ("pixels", "valid_pixels", "positions", "extra", "time_mask"):
+        value = batch.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, Tensor):
+            raise ValueError(f"batch[{name!r}] must be a tensor")
+        if value.ndim > 0 and value.shape[0] == batch_size and not (
+            name == "positions" and value.ndim == 1
+        ):
+            subset[name] = value.index_select(0, index.to(value.device))
+        else:
+            subset[name] = value
+    return subset
+
+
+@torch.no_grad()
+def scan_stable_target_labels(
+    *,
+    ema_teacher: Stage2EMATeacher,
+    target_loader,
+    hypothesis_result: TargetHypothesisScanResult,
+    phase_state: DomainPhaseState,
+    source_prototype_bank: SourcePrototypeBank,
+    config: StableLabelConfig,
+) -> StableTargetLabelScanResult:
+    class_to_group = build_confirmed_class_to_group_map(phase_state)
+    num_classes = int(source_prototype_bank.ready.numel())
+    if not class_to_group:
+        return _empty_result(hypothesis_result.num_samples, num_classes)
+
+    teacher = ema_teacher.model()
+    teacher.eval()
+    hypotheses_by_sample: dict[int, list] = {}
+    for hypothesis in hypothesis_result.hypotheses:
+        hypotheses_by_sample.setdefault(int(hypothesis.sample_id), []).append(hypothesis)
+
+    view_lookup: dict[tuple[int, int], tuple[ConfirmedPhaseView, int]] = {}
+    global_index = 0
+    candidate_view_count = 0
+    for batch in target_loader:
+        pixels = batch.get("pixels")
+        if not isinstance(pixels, Tensor):
+            raise ValueError("target batch must contain tensor pixels")
+        batch_size = pixels.shape[0]
+        rows_by_group: dict[int, list[int]] = {}
+        groups: dict[int, PhaseGroup] = {}
+        for row in range(batch_size):
+            sample_id = global_index + row
+            seen_groups: set[int] = set()
+            for hypothesis in hypotheses_by_sample.get(sample_id, ()):
+                group = class_to_group.get(int(hypothesis.class_id))
+                if group is None or group.group_id in seen_groups:
+                    continue
+                seen_groups.add(group.group_id)
+                rows_by_group.setdefault(group.group_id, []).append(row)
+                groups[group.group_id] = group
+        for group_id in sorted(rows_by_group):
+            rows = rows_by_group[group_id]
+            sample_ids = torch.tensor(
+                [global_index + row for row in rows], dtype=torch.long
+            )
+            view = build_confirmed_phase_view(
+                model=teacher,
+                batch=_subset_batch(batch, rows, batch_size),
+                sample_ids=sample_ids,
+                group=groups[group_id],
+            )
+            candidate_view_count += len(rows)
+            for view_index, sample_id in enumerate(view.sample_ids.tolist()):
+                view_lookup[(int(sample_id), group_id)] = (view, view_index)
+        global_index += batch_size
+    if global_index != hypothesis_result.num_samples:
+        raise ValueError(
+            "target loader sample count must match hypothesis_result.num_samples"
+        )
+
+    candidates: list[StableTargetCandidate] = []
+    candidate_sources: dict[tuple[int, int, int], tuple[ConfirmedPhaseView, int]] = {}
+    samples_with_phase: set[int] = set()
+    for hypothesis in hypothesis_result.hypotheses:
+        sample_id = int(hypothesis.sample_id)
+        class_id = int(hypothesis.class_id)
+        group = class_to_group.get(class_id)
+        if group is None:
+            continue
+        source = view_lookup.get((sample_id, group.group_id))
+        if source is None:
+            continue
+        samples_with_phase.add(sample_id)
+        view, view_index = source
+        candidate = evaluate_stable_target_candidate(
+            view=view,
+            view_index=view_index,
+            class_id=class_id,
+            source_prototype_bank=source_prototype_bank,
+            config=config,
+        )
+        candidates.append(candidate)
+        candidate_sources[(sample_id, class_id, group.group_id)] = source
+
+    accepted_by_sample: dict[int, list[StableTargetCandidate]] = {}
+    for candidate in candidates:
+        if candidate.accepted:
+            accepted_by_sample.setdefault(candidate.sample_id, []).append(candidate)
+    stable_labels: list[StableTargetLabel] = []
+    class_counts = [0] * num_classes
+    ambiguous_rejected = 0
+    for sample_id in sorted(accepted_by_sample):
+        accepted = accepted_by_sample[sample_id]
+        if len(accepted) != 1:
+            ambiguous_rejected += 1
+            continue
+        candidate = accepted[0]
+        view, view_index = candidate_sources[
+            (candidate.sample_id, candidate.class_id, candidate.group_id)
+        ]
+        stable_labels.append(
+            StableTargetLabel(
+                sample_id=candidate.sample_id,
+                class_id=candidate.class_id,
+                group_id=candidate.group_id,
+                aligned_q_shape=view.aligned_q_shape[view_index].detach(),
+                aligned_q_support=view.aligned_q_support[view_index].detach(),
+                fused_repr=view.fused_repr[view_index].detach(),
+                confidence_summary=min(
+                    candidate.cls_confidence,
+                    candidate.fused_confidence,
+                    candidate.q_confidence,
+                ),
+            )
+        )
+        class_counts[candidate.class_id] += 1
+    return StableTargetLabelScanResult(
+        candidates=tuple(candidates),
+        stable_labels=tuple(stable_labels),
+        num_samples=hypothesis_result.num_samples,
+        num_without_confirmed_phase=hypothesis_result.num_samples - len(samples_with_phase),
+        num_candidate_views=candidate_view_count,
+        num_classifier_pass=sum(candidate.passed_classifier for candidate in candidates),
+        num_fused_pass=sum(candidate.passed_fused for candidate in candidates),
+        num_q_pass=sum(candidate.passed_q for candidate in candidates),
+        num_stable_labels=len(stable_labels),
+        num_ambiguous_rejected=ambiguous_rejected,
+        stable_class_counts=tuple(class_counts),
+    )

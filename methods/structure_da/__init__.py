@@ -47,6 +47,13 @@ from .domain_phase_state import (
     PhaseGroupStatus,
     update_domain_phase_state,
 )
+from .confirmed_phase_view import (
+    ConfirmedPhaseView,
+    align_target_positions_to_source,
+    build_confirmed_class_to_group_map,
+    build_confirmed_phase_view,
+)
+from .ema_teacher import Stage2EMATeacher
 from .phase_registration import (
     FdasrsfCurveRegistrationAdapter,
     GammaLegalityOutput,
@@ -79,6 +86,18 @@ from .source_prototype_scanner import (
 )
 from .source_trainer import SourceClassificationTrainer, SourceTrainStepOutput
 from .stage1_objective import Stage1LossOutput, Stage1Objective
+from .stage2_parameter_policy import (
+    Stage2ParameterPolicy,
+    configure_stage2_parameter_policy,
+)
+from .stable_target_labels import (
+    StableLabelConfig,
+    StableTargetCandidate,
+    StableTargetLabel,
+    StableTargetLabelScanResult,
+    evaluate_stable_target_candidate,
+    scan_stable_target_labels,
+)
 from .target_hypothesis_scan import (
     PhaseHypothesisScanConfig,
     TargetClassPhaseHypothesis,
@@ -103,6 +122,7 @@ __all__ = [
     "QUANTILE_LEVELS",
     "ContinuousTime2Vec",
     "ContributionDiagnostics",
+    "ConfirmedPhaseView",
     "DecompositionDiagnostics",
     "DecompositionOutput",
     "DomainPhaseConfig",
@@ -131,8 +151,14 @@ __all__ = [
     "SourceRunningStandardizer",
     "SourceRunningSupportScale",
     "SourceTrainStepOutput",
+    "StableLabelConfig",
+    "StableTargetCandidate",
+    "StableTargetLabel",
+    "StableTargetLabelScanResult",
     "Stage1LossOutput",
     "Stage1Objective",
+    "Stage2EMATeacher",
+    "Stage2ParameterPolicy",
     "StructureBackbone",
     "StructureBackboneOutput",
     "SupportAwareDistanceOutput",
@@ -150,14 +176,18 @@ __all__ = [
     "TrendStructureTemporalModule",
     "build_source_prototype_bank",
     "build_source_registration_prototypes",
+    "build_confirmed_class_to_group_map",
+    "build_confirmed_phase_view",
     "check_gamma_legality",
     "compute_decomposition_diagnostics",
     "compute_gamma_diagnostics",
     "compute_structure_contribution_diagnostics",
+    "configure_stage2_parameter_policy",
     "create_feature_snapshot_manager",
     "deterministic_class_selection",
     "empirical_cdf",
     "evaluate_registration_geometry",
+    "evaluate_stable_target_candidate",
     "finalize_distance_statistics",
     "gamma_to_psi",
     "load_selected_samples",
@@ -167,6 +197,7 @@ __all__ = [
     "phase_distance",
     "resample_gamma",
     "scan_target_class_phase_hypotheses",
+    "scan_stable_target_labels",
     "shape_distance_to_prototype",
     "sqrt_mean_gamma",
     "sqrt_median_gamma",
@@ -177,4 +208,5 @@ __all__ = [
     "warp_support_gamma",
     "warp_to_identity_tangent",
     "update_domain_phase_state",
+    "align_target_positions_to_source",
 ]

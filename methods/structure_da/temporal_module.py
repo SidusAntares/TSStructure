@@ -60,6 +60,7 @@ class TrendStructureTemporalModule(nn.Module):
         positions: Tensor,
         mask: Tensor,
         *,
+        raw_positions: Tensor | None = None,
         return_geometry: bool = True,
     ) -> tuple[RawTemporalRepresentation, FunctionalGeometryOutput | None]:
         """Return ``(raw, geometry)``; geometry is ``None`` when disabled.
@@ -71,7 +72,12 @@ class TrendStructureTemporalModule(nn.Module):
             mask: Boolean validity mask with shape ``[B, L]``.
             return_geometry: Whether to run the functional-geometry path.
         """
-        raw = self.raw_encoder(trend=trend, structure=structure, positions=positions, mask=mask)
+        raw = self.raw_encoder(
+            trend=trend,
+            structure=structure,
+            positions=positions if raw_positions is None else raw_positions,
+            mask=mask,
+        )
         if not return_geometry:
             return raw, None
         geometry = self._geometry(

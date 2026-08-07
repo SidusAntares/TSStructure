@@ -140,6 +140,7 @@ class TSStructureModel(nn.Module):
         positions: Tensor,
         extra: Tensor | None = None,
         *,
+        temporal_positions_override: Tensor | None = None,
         return_geometry: bool = True,
     ) -> TSStructureForwardOutput:
         del extra, positions
@@ -150,6 +151,7 @@ class TSStructureModel(nn.Module):
             structure=structure,
             positions=backbone.normalized_positions,
             mask=mask,
+            raw_positions=temporal_positions_override,
             return_geometry=return_geometry,
         )
         logits = self.classifier(raw.fused_repr)
@@ -178,13 +180,17 @@ class TSStructureModel(nn.Module):
         extra: Tensor | None = None,
         *,
         time_mask: Tensor | None = None,
+        temporal_positions_override: Tensor | None = None,
         return_geometry: bool = True,
     ) -> TSStructureForwardOutput:
         backbone = self.forward_backbone(
             pixels, valid_pixels, positions, extra, time_mask=time_mask
         )
         return self.forward_from_backbone(
-            backbone, positions, return_geometry=return_geometry
+            backbone,
+            positions,
+            temporal_positions_override=temporal_positions_override,
+            return_geometry=return_geometry,
         )
 
     def encode_geometry(
