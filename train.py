@@ -584,7 +584,6 @@ def train_source_classification(
 ):
     epochs = config.stage1_epochs
     warmup_epochs = config.source_warmup_epochs
-    refresh_interval = getattr(config, "prototype_refresh_interval", 1)
     steps_per_epoch = getattr(config, "steps_per_epoch", None)
     if steps_per_epoch is None or steps_per_epoch <= 0:
         steps_per_epoch = len(source_loader)
@@ -629,6 +628,26 @@ def train_source_classification(
     bank_version = 0
     stage1_dir = config.fold_dir
     tmp_best_path = os.path.join(stage1_dir, "stage1_best_model_tmp.pt")
+
+    # A non-warmup epoch must always start with a bank produced by a
+    # deterministic full-source scan.  The normal protocol builds the first
+    # bank at the end of the final warmup epoch; if warmup is disabled, build
+    # it once before epoch 1 instead.
+    if epochs > 0 and warmup_epochs <= 0:
+        if source_scan_loader is None:
+            raise RuntimeError("source_scan_loader is required for prototype refresh")
+        print("PROTOTYPE_REFRESH|epoch=0")
+        bank = build_source_prototype_bank(
+            model,
+            source_scan_loader,
+            config.num_classes,
+            device=device,
+        )
+        bank_version += 1
+        print(
+            f"PROTOTYPE_READY|epoch=0|version={bank_version}"
+            f"|ready_classes={len(bank.ready_classes())}"
+        )
 
     for epoch in range(epochs):
         warmup = epoch < warmup_epochs
@@ -700,7 +719,12 @@ def train_source_classification(
                 tmp_best_path,
             )
 
-        if not warmup and epoch < epochs - 1 and (epoch + 1) % refresh_interval == 0:
+        # Refresh at epoch boundaries only.  In particular, the final warmup
+        # epoch must produce the bank consumed by the first non-warmup epoch.
+        # Every subsequent non-warmup epoch refreshes the bank for the next
+        # epoch; no mini-batch ever mutates or replaces it.
+        next_epoch_is_non_warmup = (epoch + 1) >= warmup_epochs
+        if epoch < epochs - 1 and next_epoch_is_non_warmup:
             if source_scan_loader is None:
                 raise RuntimeError("source_scan_loader is required for prototype refresh")
             print(f"PROTOTYPE_REFRESH|epoch={epoch + 1}")

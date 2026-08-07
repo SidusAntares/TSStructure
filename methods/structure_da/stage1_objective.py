@@ -267,16 +267,20 @@ class Stage1Objective(nn.Module):
                 consistency_valid_count=0,
             )
 
-        if (
-            q is None
-            or q_support is None
-            or q_valid is None
-            or integration_weights is None
-            or bank is None
-        ):
+        missing_inputs = [
+            name
+            for name, value in (
+                ("q", q),
+                ("q_support", q_support),
+                ("q_valid", q_valid),
+                ("integration_weights", integration_weights),
+                ("bank", bank),
+            )
+            if value is None
+        ]
+        if missing_inputs:
             raise ValueError(
-                "q, q_support, q_valid, integration_weights and bank are required "
-                "outside warmup"
+                "missing Stage-1 non-warmup inputs: " + ", ".join(missing_inputs)
             )
 
         q_proto, q_count = self._prototype_q_loss(

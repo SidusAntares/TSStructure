@@ -235,3 +235,26 @@ def test_prototype_not_trainable_and_not_in_optimizer() -> None:
     # A Stage1Objective holds no parameters.
     obj = Stage1Objective(num_classes=3)
     assert not any(True for _ in obj.parameters())
+
+
+def test_non_warmup_error_lists_missing_inputs() -> None:
+    obj = Stage1Objective(num_classes=3)
+    logits = torch.randn(2, 3)
+    fused = torch.randn(2, 8)
+    labels = torch.tensor([0, 1])
+
+    with pytest.raises(
+        ValueError,
+        match=r"missing Stage-1 non-warmup inputs: q, q_support, q_valid, bank",
+    ):
+        obj(
+            logits=logits,
+            fused_repr=fused,
+            labels=labels,
+            q=None,
+            q_support=None,
+            q_valid=None,
+            bank=None,
+            integration_weights=_weights(),
+            warmup=False,
+        )

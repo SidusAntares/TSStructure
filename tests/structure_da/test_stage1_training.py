@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 from methods.structure_da import (
@@ -79,6 +81,7 @@ def test_bank_version_fixed_within_epoch() -> None:
 
 
 def test_full_source_scan_counts_each_sample_once() -> None:
+    torch.manual_seed(0)
     model = _model().eval()
     dataset = TinySourceDataset(n=24)
     loader = DataLoader(dataset, batch_size=4, shuffle=False, drop_last=False)
@@ -98,3 +101,165 @@ def test_trainer_requires_no_target_loader() -> None:
     signature = inspect.signature(SourceClassificationTrainer.train_step)
     assert "target" not in signature.parameters
     assert "target_batch" not in signature.parameters
+
+
+class _RecordingWriter:
+    def add_scalar(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+
+def test_train_source_classification_builds_bank_at_warmup_boundary(
+    monkeypatch, tmp_path
+) -> None:
+    # train.py imports the real dataset stack; zarr is absent in the lightweight
+    # sandbox but present in the formal project environment.
+    pytest.importorskip("zarr")
+    import train as train_module
+
+    torch.manual_seed(0)
+    model = _model()
+    dataset = TinySourceDataset(n=24)
+    source_loader = DataLoader(dataset, batch_size=6, shuffle=False, drop_last=False)
+    source_scan_loader = DataLoader(
+        dataset, batch_size=6, shuffle=False, drop_last=False
+    )
+
+    config = SimpleNamespace(
+        stage1_epochs=3,
+        source_warmup_epochs=1,
+        steps_per_epoch=None,
+        lr=1e-3,
+        weight_decay=0.0,
+        num_classes=3,
+        lambda_q=0.1,
+        lambda_f=0.1,
+        lambda_q_to_cls=0.1,
+        margin_q=0.1,
+        margin_f=0.1,
+        tau_q=0.1,
+        fold_dir=str(tmp_path),
+        log_step=1000,
+        amp=False,
+        amp_dtype="float16",
+        progress_bar="off",
+    )
+
+    events: list[tuple] = []
+    scanned_banks = []
+    objective_calls = []
+    non_warmup_metrics = []
+
+    original_scan = train_module.build_source_prototype_bank
+
+    def tracked_scan(*args, **kwargs):
+        bank = original_scan(*args, **kwargs)
+        assert torch.all(bank.ready).item()
+        scanned_banks.append(bank)
+        events.append(("scan", id(bank)))
+        return bank
+
+    monkeypatch.setattr(train_module, "build_source_prototype_bank", tracked_scan)
+
+    original_train_step = SourceClassificationTrainer.train_step
+
+    def tracked_train_step(self, batch, *, warmup=False, bank=None):
+        events.append(("step", warmup, None if bank is None else id(bank)))
+        metrics = original_train_step(self, batch, warmup=warmup, bank=bank)
+        if not warmup:
+            non_warmup_metrics.append(metrics)
+        return metrics
+
+    monkeypatch.setattr(
+        SourceClassificationTrainer, "train_step", tracked_train_step
+    )
+
+    original_objective_forward = train_module.Stage1Objective.forward
+
+    def tracked_objective_forward(self, **kwargs):
+        if not kwargs.get("warmup", False):
+            for name in (
+                "q",
+                "q_support",
+                "q_valid",
+                "integration_weights",
+                "bank",
+            ):
+                assert kwargs[name] is not None
+            objective_calls.append(
+                (
+                    id(kwargs["bank"]),
+                    kwargs["q"].shape,
+                    kwargs["q_support"].shape,
+                    kwargs["q_valid"].shape,
+                    kwargs["integration_weights"].shape,
+                )
+            )
+        return original_objective_forward(self, **kwargs)
+
+    monkeypatch.setattr(
+        train_module.Stage1Objective, "forward", tracked_objective_forward
+    )
+
+    def fake_source_validation(
+        best_f1, best_model_path, cfg, device, epoch, model, val_loader, writer
+    ):
+        del best_model_path, cfg, device, model, val_loader, writer
+        macro_f1 = 0.5 + 0.01 * epoch
+        return max(best_f1, macro_f1), {
+            "accuracy": 0.5,
+            "macro_f1": macro_f1,
+        }
+
+    monkeypatch.setattr(train_module, "_source_validation", fake_source_validation)
+    monkeypatch.setattr(
+        train_module, "_finalize_stage1_checkpoints", lambda *args, **kwargs: None
+    )
+
+    train_module.train_source_classification(
+        model,
+        source_loader,
+        source_loader,
+        config,
+        _RecordingWriter(),
+        torch.device("cpu"),
+        None,
+        source_scan_loader=source_scan_loader,
+    )
+
+    steps_per_epoch = len(source_loader)
+    assert len(scanned_banks) == 2
+    assert scanned_banks[0] is not scanned_banks[1]
+
+    # Epoch 1 is CE-only. Its boundary scan builds the bank used by every
+    # mini-batch in epoch 2; the epoch-2 boundary scan builds the epoch-3 bank.
+    assert events[:steps_per_epoch] == [
+        ("step", True, None)
+    ] * steps_per_epoch
+    assert events[steps_per_epoch] == ("scan", id(scanned_banks[0]))
+
+    epoch2_start = steps_per_epoch + 1
+    epoch2_end = epoch2_start + steps_per_epoch
+    assert events[epoch2_start:epoch2_end] == [
+        ("step", False, id(scanned_banks[0]))
+    ] * steps_per_epoch
+    assert events[epoch2_end] == ("scan", id(scanned_banks[1]))
+    assert events[epoch2_end + 1 :] == [
+        ("step", False, id(scanned_banks[1]))
+    ] * steps_per_epoch
+
+    assert len(objective_calls) == 2 * steps_per_epoch
+    assert len(non_warmup_metrics) == 2 * steps_per_epoch
+    for metrics in non_warmup_metrics:
+        for name in ("q_proto_loss", "f_proto_loss", "q_to_cls_loss"):
+            assert torch.isfinite(torch.tensor(metrics[name])).item()
+    assert {call[0] for call in objective_calls[:steps_per_epoch]} == {
+        id(scanned_banks[0])
+    }
+    assert {call[0] for call in objective_calls[steps_per_epoch:]} == {
+        id(scanned_banks[1])
+    }
+    for _, q_shape, support_shape, valid_shape, weight_shape in objective_calls:
+        assert q_shape[:2] == (6, 5)
+        assert support_shape == (6, 5)
+        assert valid_shape == (6,)
+        assert weight_shape == (5,)
