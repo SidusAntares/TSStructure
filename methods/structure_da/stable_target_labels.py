@@ -221,12 +221,7 @@ def evaluate_stable_target_candidate(
         ).flatten()
         if candidate_positions.numel() and valid_local.sum().item() >= 2:
             local = int(candidate_positions[0].item())
-            if (
-                bool(valid_local[local].item())
-                and bank.q_distance_samples[class_id] is not None
-                and bank.q_distance_samples[class_id].numel() > 0
-                and math.isfinite(float(bank.q_quantiles[class_id, 2].item()))
-            ):
+            if bool(valid_local[local].item()):
                 valid_indices = torch.nonzero(valid_local, as_tuple=False).flatten()
                 valid_distances_sq = distances.distance_sq[0, valid_indices]
                 q_probabilities = torch.softmax(-valid_distances_sq / config.tau_q, dim=0)
@@ -238,9 +233,17 @@ def evaluate_stable_target_candidate(
                 q_confidence, q_margin = _probability_margin(
                     q_probabilities, candidate_valid_position
                 )
+                # Before Domain Shape is estimated, an absolute source-only
+                # q-range cannot be a hard acceptance condition: the shared
+                # cross-domain Shape effect is precisely allowed to move target
+                # samples outside that source range.  Stable-label Shape
+                # validation therefore uses only relative class identity
+                # (nearest ready Shape prototype + confidence/margin) and
+                # support.  Source q-quantiles remain available to calibration
+                # export as diagnostics and can be reconsidered after Shape
+                # correction.
                 passed_q = (
                     int(q_probabilities.argmax().item()) == candidate_valid_position
-                    and q_distance <= float(bank.q_quantiles[class_id, 2].item())
                     and _passes_gate(
                         q_confidence,
                         q_margin,

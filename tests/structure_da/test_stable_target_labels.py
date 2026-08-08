@@ -155,11 +155,12 @@ def test_outer_support_and_branch_threshold_gates_reject_candidates() -> None:
     f_quantiles[1, 2] = 1e-4
     assert not _evaluate(view=fused_view, bank=_bank(f_quantiles=f_quantiles)).passed_fused
 
-    q_query = torch.full((1, 4, 2), 0.1)
-    q_view = replace(_view(), aligned_q_shape=q_query)
+    # Source-only q outer range is diagnostic before Domain Shape estimation,
+    # not a stable-label hard gate.  The candidate still has to win the
+    # relative Shape comparison and pass confidence/margin/support.
     q_quantiles = _bank().q_quantiles.clone()
     q_quantiles[1, 2] = 1e-4
-    assert not _evaluate(view=q_view, bank=_bank(q_quantiles=q_quantiles)).passed_q
+    assert _evaluate(bank=_bank(q_quantiles=q_quantiles)).passed_q
 
     no_support = replace(_view(), aligned_q_support=torch.zeros(1, 4))
     assert not _evaluate(view=no_support).passed_q
@@ -169,6 +170,21 @@ def test_outer_support_and_branch_threshold_gates_reject_candidates() -> None:
     assert not _evaluate(
         config=_config(q_confidence_min=0.9999, tau_q=100.0)
     ).passed_q
+
+
+def test_q_relative_validation_does_not_require_source_outer_statistics() -> None:
+    q_samples = list(_bank().q_distance_samples)
+    q_samples[1] = None
+    q_quantiles = _bank().q_quantiles.clone()
+    q_quantiles[1, 2] = float("nan")
+    result = _evaluate(
+        bank=_bank(
+            q_distance_samples=tuple(q_samples),
+            q_quantiles=q_quantiles,
+        )
+    )
+    assert result.passed_q
+    assert result.accepted
 
 
 @pytest.mark.parametrize(
