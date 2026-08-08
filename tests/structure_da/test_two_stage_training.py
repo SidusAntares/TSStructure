@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
+import pytest
 import torch
 
 from methods.structure_da import (
@@ -85,3 +86,32 @@ def test_train_wires_stage2_without_scientific_defaults() -> None:
     assert "configure_stage2_parameter_policy(model)" in text
     assert "Stage2EMATeacher.from_student" in text
     assert "run_stage2_training(" in text
+
+
+def test_stage2_only_checkpoint_defaults_to_current_fold(tmp_path) -> None:
+    pytest.importorskip("zarr")
+    import train as train_module
+
+    config = type("Config", (), {})()
+    config.fold_dir = str(tmp_path / "fold_0")
+    config.stage1_checkpoint = None
+    config.stage2_only = True
+    config.num_folds = 1
+    assert train_module._resolve_stage1_checkpoint_path(config, 0) == str(
+        tmp_path / "fold_0" / "stage1_best.pt"
+    )
+
+
+def test_stage2_only_wiring_skips_stage1_and_reuses_formal_boundary() -> None:
+    text = Path("train.py").read_text(encoding="utf-8")
+    stage1_call = text.index("train_source_classification(", text.index("def main(config):"))
+    resume_guard = text.rfind('if not getattr(config, "stage2_only", False):', 0, stage1_call)
+    checkpoint_load = text.index("stage1_checkpoint = torch.load", stage1_call)
+    source_scan = text.index("source_bank = build_source_prototype_bank", checkpoint_load)
+    stage2_call = text.index("stage2_result = run_stage2_training", source_scan)
+
+    assert resume_guard != -1
+    assert resume_guard < stage1_call < checkpoint_load < source_scan < stage2_call
+    assert "STAGE2_RESUME|" in text
+    assert "--stage2_only" in text
+    assert "--stage1_checkpoint" in text

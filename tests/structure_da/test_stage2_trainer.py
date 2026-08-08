@@ -253,55 +253,19 @@ def test_target_test_and_oracle_outputs_cannot_change_training_trajectory() -> N
     assert first.refresh_epochs == second.refresh_epochs
     assert first.saved == second.saved
     assert first_result.best_target_val_epoch == second_result.best_target_val_epoch == 60
-    assert first.oracle_writes != second.oracle_writes
+    # Oracle target labels are no longer scanned automatically during training.
+    assert first.oracle_writes == second.oracle_writes == []
 
 
-def test_target_hypothesis_cache_is_reused_until_geometry_version_changes(monkeypatch) -> None:
-    result = TargetHypothesisScanResult(
-        hypotheses=(),
-        num_samples=0,
-        num_pairwise_attempted=0,
-        num_pre_support_rejected=0,
-        num_solver_failed=0,
-        num_gamma_rejected=0,
-        num_gain_rejected=0,
-        num_shape_support_rejected=0,
-        num_outer_rejected=0,
-        samples_with_zero_hypothesis=0,
-        samples_with_one_hypothesis=0,
-        samples_with_two_hypotheses=0,
-    )
-    calls = []
-
-    def fake_scan(*args, **kwargs):
-        calls.append(1)
-        return result
-
-    monkeypatch.setattr(
-        "methods.structure_da.stage2_trainer.scan_target_class_phase_hypotheses",
-        fake_scan,
-    )
+def test_progressive_phase_evidence_budgets_are_nested_and_bounded() -> None:
     trainer = object.__new__(Stage2Trainer)
-    trainer.hypothesis_cache = None
-    trainer.source_geometry_version = 7
-    trainer.hypothesis_scan_count = 0
-    trainer.ema_teacher = SimpleNamespace(model=lambda: object())
-    trainer.target_statistics_loader = object()
-    trainer.source_prototype_bank = object()
-    trainer.source_registration_bank = object()
-    trainer.config = SimpleNamespace(phase_scan=object())
-    trainer.device = torch.device("cpu")
-    trainer.student = SimpleNamespace(
-        temporal_module=SimpleNamespace(structure_geometry=object())
+    trainer.config = SimpleNamespace(
+        phase_evidence_initial_samples=64,
+        phase_evidence_max_samples=512,
     )
-    trainer.reg_extractor = object()
-
-    assert trainer._scan_target_hypotheses() is result
-    assert trainer._scan_target_hypotheses() is result
-    assert len(calls) == 1
-    trainer.source_geometry_version = 8
-    assert trainer._scan_target_hypotheses() is result
-    assert len(calls) == 2
+    assert trainer._phase_evidence_budgets(1000) == (64, 128, 256, 512)
+    assert trainer._phase_evidence_budgets(300) == (64, 128, 256, 300)
+    assert trainer._phase_evidence_budgets(40) == (40,)
 
 
 def test_phase_only_helper_changes_only_positions() -> None:
@@ -515,3 +479,134 @@ def test_oracle_target_labels_are_write_only(tmp_path) -> None:
         not torch.equal(first["class_centers"][class_id], second["class_centers"].get(class_id, torch.empty(0)))
         for class_id in first["class_centers"]
     )
+
+
+def test_phase_dp_stops_when_domain_phase_confirms_and_shape_uses_direct_evidence(monkeypatch) -> None:
+    import methods.structure_da.stage2_trainer as module
+
+    class FakeScanner:
+        total_cached_samples = 512
+
+        def __init__(self):
+            self.scan_budgets = []
+
+        def scan_to_budget(self, budget):
+            self.scan_budgets.append(budget)
+            return TargetHypothesisScanResult(
+                hypotheses=(),
+                num_samples=budget,
+                num_pairwise_attempted=budget,
+                num_pre_support_rejected=0,
+                num_solver_failed=0,
+                num_gamma_rejected=0,
+                num_gain_rejected=0,
+                num_shape_support_rejected=0,
+                num_outer_rejected=0,
+                samples_with_zero_hypothesis=budget,
+                samples_with_one_hypothesis=0,
+                samples_with_two_hypotheses=0,
+                num_solver_calls=budget,
+                scanned_sample_ids=tuple(range(budget)),
+            )
+
+        def sample_ids_for_budget(self, budget):
+            return tuple(range(budget))
+
+    scanner = FakeScanner()
+    trainer = object.__new__(Stage2Trainer)
+    trainer.config = SimpleNamespace(
+        phase_evidence_initial_samples=64,
+        phase_evidence_max_samples=512,
+        phase=object(),
+    )
+    trainer.source_geometry_version = 0
+    trainer.phase_evidence_stages = 0
+    trainer.hypothesis_scan_count = 1
+    trainer.shape_evidence_stages = 0
+    trainer.shape_evidence_sample_ids = ()
+    trainer.hypothesis_cache = None
+    trainer.statistics = None
+    trainer._get_phase_scanner = lambda: scanner
+
+    phase_calls = []
+
+    def fake_phase(result, _config, previous_state=None):
+        phase_calls.append(result.num_samples)
+        return _phase_state(confirmed=result.num_samples >= 128)
+
+    monkeypatch.setattr(module, "update_domain_phase_state", fake_phase)
+
+    shape_budgets = []
+
+    def fake_stable_shape(phase_state, previous_shape, *, sample_ids):
+        assert _confirmed_phase_exists_for_test(phase_state)
+        shape_budgets.append(len(sample_ids))
+        stable = StableTargetLabelScanResult(
+            candidates=(),
+            stable_labels=(),
+            num_samples=len(sample_ids),
+            num_without_confirmed_phase=0,
+            num_candidate_views=len(sample_ids),
+            num_classifier_pass=0,
+            num_fused_pass=0,
+            num_q_pass=0,
+            num_stable_labels=0,
+            num_ambiguous_rejected=0,
+            stable_class_counts=(0, 0, 0),
+        )
+        status = (
+            DomainShapeStatus.CONFIRMED
+            if len(shape_budgets) >= 2
+            else DomainShapeStatus.PROVISIONAL
+        )
+        return stable, _shape_state(status)
+
+    trainer._stable_and_shape_from_fixed_phase = fake_stable_shape
+    snapshot = Stage2Trainer.initialize_statistics(trainer)
+
+    # Exact-DP acquisition stops as soon as Phase is confirmed at 128.
+    assert scanner.scan_budgets == [64, 128]
+    assert phase_calls == [64, 128]
+    # Shape confirmation consumes nested direct confirmed-phase evidence and
+    # does not trigger any additional DP stages.
+    assert shape_budgets == [64, 128]
+    assert snapshot.shape_state.status is DomainShapeStatus.CONFIRMED
+    assert trainer.shape_evidence_sample_ids == tuple(range(128))
+
+
+def _confirmed_phase_exists_for_test(state: DomainPhaseState) -> bool:
+    return any(group.status is PhaseGroupStatus.CONFIRMED for group in state.groups)
+
+
+def test_stage2_checkpoint_contains_full_runtime_statistics_without_feature_snapshots(tmp_path) -> None:
+    trainer = _real_trainer(DomainShapeStatus.CONFIRMED)
+    trainer.output_dir = str(tmp_path)
+    trainer.hypothesis_cache = SimpleNamespace(
+        result=TargetHypothesisScanResult(
+            hypotheses=(),
+            num_samples=3,
+            num_pairwise_attempted=3,
+            num_pre_support_rejected=0,
+            num_solver_failed=0,
+            num_gamma_rejected=0,
+            num_gain_rejected=0,
+            num_shape_support_rejected=0,
+            num_outer_rejected=0,
+            samples_with_zero_hypothesis=3,
+            samples_with_one_hypothesis=0,
+            samples_with_two_hypotheses=0,
+            scanned_sample_ids=(4, 8, 12),
+        )
+    )
+    trainer.shape_evidence_sample_ids = (4, 8)
+    path = trainer.save_ema_checkpoint(
+        "stage2_test.pt", epoch=20, target_val={"accuracy": 0.5, "macro_f1": 0.4}
+    )
+    state = torch.load(path, weights_only=False)
+
+    assert state["phase_state"]["groups"][0]["center_gamma"].device.type == "cpu"
+    assert state["domain_shape_state"]["delta"].device.type == "cpu"
+    assert state["phase_evidence_sample_ids"] == (4, 8, 12)
+    assert state["shape_evidence_sample_ids"] == (4, 8)
+    assert "stable_label_state" in state
+    assert "source_prototype_bank" in state

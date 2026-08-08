@@ -45,14 +45,14 @@ from .source_prototype_scanner import refresh_source_fused_statistics
 from .stable_target_labels import (
     StableLabelConfig,
     StableTargetLabelScanResult,
-    scan_stable_target_labels,
+    scan_stable_target_labels_from_confirmed_phase,
 )
 from .stage2_objective import Stage2Objective, Stage2ObjectiveConfig
 from .stage2_parameter_policy import Stage2ParameterPolicy
 from .target_hypothesis_scan import (
     PhaseHypothesisScanConfig,
     TargetHypothesisScanResult,
-    scan_target_class_phase_hypotheses,
+    TargetPhaseHypothesisScanner,
 )
 from .temporal_srvf import TemporalSRVFExtractor
 
@@ -71,6 +71,9 @@ class Stage2TrainerConfig:
     steps_per_epoch: int | None = None
     amp_enabled: bool = False
     amp_dtype: str = "float16"
+    phase_evidence_initial_samples: int = 64
+    phase_evidence_max_samples: int = 512
+    evidence_seed: int = 0
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.ema_decay)) or not 0.0 <= float(self.ema_decay) < 1.0:
@@ -89,6 +92,14 @@ class Stage2TrainerConfig:
             raise ValueError("steps_per_epoch must be a positive integer or None")
         if self.amp_dtype not in ("float16", "bfloat16"):
             raise ValueError("amp_dtype must be 'float16' or 'bfloat16'")
+        for name in ("phase_evidence_initial_samples", "phase_evidence_max_samples"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.phase_evidence_initial_samples > self.phase_evidence_max_samples:
+            raise ValueError(
+                "phase_evidence_initial_samples cannot exceed phase_evidence_max_samples"
+            )
 
 
 @dataclass(frozen=True)
@@ -199,6 +210,19 @@ def _confirmed_phase_exists(state: DomainPhaseState) -> bool:
     return any(group.status is PhaseGroupStatus.CONFIRMED for group in state.groups)
 
 
+def _phase_groups_log_value(state: DomainPhaseState) -> str:
+    if not state.groups:
+        return "-"
+    return ";".join(
+        f"{group.group_id}:{group.status.value}:{','.join(str(c) for c in group.member_classes)}"
+        for group in state.groups
+    )
+
+
+def _optional_metric(value: float | None) -> str:
+    return "none" if value is None else f"{float(value):.6g}"
+
+
 def _phase_summary(state: DomainPhaseState) -> dict:
     confirmed_membership = {
         str(class_id): group.group_id
@@ -247,6 +271,91 @@ def _shape_summary(state: DomainShapeState) -> dict:
         "leave_one_out_drift": state.leave_one_out_drift,
         "center_drift": state.center_drift,
         "confirmation_age": state.confirmation_age,
+    }
+
+
+def _phase_state_payload(state: DomainPhaseState) -> dict:
+    return {
+        "scan_index": state.scan_index,
+        "m": state.m,
+        "valid_phase_classes": tuple(state.valid_phase_classes),
+        "rejected_classes": tuple(state.rejected_classes),
+        "class_centers": tuple(
+            {
+                "class_id": item.class_id,
+                "center_gamma": item.center_gamma.detach().cpu(),
+                "candidate_count": item.candidate_count,
+                "effective_evidence_count": item.effective_evidence_count,
+                "dispersion": item.dispersion,
+                "diameter": item.diameter,
+                "median_distance": item.median_distance,
+                "center_drift": item.center_drift,
+                "valid": item.valid,
+                "reject_reason": item.reject_reason,
+            }
+            for item in state.class_centers
+        ),
+        "groups": tuple(
+            {
+                "group_id": group.group_id,
+                "member_classes": tuple(group.member_classes),
+                "center_gamma": group.center_gamma.detach().cpu(),
+                "within_dispersion": group.within_dispersion,
+                "diameter": group.diameter,
+                "core_radius": group.core_radius,
+                "sample_evidence_count": group.sample_evidence_count,
+                "class_count": group.class_count,
+                "center_drift": group.center_drift,
+                "status": group.status.value,
+                "confirmation_age": group.confirmation_age,
+            }
+            for group in state.groups
+        ),
+    }
+
+
+def _shape_state_payload(state: DomainShapeState) -> dict:
+    return {
+        "scan_index": state.scan_index,
+        "status": state.status.value,
+        "valid_classes": tuple(state.valid_classes),
+        "delta": None if state.delta is None else state.delta.detach().cpu(),
+        "interactions": tuple(item.detach().cpu() for item in state.interactions),
+        "rho_shape": state.rho_shape,
+        "leave_one_out_drift": state.leave_one_out_drift,
+        "center_drift": state.center_drift,
+        "confirmation_age": state.confirmation_age,
+        "class_centers": tuple(
+            {
+                "class_id": item.class_id,
+                "center_q": item.center_q.detach().cpu(),
+                "center_support": item.center_support.detach().cpu(),
+                "sample_count": item.sample_count,
+                "effective_weight": item.effective_weight,
+                "source_distance": item.source_distance,
+                "residual_q": item.residual_q.detach().cpu(),
+                "valid": item.valid,
+                "reject_reason": item.reject_reason,
+            }
+            for item in state.class_centers
+        ),
+    }
+
+
+def _stable_label_payload(result: StableTargetLabelScanResult) -> dict:
+    return {
+        "num_samples": result.num_samples,
+        "num_stable_labels": result.num_stable_labels,
+        "stable_class_counts": tuple(result.stable_class_counts),
+        "labels": tuple(
+            {
+                "sample_id": item.sample_id,
+                "class_id": item.class_id,
+                "group_id": item.group_id,
+                "confidence_summary": item.confidence_summary,
+            }
+            for item in result.stable_labels
+        ),
     }
 
 
@@ -318,8 +427,12 @@ class Stage2Trainer:
             ),
         )
         self.hypothesis_cache: TargetHypothesisCache | None = None
+        self.phase_scanner: TargetPhaseHypothesisScanner | None = None
         self.statistics: Stage2StatisticsSnapshot | None = None
         self.hypothesis_scan_count = 0
+        self.phase_evidence_stages = 0
+        self.shape_evidence_stages = 0
+        self.shape_evidence_sample_ids: tuple[int, ...] = ()
         self.successful_optimizer_steps = 0
         self._validate_optimizer_boundary()
 
@@ -339,73 +452,147 @@ class Stage2Trainer:
                 "Stage-2 optimizer parameters must exactly match Stage2ParameterPolicy.trainable_parameter_names"
             )
 
-    def _scan_target_hypotheses(self) -> TargetHypothesisScanResult:
-        cache = self.hypothesis_cache
-        if cache is not None and cache.source_geometry_version == self.source_geometry_version:
-            return cache.result
-        result = scan_target_class_phase_hypotheses(
-            self.ema_teacher.model(),
-            self.target_statistics_loader,
+    def _phase_evidence_budgets(self, available: int) -> tuple[int, ...]:
+        maximum = min(self.config.phase_evidence_max_samples, available)
+        current = min(self.config.phase_evidence_initial_samples, maximum)
+        budgets: list[int] = []
+        while current < maximum:
+            budgets.append(current)
+            current = min(maximum, current * 2)
+        if not budgets or budgets[-1] != maximum:
+            budgets.append(maximum)
+        return tuple(budgets)
+
+    def _get_phase_scanner(self) -> TargetPhaseHypothesisScanner:
+        if self.phase_scanner is None:
+            self.phase_scanner = TargetPhaseHypothesisScanner(
+                self.ema_teacher.model(),
+                self.target_statistics_loader,
+                self.source_prototype_bank,
+                self.source_registration_bank,
+                self.config.phase_scan,
+                device=self.device,
+                shape_extractor=self.student.temporal_module.structure_geometry,
+                reg_extractor=self.reg_extractor,
+                evidence_seed=self.config.evidence_seed,
+            )
+            self.hypothesis_scan_count += 1
+        return self.phase_scanner
+
+    def _stable_and_shape_from_fixed_phase(
+        self,
+        phase_state: DomainPhaseState,
+        previous_shape: DomainShapeState | None,
+        *,
+        sample_ids: tuple[int, ...],
+    ) -> tuple[StableTargetLabelScanResult, DomainShapeState]:
+        stable_result = scan_stable_target_labels_from_confirmed_phase(
+            ema_teacher=self.ema_teacher,
+            target_loader=self.target_statistics_loader,
+            phase_state=phase_state,
+            source_prototype_bank=self.source_prototype_bank,
+            config=self.config.stable_labels,
+            sample_ids=sample_ids,
+        )
+        shape_state = update_domain_shape_state(
+            stable_result,
             self.source_prototype_bank,
-            self.source_registration_bank,
-            self.config.phase_scan,
-            device=self.device,
-            shape_extractor=self.student.temporal_module.structure_geometry,
-            reg_extractor=self.reg_extractor,
+            self.config.shape,
+            previous_state=previous_shape,
         )
-        self.hypothesis_scan_count += 1
-        self.hypothesis_cache = TargetHypothesisCache(
-            source_geometry_version=self.source_geometry_version,
-            result=result,
-        )
-        return result
+        return stable_result, shape_state
 
     @torch.no_grad()
-    def settle_statistics(
-        self,
-        *,
-        previous: Stage2StatisticsSnapshot | None,
-    ) -> Stage2StatisticsSnapshot:
-        """Advance frozen phase/label/Shape states without repeating registration."""
-        hypothesis_result = self._scan_target_hypotheses()
-        phase_state = None if previous is None else previous.phase_state
-        shape_state = None if previous is None else previous.shape_state
-        stable_result: StableTargetLabelScanResult | None = None
-        max_passes = (
-            self.config.phase.phase_confirmation_patience
-            + self.config.shape.shape_confirmation_patience
-        )
-        for _ in range(max_passes):
+    def initialize_statistics(self) -> Stage2StatisticsSnapshot:
+        """Acquire Domain Phase evidence, then estimate Shape under fixed Phase.
+
+        Exact DP is used only while estimating Domain Phase.  Confirmation
+        patience advances on strictly larger nested evidence sets.  Once Phase
+        is confirmed, stable labels and Domain Shape are estimated directly
+        under the confirmed group center gamma, so additional Shape evidence
+        does not require individual sample/class registration.
+        """
+        scanner = self._get_phase_scanner()
+        phase_state: DomainPhaseState | None = None
+        final_result: TargetHypothesisScanResult | None = None
+
+        for budget in self._phase_evidence_budgets(scanner.total_cached_samples):
+            final_result = scanner.scan_to_budget(budget)
+            self.phase_evidence_stages += 1
             phase_state = update_domain_phase_state(
-                hypothesis_result,
+                final_result,
                 self.config.phase,
                 previous_state=phase_state,
             )
-            stable_result = scan_stable_target_labels(
-                ema_teacher=self.ema_teacher,
-                target_loader=self.target_statistics_loader,
-                hypothesis_result=hypothesis_result,
-                phase_state=phase_state,
-                source_prototype_bank=self.source_prototype_bank,
-                config=self.config.stable_labels,
+            print(
+                "STAGE2_PHASE_EVIDENCE_STAGE|"
+                f"budget={budget}|phase_scan_index={phase_state.scan_index}"
+                f"|phase_m={phase_state.m}"
+                f"|confirmed_phase={str(_confirmed_phase_exists(phase_state)).lower()}"
+                f"|valid_classes={','.join(str(c) for c in phase_state.valid_phase_classes) or '-'}"
+                f"|groups={_phase_groups_log_value(phase_state)}"
+                f"|g0={','.join(str(c) for c in phase_state.rejected_classes) or '-'}"
+                f"|hypotheses={len(final_result.hypotheses)}"
+                f"|solver_calls={final_result.num_solver_calls}"
             )
-            shape_state = update_domain_shape_state(
-                stable_result,
-                self.source_prototype_bank,
-                self.config.shape,
-                previous_state=shape_state,
-            )
-            if phase_state.m == 0:
+            if _confirmed_phase_exists(phase_state):
                 break
-            if not _confirmed_phase_exists(phase_state):
-                continue
-            if shape_state.status is DomainShapeStatus.CONFIRMED:
-                break
-            if shape_state.status is DomainShapeStatus.UNAVAILABLE:
-                break
+
+        assert final_result is not None
         assert phase_state is not None
-        assert shape_state is not None
+        self.hypothesis_cache = TargetHypothesisCache(
+            source_geometry_version=self.source_geometry_version,
+            result=final_result,
+        )
+
+        shape_state: DomainShapeState | None = None
+        stable_result: StableTargetLabelScanResult | None = None
+        if _confirmed_phase_exists(phase_state):
+            for budget in self._phase_evidence_budgets(scanner.total_cached_samples):
+                sample_ids = scanner.sample_ids_for_budget(budget)
+                stable_result, shape_state = self._stable_and_shape_from_fixed_phase(
+                    phase_state,
+                    shape_state,
+                    sample_ids=sample_ids,
+                )
+                self.shape_evidence_stages += 1
+                self.shape_evidence_sample_ids = sample_ids
+                stable_coverage = (
+                    stable_result.num_stable_labels / stable_result.num_samples
+                    if stable_result.num_samples
+                    else 0.0
+                )
+                shape_metrics = _shape_summary(shape_state)
+                print(
+                    "STAGE2_SHAPE_EVIDENCE_STAGE|"
+                    f"budget={budget}|stable_labels={stable_result.num_stable_labels}"
+                    f"|stable_coverage={stable_coverage:.4f}"
+                    f"|candidate_views={stable_result.num_candidate_views}"
+                    f"|cls_pass={stable_result.num_classifier_pass}"
+                    f"|fused_pass={stable_result.num_fused_pass}"
+                    f"|q_pass={stable_result.num_q_pass}"
+                    f"|ambiguous={stable_result.num_ambiguous_rejected}"
+                    f"|shape_status={shape_state.status.value}"
+                    f"|shape_valid_classes={','.join(str(c) for c in shape_state.valid_classes) or '-'}"
+                    f"|rho_shape={_optional_metric(shape_state.rho_shape)}"
+                    f"|delta_norm={_optional_metric(shape_metrics['delta_norm'])}"
+                    f"|loo_drift={_optional_metric(shape_state.leave_one_out_drift)}"
+                    f"|center_drift={_optional_metric(shape_state.center_drift)}"
+                )
+                if shape_state.status is DomainShapeStatus.CONFIRMED:
+                    break
+        else:
+            self.shape_evidence_sample_ids = scanner.sample_ids_for_budget(
+                final_result.num_samples
+            )
+            stable_result, shape_state = self._stable_and_shape_from_fixed_phase(
+                phase_state,
+                None,
+                sample_ids=self.shape_evidence_sample_ids,
+            )
+
         assert stable_result is not None
+        assert shape_state is not None
         snapshot = Stage2StatisticsSnapshot(
             phase_state=phase_state,
             stable_labels=stable_result,
@@ -419,11 +606,64 @@ class Stage2Trainer:
             f"|stable_labels={stable_result.num_stable_labels}"
             f"|shape_status={shape_state.status.value}"
             f"|hypothesis_scans={self.hypothesis_scan_count}"
+            f"|phase_evidence_stages={self.phase_evidence_stages}"
+            f"|phase_evidence_samples={final_result.num_samples}"
+            f"|shape_evidence_stages={self.shape_evidence_stages}"
+            f"|shape_evidence_samples={len(self.shape_evidence_sample_ids)}"
         )
         return snapshot
 
-    def initialize_statistics(self) -> Stage2StatisticsSnapshot:
-        return self.settle_statistics(previous=None)
+    @torch.no_grad()
+    def settle_statistics(
+        self,
+        *,
+        previous: Stage2StatisticsSnapshot | None,
+    ) -> Stage2StatisticsSnapshot:
+        """Refresh stable-label/Shape statistics while freezing Domain Phase.
+
+        Exact registration is never repeated while source geometry is frozen.
+        A block boundary supplies a genuinely new EMA/fused representation, so
+        it may advance Domain Shape confirmation, but it cannot manufacture a
+        new Phase confirmation from replayed hypotheses.
+        """
+        if previous is None:
+            return self.initialize_statistics()
+        if self.hypothesis_cache is None:
+            raise RuntimeError("target hypothesis cache is unavailable")
+        stable_result, shape_state = self._stable_and_shape_from_fixed_phase(
+            previous.phase_state,
+            previous.shape_state,
+            sample_ids=self.shape_evidence_sample_ids,
+        )
+        snapshot = Stage2StatisticsSnapshot(
+            phase_state=previous.phase_state,
+            stable_labels=stable_result,
+            shape_state=shape_state,
+        )
+        self.statistics = snapshot
+        shape_metrics = _shape_summary(shape_state)
+        stable_coverage = (
+            stable_result.num_stable_labels / stable_result.num_samples
+            if stable_result.num_samples
+            else 0.0
+        )
+        print(
+            "STAGE2_STATISTICS_REFRESH|"
+            f"phase_m={previous.phase_state.m}"
+            f"|confirmed_phase={str(_confirmed_phase_exists(previous.phase_state)).lower()}"
+            f"|stable_labels={stable_result.num_stable_labels}"
+            f"|stable_coverage={stable_coverage:.4f}"
+            f"|cls_pass={stable_result.num_classifier_pass}"
+            f"|fused_pass={stable_result.num_fused_pass}"
+            f"|q_pass={stable_result.num_q_pass}"
+            f"|shape_status={shape_state.status.value}"
+            f"|rho_shape={_optional_metric(shape_state.rho_shape)}"
+            f"|delta_norm={_optional_metric(shape_metrics['delta_norm'])}"
+            f"|loo_drift={_optional_metric(shape_state.leave_one_out_drift)}"
+            f"|center_drift={_optional_metric(shape_state.center_drift)}"
+            f"|hypothesis_scans={self.hypothesis_scan_count}"
+        )
+        return snapshot
 
     @torch.no_grad()
     def refresh_source_features_and_statistics(self) -> Stage2StatisticsSnapshot:
@@ -682,10 +922,8 @@ class Stage2Trainer:
         json_path = os.path.join(
             self.output_dir, f"shape_diagnostics_{epoch:03d}{name_suffix}.json"
         )
-        tensor_path = os.path.join(
-            self.output_dir, f"shape_diagnostics_{epoch:03d}{name_suffix}.pt"
-        )
         stable = self.statistics.stable_labels
+        hypothesis = None if self.hypothesis_cache is None else self.hypothesis_cache.result
         payload = {
             "epoch": epoch,
             "phase": _phase_summary(self.statistics.phase_state),
@@ -696,22 +934,37 @@ class Stage2Trainer:
             "shape": _shape_summary(self.statistics.shape_state),
             "source_geometry_version": self.source_geometry_version,
             "target_hypothesis_scan_count": self.hypothesis_scan_count,
+            "phase_evidence_stages": self.phase_evidence_stages,
+            "phase_evidence_samples": None if hypothesis is None else hypothesis.num_samples,
+            "shape_evidence_stages": self.shape_evidence_stages,
+            "shape_evidence_samples": len(self.shape_evidence_sample_ids),
+            "phase_solver_calls": None if hypothesis is None else hypothesis.num_solver_calls,
+            "phase_proposal_pairs": None if hypothesis is None else hypothesis.num_proposal_pairs,
+            "phase_all_class_pairs": None if hypothesis is None else hypothesis.num_all_class_pairs,
+            "phase_rejections": None if hypothesis is None else {
+                "pre_support": hypothesis.num_pre_support_rejected,
+                "solver_failed": hypothesis.num_solver_failed,
+                "gamma": hypothesis.num_gamma_rejected,
+                "gamma_endpoint": hypothesis.num_gamma_endpoint_rejected,
+                "gamma_increment": hypothesis.num_gamma_increment_rejected,
+                "gamma_speed": hypothesis.num_gamma_speed_rejected,
+                "gamma_roughness": hypothesis.num_gamma_roughness_rejected,
+                "gamma_deviation": hypothesis.num_gamma_deviation_rejected,
+                "gain": hypothesis.num_gain_rejected,
+                "shape_support": hypothesis.num_shape_support_rejected,
+                "shape_outer": hypothesis.num_outer_rejected,
+            },
+            "phase_diagnostic_quantiles": None if hypothesis is None else {
+                name: {"p10": p10, "p50": p50, "p90": p90}
+                for name, p10, p50, p90 in hypothesis.diagnostic_quantiles
+            },
+            "phase_proposal_class_counts": None if hypothesis is None else list(
+                hypothesis.proposal_class_counts
+            ),
         }
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
-        torch.save(
-            {
-                "delta": (
-                    None
-                    if self.statistics.shape_state.delta is None
-                    else self.statistics.shape_state.delta.detach().cpu()
-                ),
-                "interactions": tuple(
-                    item.detach().cpu() for item in self.statistics.shape_state.interactions
-                ),
-            },
-            tensor_path,
-        )
+
 
     @torch.no_grad()
     def write_oracle_shape_snapshot(self, epoch: int) -> None:
@@ -730,13 +983,20 @@ class Stage2Trainer:
         sums: dict[int, Tensor] = {}
         support_sums: dict[int, Tensor] = {}
         counts: dict[int, int] = {}
-        global_index = 0
+        fallback_index = 0
         for batch in self.target_statistics_loader:
             labels = batch.get("label")
             pixels = batch.get("pixels")
             if not isinstance(labels, Tensor) or not isinstance(pixels, Tensor):
                 raise ValueError("oracle target snapshot requires target labels and pixels")
             batch_size = int(pixels.shape[0])
+            batch_ids = batch.get("index")
+            if not isinstance(batch_ids, Tensor) or batch_ids.shape != (batch_size,):
+                batch_ids = torch.arange(
+                    fallback_index, fallback_index + batch_size, dtype=torch.long
+                )
+            batch_ids = batch_ids.detach().to(device="cpu", dtype=torch.long)
+            fallback_index += batch_size
             rows_by_group: dict[int, list[int]] = {}
             groups = {}
             for row, class_id_value in enumerate(labels.tolist()):
@@ -753,7 +1013,7 @@ class Stage2Trainer:
                     else:
                         subset[key] = value
                 sample_ids = torch.tensor(
-                    [global_index + row for row in rows], dtype=torch.long
+                    [int(batch_ids[row].item()) for row in rows], dtype=torch.long
                 )
                 view = build_confirmed_phase_view(
                     model=teacher,
@@ -775,7 +1035,6 @@ class Stage2Trainer:
                         sums[class_id] += weighted
                         support_sums[class_id] += support
                         counts[class_id] += 1
-            global_index += batch_size
         centers = {
             class_id: sums[class_id] / (support_sums[class_id].unsqueeze(-1) + 1e-8)
             for class_id in sums
@@ -814,8 +1073,17 @@ class Stage2Trainer:
             },
             "phase_state_summary": _phase_summary(self.statistics.phase_state),
             "domain_shape_state_summary": _shape_summary(self.statistics.shape_state),
+            "phase_state": _phase_state_payload(self.statistics.phase_state),
+            "domain_shape_state": _shape_state_payload(self.statistics.shape_state),
             "source_geometry_version": self.source_geometry_version,
             "source_prototype_bank": _bank_to_cpu(self.source_prototype_bank),
+            "phase_evidence_sample_ids": (
+                ()
+                if self.hypothesis_cache is None
+                else tuple(self.hypothesis_cache.result.scanned_sample_ids)
+            ),
+            "shape_evidence_sample_ids": tuple(self.shape_evidence_sample_ids),
+            "stable_label_state": _stable_label_payload(self.statistics.stable_labels),
             "runtime_config": self.runtime_config,
             "stage2_config": {
                 key: value
@@ -875,7 +1143,6 @@ def run_stage2_training(
             )
             final_test = evaluate_target_test(teacher, epoch)
         trainer.write_shape_diagnostics(epoch)
-        trainer.write_oracle_shape_snapshot(epoch)
         trainer.refresh_source_features_and_statistics()
         if epoch == total_epochs:
             trainer.write_shape_diagnostics(epoch, suffix="final")

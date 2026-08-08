@@ -294,3 +294,34 @@ def test_target_true_labels_are_ignored_and_outputs_are_no_grad(monkeypatch) -> 
         assert label.aligned_q_shape.requires_grad is False
         assert label.aligned_q_support.requires_grad is False
         assert label.fused_repr.requires_grad is False
+
+
+def test_confirmed_phase_scan_no_longer_requires_individual_dp_hypotheses(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+
+    calls, builder = _fake_builder_factory()
+    monkeypatch.setattr(module, "build_confirmed_phase_view", builder)
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    loader = [
+        {
+            "index": torch.tensor([10, 20]),
+            "pixels": torch.zeros(2, 5, 2, 4),
+            "valid_pixels": torch.ones(2, 5, 4, dtype=torch.bool),
+            "positions": torch.linspace(0.0, 365.0, 5),
+            "label": torch.tensor([0, 0]),
+        }
+    ]
+    group = _group(0, (1, 2), PhaseGroupStatus.CONFIRMED)
+    result = module.scan_stable_target_labels_from_confirmed_phase(
+        ema_teacher=ema,
+        target_loader=loader,
+        phase_state=_state(group),
+        source_prototype_bank=_bank(),
+        config=_config(),
+        sample_ids=(20,),
+    )
+
+    assert calls == [(0, (20,))]
+    assert result.num_samples == 1
+    assert [(item.sample_id, item.class_id) for item in result.stable_labels] == [(20, 1)]
+    assert result.num_candidate_views == 1

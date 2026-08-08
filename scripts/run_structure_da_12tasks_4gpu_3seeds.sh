@@ -29,7 +29,6 @@ fi
 
 GROUP_LOG_ROOT="${LOG_ROOT}/${RUN_GROUP}"
 GROUP_TRAIN_LOG_DIRECTORY="${GROUP_LOG_ROOT}/train_logs"
-GROUP_SNAPSHOT_DIRECTORY="${GROUP_LOG_ROOT}/snapshots"
 GROUP_OUTPUT_DIRECTORY="${OUTPUT_ROOT}/${RUN_GROUP}"
 MANIFEST_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/manifest.tsv"
 COMPLETED_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/completed.tsv"
@@ -38,17 +37,17 @@ STATUS_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/experiment_status.tsv"
 
 TASKS=(
     "AT1|austria/33UVP/2017|DK1|denmark/32VNH/2017"
-    "AT1|austria/33UVP/2017|FR1|france/31TCJ/2017"
-    "AT1|austria/33UVP/2017|FR2|france/30TXT/2017"
+    "AT1|austria/33UVP/2017|FR1|france/30TXT/2017"
+    "AT1|austria/33UVP/2017|FR2|france/31TCJ/2017"
     "DK1|denmark/32VNH/2017|AT1|austria/33UVP/2017"
-    "DK1|denmark/32VNH/2017|FR1|france/31TCJ/2017"
-    "DK1|denmark/32VNH/2017|FR2|france/30TXT/2017"
-    "FR1|france/31TCJ/2017|AT1|austria/33UVP/2017"
-    "FR1|france/31TCJ/2017|DK1|denmark/32VNH/2017"
-    "FR1|france/31TCJ/2017|FR2|france/30TXT/2017"
-    "FR2|france/30TXT/2017|AT1|austria/33UVP/2017"
-    "FR2|france/30TXT/2017|DK1|denmark/32VNH/2017"
-    "FR2|france/30TXT/2017|FR1|france/31TCJ/2017"
+    "DK1|denmark/32VNH/2017|FR1|france/30TXT/2017"
+    "DK1|denmark/32VNH/2017|FR2|france/31TCJ/2017"
+    "FR1|france/30TXT/2017|AT1|austria/33UVP/2017"
+    "FR1|france/30TXT/2017|DK1|denmark/32VNH/2017"
+    "FR1|france/30TXT/2017|FR2|france/31TCJ/2017"
+    "FR2|france/31TCJ/2017|AT1|austria/33UVP/2017"
+    "FR2|france/31TCJ/2017|DK1|denmark/32VNH/2017"
+    "FR2|france/31TCJ/2017|FR1|france/30TXT/2017"
 )
 SEEDS=(1 2 3)
 PHYSICAL_GPUS=("${GPU0}" "${GPU1}" "${GPU2}" "${GPU3}")
@@ -66,7 +65,7 @@ fi
 
 prepare_run_group "${GROUP_OUTPUT_DIRECTORY}" "${GROUP_LOG_ROOT}"
 printf '%s\n' "$$" > "${GROUP_TRAIN_LOG_DIRECTORY}/launcher.pid"
-printf 'run_name\tsource\ttarget\tseed\tgpu\toutput_directory\tlog_file\tsnapshot_directory\n' \
+printf 'run_name\tsource\ttarget\tseed\tgpu\toutput_directory\tlog_file\n' \
     > "${MANIFEST_FILE}"
 printf 'run_name\texit_code\n' > "${COMPLETED_FILE}"
 printf 'run_name\texit_code\n' > "${FAILED_FILE}"
@@ -80,11 +79,9 @@ for job_index in "${!JOBS[@]}"; do
     physical_gpu="${PHYSICAL_GPUS[$worker_id]}"
     run_output_directory="${GROUP_OUTPUT_DIRECTORY}/${run_name}"
     task_log_file="${GROUP_TRAIN_LOG_DIRECTORY}/${run_name}.log"
-    snapshot_directory="${GROUP_SNAPSHOT_DIRECTORY}/${run_name}"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "${run_name}" "${source_domain}" "${target_domain}" "${seed}" \
         "${physical_gpu}" "${run_output_directory}" "${task_log_file}" \
-        "${snapshot_directory}" \
         >> "${MANIFEST_FILE}"
 done
 
@@ -99,7 +96,6 @@ run_worker() {
         local run_name="${source_short}_${target_short}_seed${seed}"
         local RUN_OUTPUT_DIRECTORY="${GROUP_OUTPUT_DIRECTORY}/${run_name}"
         local TASK_LOG_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/${run_name}.log"
-        local SNAPSHOT_DIRECTORY="${GROUP_SNAPSHOT_DIRECTORY}/${run_name}"
         local exit_code=0
         LAST_TRAINING_PID=""
 
@@ -108,27 +104,11 @@ run_worker() {
             run_training \
                 "${source_domain}" "${target_domain}" "${seed}" "${physical_gpu}" \
                 "${RUN_OUTPUT_DIRECTORY}" "${TASK_LOG_FILE}" \
-                --feature_snapshot_interval 25 \
-                --feature_snapshot_samples_per_class 8 \
-                --feature_snapshot_batch_size 8 \
-                --feature_snapshot_dtype float16 \
-                --feature_snapshot_dir "${SNAPSHOT_DIRECTORY}"
+                --feature_snapshot_interval 0
         then
             exit_code=0
             printf '%s\t%s\n' "${run_name}" "${exit_code}" >> "${COMPLETED_FILE}"
-            if [[ -f "${SNAPSHOT_DIRECTORY}/snapshot_status.json" ]]; then
-                if grep -q '"has_failures"[[:space:]]*:[[:space:]]*true' \
-                    "${SNAPSHOT_DIRECTORY}/snapshot_status.json"
-                then
-                    task_status="COMPLETED_WITH_SNAPSHOT_FAILURE"
-                else
-                    task_status="COMPLETED"
-                fi
-            elif [[ -f "${SNAPSHOT_DIRECTORY}/SNAPSHOT_FAILED" ]]; then
-                task_status="COMPLETED_WITH_SNAPSHOT_FAILURE"
-            else
-                task_status="COMPLETED"
-            fi
+            task_status="COMPLETED"
             echo "TASK_DONE|run=${run_name}|gpu=${physical_gpu}|exit_code=0|status=${task_status}"
         else
             exit_code=$?
@@ -162,14 +142,9 @@ done
 
 completed_count="$(($(wc -l < "${COMPLETED_FILE}") - 1))"
 failed_count="$(($(wc -l < "${FAILED_FILE}") - 1))"
-snapshot_failure_count="$(grep -c $'\tCOMPLETED_WITH_SNAPSHOT_FAILURE\t' "${STATUS_FILE}" || true)"
-echo "EXPERIMENT_SUMMARY|total=${EXPECTED_RUNS}|completed=${completed_count}|failed=${failed_count}|snapshot_failed=${snapshot_failure_count}"
+echo "EXPERIMENT_SUMMARY|total=${EXPECTED_RUNS}|completed=${completed_count}|failed=${failed_count}"
 if [[ "${failed_count}" -eq 0 && "${completed_count}" -eq "${EXPECTED_RUNS}" ]]; then
-    if [[ "${snapshot_failure_count}" -gt 0 ]]; then
-        experiment_status="COMPLETED_WITH_SNAPSHOT_FAILURE"
-    else
-        experiment_status="COMPLETED"
-    fi
+    experiment_status="COMPLETED"
     printf '%s\tEXPERIMENT\t-\t%s\t%s\t0\n' \
         "$(date --iso-8601=seconds)" "$$" "${experiment_status}" >> "${STATUS_FILE}"
     exit 0

@@ -14,7 +14,7 @@ from .confirmed_phase_view import (
     build_confirmed_class_to_group_map,
     build_confirmed_phase_view,
 )
-from .domain_phase_state import DomainPhaseState, PhaseGroup
+from .domain_phase_state import DomainPhaseState, PhaseGroup, PhaseGroupStatus
 from .ema_teacher import Stage2EMATeacher
 from .prototype_bank import SourcePrototypeBank, support_aware_q_distance
 from .target_hypothesis_scan import TargetHypothesisScanResult
@@ -324,17 +324,24 @@ def scan_stable_target_labels(
         hypotheses_by_sample.setdefault(int(hypothesis.sample_id), []).append(hypothesis)
 
     view_lookup: dict[tuple[int, int], tuple[ConfirmedPhaseView, int]] = {}
-    global_index = 0
+    fallback_index = 0
     candidate_view_count = 0
     for batch in target_loader:
         pixels = batch.get("pixels")
         if not isinstance(pixels, Tensor):
             raise ValueError("target batch must contain tensor pixels")
-        batch_size = pixels.shape[0]
+        batch_size = int(pixels.shape[0])
+        batch_ids = batch.get("index")
+        if not isinstance(batch_ids, Tensor) or batch_ids.shape != (batch_size,):
+            batch_ids = torch.arange(
+                fallback_index, fallback_index + batch_size, dtype=torch.long
+            )
+        batch_ids = batch_ids.detach().to(device="cpu", dtype=torch.long)
+        fallback_index += batch_size
         rows_by_group: dict[int, list[int]] = {}
         groups: dict[int, PhaseGroup] = {}
         for row in range(batch_size):
-            sample_id = global_index + row
+            sample_id = int(batch_ids[row].item())
             seen_groups: set[int] = set()
             for hypothesis in hypotheses_by_sample.get(sample_id, ()):
                 group = class_to_group.get(int(hypothesis.class_id))
@@ -346,7 +353,7 @@ def scan_stable_target_labels(
         for group_id in sorted(rows_by_group):
             rows = rows_by_group[group_id]
             sample_ids = torch.tensor(
-                [global_index + row for row in rows], dtype=torch.long
+                [int(batch_ids[row].item()) for row in rows], dtype=torch.long
             )
             view = build_confirmed_phase_view(
                 model=teacher,
@@ -357,11 +364,6 @@ def scan_stable_target_labels(
             candidate_view_count += len(rows)
             for view_index, sample_id in enumerate(view.sample_ids.tolist()):
                 view_lookup[(int(sample_id), group_id)] = (view, view_index)
-        global_index += batch_size
-    if global_index != hypothesis_result.num_samples:
-        raise ValueError(
-            "target loader sample count must match hypothesis_result.num_samples"
-        )
 
     candidates: list[StableTargetCandidate] = []
     candidate_sources: dict[tuple[int, int, int], tuple[ConfirmedPhaseView, int]] = {}
@@ -424,6 +426,148 @@ def scan_stable_target_labels(
         stable_labels=tuple(stable_labels),
         num_samples=hypothesis_result.num_samples,
         num_without_confirmed_phase=hypothesis_result.num_samples - len(samples_with_phase),
+        num_candidate_views=candidate_view_count,
+        num_classifier_pass=sum(candidate.passed_classifier for candidate in candidates),
+        num_fused_pass=sum(candidate.passed_fused for candidate in candidates),
+        num_q_pass=sum(candidate.passed_q for candidate in candidates),
+        num_stable_labels=len(stable_labels),
+        num_ambiguous_rejected=ambiguous_rejected,
+        stable_class_counts=tuple(class_counts),
+    )
+
+
+@torch.no_grad()
+def scan_stable_target_labels_from_confirmed_phase(
+    *,
+    ema_teacher: Stage2EMATeacher,
+    target_loader,
+    phase_state: DomainPhaseState,
+    source_prototype_bank: SourcePrototypeBank,
+    config: StableLabelConfig,
+    sample_ids: tuple[int, ...] | None = None,
+) -> StableTargetLabelScanResult:
+    """Scan stable labels directly under confirmed domain-level Phase groups.
+
+    Exact sample/class registration hypotheses are deliberately *not* required
+    here.  They are evidence for estimating Domain Phase.  Once a group is
+    confirmed, its center gamma defines the calibrated view; classifier, fused
+    source prototypes and q-Shape prototypes then provide the three independent
+    class gates.  This keeps Shape estimation from inheriting the cost and
+    sample-level bias of individual DP registration.
+    """
+    confirmed_groups = tuple(
+        group
+        for group in phase_state.groups
+        if group.status is PhaseGroupStatus.CONFIRMED
+    )
+    num_classes = int(source_prototype_bank.ready.numel())
+    requested = None if sample_ids is None else set(int(item) for item in sample_ids)
+    requested_count = None if requested is None else len(requested)
+    if not confirmed_groups:
+        return _empty_result(0 if requested_count is None else requested_count, num_classes)
+
+    teacher = ema_teacher.model()
+    teacher.eval()
+    candidates: list[StableTargetCandidate] = []
+    candidate_sources: dict[tuple[int, int, int], tuple[ConfirmedPhaseView, int]] = {}
+    considered_samples: set[int] = set()
+    candidate_view_count = 0
+    fallback_index = 0
+
+    for batch in target_loader:
+        pixels = batch.get("pixels")
+        if not isinstance(pixels, Tensor):
+            raise ValueError("target batch must contain tensor pixels")
+        batch_size = int(pixels.shape[0])
+        batch_ids = batch.get("index")
+        if not isinstance(batch_ids, Tensor) or batch_ids.shape != (batch_size,):
+            batch_ids = torch.arange(
+                fallback_index, fallback_index + batch_size, dtype=torch.long
+            )
+        batch_ids = batch_ids.detach().to(device="cpu", dtype=torch.long)
+        fallback_index += batch_size
+        rows = [
+            row
+            for row in range(batch_size)
+            if requested is None or int(batch_ids[row].item()) in requested
+        ]
+        if not rows:
+            continue
+        row_sample_ids = torch.tensor(
+            [int(batch_ids[row].item()) for row in rows], dtype=torch.long
+        )
+        considered_samples.update(int(item) for item in row_sample_ids.tolist())
+
+        for group in confirmed_groups:
+            view = build_confirmed_phase_view(
+                model=teacher,
+                batch=_subset_batch(batch, rows, batch_size),
+                sample_ids=row_sample_ids,
+                group=group,
+            )
+            candidate_view_count += len(rows)
+            for view_index, sample_id_value in enumerate(view.sample_ids.tolist()):
+                sample_id = int(sample_id_value)
+                for class_id in group.member_classes:
+                    candidate = evaluate_stable_target_candidate(
+                        view=view,
+                        view_index=view_index,
+                        class_id=int(class_id),
+                        source_prototype_bank=source_prototype_bank,
+                        config=config,
+                    )
+                    candidates.append(candidate)
+                    candidate_sources[(sample_id, int(class_id), group.group_id)] = (
+                        view, view_index
+                    )
+
+    if requested is not None and considered_samples != requested:
+        missing = sorted(requested - considered_samples)
+        raise ValueError(
+            "target statistics loader is missing requested sample ids: "
+            + ",".join(str(item) for item in missing[:10])
+        )
+
+    accepted_by_sample: dict[int, list[StableTargetCandidate]] = {}
+    for candidate in candidates:
+        if candidate.accepted:
+            accepted_by_sample.setdefault(candidate.sample_id, []).append(candidate)
+
+    stable_labels: list[StableTargetLabel] = []
+    class_counts = [0] * num_classes
+    ambiguous_rejected = 0
+    for sample_id in sorted(accepted_by_sample):
+        accepted = accepted_by_sample[sample_id]
+        if len(accepted) != 1:
+            ambiguous_rejected += 1
+            continue
+        candidate = accepted[0]
+        view, view_index = candidate_sources[
+            (candidate.sample_id, candidate.class_id, candidate.group_id)
+        ]
+        stable_labels.append(
+            StableTargetLabel(
+                sample_id=candidate.sample_id,
+                class_id=candidate.class_id,
+                group_id=candidate.group_id,
+                aligned_q_shape=view.aligned_q_shape[view_index].detach(),
+                aligned_q_support=view.aligned_q_support[view_index].detach(),
+                fused_repr=view.fused_repr[view_index].detach(),
+                confidence_summary=min(
+                    candidate.cls_confidence,
+                    candidate.fused_confidence,
+                    candidate.q_confidence,
+                ),
+            )
+        )
+        class_counts[candidate.class_id] += 1
+
+    num_samples = len(considered_samples)
+    return StableTargetLabelScanResult(
+        candidates=tuple(candidates),
+        stable_labels=tuple(stable_labels),
+        num_samples=num_samples,
+        num_without_confirmed_phase=0,
         num_candidate_views=candidate_view_count,
         num_classifier_pass=sum(candidate.passed_classifier for candidate in candidates),
         num_fused_pass=sum(candidate.passed_fused for candidate in candidates),

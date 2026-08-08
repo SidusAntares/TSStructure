@@ -1,11 +1,33 @@
 # TSStructure V3 offline server workflow
 
-The server uses the already active Python environment, local code, and the
-dataset path configured by `train.py`. The scripts do not activate Conda, use
-Git, access a network, download files, or install packages. `DATA_ROOT`,
-`PYTHON_BIN`, `OUTPUT_ROOT`, and `LOG_ROOT` remain optional overrides.  Round 7
-requires an explicit `STAGE2_CONFIG` JSON because the statistical thresholds and
-Stage-2 objective weights intentionally have no launcher defaults.
+The server scripts use the already-active Python environment and the dataset
+path configured by `train.py`. They do not activate Conda, install packages,
+or download data. `DATA_ROOT` is optional; leaving it unset preserves the
+`train.py` parser default. Stage 2 requires an explicit `STAGE2_CONFIG` JSON.
+
+## Stage-2 evidence runtime
+
+Domain Phase no longer performs an exhaustive `target x all classes` DP scan.
+The runtime protocol is:
+
+1. cache a deterministic representative target-train subset once;
+2. acquire nested Phase evidence (`64 -> 128 -> 256 -> 512` by default);
+3. propose classes by the high-recall union of classifier and identity-T
+   candidates;
+4. run exact fdasrsf curve-DP only for proposed pairs, in CPU worker processes;
+5. stop exact DP as soon as Domain Phase is confirmed;
+6. estimate stable labels and Domain Shape directly under the confirmed
+   domain-level Phase group, without requiring individual DP hypotheses.
+
+Logs expose proposal counts, exact solver calls, every rejection stage, and
+P10/P50/P90 diagnostic distributions. The runtime-only evidence budgets and
+worker count can be overridden by CLI without changing scientific gates.
+
+Feature snapshots are disabled in smoke and formal launchers. Stage-2 EMA
+checkpoints now contain the full Phase state, full Domain Shape state, evidence
+sample IDs, and stable-label IDs/classes. The small `shape_diagnostics_*.json`
+files remain for quick inspection. Legacy feature-snapshot/visualization code is
+kept only for old experiments and optional offline use.
 
 ## Environment check
 
@@ -15,54 +37,80 @@ bash scripts/check_server_env.sh
 
 ## Smoke run
 
-The smoke is fixed to AT1 -> DK1, seed 1, GPU 0.  By default it runs one
-Stage-1 epoch/two source steps followed by one Stage-2 epoch/one optimizer step.
-Feature snapshots are explicitly disabled.  It verifies the Stage-1 -> Stage-2
-boundary, initial target-statistics settling, a Stage-2 optimizer/EMA update,
-target validation, and `stage2_last_ema.pt`.  Formal target-test diagnostics
-remain restricted to epochs 20/40/60 and are therefore not required by smoke.
+The smoke is AT1 -> DK1, seed 1, GPU 0. It uses tiny Phase evidence budgets so
+that it validates the Stage-1 -> Stage-2 integration rather than benchmarking
+registration throughput.
 
 ```bash
 cd /data/user/TSStructure
+mkdir -p logs/smoke_structure_da_v3/train_logs
+STAGE2_CONFIG=/data/user/TSStructure/configs/stage2_pilot_v1.json
 
-mkdir -p \
-    logs/smoke_structure_da_v3/train_logs \
-    logs/smoke_structure_da_v3/snapshots
-
-STAGE2_CONFIG=/data/user/configs/tsstructure_v3_stage2.json
-
-nohup env STAGE2_CONFIG="${STAGE2_CONFIG}" bash scripts/smoke_structure_da_v3.sh \
+nohup env STAGE2_CONFIG="${STAGE2_CONFIG}" \
+    bash scripts/smoke_structure_da_v3.sh \
     > logs/smoke_structure_da_v3/train_logs/nohup.log \
     2>&1 < /dev/null &
 
 echo $! > logs/smoke_structure_da_v3/train_logs/launcher.pid
 ```
 
-Monitor it with:
+Monitor:
 
 ```bash
 tail -f logs/smoke_structure_da_v3/train_logs/nohup.log
 tail -f logs/smoke_structure_da_v3/train_logs/smoke.log
 ```
 
-Training artifacts stay in `outputs/smoke_structure_da_v3/`. The smoke log is
-the only per-task log and ends with `SMOKE_RESULT|status=SUCCESS` or
-`SMOKE_RESULT|status=FAILED`.
+## Recommended formal workflow: one seed at a time
 
-## Formal 12-task x 3-seed experiment
-
-Run this only after reviewing a successful smoke:
+Run all 12 directed domain pairs for one seed across four GPUs, then repeat for
+seeds 2 and 3 with the same frozen config.
 
 ```bash
 cd /data/user/TSStructure
+SEED=1
+RUN_GROUP="structure_da_v3_seed${SEED}_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "logs/${RUN_GROUP}/train_logs"
+STAGE2_CONFIG=/data/user/TSStructure/configs/stage2_pilot_v1.json
 
+nohup env \
+    SEED="${SEED}" \
+    RUN_GROUP="${RUN_GROUP}" \
+    STAGE2_CONFIG="${STAGE2_CONFIG}" \
+    GPU0=0 GPU1=1 GPU2=2 GPU3=3 \
+    bash scripts/run_structure_da_12tasks_4gpu_seed.sh \
+    > "logs/${RUN_GROUP}/train_logs/nohup.log" \
+    2>&1 < /dev/null &
+
+echo $! > "logs/${RUN_GROUP}/train_logs/launcher.pid"
+echo "${RUN_GROUP}"
+```
+
+Each GPU worker runs three tasks sequentially. The launcher writes
+`manifest.tsv`, `completed.tsv`, `failed.tsv`, and `experiment_status.tsv` under
+`logs/${RUN_GROUP}/train_logs/`. Per-task checkpoints and TensorBoard events are
+under `outputs/${RUN_GROUP}/<task_seed>/`.
+
+The fixed domain naming is:
+
+```text
+AT1 = austria/33UVP/2017
+DK1 = denmark/32VNH/2017
+FR1 = france/30TXT/2017
+FR2 = france/31TCJ/2017
+```
+
+After seed 1 finishes, keep the same code/config and launch `SEED=2`, then
+`SEED=3`. Do not average seeds produced with different Stage-2 configs.
+
+## All 36 runs in one launcher
+
+The legacy all-at-once launcher remains available:
+
+```bash
 RUN_GROUP="structure_da_v3_12tasks_3seeds_$(date +%Y%m%d_%H%M%S)"
-
-mkdir -p \
-    "logs/${RUN_GROUP}/train_logs" \
-    "logs/${RUN_GROUP}/snapshots"
-
-STAGE2_CONFIG=/data/user/configs/tsstructure_v3_stage2.json
+mkdir -p "logs/${RUN_GROUP}/train_logs"
+STAGE2_CONFIG=/data/user/TSStructure/configs/stage2_pilot_v1.json
 
 nohup env \
     RUN_GROUP="${RUN_GROUP}" \
@@ -71,72 +119,59 @@ nohup env \
     bash scripts/run_structure_da_12tasks_4gpu_3seeds.sh \
     > "logs/${RUN_GROUP}/train_logs/nohup.log" \
     2>&1 < /dev/null &
-
-echo $! > "logs/${RUN_GROUP}/train_logs/launcher.pid"
-echo "${RUN_GROUP}"
 ```
 
-Monitor scheduling, one task, and GPUs:
+The seed-wise launcher is preferred when results need to be inspected between
+seeds.
+
+## Stage-2-only resume
+
+A completed Stage-1 checkpoint can be reused without retraining Stage 1:
 
 ```bash
-tail -f "logs/${RUN_GROUP}/train_logs/nohup.log"
-tail -f "logs/${RUN_GROUP}/train_logs/AT1_DK1_seed1.log"
-watch -n 5 nvidia-smi
+python -u train.py \
+    --source austria/33UVP/2017 \
+    --target denmark/32VNH/2017 \
+    --seed 1 \
+    --device cuda:0 \
+    --output_dir outputs/<run>/AT1_DK1_seed1 \
+    --tensorboard_log_dir outputs/<run>/AT1_DK1_seed1/tensorboard/events \
+    --stage2_only \
+    --stage1_checkpoint outputs/<run>/AT1_DK1_seed1/fold_0/stage1_best.pt \
+    --stage2_config configs/stage2_pilot_v1.json \
+    --feature_snapshot_interval 0 \
+    --progress_bar off
 ```
 
-The four GPU workers each run nine jobs sequentially. Each task has exactly one
-merged stdout/stderr log in `logs/${RUN_GROUP}/train_logs/`. Experiment-level
-PID, exit code, and completion state are recorded in `experiment_status.tsv`.
-Snapshots at epochs 25, 50, 75, and 100 are stored under
-`logs/${RUN_GROUP}/snapshots/<task_seed>/`. Checkpoints, metrics, and TensorBoard
-events remain under `outputs/${RUN_GROUP}/<task_seed>/`. Each domain contributes
-at most eight fixed parcels per class. Stable per-parcel indices select exactly
-`num_pixels` pixels with the same sampling/padding semantics as training, and all
-epochs reuse those indices. The first successful scheduled snapshot fits one
-parcel-weighted source+target PCA basis for PSE and a separate joint basis for
-unaligned/aligned Shape. Later epochs reuse those bases and store only PC1-PC8
-curves. Snapshot inference uses an independent batch size of 8 and retries CUDA
-OOM failures with progressively smaller batches. Per-epoch outcomes are recorded
-atomically in `snapshot_status.json`; training continues and the launcher reports
-`COMPLETED_WITH_SNAPSHOT_FAILURE` only while the current status has failures.
+The selected checkpoint restores the frozen Stage-1 source prototype bank.
+Only the K_reg source registration prototypes, which are not stored in the
+Stage-1 checkpoint, are rescanned before Stage 2.
 
+## What to monitor
 
-The Stage-2 JSON is a flat object whose keys use the same names as the CLI
-destinations, for example `stage2_registration_lambda`,
-`stage2_phase_confirmation_patience`, `stage2_shape_confirmation_patience`,
-`stage2_lambda_src_proto`, `stage2_ema_decay`, and `stage2_lambda_delta`.  The
-launcher fails before starting any run if `STAGE2_CONFIG` is absent.  Values are
-not documented here because they are experimental configuration, not frozen
-method defaults.
+During Stage-2 initialization, useful lines are:
 
-Stage 2 always uses the source-val-selected `stage1_best.pt`, runs 60 epochs in
-20-epoch fixed-statistics blocks, validates the EMA teacher every epoch, and
-runs diagnostic target test only at epochs 20/40/60.  The fold directory keeps
-`stage2_ema_020.pt`, `stage2_ema_040.pt`, `stage2_ema_060.pt`,
-`stage2_best_target_val_ema.pt`, and `stage2_last_ema.pt`, plus Shape/oracle
-diagnostics.
-
-## Offline snapshot plots
-
-Training never invokes visualization. After snapshots exist:
-
-```bash
-python scripts/visualize_structure_feature_snapshots.py \
-    --snapshot-dir "logs/${RUN_GROUP}/snapshots/AT1_DK1_seed1" \
-    --output-dir "analysis_output/${RUN_GROUP}/AT1_DK1_seed1" \
-    --display-samples-per-class 8 \
-    --separation-samples-per-class 3 \
-    --components 1 2
+```text
+STAGE2_SOURCE_BANK
+STAGE2_SOURCE_REGISTRATION_SCAN
+TARGET_GEOMETRY_CACHE_READY
+TARGET_HYPOTHESIS_SCAN_STAGE_START
+TARGET_DP_PROGRESS
+TARGET_HYPOTHESIS_SCAN_STAGE_DONE
+TARGET_HYPOTHESIS_SCAN_DISTRIBUTIONS
+STAGE2_PHASE_EVIDENCE_STAGE
+STAGE2_SHAPE_EVIDENCE_STAGE
+STAGE2_STATISTICS
+STAGE2_TRAIN
+STAGE2_TARGET_VAL
 ```
 
-The visualizer discovers every available epoch, supports PC1-PC8 for schema 3,
-and adds unaligned/aligned Shape, phase-status, and accepted-warp diagnostics.
-It also reads schema 1 full-dimensional and schema 2 compact snapshots. Schema 2
-cannot fabricate unaligned Shape and reports that diagnostic as skipped. Source
-NPZ files are never modified.
+`TARGET_HYPOTHESIS_SCAN_STAGE_DONE` reports pre-support, solver, each gamma
+legality gate, gain, Shape-support, and Shape-outer rejection counts. This is
+the primary input for tuning pilot thresholds.
 
 ## Stopping safely
 
 Killing only the launcher PID may leave already-started training children. Use
-`experiment_status.tsv` to identify recorded task PIDs, inspect them with
-`ps -fp <PID>`, and only then terminate the confirmed experiment processes.
+`experiment_status.tsv` or `pgrep -af train.py` to identify task PIDs, inspect
+them with `ps -fp <PID>`, and terminate only confirmed experiment processes.

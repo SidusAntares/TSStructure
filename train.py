@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -9,7 +11,7 @@ from copy import deepcopy
 import numpy as np
 import torch
 import torch.backends.cudnn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision.transforms import transforms
 
 from dataset import (
@@ -129,8 +131,30 @@ def create_source_scan_loader(config, splits):
     )
 
 
-def create_target_statistics_loader(config, splits):
-    """Deterministic full target-train loader for Stage-2 statistics only."""
+def _evenly_spaced_subset_indices(total: int, maximum: int) -> list[int]:
+    """Deterministically cover the full target-train index range."""
+    if total < 1:
+        return []
+    if maximum >= total:
+        return list(range(total))
+    edges = np.linspace(0.0, float(total), num=maximum + 1)
+    indices = [
+        min(total - 1, int((edges[i] + edges[i + 1]) * 0.5))
+        for i in range(maximum)
+    ]
+    # Rounding cannot normally duplicate interval midpoints, but preserve a
+    # strict unique-order contract for very small synthetic test datasets.
+    return list(dict.fromkeys(indices))
+
+
+def create_target_statistics_loader(config, splits, *, max_samples: int | None = None):
+    """Deterministic representative target-train loader for Stage-2 statistics.
+
+    Domain Phase/Shape are population statistics, not per-target predictions.
+    The loader therefore covers the full target-train index range with a fixed
+    representative subset when ``max_samples`` is smaller than the dataset.
+    No target label is used for selection.
+    """
     from dataset import GroupByShapesBatchSampler
 
     scan_transform = transforms.Compose([Identity(), Normalize(), ToTensor()])
@@ -147,16 +171,25 @@ def create_target_statistics_loader(config, splits):
             config, "time_coordinate_mode", "canonical_day_of_year"
         ),
     )
+    total = len(scan_dataset)
+    dataset = scan_dataset
+    if max_samples is not None and max_samples < total:
+        dataset = Subset(
+            scan_dataset, _evenly_spaced_subset_indices(total, max_samples)
+        )
     scan_batch_size = getattr(config, "eval_batch_size", None) or config.batch_size
-    return DataLoader(
-        dataset=scan_dataset,
+    loader = DataLoader(
+        dataset=dataset,
         batch_sampler=GroupByShapesBatchSampler(
-            scan_dataset, scan_batch_size, by_pixel_dim=True
+            dataset, scan_batch_size, by_pixel_dim=True
         ),
         num_workers=config.num_workers,
         pin_memory=torch.cuda.is_available(),
         worker_init_fn=worker_init_fn,
     )
+    loader.stage2_total_target_train = total
+    loader.stage2_selected_samples = len(dataset)
+    return loader
 
 
 def _apply_stage2_config_file(config) -> None:
@@ -243,6 +276,21 @@ def build_stage2_config(config) -> Stage2TrainerConfig:
             registration_max_local_speed=config.stage2_registration_max_local_speed,
             registration_max_deviation=config.stage2_registration_max_deviation,
             class_hypothesis_margin=config.stage2_class_hypothesis_margin,
+            proposal_classifier_topk=(
+                2
+                if config.stage2_phase_proposal_classifier_topk is None
+                else config.stage2_phase_proposal_classifier_topk
+            ),
+            proposal_identity_topk=(
+                2
+                if config.stage2_phase_proposal_identity_topk is None
+                else config.stage2_phase_proposal_identity_topk
+            ),
+            registration_workers=(
+                4
+                if config.stage2_registration_workers is None
+                else config.stage2_registration_workers
+            ),
         ),
         phase=DomainPhaseConfig(
             phase_min_samples_per_class=config.stage2_phase_min_samples_per_class,
@@ -289,6 +337,17 @@ def build_stage2_config(config) -> Stage2TrainerConfig:
         steps_per_epoch=config.stage2_steps_per_epoch,
         amp_enabled=bool(getattr(config, "amp", False)),
         amp_dtype=getattr(config, "amp_dtype", "float16"),
+        phase_evidence_initial_samples=(
+            64
+            if config.stage2_phase_evidence_initial_samples is None
+            else config.stage2_phase_evidence_initial_samples
+        ),
+        phase_evidence_max_samples=(
+            512
+            if config.stage2_phase_evidence_max_samples is None
+            else config.stage2_phase_evidence_max_samples
+        ),
+        evidence_seed=int(config.seed),
     )
 
 
@@ -307,7 +366,56 @@ def _int_list(value):
     return _comma_separated_ints(value)
 
 
+def _resolve_stage1_checkpoint_path(config, fold_num: int) -> str:
+    del fold_num
+    explicit = getattr(config, "stage1_checkpoint", None)
+    if not getattr(config, "stage2_only", False) or explicit is None:
+        return os.path.join(config.fold_dir, "stage1_best.pt")
+    if int(getattr(config, "num_folds", 1)) != 1:
+        raise ValueError(
+            "--stage1_checkpoint is only supported with --num_folds 1; "
+            "otherwise place stage1_best.pt under each output fold directory"
+        )
+    return os.path.abspath(os.path.expanduser(explicit))
+
+
+def _source_prototype_bank_from_checkpoint(state: dict, device: torch.device) -> SourcePrototypeBank | None:
+    payload = state.get("prototype_bank")
+    if not isinstance(payload, dict):
+        return None
+    required = (
+        "trend_srvf", "shape_srvf", "trend_support", "shape_support",
+        "fused", "class_counts", "ready", "q_distance_samples",
+        "f_distance_samples", "q_quantiles", "f_quantiles", "version",
+    )
+    if any(name not in payload for name in required):
+        return None
+    def tensor(name):
+        return payload[name].to(device=device)
+    return SourcePrototypeBank(
+        trend_srvf=tensor("trend_srvf"),
+        shape_srvf=tensor("shape_srvf"),
+        trend_support=tensor("trend_support"),
+        shape_support=tensor("shape_support"),
+        fused=tensor("fused"),
+        class_counts=tensor("class_counts").long(),
+        ready=tensor("ready").bool(),
+        q_distance_samples=tuple(v.to(device=device) for v in payload["q_distance_samples"]),
+        f_distance_samples=tuple(v.to(device=device) for v in payload["f_distance_samples"]),
+        q_quantiles=tensor("q_quantiles"),
+        f_quantiles=tensor("f_quantiles"),
+        version=int(payload["version"]),
+    )
+
+
 def main(config):
+    if getattr(config, "stage2_only", False) and (config.eval or config.overall):
+        raise ValueError("--stage2_only cannot be combined with --eval or --overall")
+    if getattr(config, "stage1_checkpoint", None) and not getattr(
+        config, "stage2_only", False
+    ):
+        raise ValueError("--stage1_checkpoint requires --stage2_only")
+
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -354,8 +462,19 @@ def main(config):
             target_val_loader, target_test_loader = create_evaluation_loaders(
                 config.target, splits, config, sample_pixels_val
             )
+            target_statistics_raw_loader = create_target_statistics_loader(
+                config,
+                splits,
+                max_samples=stage2_runtime_config.phase_evidence_max_samples,
+            )
+            print(
+                "STAGE2_STATISTICS_SUBSET|"
+                f"total={target_statistics_raw_loader.stage2_total_target_train}"
+                f"|selected={target_statistics_raw_loader.stage2_selected_samples}"
+                "|strategy=evenly_spaced_full_target_train"
+            )
             target_statistics_loader = DeviceBatchLoader(
-                create_target_statistics_loader(config, splits), device
+                target_statistics_raw_loader, device
             )
 
         source_loader = None
@@ -442,35 +561,70 @@ def main(config):
 
         print(model)
         print('Number of Stage-1 trainable parameters:', get_num_trainable_params(model))
-        writer = SummaryWriter(
-            log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0
-        )
-        feature_snapshot_manager = create_feature_snapshot_manager(
-            model, config, splits, device=device
-        )
-        best_model_path = os.path.join(config.fold_dir, 'model.pt')
-        train_source_classification(
-            model, source_loader, source_val_loader,
-            config, writer, device, best_model_path,
-            feature_snapshot_manager,
-            source_scan_loader=source_scan_loader,
-        )
+        writer_log_dir = f'{config.tensorboard_log_dir}_fold{fold_num}'
+        if getattr(config, "stage2_only", False):
+            writer_log_dir = f'{config.tensorboard_log_dir}_stage2_resume_fold{fold_num}'
+        writer = SummaryWriter(log_dir=writer_log_dir, purge_step=0)
 
-        # Formal Stage-1 -> Stage-2 boundary: select source-val best, then
-        # recompute the final frozen full-source geometry/statistics once.
-        stage1_best_path = os.path.join(config.fold_dir, "stage1_best.pt")
+        if not getattr(config, "stage2_only", False):
+            feature_snapshot_manager = create_feature_snapshot_manager(
+                model, config, splits, device=device
+            )
+            best_model_path = os.path.join(config.fold_dir, 'model.pt')
+            train_source_classification(
+                model, source_loader, source_val_loader,
+                config, writer, device, best_model_path,
+                feature_snapshot_manager,
+                source_scan_loader=source_scan_loader,
+            )
+
+        # Formal Stage-1 -> Stage-2 boundary. A Stage-2-only resume deliberately
+        # reuses this exact boundary: load the selected source-val checkpoint,
+        # restore its frozen source bank when available, and rebuild only the
+        # registration-grid source prototypes that are not stored in Stage 1.
+        stage1_best_path = _resolve_stage1_checkpoint_path(config, fold_num)
+        if not os.path.isfile(stage1_best_path):
+            raise FileNotFoundError(
+                f"Stage-1 checkpoint not found for Stage-2 boundary: {stage1_best_path}"
+            )
         stage1_checkpoint = torch.load(stage1_best_path, weights_only=False)
+        if "model_state_dict" not in stage1_checkpoint:
+            raise ValueError(
+                "Stage-1 checkpoint is missing model_state_dict: "
+                f"{stage1_best_path}"
+            )
+        if getattr(config, "stage2_only", False):
+            source_val = stage1_checkpoint.get("source_val", {})
+            print(
+                "STAGE2_RESUME|"
+                f"checkpoint={stage1_best_path}"
+                f"|stage1_epoch={stage1_checkpoint.get('epoch', 'unknown')}"
+                f"|source_val_macro_f1={source_val.get('macro_f1', 'unknown')}"
+            )
         load_structure_da_state_dict(model, stage1_checkpoint["model_state_dict"])
         model.to(device)
         model.eval()
-        source_bank = build_source_prototype_bank(
-            model, source_scan_loader, config.num_classes, device=device
-        )
-        source_bank, _ = finalize_distance_statistics(
-            model, source_scan_loader, source_bank, device=device
-        )
+        source_bank = _source_prototype_bank_from_checkpoint(stage1_checkpoint, device)
+        if source_bank is None:
+            print("STAGE2_SOURCE_BANK|source=full_source_fallback")
+            source_bank = build_source_prototype_bank(
+                model, source_scan_loader, config.num_classes, device=device
+            )
+            source_bank, _ = finalize_distance_statistics(
+                model, source_scan_loader, source_bank, device=device
+            )
+        else:
+            print(
+                "STAGE2_SOURCE_BANK|source=stage1_checkpoint"
+                f"|version={source_bank.version}"
+                f"|ready_classes={len(source_bank.ready_classes())}"
+            )
         reg_extractor = build_stage2_registration_extractor(
             model, device=device, k_reg=stage2_runtime_config.phase_scan.k_reg
+        )
+        print(
+            "STAGE2_SOURCE_REGISTRATION_SCAN|status=start"
+            f"|k_reg={stage2_runtime_config.phase_scan.k_reg}"
         )
         source_registration_bank = build_source_registration_prototypes(
             model,
@@ -478,6 +632,10 @@ def main(config):
             config.num_classes,
             device=device,
             reg_extractor=reg_extractor,
+        )
+        print(
+            "STAGE2_SOURCE_REGISTRATION_SCAN|status=ready"
+            f"|ready_classes={len(source_registration_bank.ready_classes())}"
         )
 
         policy = configure_stage2_parameter_policy(model)
@@ -1236,9 +1394,44 @@ if __name__ == '__main__':
     # Stage-2 orchestration. Scientific thresholds/weights intentionally have
     # no defaults; provide them explicitly or through --stage2_config JSON.
     parser.add_argument('--stage2_config', default=None, type=str)
+    parser.add_argument(
+        '--stage2_only', action='store_true',
+        help=(
+            'skip Stage-1 optimization, load a completed stage1_best.pt, restore '
+            'full-source statistics, and start Stage 2'
+        ),
+    )
+    parser.add_argument(
+        '--stage1_checkpoint', default=None, type=str,
+        help=(
+            'Stage-1 checkpoint for --stage2_only; defaults to '
+            '<output_dir>/fold_<n>/stage1_best.pt'
+        ),
+    )
     parser.add_argument('--stage2_epochs', default=60, type=int)
     parser.add_argument('--stage2_block_epochs', default=20, type=int)
     parser.add_argument('--stage2_steps_per_epoch', default=None, type=int)
+    parser.add_argument(
+        '--stage2_phase_evidence_initial_samples', default=None, type=int,
+        help='initial deterministic target evidence budget for progressive Domain Phase scan',
+    )
+    parser.add_argument(
+        '--stage2_phase_evidence_max_samples', default=None, type=int,
+        help='maximum target evidence cached for progressive Domain Phase/Shape statistics',
+    )
+    parser.add_argument(
+        '--stage2_registration_workers', default=None, type=int,
+        help='Linux process workers for independent fdasrsf exact-DP registrations',
+    )
+
+    parser.add_argument(
+        '--stage2_phase_proposal_classifier_topk', default=None, type=int,
+        help='high-recall classifier candidate count before exact DP (default: 2)',
+    )
+    parser.add_argument(
+        '--stage2_phase_proposal_identity_topk', default=None, type=int,
+        help='high-recall identity-T candidate count before exact DP (default: 2)',
+    )
 
     parser.add_argument('--stage2_registration_lambda', default=None, type=float)
     parser.add_argument('--stage2_registration_gain_ratio_max', default=None, type=float)

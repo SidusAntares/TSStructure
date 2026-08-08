@@ -50,8 +50,9 @@ class RegistrationGeometryOutput:
 class TargetGeometryCache:
     """Per-target-sample cached geometry for the class-conditioned scan.
 
-    Holds only geometry. It never stores target labels, classifier logits,
-    pseudo-labels or any derived phase-group state.
+    Holds frozen target geometry plus source-only-model classifier logits for
+    high-recall class proposal. It never stores target labels, pseudo-labels
+    or any derived phase-group state.
     """
 
     sample_ids: Tensor  # [N]
@@ -66,6 +67,7 @@ class TargetGeometryCache:
 
     registration_grid: Tensor  # [K_reg]
     shape_grid: Tensor         # [K_shape]
+    classifier_logits: Tensor | None = None  # [N, C], proposal only
 
 
 @dataclass(frozen=True)

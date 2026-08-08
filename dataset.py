@@ -370,6 +370,7 @@ class GroupByShapesBatchSampler(torch.utils.data.BatchSampler):
             shapes = [shape for d in datasets for shape in d.get_shapes()]
         elif isinstance(data_source, Subset):
             datasets = [data_source]
+            selected_indices = set(data_source.indices)
             if isinstance(data_source.dataset, ConcatDataset):
                 shapes = [
                     shape
@@ -379,13 +380,13 @@ class GroupByShapesBatchSampler(torch.utils.data.BatchSampler):
                 shapes = [
                     shape
                     for idx, shape in enumerate(shapes)
-                    if idx in data_source.indices
+                    if idx in selected_indices
                 ]
             else:
                 shapes = [
                     shape
                     for idx, shape in enumerate(data_source.dataset.get_shapes())
-                    if idx in data_source.indices
+                    if idx in selected_indices
                 ]
         else:
             raise NotImplementedError

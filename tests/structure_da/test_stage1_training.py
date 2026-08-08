@@ -329,3 +329,55 @@ def test_full_scan_loaders_group_variable_pixel_widths_before_collate(monkeypatc
             seen.extend(batch["parcel_index"].tolist())
             assert batch["pixels"].shape[-1] in {3, 4, 5}
         assert sorted(seen) == list(range(5))
+
+
+def test_target_statistics_subset_is_deterministic_and_spans_full_train_range(monkeypatch) -> None:
+    import train as train_module
+
+    class FixedDataset(torch.utils.data.Dataset):
+        def __init__(self, *args, indices=None, **kwargs):
+            self.n = len(indices)
+
+        def __len__(self):
+            return self.n
+
+        def get_shapes(self):
+            return [(5, 2, 4)] * self.n
+
+        def __getitem__(self, index):
+            return {
+                "index": index,
+                "parcel_index": index,
+                "pixels": torch.zeros(5, 2, 4),
+                "valid_pixels": torch.ones(5, 4),
+                "positions": torch.arange(5, dtype=torch.float32),
+                "label": index % 3,
+            }
+
+    monkeypatch.setattr(train_module, "PixelSetData", FixedDataset)
+    config = SimpleNamespace(
+        data_root="unused",
+        target="target/domain/2017",
+        classes=("a", "b", "c"),
+        closed_set=True,
+        combine_spring_and_winter=False,
+        time_coordinate_mode="canonical_day_of_year",
+        eval_batch_size=8,
+        batch_size=8,
+        num_workers=0,
+    )
+    splits = {config.target: {"train": list(range(20))}}
+    loader = train_module.create_target_statistics_loader(
+        config, splits, max_samples=4
+    )
+    seen = []
+    for batch in loader:
+        seen.extend(batch["index"].tolist())
+
+    expected = train_module._evenly_spaced_subset_indices(20, 4)
+    assert sorted(seen) == sorted(expected)
+    assert len(seen) == 4
+    assert min(seen) < 5
+    assert max(seen) >= 15
+    assert loader.stage2_total_target_train == 20
+    assert loader.stage2_selected_samples == 4

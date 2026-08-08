@@ -132,11 +132,13 @@ from .stable_target_labels import (
     StableTargetLabelScanResult,
     evaluate_stable_target_candidate,
     scan_stable_target_labels,
+    scan_stable_target_labels_from_confirmed_phase,
 )
 from .target_hypothesis_scan import (
     PhaseHypothesisScanConfig,
     TargetClassPhaseHypothesis,
     TargetHypothesisScanResult,
+    TargetPhaseHypothesisScanner,
     scan_target_class_phase_hypotheses,
 )
 from .temporal_functional import (
@@ -193,6 +195,7 @@ __all__ = [
     "StableTargetCandidate",
     "StableTargetLabel",
     "StableTargetLabelScanResult",
+    "scan_stable_target_labels_from_confirmed_phase",
     "Stage1LossOutput",
     "Stage1Objective",
     "Stage2EMATeacher",
@@ -211,6 +214,7 @@ __all__ = [
     "TargetClassPhaseHypothesis",
     "TargetGeometryCache",
     "TargetHypothesisScanResult",
+    "TargetPhaseHypothesisScanner",
     "TargetShapeClassCenter",
     "TemporalFunctionalLift",
     "TemporalFunctionalOutput",

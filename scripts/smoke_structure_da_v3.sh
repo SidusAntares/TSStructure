@@ -16,7 +16,6 @@ SMOKE_STAGE2_STEPS_PER_EPOCH="${SMOKE_STAGE2_STEPS_PER_EPOCH:-1}"
 RUN_OUTPUT_DIRECTORY="${OUTPUT_ROOT}/smoke_structure_da_v3"
 SMOKE_LOG_ROOT="${LOG_ROOT}/smoke_structure_da_v3"
 SMOKE_TRAIN_LOG_DIRECTORY="${SMOKE_LOG_ROOT}/train_logs"
-SMOKE_SNAPSHOT_DIRECTORY="${SMOKE_LOG_ROOT}/snapshots"
 SMOKE_LOG_FILE="${SMOKE_TRAIN_LOG_DIRECTORY}/smoke.log"
 
 if [[ -z "${STAGE2_CONFIG}" ]]; then
@@ -36,6 +35,9 @@ if run_training \
     --stage2_epochs "${SMOKE_STAGE2_EPOCHS}" \
     --stage2_block_epochs "${SMOKE_STAGE2_EPOCHS}" \
     --stage2_steps_per_epoch "${SMOKE_STAGE2_STEPS_PER_EPOCH}" \
+    --stage2_phase_evidence_initial_samples 4 \
+    --stage2_phase_evidence_max_samples 8 \
+    --stage2_registration_workers 4 \
     --feature_snapshot_interval 0
 then
     status=0

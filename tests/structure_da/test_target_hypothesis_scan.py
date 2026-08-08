@@ -5,11 +5,13 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from methods.structure_da import (
+    DeviceBatchLoader,
     FdasrsfCurveRegistrationAdapter,
     PhaseHypothesisScanConfig,
     SourcePrototypeBank,
     SourceRegistrationPrototypeBank,
     TSStructureModel,
+    TargetPhaseHypothesisScanner,
     build_source_registration_prototypes,
     scan_target_class_phase_hypotheses,
 )
@@ -128,6 +130,15 @@ def _extractors(model):
     return shape_extractor, reg_extractor
 
 
+class _IdentityAdapter:
+    def __init__(self):
+        self.calls = 0
+
+    def register(self, source, target):
+        self.calls += 1
+        return torch.linspace(0.0, 1.0, source.shape[0], dtype=torch.float64)
+
+
 def test_scan_uses_k_reg_128_and_k_shape_64() -> None:
     model = _model().eval()
     shape_extractor, reg_extractor = _extractors(model)
@@ -143,6 +154,7 @@ def test_scan_uses_k_reg_128_and_k_shape_64() -> None:
         device=torch.device("cpu"),
         shape_extractor=shape_extractor,
         reg_extractor=reg_extractor,
+        adapter=_IdentityAdapter(),
     )
 
     assert result.num_samples == 6
@@ -166,6 +178,7 @@ def test_scan_is_no_grad_and_no_backward() -> None:
         device=torch.device("cpu"),
         shape_extractor=shape_extractor,
         reg_extractor=reg_extractor,
+        adapter=_IdentityAdapter(),
     )
     for hypothesis in result.hypotheses:
         assert hypothesis.gamma.requires_grad is False
@@ -197,12 +210,12 @@ def test_scan_ignores_target_labels() -> None:
     result_a = scan_target_class_phase_hypotheses(
         model, loader_a, _stage1_bank(), _reg_bank(), _scan_config(),
         device=torch.device("cpu"), shape_extractor=shape_extractor,
-        reg_extractor=reg_extractor,
+        reg_extractor=reg_extractor, adapter=_IdentityAdapter(),
     )
     result_b = scan_target_class_phase_hypotheses(
         model, loader_b, _stage1_bank(), _reg_bank(), _scan_config(),
         device=torch.device("cpu"), shape_extractor=shape_extractor,
-        reg_extractor=reg_extractor,
+        reg_extractor=reg_extractor, adapter=_IdentityAdapter(),
     )
     assert len(result_a.hypotheses) == len(result_b.hypotheses)
     for ha, hb in zip(result_a.hypotheses, result_b.hypotheses):
@@ -215,15 +228,15 @@ def test_solver_failure_isolated_to_one_pair() -> None:
     shape_extractor, reg_extractor = _extractors(model)
     loader = DataLoader(TinyParcelDataset(n=4, labels=False), batch_size=2)
 
-    class _FlakyAdapter(FdasrsfCurveRegistrationAdapter):
+    class _FlakyAdapter:
         def __init__(self):
-            super().__init__(registration_lambda=0.0)
             self.calls = 0
         def register(self, source, target):
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("synthetic solver failure")
-            return super().register(source, target)
+            return torch.linspace(0.0, 1.0, source.shape[0], dtype=torch.float64)
+
 
     adapter = _FlakyAdapter()
     result = scan_target_class_phase_hypotheses(
@@ -244,7 +257,7 @@ def test_scan_restores_training_state() -> None:
     scan_target_class_phase_hypotheses(
         model, loader, _stage1_bank(), _reg_bank(), _scan_config(),
         device=torch.device("cpu"), shape_extractor=shape_extractor,
-        reg_extractor=reg_extractor,
+        reg_extractor=reg_extractor, adapter=_IdentityAdapter(),
     )
     assert model.training is True
 
@@ -264,3 +277,82 @@ def test_build_source_registration_prototypes_k_reg() -> None:
     assert bank.trend_support.shape == (3, 128)
     assert bank.ready.tolist() == [True, True, True]
     assert bank.class_counts.tolist() == [4, 4, 4]
+
+
+def test_scan_keeps_exact_dp_solver_inputs_cpu_native() -> None:
+    device = torch.device("cpu")
+    model = _model().to(device).eval()
+    shape_extractor, reg_extractor = _extractors(model)
+    reg_extractor = reg_extractor.to(device)
+    loader = DeviceBatchLoader(
+        DataLoader(TinyParcelDataset(n=4, labels=False), batch_size=2), device
+    )
+
+    class _CpuIdentityAdapter:
+        def register(self, source, target):
+            assert source.device.type == "cpu"
+            assert target.device.type == "cpu"
+            return torch.linspace(
+                0.0, 1.0, source.shape[0], dtype=torch.float64, device="cpu"
+            )
+
+    result = scan_target_class_phase_hypotheses(
+        model,
+        loader,
+        _stage1_bank(),
+        _reg_bank(),
+        _scan_config(),
+        device=device,
+        shape_extractor=shape_extractor,
+        reg_extractor=reg_extractor,
+        adapter=_CpuIdentityAdapter(),
+    )
+
+    assert result.num_samples == 4
+    assert all(hypothesis.gamma.device.type == "cpu" for hypothesis in result.hypotheses)
+
+
+def test_high_recall_proposal_reduces_exact_dp_calls() -> None:
+    model = _model().eval()
+    shape_extractor, reg_extractor = _extractors(model)
+    loader = DataLoader(TinyParcelDataset(n=8, labels=False), batch_size=4)
+    adapter = _IdentityAdapter()
+    result = scan_target_class_phase_hypotheses(
+        model, loader, _stage1_bank(), _reg_bank(), _scan_config(),
+        device=torch.device("cpu"), shape_extractor=shape_extractor,
+        reg_extractor=reg_extractor, adapter=adapter,
+    )
+    assert result.num_all_class_pairs == 8 * 3
+    assert result.num_solver_calls == adapter.calls
+    assert result.num_solver_calls <= result.num_all_class_pairs
+    assert result.num_proposal_pairs <= result.num_all_class_pairs
+
+
+def test_progressive_scanner_only_solves_new_nested_evidence() -> None:
+    model = _model().eval()
+    shape_extractor, reg_extractor = _extractors(model)
+    loader = DataLoader(TinyParcelDataset(n=8, labels=False), batch_size=4)
+    adapter = _IdentityAdapter()
+    scanner = TargetPhaseHypothesisScanner(
+        model,
+        loader,
+        _stage1_bank(),
+        _reg_bank(),
+        _scan_config(),
+        device=torch.device("cpu"),
+        shape_extractor=shape_extractor,
+        reg_extractor=reg_extractor,
+        evidence_seed=3,
+        adapter=adapter,
+    )
+
+    first = scanner.scan_to_budget(4)
+    calls_after_first = adapter.calls
+    second = scanner.scan_to_budget(8)
+
+    assert first.num_samples == 4
+    assert second.num_samples == 8
+    assert set(first.scanned_sample_ids).issubset(second.scanned_sample_ids)
+    assert adapter.calls == second.num_solver_calls
+    assert adapter.calls > calls_after_first
+    assert second.num_solver_calls - first.num_solver_calls <= 4 * 3

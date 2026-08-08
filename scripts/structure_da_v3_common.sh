@@ -7,7 +7,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs}"
 LOG_ROOT="${LOG_ROOT:-${PROJECT_ROOT}/logs}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-CODE_VERSION="${CODE_VERSION:-structure_da_v3_snapshot_schema3_no_fused_alignment_v4}"
+CODE_VERSION="${CODE_VERSION:-structure_da_v3_progressive_phase_evidence_v6}"
 OVERWRITE="${OVERWRITE:-0}"
 STAGE2_CONFIG="${STAGE2_CONFIG:-}"
 
@@ -48,7 +48,6 @@ prepare_run_group() {
     local output_directory="$1"
     local group_log_root="$2"
     local train_log_directory="${group_log_root}/train_logs"
-    local snapshot_directory="${group_log_root}/snapshots"
     _validate_child_directory "${output_directory}" "${OUTPUT_ROOT}"
     _validate_child_directory "${group_log_root}" "${LOG_ROOT}"
 
@@ -71,16 +70,7 @@ prepare_run_group() {
         echo "Training log path is not a directory: ${train_log_directory}" >&2
         return 1
     fi
-    if [[ -d "${snapshot_directory}" ]] && \
-        find "${snapshot_directory}" -mindepth 1 -print -quit | grep -q .
-    then
-        echo "Snapshot directory contains an earlier run: ${snapshot_directory}" >&2
-        return 1
-    elif [[ -e "${snapshot_directory}" && ! -d "${snapshot_directory}" ]]; then
-        echo "Snapshot path is not a directory: ${snapshot_directory}" >&2
-        return 1
-    fi
-    mkdir -p "${output_directory}" "${train_log_directory}" "${snapshot_directory}"
+    mkdir -p "${output_directory}" "${train_log_directory}"
 }
 
 make_run_output_directory() {

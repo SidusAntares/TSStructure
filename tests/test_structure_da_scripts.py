@@ -22,9 +22,10 @@ DIAGNOSTIC_ANALYZER = SCRIPTS / "analyze_structure_da_diagnostic.py"
 PILOT4 = SCRIPTS / "run_structure_da_pilot4_4gpu.sh"
 PILOT4_ANALYZER = SCRIPTS / "analyze_structure_da_pilot4.py"
 FORMAL = SCRIPTS / "run_structure_da_12tasks_4gpu_3seeds.sh"
+SEEDWISE = SCRIPTS / "run_structure_da_12tasks_4gpu_seed.sh"
 README = SCRIPTS / "README_structure_da_v3.md"
-SHELL_SCRIPTS = [COMMON, ENV_CHECK, SMOKE, DIAGNOSTIC, PILOT4, FORMAL]
-EXPECTED_VERSION = "structure_da_v3_snapshot_schema3_no_fused_alignment_v4"
+SHELL_SCRIPTS = [COMMON, ENV_CHECK, SMOKE, DIAGNOSTIC, PILOT4, FORMAL, SEEDWISE]
+EXPECTED_VERSION = "structure_da_v3_progressive_phase_evidence_v6"
 OBSOLETE_FLAGS = {
     "--structure_dim",
     "--lambda_task",
@@ -180,9 +181,11 @@ def test_smoke_is_short_fixed_and_checked() -> None:
         'RUN_OUTPUT_DIRECTORY="${OUTPUT_ROOT}/smoke_structure_da_v3"',
         'SMOKE_LOG_ROOT="${LOG_ROOT}/smoke_structure_da_v3"',
         'SMOKE_TRAIN_LOG_DIRECTORY="${SMOKE_LOG_ROOT}/train_logs"',
-        'SMOKE_SNAPSHOT_DIRECTORY="${SMOKE_LOG_ROOT}/snapshots"',
         'SMOKE_LOG_FILE="${SMOKE_TRAIN_LOG_DIRECTORY}/smoke.log"',
         "check_structure_da_smoke.py", "--log-directory",
+        "--stage2_phase_evidence_initial_samples 4",
+        "--stage2_phase_evidence_max_samples 8",
+        "--stage2_registration_workers 4",
         "--feature_snapshot_interval 0",
         "SMOKE_RESULT|status=SUCCESS", "SMOKE_RESULT|status=FAILED",
     ):
@@ -200,18 +203,19 @@ def test_smoke_checker_supports_separate_output_and_log_directories() -> None:
 
 EXPECTED_FORMAL_TASKS = (
     "AT1|austria/33UVP/2017|DK1|denmark/32VNH/2017",
-    "AT1|austria/33UVP/2017|FR1|france/31TCJ/2017",
-    "AT1|austria/33UVP/2017|FR2|france/30TXT/2017",
+    "AT1|austria/33UVP/2017|FR1|france/30TXT/2017",
+    "AT1|austria/33UVP/2017|FR2|france/31TCJ/2017",
     "DK1|denmark/32VNH/2017|AT1|austria/33UVP/2017",
-    "DK1|denmark/32VNH/2017|FR1|france/31TCJ/2017",
-    "DK1|denmark/32VNH/2017|FR2|france/30TXT/2017",
-    "FR1|france/31TCJ/2017|AT1|austria/33UVP/2017",
-    "FR1|france/31TCJ/2017|DK1|denmark/32VNH/2017",
-    "FR1|france/31TCJ/2017|FR2|france/30TXT/2017",
-    "FR2|france/30TXT/2017|AT1|austria/33UVP/2017",
-    "FR2|france/30TXT/2017|DK1|denmark/32VNH/2017",
-    "FR2|france/30TXT/2017|FR1|france/31TCJ/2017",
+    "DK1|denmark/32VNH/2017|FR1|france/30TXT/2017",
+    "DK1|denmark/32VNH/2017|FR2|france/31TCJ/2017",
+    "FR1|france/30TXT/2017|AT1|austria/33UVP/2017",
+    "FR1|france/30TXT/2017|DK1|denmark/32VNH/2017",
+    "FR1|france/30TXT/2017|FR2|france/31TCJ/2017",
+    "FR2|france/31TCJ/2017|AT1|austria/33UVP/2017",
+    "FR2|france/31TCJ/2017|DK1|denmark/32VNH/2017",
+    "FR2|france/31TCJ/2017|FR1|france/30TXT/2017",
 )
+
 
 
 def test_formal_launcher_defines_exactly_12_tasks_and_36_runs() -> None:
@@ -241,17 +245,11 @@ def test_formal_launcher_separates_logs_outputs_and_status_files() -> None:
     for fragment in (
         'GROUP_LOG_ROOT="${LOG_ROOT}/${RUN_GROUP}"',
         'GROUP_TRAIN_LOG_DIRECTORY="${GROUP_LOG_ROOT}/train_logs"',
-        'GROUP_SNAPSHOT_DIRECTORY="${GROUP_LOG_ROOT}/snapshots"',
         'GROUP_OUTPUT_DIRECTORY="${OUTPUT_ROOT}/${RUN_GROUP}"',
         "launcher.pid", "manifest.tsv", "completed.tsv", "failed.tsv",
         "experiment_status.tsv",
         'TASK_LOG_FILE="${GROUP_TRAIN_LOG_DIRECTORY}/${run_name}.log"',
-        'SNAPSHOT_DIRECTORY="${GROUP_SNAPSHOT_DIRECTORY}/${run_name}"',
         'RUN_OUTPUT_DIRECTORY="${GROUP_OUTPUT_DIRECTORY}/${run_name}"',
-        "--feature_snapshot_interval 25",
-        "--feature_snapshot_samples_per_class 8",
-        "--feature_snapshot_batch_size 8",
-        "--feature_snapshot_dtype float16",
     ):
         assert fragment in source
     for legacy in (
@@ -264,12 +262,23 @@ def test_formal_launcher_separates_logs_outputs_and_status_files() -> None:
     assert "run_structure_da_pilot4_4gpu.sh" not in source
 
 
-def test_formal_launcher_reports_completed_with_snapshot_failure() -> None:
+def test_formal_launcher_disables_training_feature_snapshots() -> None:
     source = FORMAL.read_text(encoding="utf-8")
-    assert "snapshot_status.json" in source
-    assert '"has_failures"' in source
-    assert "SNAPSHOT_FAILED" in source
-    assert "COMPLETED_WITH_SNAPSHOT_FAILURE" in source
+    assert "--feature_snapshot_interval 0" in source
+    assert "--feature_snapshot_interval 25" not in source
+
+
+def test_seedwise_launcher_runs_one_seed_across_exactly_12_tasks() -> None:
+    source = SEEDWISE.read_text(encoding="utf-8")
+    for task in EXPECTED_FORMAL_TASKS:
+        assert f'"{task}"' in source
+    assert 'SEED="${SEED:-1}"' in source
+    assert "--feature_snapshot_interval 0" in source
+    assert "--stage2_phase_evidence_initial_samples 64" in source
+    assert "--stage2_phase_evidence_max_samples 512" in source
+    assert "--stage2_registration_workers 4" in source
+    for fragment in ("manifest.tsv", "completed.tsv", "failed.tsv", "experiment_status.tsv"):
+        assert fragment in source
 
 
 def test_readme_has_standard_nohup_workflow_without_pilot_gate() -> None:
@@ -277,9 +286,10 @@ def test_readme_has_standard_nohup_workflow_without_pilot_gate() -> None:
     for fragment in (
         "logs/smoke_structure_da_v3/train_logs/nohup.log",
         "logs/smoke_structure_da_v3/train_logs/smoke.log",
-        'RUN_GROUP="structure_da_v3_12tasks_3seeds_$(date +%Y%m%d_%H%M%S)"',
+        'RUN_GROUP="structure_da_v3_seed${SEED}_$(date +%Y%m%d_%H%M%S)"',
+        "run_structure_da_12tasks_4gpu_seed.sh",
         "run_structure_da_12tasks_4gpu_3seeds.sh",
-        'logs/${RUN_GROUP}/train_logs/AT1_DK1_seed1.log',
+        "TARGET_HYPOTHESIS_SCAN_STAGE_DONE",
         "Killing only the launcher PID may leave already-started training children",
     ):
         assert fragment in source

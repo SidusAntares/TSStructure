@@ -1,4 +1,9 @@
 {
+  "stage2_phase_evidence_initial_samples": 64,
+  "stage2_phase_evidence_max_samples": 512,
+  "stage2_registration_workers": 4,
+  "stage2_phase_proposal_classifier_topk": 2,
+  "stage2_phase_proposal_identity_topk": 2,
   "stage2_registration_lambda": 0.0,
   "stage2_registration_gain_ratio_max": 0.95,
   "stage2_registration_min_common_support": 0.6,
