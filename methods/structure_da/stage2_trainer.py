@@ -24,6 +24,7 @@ from .confirmed_phase_view import (
 from .domain_phase_state import (
     DomainPhaseConfig,
     DomainPhaseState,
+    PhaseDecisionStatus,
     PhaseGroupStatus,
     update_domain_phase_state,
 )
@@ -207,7 +208,7 @@ def _stack_synthetic(
 
 
 def _confirmed_phase_exists(state: DomainPhaseState) -> bool:
-    return any(group.status is PhaseGroupStatus.CONFIRMED for group in state.groups)
+    return state.decision_status is PhaseDecisionStatus.NONIDENTITY_CONFIRMED
 
 
 def _phase_groups_log_value(state: DomainPhaseState) -> str:
@@ -233,6 +234,12 @@ def _phase_summary(state: DomainPhaseState) -> dict:
     return {
         "scan_index": state.scan_index,
         "m": state.m,
+        "decision_status": state.decision_status.value,
+        "decision_stability_age": state.decision_stability_age,
+        "identity_evidence_classes": list(state.identity_evidence_classes),
+        "identity_evidence_count": state.identity_evidence_count,
+        "residual_evidence_count": state.residual_evidence_count,
+        "residual_evidence_classes": list(state.residual_evidence_classes),
         "valid_phase_classes": list(state.valid_phase_classes),
         "rejected_classes": list(state.rejected_classes),
         "g0_classes": list(state.rejected_classes),
@@ -278,6 +285,12 @@ def _phase_state_payload(state: DomainPhaseState) -> dict:
     return {
         "scan_index": state.scan_index,
         "m": state.m,
+        "decision_status": state.decision_status.value,
+        "decision_stability_age": state.decision_stability_age,
+        "identity_evidence_classes": tuple(state.identity_evidence_classes),
+        "identity_evidence_count": state.identity_evidence_count,
+        "residual_evidence_count": state.residual_evidence_count,
+        "residual_evidence_classes": tuple(state.residual_evidence_classes),
         "valid_phase_classes": tuple(state.valid_phase_classes),
         "rejected_classes": tuple(state.rejected_classes),
         "class_centers": tuple(
@@ -504,13 +517,13 @@ class Stage2Trainer:
 
     @torch.no_grad()
     def initialize_statistics(self) -> Stage2StatisticsSnapshot:
-        """Acquire Domain Phase evidence, then estimate Shape under fixed Phase.
+        """Acquire progressive Domain Phase evidence, then estimate Shape.
 
-        Exact DP is used only while estimating Domain Phase.  Confirmation
-        patience advances on strictly larger nested evidence sets.  Once Phase
-        is confirmed, stable labels and Domain Shape are estimated directly
-        under the confirmed group center gamma, so additional Shape evidence
-        does not require individual sample/class registration.
+        Round B deliberately scans every configured nested evidence budget.
+        A confirmed group at an intermediate budget is not treated as proof
+        that the complete domain-level model order is settled: later evidence
+        may reveal a second multi-class Phase group.  Exact pairwise gammas are
+        cached by the scanner and never recomputed at block boundaries.
         """
         scanner = self._get_phase_scanner()
         phase_state: DomainPhaseState | None = None
@@ -528,15 +541,18 @@ class Stage2Trainer:
                 "STAGE2_PHASE_EVIDENCE_STAGE|"
                 f"budget={budget}|phase_scan_index={phase_state.scan_index}"
                 f"|phase_m={phase_state.m}"
+                f"|phase_decision={phase_state.decision_status.value}"
+                f"|decision_age={phase_state.decision_stability_age}"
                 f"|confirmed_phase={str(_confirmed_phase_exists(phase_state)).lower()}"
                 f"|valid_classes={','.join(str(c) for c in phase_state.valid_phase_classes) or '-'}"
                 f"|groups={_phase_groups_log_value(phase_state)}"
                 f"|g0={','.join(str(c) for c in phase_state.rejected_classes) or '-'}"
                 f"|hypotheses={len(final_result.hypotheses)}"
+                f"|residual_evidence={phase_state.residual_evidence_count}"
+                f"|residual_classes={','.join(str(c) for c in phase_state.residual_evidence_classes) or '-'}"
+                f"|identity_classes={','.join(str(c) for c in phase_state.identity_evidence_classes) or '-'}"
                 f"|solver_calls={final_result.num_solver_calls}"
             )
-            if _confirmed_phase_exists(phase_state):
-                break
 
         assert final_result is not None
         assert phase_state is not None
@@ -602,6 +618,7 @@ class Stage2Trainer:
         print(
             "STAGE2_STATISTICS|"
             f"scan_index={phase_state.scan_index}|phase_m={phase_state.m}"
+            f"|phase_decision={phase_state.decision_status.value}"
             f"|confirmed_phase={str(_confirmed_phase_exists(phase_state)).lower()}"
             f"|stable_labels={stable_result.num_stable_labels}"
             f"|shape_status={shape_state.status.value}"
@@ -650,6 +667,7 @@ class Stage2Trainer:
         print(
             "STAGE2_STATISTICS_REFRESH|"
             f"phase_m={previous.phase_state.m}"
+            f"|phase_decision={previous.phase_state.decision_status.value}"
             f"|confirmed_phase={str(_confirmed_phase_exists(previous.phase_state)).lower()}"
             f"|stable_labels={stable_result.num_stable_labels}"
             f"|stable_coverage={stable_coverage:.4f}"

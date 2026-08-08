@@ -78,6 +78,31 @@ def test_sqrt_mean_passes_k_by_n_and_parallel_false_to_fdasrsf(monkeypatch) -> N
     assert result.requires_grad is False
 
 
+def test_sqrt_mean_falls_back_when_fdasrsf_does_not_converge(monkeypatch) -> None:
+    import fdasrsf.utility_functions as utility_functions
+    from methods.structure_da.phase_geometry import phase_distance, sqrt_mean_gamma
+
+    def broken_sqrt_mean(*args, **kwargs):
+        raise IndexError("index 501 is out of bounds for axis 0 with size 501")
+
+    monkeypatch.setattr(utility_functions, "SqrtMean", broken_sqrt_mean)
+    grid = _identity()
+    gammas = torch.stack((grid.pow(2.00), grid.pow(2.02)))
+
+    result = sqrt_mean_gamma(gammas)
+
+    assert result.dtype == torch.float64
+    assert result.device.type == "cpu"
+    assert result.requires_grad is False
+    assert torch.isfinite(result).all()
+    assert result[0].item() == pytest.approx(0.0, abs=1e-12)
+    assert result[-1].item() == pytest.approx(1.0, abs=1e-12)
+    assert torch.all(torch.diff(result) > 0.0)
+    left = phase_distance(gammas[0], result).item()
+    right = phase_distance(gammas[1], result).item()
+    assert left == pytest.approx(right, rel=0.0, abs=1e-8)
+
+
 @pytest.mark.parametrize("reducer_name", ["sqrt_median_gamma", "sqrt_mean_gamma"])
 def test_identical_gammas_bypass_fdasrsf_without_nan(monkeypatch, reducer_name: str) -> None:
     import fdasrsf.utility_functions as utility_functions

@@ -104,18 +104,99 @@ def sqrt_median_gamma(gammas: Tensor) -> Tensor:
     )
 
 
+def _intrinsic_mean_gamma_fallback(
+    gammas: Tensor, *, max_iterations: int = 256, tolerance: float = 1e-10
+) -> Tensor:
+    """Deterministic Fisher--Rao Karcher mean fallback on the SRVF sphere.
+
+    ``gamma_to_psi`` returns a unit-norm square-root velocity under the
+    discretized L2 inner product.  Multiplying by ``sqrt(step)`` converts the
+    samples to ordinary Euclidean unit vectors, so the usual sphere log/exp
+    maps implement the same Fisher--Rao geometry without depending on the
+    fdasrsf optimizer.
+    """
+    gammas_cpu = _as_gammas(gammas)
+    interval_count = int(gammas_cpu.shape[1] - 1)
+    step = 1.0 / interval_count
+    sqrt_step = step ** 0.5
+    sphere_points = torch.stack(
+        [gamma_to_psi(gamma) * sqrt_step for gamma in gammas_cpu], dim=0
+    )
+
+    mean_direction = sphere_points.mean(dim=0)
+    mean_norm = torch.linalg.vector_norm(mean_direction)
+    if not torch.isfinite(mean_norm) or mean_norm.item() <= 0.0:
+        raise RuntimeError("cannot initialize Fisher--Rao mean from the supplied warps")
+    mu = mean_direction / mean_norm
+
+    for _ in range(max_iterations):
+        tangents = []
+        for point in sphere_points:
+            cosine = torch.dot(mu, point).clamp(-1.0, 1.0)
+            theta = torch.acos(cosine)
+            if theta.item() <= 1e-12:
+                tangents.append(torch.zeros_like(mu))
+                continue
+            sine = torch.sin(theta)
+            if sine.abs().item() <= 1e-12:
+                raise RuntimeError("Fisher--Rao mean encountered an antipodal warp")
+            tangents.append((theta / sine) * (point - cosine * mu))
+        tangent_mean = torch.stack(tangents, dim=0).mean(dim=0)
+        tangent_norm = torch.linalg.vector_norm(tangent_mean)
+        if not torch.isfinite(tangent_norm):
+            raise RuntimeError("Fisher--Rao mean produced a non-finite tangent")
+        if tangent_norm.item() <= tolerance:
+            break
+        mu = (
+            torch.cos(tangent_norm) * mu
+            + torch.sin(tangent_norm) * tangent_mean / tangent_norm
+        )
+        mu_norm = torch.linalg.vector_norm(mu)
+        if not torch.isfinite(mu_norm) or mu_norm.item() <= 0.0:
+            raise RuntimeError("Fisher--Rao mean produced an invalid sphere point")
+        mu = mu / mu_norm
+
+    # All input warp SRVFs lie in the non-negative orthant.  Numerical sphere
+    # updates can create tiny negative values; clipping preserves monotonicity
+    # while leaving the geometry unchanged at numerical precision.
+    mu = mu.clamp_min(0.0)
+    mu_norm = torch.linalg.vector_norm(mu)
+    if not torch.isfinite(mu_norm) or mu_norm.item() <= 0.0:
+        raise RuntimeError("Fisher--Rao mean fallback collapsed to zero")
+    mu = mu / mu_norm
+
+    # In Euclidean sphere coordinates, each squared component is exactly the
+    # corresponding gamma increment because derivative * step = psi^2 * step.
+    increments = mu.square()
+    mean_gamma = torch.empty(
+        interval_count + 1, dtype=torch.float64, device="cpu"
+    )
+    mean_gamma[0] = 0.0
+    mean_gamma[1:] = torch.cumsum(increments, dim=0)
+    mean_gamma[-1] = 1.0
+    return mean_gamma.detach()
+
+
 def sqrt_mean_gamma(gammas: Tensor) -> Tensor:
-    """Compute the unweighted fdasrsf square-root mean of ``gammas[N,K]``."""
+    """Compute the unweighted Fisher--Rao square-root mean of ``gammas[N,K]``.
+
+    fdasrsf remains the primary implementation.  Its ``SqrtMean`` routine can
+    raise on non-convergence for otherwise valid monotone warps; in that case
+    fall back to an internal Karcher-mean iteration on the same SRVF sphere.
+    """
     gammas_cpu = _as_gammas(gammas)
     if _all_phase_identical(gammas_cpu):
         return gammas_cpu[0].clone().detach()
     from fdasrsf import utility_functions
 
     gamma_matrix_np = gammas_cpu.numpy().T
-    _mu, gam_mean, _psi, _vec = utility_functions.SqrtMean(
-        gamma_matrix_np,
-        parallel=False,
-    )
-    return _validate_reducer_result(
-        gam_mean, size=gammas_cpu.shape[1], name="SqrtMean"
-    )
+    try:
+        _mu, gam_mean, _psi, _vec = utility_functions.SqrtMean(
+            gamma_matrix_np,
+            parallel=False,
+        )
+        return _validate_reducer_result(
+            gam_mean, size=gammas_cpu.shape[1], name="SqrtMean"
+        )
+    except Exception:
+        return _intrinsic_mean_gamma_fallback(gammas_cpu)

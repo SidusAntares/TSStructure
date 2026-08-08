@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
+import math
 
 import torch
 from torch import Tensor
@@ -14,7 +15,10 @@ from .phase_geometry import (
     sqrt_mean_gamma,
     sqrt_median_gamma,
 )
-from .target_hypothesis_scan import TargetHypothesisScanResult
+from .target_hypothesis_scan import (
+    PairwiseClassAlignment,
+    TargetHypothesisScanResult,
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,11 @@ class DomainPhaseConfig:
     phase_center_drift_max: float
     phase_group_cap: int = 2
     phase_min_classes_per_group: int = 2
+    # Identity evidence is deliberately disabled until calibration supplies
+    # explicit numerical tolerances.  ``None`` must never be interpreted as
+    # evidence for identity.
+    phase_identity_radius: float | None = None
+    phase_identity_gain_ratio_min: float | None = None
 
     def __post_init__(self) -> None:
         if self.phase_group_cap != 2:
@@ -38,6 +47,10 @@ class DomainPhaseConfig:
             raise ValueError("phase_min_classes_per_group must equal 2")
         if self.phase_confirmation_patience < 2:
             raise ValueError("phase_confirmation_patience must be at least 2")
+        if (self.phase_identity_radius is None) != (self.phase_identity_gain_ratio_min is None):
+            raise ValueError(
+                "phase_identity_radius and phase_identity_gain_ratio_min must both be set or both be None"
+            )
         thresholds = {
             "phase_min_samples_per_class": self.phase_min_samples_per_class,
             "phase_class_dispersion_max": self.phase_class_dispersion_max,
@@ -47,6 +60,14 @@ class DomainPhaseConfig:
             "phase_group_core_separation": self.phase_group_core_separation,
             "phase_global_radius": self.phase_global_radius,
             "phase_center_drift_max": self.phase_center_drift_max,
+            **(
+                {}
+                if self.phase_identity_radius is None
+                else {
+                    "phase_identity_radius": self.phase_identity_radius,
+                    "phase_identity_gain_ratio_min": self.phase_identity_gain_ratio_min,
+                }
+            ),
         }
         for name, value in thresholds.items():
             if value < 0:
@@ -73,6 +94,50 @@ class PhaseGroupStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class PhaseDecisionStatus(str, Enum):
+    """Domain-level decision, distinct from non-identity group model order M."""
+
+    UNCONFIRMED = "unconfirmed"
+    IDENTITY_CONFIRMED = "identity_confirmed"
+    NONIDENTITY_CONFIRMED = "nonidentity_confirmed"
+
+
+class CandidatePhaseCompatibilityStatus(str, Enum):
+    NO_CONFIRMED_GROUP = "no_confirmed_group"
+    UNUSABLE = "unusable"
+    COMPATIBLE = "compatible"
+    RESIDUAL = "residual"
+
+
+@dataclass(frozen=True)
+class CandidatePhaseCompatibility:
+    sample_id: int
+    class_id: int
+    status: CandidatePhaseCompatibilityStatus
+    assigned_group_id: int | None
+    nearest_group_id: int | None
+    phase_distance_to_group: float | None
+    gamma: Tensor | None
+
+
+@dataclass(frozen=True)
+class ResidualPhaseEvidence:
+    sample_id: int
+    class_id: int
+    gamma: Tensor
+    nearest_group_id: int | None
+    phase_distance_to_group: float
+
+
+@dataclass(frozen=True)
+class ResidualPhaseGroupCandidate:
+    member_classes: tuple[int, ...]
+    center_gamma: Tensor
+    sample_evidence_count: float
+    within_dispersion: float
+    diameter: float
+
+
 @dataclass(frozen=True)
 class PhaseGroup:
     group_id: int
@@ -96,6 +161,12 @@ class DomainPhaseState:
     valid_phase_classes: tuple[int, ...]
     groups: tuple[PhaseGroup, ...]
     rejected_classes: tuple[int, ...]
+    decision_status: PhaseDecisionStatus = PhaseDecisionStatus.UNCONFIRMED
+    decision_stability_age: int = 0
+    identity_evidence_classes: tuple[int, ...] = ()
+    identity_evidence_count: float = 0.0
+    residual_evidence_count: int = 0
+    residual_evidence_classes: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -375,32 +446,310 @@ def _materialize_groups(
     return tuple(groups)
 
 
-@torch.no_grad()
-def update_domain_phase_state(
+def _alignment_lookup(
+    scan_result: TargetHypothesisScanResult,
+) -> dict[tuple[int, int], PairwiseClassAlignment]:
+    return {
+        (int(item.sample_id), int(item.class_id)): item
+        for item in scan_result.pairwise_alignments
+    }
+
+
+def _identity_evidence_summary(
     scan_result: TargetHypothesisScanResult,
     config: DomainPhaseConfig,
-    previous_state: DomainPhaseState | None = None,
-) -> DomainPhaseState:
-    """Build robust phase classes, M=0/1/2 groups and confirmation state."""
-    if not isinstance(scan_result, TargetHypothesisScanResult):
-        raise TypeError("scan_result must be a TargetHypothesisScanResult")
-    class_centers = _build_class_centers(scan_result, config, previous_state)
-    valid_indices = tuple(
-        index for index, center in enumerate(class_centers) if center.valid
+) -> tuple[tuple[int, ...], float]:
+    """Collect explicit identity evidence from geometry-first primary labels.
+
+    Identity is disabled unless both calibrated tolerances are supplied.  A
+    missing non-identity group is therefore never reinterpreted as identity.
+    """
+    if (
+        config.phase_identity_radius is None
+        or config.phase_identity_gain_ratio_min is None
+    ):
+        return (), 0.0
+    lookup = _alignment_lookup(scan_result)
+    counts: dict[int, float] = {}
+    for candidate in scan_result.candidate_pseudo_labels:
+        alignment = lookup.get((int(candidate.sample_id), int(candidate.class_id)))
+        if (
+            alignment is None
+            or alignment.gamma is None
+            or not alignment.numerically_valid
+            or alignment.t_gain_ratio is None
+            or not math.isfinite(float(alignment.t_gain_ratio))
+            or alignment.q_shape_distance is None
+            or not math.isfinite(float(alignment.q_shape_distance))
+        ):
+            continue
+        identity = _identity_like(alignment.gamma)
+        distance = float(phase_distance(alignment.gamma, identity).item())
+        if (
+            distance <= float(config.phase_identity_radius)
+            and float(alignment.t_gain_ratio)
+            >= float(config.phase_identity_gain_ratio_min)
+        ):
+            class_id = int(candidate.class_id)
+            counts[class_id] = counts.get(class_id, 0.0) + 1.0
+    valid_classes = tuple(
+        sorted(
+            class_id
+            for class_id, count in counts.items()
+            if count >= config.phase_min_samples_per_class
+        )
     )
-    valid_classes = tuple(class_centers[index].class_id for index in valid_indices)
-    scan_index = 0 if previous_state is None else previous_state.scan_index + 1
-    invalid_classes = {
-        center.class_id for center in class_centers if not center.valid
-    }
-    if len(valid_indices) < config.phase_min_classes_per_group:
+    total = float(sum(counts[class_id] for class_id in valid_classes))
+    return valid_classes, total
+
+
+def _confirmed_groups(state: DomainPhaseState) -> tuple[PhaseGroup, ...]:
+    return tuple(
+        group for group in state.groups if group.status is PhaseGroupStatus.CONFIRMED
+    )
+
+
+@torch.no_grad()
+def evaluate_candidate_phase_compatibility(
+    scan_result: TargetHypothesisScanResult,
+    state: DomainPhaseState,
+    config: DomainPhaseConfig,
+) -> tuple[CandidatePhaseCompatibility, ...]:
+    """Compare each primary candidate gamma with confirmed Domain Phase groups.
+
+    This does not relabel the target sample.  It only states whether the
+    geometry-first candidate Phase evidence agrees with the already-confirmed
+    domain-level group center.  Reliable far candidates are retained as
+    residual evidence instead of being silently discarded.
+    """
+    lookup = _alignment_lookup(scan_result)
+    confirmed = _confirmed_groups(state)
+    output: list[CandidatePhaseCompatibility] = []
+    for candidate in scan_result.candidate_pseudo_labels:
+        key = (int(candidate.sample_id), int(candidate.class_id))
+        alignment = lookup.get(key)
+        gamma = None if alignment is None else alignment.gamma
+        if not confirmed:
+            output.append(
+                CandidatePhaseCompatibility(
+                    sample_id=key[0],
+                    class_id=key[1],
+                    status=CandidatePhaseCompatibilityStatus.NO_CONFIRMED_GROUP,
+                    assigned_group_id=None,
+                    nearest_group_id=None,
+                    phase_distance_to_group=None,
+                    gamma=None if gamma is None else gamma.detach().cpu().double(),
+                )
+            )
+            continue
+        if (
+            alignment is None
+            or gamma is None
+            or not alignment.phase_evidence_eligible
+        ):
+            output.append(
+                CandidatePhaseCompatibility(
+                    sample_id=key[0],
+                    class_id=key[1],
+                    status=CandidatePhaseCompatibilityStatus.UNUSABLE,
+                    assigned_group_id=None,
+                    nearest_group_id=None,
+                    phase_distance_to_group=None,
+                    gamma=None if gamma is None else gamma.detach().cpu().double(),
+                )
+            )
+            continue
+
+        assigned = next(
+            (group for group in confirmed if key[1] in group.member_classes),
+            None,
+        )
+        distances = [
+            (float(phase_distance(gamma, group.center_gamma).item()), group)
+            for group in confirmed
+        ]
+        _nearest_distance, nearest = min(distances, key=lambda item: item[0])
+        comparison_group = assigned or nearest
+        comparison_distance = float(
+            phase_distance(gamma, comparison_group.center_gamma).item()
+        )
+        compatible = comparison_distance <= config.phase_group_diameter_max
+        output.append(
+            CandidatePhaseCompatibility(
+                sample_id=key[0],
+                class_id=key[1],
+                status=(
+                    CandidatePhaseCompatibilityStatus.COMPATIBLE
+                    if compatible
+                    else CandidatePhaseCompatibilityStatus.RESIDUAL
+                ),
+                assigned_group_id=None if assigned is None else assigned.group_id,
+                nearest_group_id=nearest.group_id,
+                phase_distance_to_group=comparison_distance,
+                gamma=gamma.detach().cpu().double(),
+            )
+        )
+    return tuple(output)
+
+
+def collect_residual_phase_evidence(
+    compatibility: tuple[CandidatePhaseCompatibility, ...],
+) -> tuple[ResidualPhaseEvidence, ...]:
+    result = []
+    for item in compatibility:
+        if (
+            item.status is CandidatePhaseCompatibilityStatus.RESIDUAL
+            and item.gamma is not None
+            and item.phase_distance_to_group is not None
+        ):
+            result.append(
+                ResidualPhaseEvidence(
+                    sample_id=item.sample_id,
+                    class_id=item.class_id,
+                    gamma=item.gamma.detach().cpu().double(),
+                    nearest_group_id=item.nearest_group_id,
+                    phase_distance_to_group=float(item.phase_distance_to_group),
+                )
+            )
+    return tuple(result)
+
+
+def detect_residual_phase_group(
+    compatibility: tuple[CandidatePhaseCompatibility, ...],
+    state: DomainPhaseState,
+    config: DomainPhaseConfig,
+) -> ResidualPhaseGroupCandidate | None:
+    """Return a supported residual group, never one produced by a lone outlier."""
+    residuals = collect_residual_phase_evidence(compatibility)
+    by_class: dict[int, list[ResidualPhaseEvidence]] = {}
+    for item in residuals:
+        by_class.setdefault(int(item.class_id), []).append(item)
+
+    centers: list[PhaseClassCenter] = []
+    for class_id in sorted(by_class):
+        evidence = by_class[class_id]
+        if len(evidence) < config.phase_min_samples_per_class:
+            continue
+        gammas = torch.stack([item.gamma for item in evidence])
+        center = sqrt_median_gamma(gammas)
+        distances = torch.stack([phase_distance(gamma, center) for gamma in gammas])
+        pairwise = pairwise_phase_distances(gammas)
+        dispersion = float(distances.square().mean().item())
+        diameter = float(pairwise.max().item())
+        if (
+            dispersion > config.phase_class_dispersion_max
+            or diameter > config.phase_class_diameter_max
+        ):
+            continue
+        centers.append(
+            PhaseClassCenter(
+                class_id=class_id,
+                center_gamma=center.detach(),
+                candidate_count=len(evidence),
+                effective_evidence_count=float(len(evidence)),
+                dispersion=dispersion,
+                diameter=diameter,
+                median_distance=float(distances.median().item()),
+                center_drift=None,
+                valid=True,
+                reject_reason=None,
+            )
+        )
+    if len(centers) < config.phase_min_classes_per_group:
+        return None
+    center_tuple = tuple(centers)
+    valid_indices = tuple(range(len(center_tuple)))
+    candidate = _try_m1(valid_indices, center_tuple, config)
+    if candidate is None:
+        return None
+    group, _outliers = candidate
+    confirmed = _confirmed_groups(state)
+    for existing in confirmed:
+        separation = float(
+            phase_distance(group.center_gamma, existing.center_gamma).item()
+        )
+        if not (
+            separation >= config.phase_group_core_separation
+            and separation > group.core_radius + existing.core_radius
+        ):
+            return None
+    member_classes = tuple(
+        sorted(center_tuple[index].class_id for index in group.member_indices)
+    )
+    evidence_count = float(
+        sum(center_tuple[index].effective_evidence_count for index in group.member_indices)
+    )
+    return ResidualPhaseGroupCandidate(
+        member_classes=member_classes,
+        center_gamma=group.center_gamma.detach(),
+        sample_evidence_count=evidence_count,
+        within_dispersion=group.within_dispersion,
+        diameter=group.diameter,
+    )
+
+
+def _model_signature(groups: tuple[PhaseGroup, ...]) -> tuple[tuple[int, ...], ...]:
+    return tuple(sorted(tuple(group.member_classes) for group in groups))
+
+
+def _decision_stability_age(
+    groups: tuple[PhaseGroup, ...],
+    previous_state: DomainPhaseState | None,
+    *,
+    identity_classes: tuple[int, ...],
+) -> int:
+    if groups:
+        if (
+            previous_state is not None
+            and previous_state.groups
+            and _model_signature(groups) == _model_signature(previous_state.groups)
+            and all(
+                group.center_drift is not None
+                for group in groups
+            )
+        ):
+            return previous_state.decision_stability_age + 1
+        return 1
+    if identity_classes:
+        if (
+            previous_state is not None
+            and previous_state.m == 0
+            and previous_state.identity_evidence_classes == identity_classes
+        ):
+            return previous_state.decision_stability_age + 1
+        return 1
+    return 0
+
+
+def _build_grouped_state(
+    *,
+    scan_index: int,
+    class_centers: tuple[PhaseClassCenter, ...],
+    valid_classes: tuple[int, ...],
+    invalid_classes: set[int],
+    valid_indices: tuple[int, ...],
+    config: DomainPhaseConfig,
+    previous_state: DomainPhaseState | None,
+) -> DomainPhaseState:
+    # M=2 is evaluated before M=1.  The existing separation/core constraints
+    # are the structural guard against splitting one coherent group merely
+    # because two clusters always fit more tightly than one.
+    m2 = _try_m2(valid_indices, class_centers, config) if len(valid_indices) >= 4 else None
+    if m2 is not None:
+        candidates, outlier_indices = m2
+        groups = _materialize_groups(candidates, class_centers, previous_state, config)
+        rejected = invalid_classes | {
+            class_centers[index].class_id for index in outlier_indices
+        }
+        active = {class_id for group in groups for class_id in group.member_classes}
+        rejected.update(set(valid_classes) - active)
         return DomainPhaseState(
             scan_index=scan_index,
-            m=0,
+            m=2,
             class_centers=class_centers,
             valid_phase_classes=valid_classes,
-            groups=(),
-            rejected_classes=tuple(sorted(center.class_id for center in class_centers)),
+            groups=groups,
+            rejected_classes=tuple(sorted(rejected)),
         )
 
     m1 = _try_m1(valid_indices, class_centers, config)
@@ -419,24 +768,6 @@ def update_domain_phase_state(
             rejected_classes=tuple(sorted(rejected)),
         )
 
-    m2 = _try_m2(valid_indices, class_centers, config)
-    if m2 is not None:
-        candidates, outlier_indices = m2
-        groups = _materialize_groups(candidates, class_centers, previous_state, config)
-        rejected = invalid_classes | {
-            class_centers[index].class_id for index in outlier_indices
-        }
-        active = {class_id for group in groups for class_id in group.member_classes}
-        rejected.update(set(valid_classes) - active)
-        return DomainPhaseState(
-            scan_index=scan_index,
-            m=2,
-            class_centers=class_centers,
-            valid_phase_classes=valid_classes,
-            groups=groups,
-            rejected_classes=tuple(sorted(rejected)),
-        )
-
     return DomainPhaseState(
         scan_index=scan_index,
         m=0,
@@ -444,4 +775,95 @@ def update_domain_phase_state(
         valid_phase_classes=valid_classes,
         groups=(),
         rejected_classes=tuple(sorted(center.class_id for center in class_centers)),
+    )
+
+
+@torch.no_grad()
+def update_domain_phase_state(
+    scan_result: TargetHypothesisScanResult,
+    config: DomainPhaseConfig,
+    previous_state: DomainPhaseState | None = None,
+) -> DomainPhaseState:
+    """Update group model and explicit domain-level Phase decision state."""
+    if not isinstance(scan_result, TargetHypothesisScanResult):
+        raise TypeError("scan_result must be a TargetHypothesisScanResult")
+    class_centers = _build_class_centers(scan_result, config, previous_state)
+    valid_indices = tuple(
+        index for index, center in enumerate(class_centers) if center.valid
+    )
+    valid_classes = tuple(class_centers[index].class_id for index in valid_indices)
+    scan_index = 0 if previous_state is None else previous_state.scan_index + 1
+    invalid_classes = {
+        center.class_id for center in class_centers if not center.valid
+    }
+
+    if len(valid_indices) < config.phase_min_classes_per_group:
+        state = DomainPhaseState(
+            scan_index=scan_index,
+            m=0,
+            class_centers=class_centers,
+            valid_phase_classes=valid_classes,
+            groups=(),
+            rejected_classes=tuple(sorted(center.class_id for center in class_centers)),
+        )
+    else:
+        state = _build_grouped_state(
+            scan_index=scan_index,
+            class_centers=class_centers,
+            valid_classes=valid_classes,
+            invalid_classes=invalid_classes,
+            valid_indices=valid_indices,
+            config=config,
+            previous_state=previous_state,
+        )
+
+    identity_classes, identity_count = _identity_evidence_summary(scan_result, config)
+    stability_age = _decision_stability_age(
+        state.groups,
+        previous_state,
+        identity_classes=identity_classes,
+    )
+    provisional = replace(
+        state,
+        decision_stability_age=stability_age,
+        identity_evidence_classes=identity_classes,
+        identity_evidence_count=identity_count,
+    )
+
+    compatibility = evaluate_candidate_phase_compatibility(
+        scan_result,
+        provisional,
+        config,
+    )
+    residuals = collect_residual_phase_evidence(compatibility)
+    residual_group = detect_residual_phase_group(
+        compatibility,
+        provisional,
+        config,
+    )
+    residual_classes = tuple(sorted({item.class_id for item in residuals}))
+
+    decision = PhaseDecisionStatus.UNCONFIRMED
+    if provisional.m > 0:
+        all_confirmed = bool(provisional.groups) and all(
+            group.status is PhaseGroupStatus.CONFIRMED
+            for group in provisional.groups
+        )
+        if (
+            all_confirmed
+            and stability_age >= config.phase_confirmation_patience
+            and residual_group is None
+        ):
+            decision = PhaseDecisionStatus.NONIDENTITY_CONFIRMED
+    elif (
+        len(identity_classes) >= config.phase_min_classes_per_group
+        and stability_age >= config.phase_confirmation_patience
+    ):
+        decision = PhaseDecisionStatus.IDENTITY_CONFIRMED
+
+    return replace(
+        provisional,
+        decision_status=decision,
+        residual_evidence_count=len(residuals),
+        residual_evidence_classes=residual_classes,
     )

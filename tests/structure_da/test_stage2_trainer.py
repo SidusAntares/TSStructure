@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from methods.structure_da import (
     DomainPhaseConfig,
     DomainPhaseState,
+    PhaseDecisionStatus,
     DomainShapeConfig,
     DomainShapeState,
     DomainShapeStatus,
@@ -134,6 +135,7 @@ def _phase_state(*, confirmed: bool) -> DomainPhaseState:
             valid_phase_classes=(),
             groups=(),
             rejected_classes=(),
+            decision_status=PhaseDecisionStatus.UNCONFIRMED,
         )
     gamma = torch.tensor([0.0, 0.18, 0.48, 0.78, 1.0])
     group = PhaseGroup(
@@ -156,6 +158,8 @@ def _phase_state(*, confirmed: bool) -> DomainPhaseState:
         valid_phase_classes=(0, 1, 2),
         groups=(group,),
         rejected_classes=(),
+        decision_status=PhaseDecisionStatus.NONIDENTITY_CONFIRMED,
+        decision_stability_age=2,
     )
 
 
@@ -565,11 +569,13 @@ def test_phase_dp_stops_when_domain_phase_confirms_and_shape_uses_direct_evidenc
     trainer._stable_and_shape_from_fixed_phase = fake_stable_shape
     snapshot = Stage2Trainer.initialize_statistics(trainer)
 
-    # Exact-DP acquisition stops as soon as Phase is confirmed at 128.
-    assert scanner.scan_budgets == [64, 128]
-    assert phase_calls == [64, 128]
-    # Shape confirmation consumes nested direct confirmed-phase evidence and
-    # does not trigger any additional DP stages.
+    # Round B never treats the first confirmed group as proof that the whole
+    # domain-level model order is complete; all configured nested budgets are
+    # scanned so later evidence can reveal M=2.
+    assert scanner.scan_budgets == [64, 128, 256, 512]
+    assert phase_calls == [64, 128, 256, 512]
+    # Shape confirmation starts only after the final Phase evidence state and
+    # consumes confirmed-phase views without additional DP.
     assert shape_budgets == [64, 128]
     assert snapshot.shape_state.status is DomainShapeStatus.CONFIRMED
     assert trainer.shape_evidence_sample_ids == tuple(range(128))
