@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+import methods.structure_da.target_hypothesis_scan as scan_module
+
 from methods.structure_da import (
     DeviceBatchLoader,
+    PairwiseClassAlignment,
     FdasrsfCurveRegistrationAdapter,
     PhaseHypothesisScanConfig,
     SourcePrototypeBank,
@@ -82,33 +87,33 @@ def _scan_config(**overrides) -> PhaseHypothesisScanConfig:
     return PhaseHypothesisScanConfig(**values)
 
 
-def _stage1_bank() -> SourcePrototypeBank:
+def _stage1_bank(num_classes: int = 3, *, q_outer: float = 0.9) -> SourcePrototypeBank:
     return SourcePrototypeBank(
-        trend_srvf=torch.zeros(3, 64, 4),
-        shape_srvf=torch.zeros(3, 64, 4),
-        trend_support=torch.ones(3, 64),
-        shape_support=torch.ones(3, 64),
-        fused=torch.zeros(3, 8),
-        class_counts=torch.tensor([4, 4, 4]),
-        ready=torch.ones(3, dtype=torch.bool),
-        q_distance_samples=(
-            torch.tensor([0.1, 0.2, 0.4, 0.8]),
-            torch.tensor([0.1, 0.2, 0.4, 0.8]),
-            torch.tensor([0.1, 0.2, 0.4, 0.8]),
+        trend_srvf=torch.zeros(num_classes, 64, 4),
+        shape_srvf=torch.zeros(num_classes, 64, 4),
+        trend_support=torch.ones(num_classes, 64),
+        shape_support=torch.ones(num_classes, 64),
+        fused=torch.zeros(num_classes, 8),
+        class_counts=torch.full((num_classes,), 4, dtype=torch.long),
+        ready=torch.ones(num_classes, dtype=torch.bool),
+        q_distance_samples=tuple(
+            torch.tensor([0.1, 0.2, 0.4, 0.8]) for _ in range(num_classes)
         ),
-        f_distance_samples=(torch.zeros(0), torch.zeros(0), torch.zeros(0)),
-        q_quantiles=torch.tensor([[0.3, 0.5, 0.9]] * 3),
-        f_quantiles=torch.zeros(3, 3),
+        f_distance_samples=tuple(torch.zeros(0) for _ in range(num_classes)),
+        q_quantiles=torch.tensor([[0.3, 0.5, q_outer]] * num_classes),
+        f_quantiles=torch.zeros(num_classes, 3),
         version=1,
     )
 
 
-def _reg_bank() -> SourceRegistrationPrototypeBank:
+def _reg_bank(num_classes: int = 3, *, trend_srvf: torch.Tensor | None = None) -> SourceRegistrationPrototypeBank:
+    if trend_srvf is None:
+        trend_srvf = torch.zeros(num_classes, 128, 4)
     return SourceRegistrationPrototypeBank(
-        trend_srvf=torch.zeros(3, 128, 4),
-        trend_support=torch.ones(3, 128),
-        class_counts=torch.tensor([4, 4, 4]),
-        ready=torch.ones(3, dtype=torch.bool),
+        trend_srvf=trend_srvf,
+        trend_support=torch.ones(num_classes, 128),
+        class_counts=torch.full((num_classes,), 4, dtype=torch.long),
+        ready=torch.ones(num_classes, dtype=torch.bool),
         registration_grid=torch.linspace(0, 1, 128),
     )
 
@@ -217,6 +222,12 @@ def test_scan_ignores_target_labels() -> None:
         device=torch.device("cpu"), shape_extractor=shape_extractor,
         reg_extractor=reg_extractor, adapter=_IdentityAdapter(),
     )
+    assert _candidate_signature(result_a) == _candidate_signature(result_b)
+    assert len(result_a.pairwise_alignments) == len(result_b.pairwise_alignments)
+    for aa, ab in zip(result_a.pairwise_alignments, result_b.pairwise_alignments):
+        assert (aa.sample_id, aa.class_id) == (ab.sample_id, ab.class_id)
+        if aa.gamma is not None and ab.gamma is not None:
+            torch.testing.assert_close(aa.gamma, ab.gamma, rtol=0, atol=0)
     assert len(result_a.hypotheses) == len(result_b.hypotheses)
     for ha, hb in zip(result_a.hypotheses, result_b.hypotheses):
         assert ha.class_id == hb.class_id
@@ -312,20 +323,26 @@ def test_scan_keeps_exact_dp_solver_inputs_cpu_native() -> None:
     assert all(hypothesis.gamma.device.type == "cpu" for hypothesis in result.hypotheses)
 
 
-def test_high_recall_proposal_reduces_exact_dp_calls() -> None:
-    model = _model().eval()
+def test_formal_scan_runs_exact_dp_for_every_ready_class() -> None:
+    num_classes = 10
+    model = _model(num_classes=num_classes).eval()
     shape_extractor, reg_extractor = _extractors(model)
-    loader = DataLoader(TinyParcelDataset(n=8, labels=False), batch_size=4)
+    loader = DataLoader(TinyParcelDataset(n=4, labels=False), batch_size=2)
     adapter = _IdentityAdapter()
     result = scan_target_class_phase_hypotheses(
-        model, loader, _stage1_bank(), _reg_bank(), _scan_config(),
+        model, loader, _stage1_bank(num_classes), _reg_bank(num_classes), _scan_config(),
         device=torch.device("cpu"), shape_extractor=shape_extractor,
         reg_extractor=reg_extractor, adapter=adapter,
     )
-    assert result.num_all_class_pairs == 8 * 3
-    assert result.num_solver_calls == adapter.calls
-    assert result.num_solver_calls <= result.num_all_class_pairs
-    assert result.num_proposal_pairs <= result.num_all_class_pairs
+    assert result.num_all_class_pairs == 4 * 10
+    assert result.num_pairwise_attempted == 4 * 10
+    assert result.num_solver_calls == 4 * 10
+    assert adapter.calls == 4 * 10
+    assert len(result.pairwise_alignments) == 4 * 10
+    assert result.pairwise_class_counts == (4,) * 10
+    # Deprecated proposal diagnostics are aliases only; there is no pruning.
+    assert result.num_proposal_pairs == result.num_all_class_pairs
+    assert result.proposal_class_counts == result.pairwise_class_counts
 
 
 def test_progressive_scanner_only_solves_new_nested_evidence() -> None:
@@ -355,4 +372,223 @@ def test_progressive_scanner_only_solves_new_nested_evidence() -> None:
     assert set(first.scanned_sample_ids).issubset(second.scanned_sample_ids)
     assert adapter.calls == second.num_solver_calls
     assert adapter.calls > calls_after_first
-    assert second.num_solver_calls - first.num_solver_calls <= 4 * 3
+    assert second.num_solver_calls - first.num_solver_calls == 4 * 3
+
+
+def _alignment(
+    *,
+    class_id: int,
+    q_distance: float,
+    q_percentile: float,
+    eligible: bool = True,
+    sample_id: int = 0,
+    reasons: tuple[str, ...] = (),
+) -> PairwiseClassAlignment:
+    gamma = torch.linspace(0.0, 1.0, 128, dtype=torch.float64)
+    return PairwiseClassAlignment(
+        sample_id=sample_id,
+        class_id=class_id,
+        gamma=gamma,
+        t_identity_error=1.0,
+        t_registered_error=0.5,
+        t_gain_ratio=0.5,
+        pre_common_support_t=1.0,
+        common_support_t=1.0,
+        gamma_finite=True,
+        gamma_endpoint_error=0.0,
+        gamma_strictly_increasing=True,
+        gamma_min_increment=1.0 / 127.0,
+        gamma_max_local_speed=1.0,
+        gamma_roughness=0.0,
+        phase_deviation=0.0,
+        q_shape_distance=q_distance,
+        q_distance_percentile=q_percentile,
+        common_support_shape=1.0,
+        numerically_valid=True,
+        phase_evidence_eligible=eligible,
+        reject_reasons=reasons,
+    )
+
+
+def _candidate_signature(result):
+    return tuple(
+        (
+            item.sample_id,
+            item.class_id,
+            item.secondary_class_id,
+            item.ambiguous,
+        )
+        for item in result.candidate_pseudo_labels
+    )
+
+
+def test_candidate_pseudo_label_ignores_classifier_logits() -> None:
+    model_a = _model().eval()
+    model_b = copy.deepcopy(model_a).eval()
+    with torch.no_grad():
+        final = model_b.classifier[-1]
+        final.weight.zero_()
+        final.bias.copy_(torch.tensor([-100.0, -50.0, 100.0]))
+
+    loader = DataLoader(TinyParcelDataset(n=5, labels=False), batch_size=5)
+    shape_a, reg_a = _extractors(model_a)
+    shape_b, reg_b = _extractors(model_b)
+    result_a = scan_target_class_phase_hypotheses(
+        model_a, loader, _stage1_bank(), _reg_bank(), _scan_config(),
+        device=torch.device("cpu"), shape_extractor=shape_a, reg_extractor=reg_a,
+        adapter=_IdentityAdapter(),
+    )
+    result_b = scan_target_class_phase_hypotheses(
+        model_b, loader, _stage1_bank(), _reg_bank(), _scan_config(),
+        device=torch.device("cpu"), shape_extractor=shape_b, reg_extractor=reg_b,
+        adapter=_IdentityAdapter(),
+    )
+    assert _candidate_signature(result_a) == _candidate_signature(result_b)
+
+
+def test_candidate_pseudo_label_does_not_use_identity_trend_ranking() -> None:
+    model = _model().eval()
+    shape_extractor, reg_extractor = _extractors(model)
+    loader = DataLoader(TinyParcelDataset(n=5, labels=False), batch_size=5)
+    normal = _reg_bank()
+    distorted = _reg_bank(
+        trend_srvf=torch.stack(
+            [torch.full((128, 4), float(scale)) for scale in (100.0, -50.0, 7.0)]
+        )
+    )
+    result_a = scan_target_class_phase_hypotheses(
+        model, loader, _stage1_bank(), normal, _scan_config(),
+        device=torch.device("cpu"), shape_extractor=shape_extractor, reg_extractor=reg_extractor,
+        adapter=_IdentityAdapter(),
+    )
+    result_b = scan_target_class_phase_hypotheses(
+        model, loader, _stage1_bank(), distorted, _scan_config(),
+        device=torch.device("cpu"), shape_extractor=shape_extractor, reg_extractor=reg_extractor,
+        adapter=_IdentityAdapter(),
+    )
+    assert _candidate_signature(result_a) == _candidate_signature(result_b)
+
+
+def test_candidate_pseudo_label_uses_raw_q_distance_not_percentile() -> None:
+    candidate, hypotheses = scan_module._select_candidate_and_hypotheses(
+        [
+            _alignment(class_id=0, q_distance=0.20, q_percentile=0.95),
+            _alignment(class_id=1, q_distance=0.30, q_percentile=0.05),
+        ],
+        ambiguity_margin=0.05,
+    )
+    assert candidate is not None
+    assert candidate.class_id == 0
+    assert [item.class_id for item in hypotheses] == [0]
+
+
+def test_clear_top1_only_contributes_phase_evidence() -> None:
+    candidate, hypotheses = scan_module._select_candidate_and_hypotheses(
+        [
+            _alignment(class_id=0, q_distance=0.10, q_percentile=0.8),
+            _alignment(class_id=1, q_distance=0.50, q_percentile=0.1),
+        ],
+        ambiguity_margin=0.20,
+    )
+    assert candidate is not None
+    assert candidate.class_id == 0
+    assert candidate.ambiguous is False
+    assert candidate.secondary_class_id is None
+    assert len(hypotheses) == 1
+    assert hypotheses[0].class_id == 0
+    assert hypotheses[0].preferred is True
+    assert hypotheses[0].evidence_weight == pytest.approx(1.0)
+
+
+def test_near_tie_keeps_at_most_two_phase_hypotheses() -> None:
+    candidate, hypotheses = scan_module._select_candidate_and_hypotheses(
+        [
+            _alignment(class_id=0, q_distance=0.10, q_percentile=0.9),
+            _alignment(class_id=1, q_distance=0.15, q_percentile=0.2),
+            _alignment(class_id=2, q_distance=0.50, q_percentile=0.1),
+        ],
+        ambiguity_margin=0.10,
+    )
+    assert candidate is not None
+    assert candidate.class_id == 0
+    assert candidate.ambiguous is True
+    assert candidate.secondary_class_id == 1
+    assert [item.class_id for item in hypotheses] == [0, 1]
+    assert all(item.ambiguous_class for item in hypotheses)
+    assert [item.evidence_weight for item in hypotheses] == pytest.approx([0.5, 0.5])
+
+
+def test_outer_range_failure_keeps_candidate_pseudo_label_but_not_phase_evidence() -> None:
+    candidate, hypotheses = scan_module._select_candidate_and_hypotheses(
+        [
+            _alignment(
+                class_id=0,
+                q_distance=0.10,
+                q_percentile=1.0,
+                eligible=False,
+                reasons=("shape_outer",),
+            ),
+            _alignment(class_id=1, q_distance=0.50, q_percentile=0.2),
+        ],
+        ambiguity_margin=0.05,
+    )
+    assert candidate is not None
+    assert candidate.class_id == 0
+    assert candidate.phase_evidence_eligible is False
+    # Class 1 cannot replace the geometry argmin merely because class 0 failed
+    # an evidence-reliability gate.
+    assert hypotheses == ()
+
+
+def test_all_successful_pairwise_gammas_are_cached() -> None:
+    model = _model().eval()
+    shape_extractor, reg_extractor = _extractors(model)
+    loader = DataLoader(TinyParcelDataset(n=4, labels=False), batch_size=2)
+    result = scan_target_class_phase_hypotheses(
+        model, loader, _stage1_bank(), _reg_bank(), _scan_config(),
+        device=torch.device("cpu"), shape_extractor=shape_extractor,
+        reg_extractor=reg_extractor, adapter=_IdentityAdapter(),
+    )
+    assert len(result.pairwise_alignments) == 4 * 3
+    assert all(item.gamma is not None for item in result.pairwise_alignments)
+    assert all(item.gamma.shape == (128,) for item in result.pairwise_alignments if item.gamma is not None)
+    assert {(item.sample_id, item.class_id) for item in result.pairwise_alignments} == {
+        (sample_id, class_id) for sample_id in range(4) for class_id in range(3)
+    }
+
+
+def test_support_gate_does_not_prune_classes_before_pseudo_label() -> None:
+    model = _model().eval()
+    shape_extractor, reg_extractor = _extractors(model)
+    loader = DataLoader(TinyParcelDataset(n=2, labels=False), batch_size=2)
+    adapter = _IdentityAdapter()
+    result = scan_target_class_phase_hypotheses(
+        model, loader, _stage1_bank(), _reg_bank(),
+        _scan_config(registration_min_common_support=2.0),
+        device=torch.device("cpu"), shape_extractor=shape_extractor,
+        reg_extractor=reg_extractor, adapter=adapter,
+    )
+    assert adapter.calls == 2 * 3
+    assert len(result.candidate_pseudo_labels) == 2
+    assert all(not item.phase_evidence_eligible for item in result.candidate_pseudo_labels)
+    assert result.num_pre_support_rejected == 2 * 3
+
+
+def test_actual_outer_gate_marks_reliability_without_erasing_candidate_label() -> None:
+    model = _model().eval()
+    shape_extractor, reg_extractor = _extractors(model)
+    loader = DataLoader(TinyParcelDataset(n=3, labels=False), batch_size=3)
+    result = scan_target_class_phase_hypotheses(
+        model, loader, _stage1_bank(q_outer=-1.0), _reg_bank(), _scan_config(),
+        device=torch.device("cpu"), shape_extractor=shape_extractor,
+        reg_extractor=reg_extractor, adapter=_IdentityAdapter(),
+    )
+    assert len(result.candidate_pseudo_labels) == 3
+    assert all(not item.phase_evidence_eligible for item in result.candidate_pseudo_labels)
+    assert result.hypotheses == ()
+    assert result.num_outer_rejected == 3 * 3
+    assert all(
+        "shape_outer" in item.reject_reasons
+        for item in result.pairwise_alignments
+        if item.q_shape_distance is not None
+    )

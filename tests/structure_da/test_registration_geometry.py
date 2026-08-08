@@ -111,4 +111,4 @@ def test_target_geometry_cache_holds_no_labels() -> None:
         shape_grid=torch.linspace(0, 1, 64),
     )
     fields = set(cache.__dataclass_fields__)
-    assert not (fields & {"labels", "logits", "pseudo_label", "z_shape"})
+    assert not (fields & {"labels", "logits", "classifier_logits", "pseudo_label", "z_shape"})

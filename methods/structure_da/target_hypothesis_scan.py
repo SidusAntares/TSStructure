@@ -1,20 +1,21 @@
-"""Progressive target evidence acquisition for Domain Phase estimation.
+"""Progressive all-class target evidence acquisition for Domain Phase.
 
-The expensive object in Stage 2 is an exact vector-valued curve-DP
-registration.  Domain Phase is a population statistic, so exact DP is only
-run for a deterministic representative target subset and only for high-recall
-class proposals.  The final registration/gain/Shape gates are unchanged: the
-proposal stage may *offer* a class, but only exact fdasrsf DP plus the frozen
-Stage-1 geometry may promote it to a phase hypothesis.
+For every representative target sample, this module performs the exact
+vector-valued T-SRVF registration against every ready source class.  The same
+class-conditioned gamma is then applied to target Shape geometry, and the raw
+Shape distance defines the candidate pseudo-label.  Statistical gates decide
+only whether the associated sample-class alignment is reliable enough to enter
+Domain Phase estimation; they do not erase the candidate pseudo-label itself.
 
-No target ground-truth labels are read anywhere in this module.
+All successful pairwise gammas are cached so later Phase-state logic can reuse
+them without rerunning fdasrsf.  No target ground-truth labels are read here.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 import os
 import platform
@@ -25,7 +26,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from .phase_evidence import PairwisePhaseCandidate, compute_gamma_diagnostics, empirical_cdf
+from .phase_evidence import compute_gamma_diagnostics, empirical_cdf
 from .phase_registration import (
     FdasrsfCurveRegistrationAdapter,
     check_gamma_legality,
@@ -44,7 +45,12 @@ from .temporal_srvf import TemporalSRVFExtractor
 
 @dataclass(frozen=True)
 class PhaseHypothesisScanConfig:
-    """Statistical gates plus fixed high-recall proposal settings."""
+    """Registration/Shape reliability gates for all-class evidence scanning.
+
+    ``proposal_*`` fields are retained only for CLI/checkpoint compatibility
+    with V6.  Round A deliberately ignores them: every ready source class is
+    registered for every selected target sample.
+    """
 
     registration_lambda: float
     registration_gain_ratio_max: float
@@ -66,6 +72,10 @@ class PhaseHypothesisScanConfig:
             raise ValueError("k_reg must be at least 2")
         if self.class_hypothesis_max != 2:
             raise ValueError("class_hypothesis_max must equal 2")
+        if self.class_hypothesis_margin < 0:
+            raise ValueError("class_hypothesis_margin must be non-negative")
+        # Deprecated V6 proposal settings remain type-checked for config
+        # compatibility, but do not affect class selection in Round A.
         for name in ("proposal_classifier_topk", "proposal_identity_topk"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -76,6 +86,59 @@ class PhaseHypothesisScanConfig:
             or self.registration_workers < 1
         ):
             raise ValueError("registration_workers must be a positive integer")
+
+
+@dataclass(frozen=True)
+class PairwiseClassAlignment:
+    """Cached result of one target-sample × source-class exact registration.
+
+    ``numerically_valid`` means the solver returned a finite, endpoint-valid,
+    strictly increasing gamma that can be used to evaluate Shape.  The stricter
+    ``phase_evidence_eligible`` flag additionally applies the configured
+    support/deformation/gain/Shape-range reliability gates.
+    """
+
+    sample_id: int
+    class_id: int
+    gamma: Tensor | None
+
+    t_identity_error: float | None
+    t_registered_error: float | None
+    t_gain_ratio: float | None
+    pre_common_support_t: float
+    common_support_t: float | None
+
+    gamma_finite: bool
+    gamma_endpoint_error: float | None
+    gamma_strictly_increasing: bool
+    gamma_min_increment: float | None
+    gamma_max_local_speed: float | None
+    gamma_roughness: float | None
+    phase_deviation: float | None
+
+    q_shape_distance: float | None
+    q_distance_percentile: float | None
+    common_support_shape: float | None
+
+    numerically_valid: bool
+    phase_evidence_eligible: bool
+    reject_reasons: tuple[str, ...]
+    solver_error: str | None = None
+
+
+@dataclass(frozen=True)
+class CandidatePseudoLabel:
+    """Geometry-first pseudo-label defined by minimum raw aligned Shape distance."""
+
+    sample_id: int
+    class_id: int
+    q_shape_distance: float
+    q_distance_percentile: float | None
+    phase_evidence_eligible: bool
+    ambiguous: bool
+    secondary_class_id: int | None = None
+    secondary_q_shape_distance: float | None = None
+    secondary_phase_evidence_eligible: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -112,19 +175,24 @@ class TargetHypothesisScanResult:
     samples_with_one_hypothesis: int
     samples_with_two_hypotheses: int
 
-    # Extended runtime diagnostics.  Defaults keep older hand-built fixtures
-    # source compatible.
+    # Round-A geometry-first records.  Defaults preserve older hand-built test
+    # fixtures while downstream rounds migrate to the richer evidence model.
+    pairwise_alignments: tuple[PairwiseClassAlignment, ...] = ()
+    candidate_pseudo_labels: tuple[CandidatePseudoLabel, ...] = ()
+
+    # Extended runtime diagnostics.
     num_solver_calls: int = 0
     num_ready_classes: int = 0
     num_all_class_pairs: int = 0
-    num_proposal_pairs: int = 0
+    num_proposal_pairs: int = 0  # deprecated alias; equals all-class attempts
     num_gamma_endpoint_rejected: int = 0
     num_gamma_increment_rejected: int = 0
     num_gamma_speed_rejected: int = 0
     num_gamma_roughness_rejected: int = 0
     num_gamma_deviation_rejected: int = 0
     scanned_sample_ids: tuple[int, ...] = ()
-    proposal_class_counts: tuple[int, ...] = ()
+    pairwise_class_counts: tuple[int, ...] = ()
+    proposal_class_counts: tuple[int, ...] = ()  # deprecated alias
     diagnostic_quantiles: tuple[tuple[str, float, float, float], ...] = ()
 
 
@@ -257,7 +325,7 @@ def _build_target_geometry_cache(
 ) -> TargetGeometryCache:
     """Cache the selected target evidence once; expensive DP never reruns the model."""
     del shape_extractor
-    rows: list[tuple[int, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]] = []
+    rows: list[tuple[int, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]] = []
     registration_grid: Tensor | None = None
     fallback_start = 0
     was_training = model.training
@@ -292,7 +360,6 @@ def _build_target_geometry_cache(
                             output.geometry.structure_srvf[index].detach().cpu(),
                             output.geometry.structure_support[index].detach().cpu(),
                             output.geometry.structure_valid[index].detach().cpu(),
-                            output.logits[index].detach().cpu(),
                         )
                     )
     finally:
@@ -311,7 +378,6 @@ def _build_target_geometry_cache(
         structure_srvf_shape=torch.stack([row[4] for row in rows]),
         structure_support_shape=torch.stack([row[5] for row in rows]),
         structure_valid=torch.stack([row[6] for row in rows]),
-        classifier_logits=torch.stack([row[7] for row in rows]),
         registration_grid=registration_grid,
         shape_grid=shape_grid,
     )
@@ -320,78 +386,6 @@ def _build_target_geometry_cache(
 def _common_support(support_a: Tensor, support_b: Tensor, integration_weights: Tensor) -> float:
     common = integration_weights * torch.minimum(support_a, support_b)
     return float(common.sum().item())
-
-
-def _identity_error(
-    source_q: Tensor,
-    target_q: Tensor,
-    source_support: Tensor,
-    target_support: Tensor,
-    integration_weights: Tensor,
-) -> float:
-    common = integration_weights * torch.minimum(source_support, target_support)
-    denom = common.sum()
-    if float(denom.item()) <= 0.0:
-        return float("inf")
-    diff = (source_q - target_q).square().sum(dim=-1)
-    return float(((common * diff).sum() / denom).item())
-
-
-def _topk_ready(logits_or_scores: Tensor, ready_indices: Tensor, k: int, *, largest: bool) -> list[int]:
-    if ready_indices.numel() == 0:
-        return []
-    k = min(int(k), int(ready_indices.numel()))
-    local = torch.topk(logits_or_scores, k=k, largest=largest).indices
-    return [int(ready_indices[index].item()) for index in local]
-
-
-def _proposal_classes(
-    *,
-    sample_index: int,
-    cache: TargetGeometryCache,
-    source_cache: _CpuSourceScanCache,
-    config: PhaseHypothesisScanConfig,
-    integration_reg: Tensor,
-) -> tuple[int, ...]:
-    """High-recall union: classifier top-k ∪ identity-T-distance top-k."""
-    ready_indices = torch.nonzero(source_cache.ready, as_tuple=False).flatten()
-    if ready_indices.numel() == 0:
-        return ()
-
-    if cache.classifier_logits is None:
-        raise RuntimeError("target geometry cache is missing classifier logits")
-    logits = cache.classifier_logits[sample_index][ready_indices]
-    classifier = _topk_ready(
-        logits, ready_indices, config.proposal_classifier_topk, largest=True
-    )
-
-    target_q = cache.trend_srvf_reg[sample_index]
-    target_support = cache.trend_support_reg[sample_index]
-    identity_scores = []
-    identity_classes = []
-    for class_id in ready_indices.tolist():
-        source_support = source_cache.trend_support[class_id]
-        common = _common_support(source_support, target_support, integration_reg)
-        if common <= 0.0:
-            continue
-        score = _identity_error(
-            source_cache.trend_srvf[class_id],
-            target_q,
-            source_support,
-            target_support,
-            integration_reg,
-        )
-        identity_classes.append(int(class_id))
-        identity_scores.append(score)
-    identity: list[int] = []
-    if identity_scores:
-        score_tensor = torch.tensor(identity_scores, dtype=torch.float64)
-        order = torch.argsort(score_tensor)[: config.proposal_identity_topk]
-        identity = [identity_classes[int(index)] for index in order]
-
-    # Stable deterministic union; proposal only controls which exact DP calls
-    # are worth attempting, never whether a candidate is accepted.
-    return tuple(sorted(set(classifier) | set(identity)))
 
 
 def _gamma_rejection_flags(legality, config: PhaseHypothesisScanConfig) -> tuple[str, ...]:
@@ -410,23 +404,24 @@ def _gamma_rejection_flags(legality, config: PhaseHypothesisScanConfig) -> tuple
 
 
 def _shape_evaluate(
-    candidate: PairwisePhaseCandidate,
+    gamma: Tensor,
+    class_id: int,
     *,
     cache: TargetGeometryCache,
     sample_index: int,
     source_cache: _CpuSourceScanCache,
     integration_shape: Tensor,
-) -> tuple[float, float, float] | None:
-    """CPU-native aligned Shape validation for one exact-DP candidate."""
+) -> tuple[float, float | None, float] | None:
+    """Evaluate aligned Shape without applying Phase-evidence reliability gates."""
     reg_grid = cache.registration_grid
     shape_grid = cache.shape_grid
-    gamma_shape = resample_gamma(candidate.gamma, reg_grid, shape_grid)
+    gamma_shape = resample_gamma(gamma, reg_grid, shape_grid)
     target_shape = cache.structure_srvf_shape[sample_index]
     target_support = cache.structure_support_shape[sample_index]
     aligned = warp_q_gamma(target_shape, gamma_shape).squeeze(0)
     aligned_support = warp_support_gamma(target_support, gamma_shape, shape_grid)
-    proto = source_cache.shape_srvf[candidate.class_id].to(aligned.dtype)
-    proto_support = source_cache.shape_support[candidate.class_id].to(aligned_support.dtype)
+    proto = source_cache.shape_srvf[class_id].to(aligned.dtype)
+    proto_support = source_cache.shape_support[class_id].to(aligned_support.dtype)
     distance = support_aware_q_distance(
         aligned.unsqueeze(0),
         proto.unsqueeze(0),
@@ -438,16 +433,114 @@ def _shape_evaluate(
         return None
     q_dist = float(distance.distance[0, 0].item())
     common_shape = float(distance.common_support[0, 0].item())
-    samples = source_cache.q_distance_samples[candidate.class_id]
-    if samples.numel() == 0:
-        return None
-    pct = float(
-        empirical_cdf(
-            samples,
-            torch.tensor([q_dist], dtype=torch.float64),
-        )[0].item()
-    )
+    samples = source_cache.q_distance_samples[class_id]
+    pct: float | None = None
+    if samples.numel() > 0:
+        pct = float(
+            empirical_cdf(
+                samples,
+                torch.tensor([q_dist], dtype=torch.float64),
+            )[0].item()
+        )
     return q_dist, pct, common_shape
+
+
+def _alignment_to_hypothesis(
+    alignment: PairwiseClassAlignment,
+    *,
+    preferred: bool,
+    ambiguous_class: bool,
+    evidence_weight: float,
+) -> TargetClassPhaseHypothesis:
+    if not alignment.phase_evidence_eligible or alignment.gamma is None:
+        raise ValueError("only Phase-evidence-eligible alignments can become hypotheses")
+    required = (
+        alignment.t_identity_error,
+        alignment.t_registered_error,
+        alignment.t_gain_ratio,
+        alignment.q_shape_distance,
+        alignment.q_distance_percentile,
+        alignment.common_support_t,
+        alignment.common_support_shape,
+        alignment.gamma_roughness,
+        alignment.phase_deviation,
+    )
+    if any(value is None for value in required):
+        raise ValueError("eligible alignment is missing required diagnostics")
+    return TargetClassPhaseHypothesis(
+        sample_id=alignment.sample_id,
+        class_id=alignment.class_id,
+        gamma=alignment.gamma.detach().cpu().double(),
+        t_identity_error=float(alignment.t_identity_error),
+        t_registered_error=float(alignment.t_registered_error),
+        t_gain_ratio=float(alignment.t_gain_ratio),
+        q_shape_distance=float(alignment.q_shape_distance),
+        q_distance_percentile=float(alignment.q_distance_percentile),
+        common_support_t=float(alignment.common_support_t),
+        common_support_shape=float(alignment.common_support_shape),
+        roughness=float(alignment.gamma_roughness),
+        phase_deviation=float(alignment.phase_deviation),
+        preferred=preferred,
+        ambiguous_class=ambiguous_class,
+        evidence_weight=float(evidence_weight),
+    )
+
+
+def _select_candidate_and_hypotheses(
+    alignments: Iterable[PairwiseClassAlignment],
+    *,
+    ambiguity_margin: float,
+) -> tuple[CandidatePseudoLabel | None, tuple[TargetClassPhaseHypothesis, ...]]:
+    """Select raw-Shape argmin first, then apply reliability to Phase evidence."""
+    usable = [
+        item
+        for item in alignments
+        if item.q_shape_distance is not None and math.isfinite(float(item.q_shape_distance))
+    ]
+    if not usable:
+        return None, ()
+    usable.sort(key=lambda item: (float(item.q_shape_distance), int(item.class_id)))
+    primary = usable[0]
+    secondary = usable[1] if len(usable) > 1 else None
+    gap = (
+        float(secondary.q_shape_distance) - float(primary.q_shape_distance)
+        if secondary is not None
+        else float("inf")
+    )
+    ambiguous = secondary is not None and gap < float(ambiguity_margin)
+    candidate = CandidatePseudoLabel(
+        sample_id=primary.sample_id,
+        class_id=primary.class_id,
+        q_shape_distance=float(primary.q_shape_distance),
+        q_distance_percentile=primary.q_distance_percentile,
+        phase_evidence_eligible=primary.phase_evidence_eligible,
+        ambiguous=ambiguous,
+        secondary_class_id=secondary.class_id if ambiguous and secondary is not None else None,
+        secondary_q_shape_distance=(
+            float(secondary.q_shape_distance) if ambiguous and secondary is not None else None
+        ),
+        secondary_phase_evidence_eligible=(
+            secondary.phase_evidence_eligible if ambiguous and secondary is not None else None
+        ),
+    )
+
+    evidence_candidates = [primary]
+    if ambiguous and secondary is not None:
+        evidence_candidates.append(secondary)
+    eligible = [item for item in evidence_candidates if item.phase_evidence_eligible]
+    if not eligible:
+        return candidate, ()
+    weight = 1.0 / len(eligible)
+    hypotheses = tuple(
+        _alignment_to_hypothesis(
+            item,
+            preferred=(item.class_id == primary.class_id and len(eligible) == 1),
+            ambiguous_class=ambiguous,
+            evidence_weight=weight,
+        )
+        for item in eligible
+    )
+    return candidate, hypotheses
 
 
 def _quantiles(values: Iterable[float]) -> tuple[float, float, float]:
@@ -511,6 +604,8 @@ class TargetPhaseHypothesisScanner:
         self.integration_shape = _integration_weights(self.cache.shape_grid)
         self.scanned = 0
         self.hypotheses: list[TargetClassPhaseHypothesis] = []
+        self.pairwise_alignments: list[PairwiseClassAlignment] = []
+        self.candidate_pseudo_labels: list[CandidatePseudoLabel] = []
         self.sample_cardinality: dict[int, int] = {}
         self.counts = {
             "attempted": 0,
@@ -527,7 +622,7 @@ class TargetPhaseHypothesisScanner:
             "shape_support_rejected": 0,
             "outer_rejected": 0,
         }
-        self.proposal_class_counts = [0] * int(source_registration_bank.ready.numel())
+        self.pairwise_class_counts = [0] * int(source_registration_bank.ready.numel())
         self.diagnostics: dict[str, list[float]] = {
             "common_support": [],
             "gain_ratio": [],
@@ -665,50 +760,81 @@ class TargetPhaseHypothesisScanner:
 
         stage_start = time.monotonic()
         new_cache_indices = [int(i) for i in self.order[self.scanned : budget].tolist()]
-        ready_count = int(self.source_cache.ready.sum().item())
+        ready_classes = [
+            int(index)
+            for index in torch.nonzero(self.source_cache.ready, as_tuple=False).flatten().tolist()
+        ]
+        ready_count = len(ready_classes)
         tasks: list[_SolverTask] = []
-        task_common_support: dict[tuple[int, int], float] = {}
-        proposals_by_sample: dict[int, tuple[int, ...]] = {}
+        pre_common_support: dict[tuple[int, int], float] = {}
 
+        # Round A formal semantics: every representative target sample is
+        # registered against every ready source class.  No classifier or
+        # identity-T proposal is allowed to shrink this search space.
         for sample_index in new_cache_indices:
             sample_id = int(self.cache.sample_ids[sample_index].item())
-            proposals = _proposal_classes(
-                sample_index=sample_index,
-                cache=self.cache,
-                source_cache=self.source_cache,
-                config=self.config,
-                integration_reg=self.integration_reg,
-            )
-            proposals_by_sample[sample_index] = proposals
-            self.counts["attempted"] += len(proposals)
-            for class_id in proposals:
-                self.proposal_class_counts[class_id] += 1
+            for class_id in ready_classes:
+                self.counts["attempted"] += 1
+                self.pairwise_class_counts[class_id] += 1
                 source_support = self.source_cache.trend_support[class_id]
                 target_support = self.cache.trend_support_reg[sample_index]
                 common = _common_support(source_support, target_support, self.integration_reg)
+                pre_common_support[(sample_index, class_id)] = common
                 self.diagnostics["common_support"].append(common)
                 if common < self.config.registration_min_common_support:
+                    # Reliability mark only: do not erase this class before the
+                    # geometry-first pseudo-label can be formed.
                     self.counts["pre_support"] += 1
-                    continue
                 tasks.append(_SolverTask(sample_index, sample_id, class_id))
-                task_common_support[(sample_index, class_id)] = common
+
         self.counts["solver_calls"] += len(tasks)
         print(
             "TARGET_HYPOTHESIS_SCAN_STAGE_START|"
             f"budget={budget}|new_samples={len(new_cache_indices)}"
-            f"|ready_classes={ready_count}|proposal_pairs={sum(len(v) for v in proposals_by_sample.values())}"
+            f"|ready_classes={ready_count}|all_class_pairs={len(tasks)}"
             f"|solver_calls={len(tasks)}|workers={self.config.registration_workers}"
         )
 
         solved = self._solve(tasks)
-        accepted_by_sample: dict[int, list[TargetClassPhaseHypothesis]] = {
+        alignments_by_sample: dict[int, list[PairwiseClassAlignment]] = {
             index: [] for index in new_cache_indices
         }
         reg_grid = self.cache.registration_grid
+
         for solved_pair in solved:
+            sample_index = solved_pair.sample_index
+            class_id = solved_pair.class_id
+            pre_common = pre_common_support[(sample_index, class_id)]
             if solved_pair.error_name is not None or solved_pair.gamma is None:
                 self.counts["solver_failed"] += 1
+                alignment = PairwiseClassAlignment(
+                    sample_id=solved_pair.sample_id,
+                    class_id=class_id,
+                    gamma=None,
+                    t_identity_error=None,
+                    t_registered_error=None,
+                    t_gain_ratio=None,
+                    pre_common_support_t=pre_common,
+                    common_support_t=None,
+                    gamma_finite=False,
+                    gamma_endpoint_error=None,
+                    gamma_strictly_increasing=False,
+                    gamma_min_increment=None,
+                    gamma_max_local_speed=None,
+                    gamma_roughness=None,
+                    phase_deviation=None,
+                    q_shape_distance=None,
+                    q_distance_percentile=None,
+                    common_support_shape=None,
+                    numerically_valid=False,
+                    phase_evidence_eligible=False,
+                    reject_reasons=("solver_failed",),
+                    solver_error=solved_pair.error_name,
+                )
+                self.pairwise_alignments.append(alignment)
+                alignments_by_sample[sample_index].append(alignment)
                 continue
+
             gamma = solved_pair.gamma.to(dtype=torch.float32)
             legality = check_gamma_legality(
                 gamma,
@@ -721,101 +847,119 @@ class TargetPhaseHypothesisScanner:
             self.diagnostics["roughness"].append(legality.roughness)
             self.diagnostics["max_local_speed"].append(legality.max_local_speed)
             self.diagnostics["phase_deviation"].append(legality.phase_deviation)
-            if not legality.legal:
+            gamma_flags = _gamma_rejection_flags(legality, self.config)
+            if gamma_flags:
                 self.counts["gamma_rejected"] += 1
-                for flag in _gamma_rejection_flags(legality, self.config):
+                for flag in gamma_flags:
                     self.counts[flag] += 1
-                continue
 
-            class_id = solved_pair.class_id
-            sample_index = solved_pair.sample_index
-            source_q = self.source_cache.trend_srvf[class_id].to(gamma.dtype)
-            target_q = self.cache.trend_srvf_reg[sample_index].to(gamma.dtype)
-            source_support = self.source_cache.trend_support[class_id].to(gamma.dtype)
-            target_support = self.cache.trend_support_reg[sample_index].to(gamma.dtype)
-            diagnostics = compute_gamma_diagnostics(
-                sample_id=solved_pair.sample_id,
-                class_id=class_id,
-                gamma=gamma,
-                source_trend_srvf=source_q,
-                target_trend_srvf=target_q,
-                source_support=source_support,
-                target_support=target_support,
-                integration_weights=self.integration_reg.to(gamma.dtype),
-                registration_grid=reg_grid.to(gamma.dtype),
+            # Basic numerical validity is intentionally weaker than the
+            # configured plausibility gates: finite + endpoint-valid + strictly
+            # increasing is enough to evaluate Shape for pseudo-label ranking.
+            numerically_valid = (
+                legality.finite
+                and legality.endpoint_error <= 1e-6
+                and legality.strictly_increasing
             )
-            self.diagnostics["gain_ratio"].append(diagnostics.gain_ratio)
-            if diagnostics.gain_ratio > self.config.registration_gain_ratio_max:
-                self.counts["gain_rejected"] += 1
-                continue
+            diagnostics = None
+            evaluated = None
+            if numerically_valid:
+                source_q = self.source_cache.trend_srvf[class_id].to(gamma.dtype)
+                target_q = self.cache.trend_srvf_reg[sample_index].to(gamma.dtype)
+                source_support = self.source_cache.trend_support[class_id].to(gamma.dtype)
+                target_support = self.cache.trend_support_reg[sample_index].to(gamma.dtype)
+                diagnostics = compute_gamma_diagnostics(
+                    sample_id=solved_pair.sample_id,
+                    class_id=class_id,
+                    gamma=gamma,
+                    source_trend_srvf=source_q,
+                    target_trend_srvf=target_q,
+                    source_support=source_support,
+                    target_support=target_support,
+                    integration_weights=self.integration_reg.to(gamma.dtype),
+                    registration_grid=reg_grid.to(gamma.dtype),
+                )
+                self.diagnostics["gain_ratio"].append(diagnostics.gain_ratio)
+                if (
+                    not math.isfinite(diagnostics.gain_ratio)
+                    or diagnostics.gain_ratio > self.config.registration_gain_ratio_max
+                ):
+                    self.counts["gain_rejected"] += 1
+                evaluated = _shape_evaluate(
+                    gamma.detach().cpu().double(),
+                    class_id,
+                    cache=self.cache,
+                    sample_index=sample_index,
+                    source_cache=self.source_cache,
+                    integration_shape=self.integration_shape,
+                )
 
-            candidate = PairwisePhaseCandidate(
+            q_dist: float | None = None
+            pct: float | None = None
+            common_shape: float | None = None
+            if numerically_valid and evaluated is None:
+                self.counts["shape_support_rejected"] += 1
+            elif evaluated is not None:
+                q_dist, pct, common_shape = evaluated
+                self.diagnostics["q_distance"].append(q_dist)
+                if pct is not None:
+                    self.diagnostics["q_percentile"].append(pct)
+                outer = float(self.source_cache.q_outer[class_id].item())
+                if q_dist > outer:
+                    self.counts["outer_rejected"] += 1
+
+            reasons: list[str] = []
+            if pre_common < self.config.registration_min_common_support:
+                reasons.append("pre_support")
+            reasons.extend(f"gamma_{flag}" for flag in gamma_flags)
+            if diagnostics is None or not math.isfinite(diagnostics.gain_ratio):
+                reasons.append("gain_unavailable")
+            elif diagnostics.gain_ratio > self.config.registration_gain_ratio_max:
+                reasons.append("gain")
+            if evaluated is None:
+                reasons.append("shape_support")
+            else:
+                if pct is None:
+                    reasons.append("q_cdf_unavailable")
+                if q_dist is not None and q_dist > float(self.source_cache.q_outer[class_id].item()):
+                    reasons.append("shape_outer")
+
+            eligible = numerically_valid and not reasons
+            alignment = PairwiseClassAlignment(
                 sample_id=solved_pair.sample_id,
                 class_id=class_id,
                 gamma=gamma.detach().cpu().double(),
-                t_identity_error=diagnostics.e_id,
-                t_registered_error=diagnostics.e_reg,
-                t_gain_ratio=diagnostics.gain_ratio,
-                common_support=diagnostics.common_support,
-                roughness=legality.roughness,
-                min_increment=legality.min_increment,
-                max_local_speed=legality.max_local_speed,
+                t_identity_error=None if diagnostics is None else diagnostics.e_id,
+                t_registered_error=None if diagnostics is None else diagnostics.e_reg,
+                t_gain_ratio=None if diagnostics is None else diagnostics.gain_ratio,
+                pre_common_support_t=pre_common,
+                common_support_t=None if diagnostics is None else diagnostics.common_support,
+                gamma_finite=legality.finite,
+                gamma_endpoint_error=legality.endpoint_error,
+                gamma_strictly_increasing=legality.strictly_increasing,
+                gamma_min_increment=legality.min_increment,
+                gamma_max_local_speed=legality.max_local_speed,
+                gamma_roughness=legality.roughness,
                 phase_deviation=legality.phase_deviation,
-                legal=True,
-                reject_reason=None,
+                q_shape_distance=q_dist,
+                q_distance_percentile=pct,
+                common_support_shape=common_shape,
+                numerically_valid=numerically_valid,
+                phase_evidence_eligible=eligible,
+                reject_reasons=tuple(reasons),
+                solver_error=None,
             )
-            evaluated = _shape_evaluate(
-                candidate,
-                cache=self.cache,
-                sample_index=sample_index,
-                source_cache=self.source_cache,
-                integration_shape=self.integration_shape,
-            )
-            if evaluated is None:
-                self.counts["shape_support_rejected"] += 1
-                continue
-            q_dist, pct, common_shape = evaluated
-            self.diagnostics["q_distance"].append(q_dist)
-            self.diagnostics["q_percentile"].append(pct)
-            outer = float(self.source_cache.q_outer[class_id].item())
-            if q_dist > outer:
-                self.counts["outer_rejected"] += 1
-                continue
-            accepted_by_sample[sample_index].append(
-                TargetClassPhaseHypothesis(
-                    sample_id=solved_pair.sample_id,
-                    class_id=class_id,
-                    gamma=candidate.gamma,
-                    t_identity_error=candidate.t_identity_error,
-                    t_registered_error=candidate.t_registered_error,
-                    t_gain_ratio=candidate.t_gain_ratio,
-                    q_shape_distance=q_dist,
-                    q_distance_percentile=pct,
-                    common_support_t=candidate.common_support,
-                    common_support_shape=common_shape,
-                    roughness=candidate.roughness,
-                    phase_deviation=candidate.phase_deviation,
-                    preferred=False,
-                    ambiguous_class=False,
-                    evidence_weight=1.0,
-                )
-            )
+            self.pairwise_alignments.append(alignment)
+            alignments_by_sample[sample_index].append(alignment)
 
         for sample_index in new_cache_indices:
-            sample_hypotheses = accepted_by_sample[sample_index]
-            sample_hypotheses.sort(key=lambda h: h.q_distance_percentile)
-            kept = sample_hypotheses[: self.config.class_hypothesis_max]
-            if len(kept) == 1:
-                kept[0] = _replace(kept[0], preferred=True, ambiguous_class=False, evidence_weight=1.0)
-            elif len(kept) == 2:
-                u1, u2 = kept[0].q_distance_percentile, kept[1].q_distance_percentile
-                if u2 - u1 >= self.config.class_hypothesis_margin:
-                    kept[0] = _replace(kept[0], preferred=True, ambiguous_class=False, evidence_weight=0.5)
-                    kept[1] = _replace(kept[1], preferred=False, ambiguous_class=False, evidence_weight=0.5)
-                else:
-                    kept[0] = _replace(kept[0], preferred=False, ambiguous_class=True, evidence_weight=0.5)
-                    kept[1] = _replace(kept[1], preferred=False, ambiguous_class=True, evidence_weight=0.5)
+            candidate, kept = _select_candidate_and_hypotheses(
+                alignments_by_sample[sample_index],
+                ambiguity_margin=self.config.class_hypothesis_margin,
+            )
             sample_id = int(self.cache.sample_ids[sample_index].item())
+            if candidate is not None:
+                self.candidate_pseudo_labels.append(candidate)
             self.sample_cardinality[sample_id] = len(kept)
             self.hypotheses.extend(kept)
 
@@ -823,7 +967,8 @@ class TargetPhaseHypothesisScanner:
         result = self.result()
         print(
             "TARGET_HYPOTHESIS_SCAN_STAGE_DONE|"
-            f"budget={budget}|hypotheses={len(result.hypotheses)}"
+            f"budget={budget}|candidate_labels={len(result.candidate_pseudo_labels)}"
+            f"|hypotheses={len(result.hypotheses)}"
             f"|zero={result.samples_with_zero_hypothesis}"
             f"|one={result.samples_with_one_hypothesis}"
             f"|two={result.samples_with_two_hypotheses}"
@@ -876,6 +1021,8 @@ class TargetPhaseHypothesisScanner:
             samples_with_zero_hypothesis=zero,
             samples_with_one_hypothesis=one,
             samples_with_two_hypotheses=two,
+            pairwise_alignments=tuple(self.pairwise_alignments),
+            candidate_pseudo_labels=tuple(self.candidate_pseudo_labels),
             num_solver_calls=self.counts["solver_calls"],
             num_ready_classes=ready_count,
             num_all_class_pairs=self.scanned * ready_count,
@@ -886,7 +1033,8 @@ class TargetPhaseHypothesisScanner:
             num_gamma_roughness_rejected=self.counts["roughness"],
             num_gamma_deviation_rejected=self.counts["deviation"],
             scanned_sample_ids=sample_ids,
-            proposal_class_counts=tuple(self.proposal_class_counts),
+            pairwise_class_counts=tuple(self.pairwise_class_counts),
+            proposal_class_counts=tuple(self.pairwise_class_counts),
             diagnostic_quantiles=quantiles,
         )
 
@@ -917,7 +1065,3 @@ def scan_target_class_phase_hypotheses(
         adapter=adapter,
     )
     return scanner.scan_to_budget(scanner.total_cached_samples)
-
-
-def _replace(hypothesis: TargetClassPhaseHypothesis, **changes) -> TargetClassPhaseHypothesis:
-    return TargetClassPhaseHypothesis(**{**hypothesis.__dict__, **changes})

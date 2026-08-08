@@ -136,6 +136,8 @@ from .stable_target_labels import (
     scan_stable_target_labels_from_confirmed_phase,
 )
 from .target_hypothesis_scan import (
+    CandidatePseudoLabel,
+    PairwiseClassAlignment,
     PhaseHypothesisScanConfig,
     TargetClassPhaseHypothesis,
     TargetHypothesisScanResult,
@@ -177,6 +179,8 @@ __all__ = [
     "GammaDiagnostics",
     "GammaLegalityOutput",
     "PairwisePhaseCandidate",
+    "PairwiseClassAlignment",
+    "CandidatePseudoLabel",
     "PhaseHypothesisScanConfig",
     "PhaseClassCenter",
     "PhaseGroup",
