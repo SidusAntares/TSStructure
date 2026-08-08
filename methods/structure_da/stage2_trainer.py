@@ -50,6 +50,7 @@ from .stable_target_labels import (
 )
 from .stage2_objective import Stage2Objective, Stage2ObjectiveConfig
 from .stage2_parameter_policy import Stage2ParameterPolicy
+from .stage2_calibration import export_stage2_calibration_statistics
 from .target_hypothesis_scan import (
     PhaseHypothesisScanConfig,
     TargetHypothesisScanResult,
@@ -1020,6 +1021,27 @@ class Stage2Trainer:
                 self.writer.add_scalar(f"stage2/train/{key}", value, epoch)
         return averages
 
+    def write_calibration_statistics(self) -> dict[str, str]:
+        if self.statistics is None or self.hypothesis_cache is None:
+            raise RuntimeError("Stage-2 calibration requires initialized statistics and hypothesis cache")
+        paths = export_stage2_calibration_statistics(
+            output_dir=self.output_dir,
+            hypothesis_result=self.hypothesis_cache.result,
+            phase_state=self.statistics.phase_state,
+            stable_result=self.statistics.stable_labels,
+            shape_state=self.statistics.shape_state,
+            source_prototype_bank=self.source_prototype_bank,
+        )
+        print(
+            "STAGE2_CALIBRATION_EXPORT|"
+            f"summary={paths['summary']}"
+            f"|pairwise={paths['pairwise']}"
+            f"|candidates={paths['candidates']}"
+            f"|stable_candidates={paths['stable_candidates']}"
+            f"|geometry={paths['geometry']}"
+        )
+        return paths
+
     def write_shape_diagnostics(self, epoch: int, *, suffix: str = "") -> None:
         if self.statistics is None:
             raise RuntimeError("Stage-2 statistics are unavailable")
@@ -1254,6 +1276,8 @@ def run_stage2_statistics_diagnostic(trainer) -> Stage2StatisticsSnapshot:
     snapshot = trainer.initialize_statistics()
     print("STAGE2_INIT_COMPLETE|statistics_ready=true")
     trainer.write_shape_diagnostics(0, suffix="initial")
+    if hasattr(trainer, "write_calibration_statistics"):
+        trainer.write_calibration_statistics()
     stable = snapshot.stable_labels
     print(
         "STAGE2_DIAGNOSTIC_COMPLETE|"
