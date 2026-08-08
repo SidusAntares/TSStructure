@@ -1273,9 +1273,14 @@ class Stage2Trainer:
                     sample_ids = _source_sample_ids(batch, source_labels.shape[0])
 
                     pending: list[tuple[int, SyntheticSourceExample]] = []
+                    pending_counts = {class_id: 0 for class_id in counts}
+
                     for row_index in range(source_labels.shape[0]):
                         class_id = int(source_labels[row_index].item())
-                        if class_id not in counts or counts[class_id] >= samples_per_class:
+                        if (
+                                class_id not in counts
+                                or counts[class_id] + pending_counts[class_id] >= samples_per_class
+                        ):
                             continue
                         example = build_synthetic_source_example(
                             source_sample_id=sample_ids[row_index],
@@ -1292,6 +1297,7 @@ class Stage2Trainer:
                         )
                         if example is not None:
                             pending.append((row_index, example))
+                            pending_counts[class_id] += 1
 
                     if not pending:
                         if counts and all(value >= samples_per_class for value in counts.values()):
