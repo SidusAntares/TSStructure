@@ -115,3 +115,14 @@ def test_stage2_only_wiring_skips_stage1_and_reuses_formal_boundary() -> None:
     assert "STAGE2_RESUME|" in text
     assert "--stage2_only" in text
     assert "--stage1_checkpoint" in text
+
+
+def test_stage2_diagnostic_only_is_guarded_and_skips_training() -> None:
+    text = Path("train.py").read_text(encoding="utf-8")
+    assert "--stage2_diagnostic_only" in text
+    assert 'raise ValueError("--stage2_diagnostic_only requires --stage2_only")' in text
+    diagnostic_call = text.index("run_stage2_statistics_diagnostic(stage2_trainer)")
+    training_call = text.index("stage2_result = run_stage2_training", diagnostic_call)
+    continue_pos = text.index("continue", diagnostic_call)
+    assert diagnostic_call < continue_pos < training_call
+    assert "STAGE2_DIAGNOSTIC_ONLY_EXIT|training_skipped=true" in text

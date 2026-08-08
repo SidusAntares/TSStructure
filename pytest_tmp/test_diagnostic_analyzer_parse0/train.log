@@ -1,0 +1,5 @@
+TRAIN_EPOCH|epoch=1/2|task_step_success_rate=1|task_step_skip_rate=0|source_state_update_rate=1
+Validation result: loss=1.2, acc=0.40, f1=0.35
+PHASE_EPOCH|epoch=1|domain=source|valid_identity_rate=0.4|valid_nonidentity_rate=0.5|failure_rate=0.1|candidate_collapse_rate=0.2|candidate_trainable_rate=0.8|candidate_acceptable_rate=0.7|T_phase_magnitude_mean=0.03|T_phase_magnitude_p95=0.08|S_shape_valid_rate=0.6
+PHASE_CLASS_EPOCH|epoch=1|split=source|label_source=source_true|class_id=0|sample_count=8|failure_rate=0.1
+PHASE_CLASS_EPOCH|epoch=1|split=target|label_source=target_geometry_pseudo|class_id=0|sample_count=4|failure_rate=0.2

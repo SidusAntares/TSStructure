@@ -102,6 +102,7 @@ from .stage2_trainer import (
     Stage2TrainerConfig,
     TargetHypothesisCache,
     build_stage2_registration_extractor,
+    run_stage2_statistics_diagnostic,
     run_stage2_training,
 )
 from .stage2_parameter_policy import (
@@ -269,6 +270,7 @@ __all__ = [
     "build_stage2_registration_extractor",
     "DeviceBatchLoader",
     "refresh_source_fused_statistics",
+    "run_stage2_statistics_diagnostic",
     "run_stage2_training",
     "Stage2RunResult",
     "Stage2StatisticsSnapshot",

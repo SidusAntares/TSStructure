@@ -27,6 +27,7 @@ from methods.structure_da import (
     build_phase_only_synthetic_source_example,
     configure_stage2_parameter_policy,
     refresh_source_fused_statistics,
+    run_stage2_statistics_diagnostic,
     run_stage2_training,
 )
 
@@ -610,3 +611,35 @@ def test_stage2_checkpoint_contains_full_runtime_statistics_without_feature_snap
     assert state["shape_evidence_sample_ids"] == (4, 8)
     assert "stable_label_state" in state
     assert "source_prototype_bank" in state
+
+
+def test_statistics_diagnostic_never_trains_or_updates_optimizer() -> None:
+    phase = _phase_state(confirmed=False)
+    snapshot = SimpleNamespace(
+        phase_state=phase,
+        stable_labels=SimpleNamespace(num_stable_labels=0),
+        shape_state=SimpleNamespace(status=DomainShapeStatus.UNAVAILABLE),
+    )
+
+    class DiagnosticTrainer:
+        def __init__(self):
+            self.successful_optimizer_steps = 0
+            self.train_calls = 0
+            self.diagnostics = []
+
+        def initialize_statistics(self):
+            return snapshot
+
+        def write_shape_diagnostics(self, epoch, *, suffix=""):
+            self.diagnostics.append((epoch, suffix))
+
+        def train_epoch(self, _epoch):
+            self.train_calls += 1
+            raise AssertionError("diagnostic-only mode must not train")
+
+    trainer = DiagnosticTrainer()
+    result = run_stage2_statistics_diagnostic(trainer)
+    assert result is snapshot
+    assert trainer.successful_optimizer_steps == 0
+    assert trainer.train_calls == 0
+    assert trainer.diagnostics == [(0, "initial")]

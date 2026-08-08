@@ -845,7 +845,10 @@ class TargetPhaseHypothesisScanner:
             for name, p10, p50, p90 in result.diagnostic_quantiles
         )
         if quantile_text:
-            print("TARGET_HYPOTHESIS_SCAN_DISTRIBUTIONS|" + quantile_text)
+            print(
+                "TARGET_HYPOTHESIS_SCAN_DISTRIBUTIONS|"
+                f"budget={budget}|" + quantile_text
+            )
         return result
 
     def result(self) -> TargetHypothesisScanResult:

@@ -42,6 +42,7 @@ from methods.structure_da import (
     configure_stage2_parameter_policy,
     create_feature_snapshot_manager,
     finalize_distance_statistics,
+    run_stage2_statistics_diagnostic,
     run_stage2_training,
 )
 from transforms import Identity, Normalize, RandomSamplePixels, ToTensor
@@ -415,6 +416,10 @@ def main(config):
         config, "stage2_only", False
     ):
         raise ValueError("--stage1_checkpoint requires --stage2_only")
+    if getattr(config, "stage2_diagnostic_only", False) and not getattr(
+        config, "stage2_only", False
+    ):
+        raise ValueError("--stage2_diagnostic_only requires --stage2_only")
 
     random.seed(config.seed)
     np.random.seed(config.seed)
@@ -702,6 +707,13 @@ def main(config):
                 f"|macro_f1={metrics['macro_f1']:.4f}"
             )
             return metrics
+
+        if getattr(config, "stage2_diagnostic_only", False):
+            run_stage2_statistics_diagnostic(stage2_trainer)
+            writer.close()
+            all_folds_have_formal_test = False
+            print("STAGE2_DIAGNOSTIC_ONLY_EXIT|training_skipped=true")
+            continue
 
         stage2_result = run_stage2_training(
             stage2_trainer,
@@ -1406,6 +1418,13 @@ if __name__ == '__main__':
         help=(
             'Stage-1 checkpoint for --stage2_only; defaults to '
             '<output_dir>/fold_<n>/stage1_best.pt'
+        ),
+    )
+    parser.add_argument(
+        '--stage2_diagnostic_only', action='store_true',
+        help=(
+            'with --stage2_only, run Stage-2 statistics/diagnostics and exit '
+            'before any Stage-2 optimizer step'
         ),
     )
     parser.add_argument('--stage2_epochs', default=60, type=int)

@@ -961,6 +961,26 @@ class Stage2Trainer:
             "phase_proposal_class_counts": None if hypothesis is None else list(
                 hypothesis.proposal_class_counts
             ),
+            "phase_scanned_sample_ids": None if hypothesis is None else list(
+                hypothesis.scanned_sample_ids
+            ),
+            "phase_hypotheses": None if hypothesis is None else [
+                {
+                    "sample_id": item.sample_id,
+                    "class_id": item.class_id,
+                    "t_gain_ratio": item.t_gain_ratio,
+                    "q_shape_distance": item.q_shape_distance,
+                    "q_distance_percentile": item.q_distance_percentile,
+                    "common_support_t": item.common_support_t,
+                    "common_support_shape": item.common_support_shape,
+                    "roughness": item.roughness,
+                    "phase_deviation": item.phase_deviation,
+                    "preferred": item.preferred,
+                    "ambiguous_class": item.ambiguous_class,
+                    "evidence_weight": item.evidence_weight,
+                }
+                for item in hypothesis.hypotheses
+            ],
         }
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
@@ -1095,6 +1115,30 @@ class Stage2Trainer:
         torch.save(state, path)
         print(f"STAGE2_CHECKPOINT|path={path}|epoch={epoch}")
         return path
+
+
+def run_stage2_statistics_diagnostic(trainer) -> Stage2StatisticsSnapshot:
+    """Run Stage-2 statistics only; never perform an optimizer step.
+
+    This mode exists for scientific diagnostics of Domain Phase evidence
+    acquisition and downstream Stable Label / Domain Shape gates.  It writes
+    the same initial statistics payload used by training but exits before any
+    Stage-2 parameter update, so an ``M=0`` diagnostic cannot silently become
+    source-only continuation training.
+    """
+    snapshot = trainer.initialize_statistics()
+    print("STAGE2_INIT_COMPLETE|statistics_ready=true")
+    trainer.write_shape_diagnostics(0, suffix="initial")
+    stable = snapshot.stable_labels
+    print(
+        "STAGE2_DIAGNOSTIC_COMPLETE|"
+        f"phase_m={snapshot.phase_state.m}"
+        f"|confirmed_phase={str(_confirmed_phase_exists(snapshot.phase_state)).lower()}"
+        f"|stable_labels={stable.num_stable_labels}"
+        f"|shape_status={snapshot.shape_state.status.value}"
+        f"|optimizer_steps={trainer.successful_optimizer_steps}"
+    )
+    return snapshot
 
 
 def run_stage2_training(

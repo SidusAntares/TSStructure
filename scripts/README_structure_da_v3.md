@@ -175,3 +175,33 @@ the primary input for tuning pilot thresholds.
 Killing only the launcher PID may leave already-started training children. Use
 `experiment_status.tsv` or `pgrep -af train.py` to identify task PIDs, inspect
 them with `ps -fp <PID>`, and terminate only confirmed experiment processes.
+
+
+## Stage-2 Phase A/B diagnostic
+
+Use `run_stage2_phase_diagnostic_ab.sh` after a completed Stage-1 checkpoint when
+Phase evidence is unexpectedly rejected.  This launcher performs **statistics
+only**: it never executes a Stage-2 optimizer step.
+
+It runs two deterministic cases on the same target split and seed:
+
+- **A / proposal:** V6 classifier-top2 ∪ identity-T-top2 proposal, progressive
+  64→128 evidence, with only the roughness gate bypassed.
+- **B / all-class:** exhaustive exact DP for all ready source classes with the
+  same 64→128 evidence cache. The comparison itself uses the exact same first
+  64 samples; roughness alone is bypassed.
+
+The comparison is written to
+`logs/<RUN_GROUP>/comparison.json`.  In addition to gate counts/distributions it
+reports whether both runs used identical sample IDs and how many hypotheses
+retained by exhaustive DP were missed by the proposal.  A non-empty
+`missed_by_proposal` list means the proposal requires revision before formal
+experiments.
+
+Example:
+
+```bash
+nohup env RUN_GROUP=stage2_phase_diag_at1_dk1 \
+  bash scripts/run_stage2_phase_diagnostic_ab.sh \
+  > logs/stage2_phase_diag_at1_dk1_nohup.log 2>&1 < /dev/null &
+```

@@ -23,8 +23,10 @@ PILOT4 = SCRIPTS / "run_structure_da_pilot4_4gpu.sh"
 PILOT4_ANALYZER = SCRIPTS / "analyze_structure_da_pilot4.py"
 FORMAL = SCRIPTS / "run_structure_da_12tasks_4gpu_3seeds.sh"
 SEEDWISE = SCRIPTS / "run_structure_da_12tasks_4gpu_seed.sh"
+PHASE_DIAGNOSTIC_AB = SCRIPTS / "run_stage2_phase_diagnostic_ab.sh"
+PHASE_DIAGNOSTIC_COMPARE = SCRIPTS / "compare_stage2_phase_diagnostics.py"
 README = SCRIPTS / "README_structure_da_v3.md"
-SHELL_SCRIPTS = [COMMON, ENV_CHECK, SMOKE, DIAGNOSTIC, PILOT4, FORMAL, SEEDWISE]
+SHELL_SCRIPTS = [COMMON, ENV_CHECK, SMOKE, DIAGNOSTIC, PILOT4, FORMAL, SEEDWISE, PHASE_DIAGNOSTIC_AB]
 EXPECTED_VERSION = "structure_da_v3_progressive_phase_evidence_v6"
 OBSOLETE_FLAGS = {
     "--structure_dim",
@@ -78,6 +80,7 @@ def test_all_v3_server_artifacts_exist() -> None:
         SMOKE_CHECKER,
         DIAGNOSTIC_ANALYZER,
         PILOT4_ANALYZER,
+        PHASE_DIAGNOSTIC_COMPARE,
         README,
     ]:
         assert path.is_file(), path
@@ -415,3 +418,33 @@ def test_shell_scripts_parse_with_bash_when_available(script: Path) -> None:
     if "CreateInstance" in normalized and "E_ACCESSDENIED" in normalized:
         pytest.skip("Windows/WSL CreateInstance E_ACCESSDENIED")
     assert result.returncode == 0, combined
+
+
+def test_phase_ab_diagnostic_is_statistics_only_and_compares_same_64_samples() -> None:
+    source = PHASE_DIAGNOSTIC_AB.read_text(encoding="utf-8")
+    for fragment in (
+        "--stage2_only",
+        "--stage2_diagnostic_only",
+        "--stage2_phase_evidence_initial_samples",
+        "--stage2_phase_evidence_max_samples",
+        "--stage2_registration_max_roughness",
+        'run_case "A_proposal_64_128_no_roughness" 64 128 2 2',
+        'run_case "B_allclass_64_128_no_roughness" 64 128 999 999',
+        "compare_stage2_phase_diagnostics.py",
+        "--compare-budget 64",
+        "comparison.json",
+    ):
+        assert fragment in source
+    assert "--stage2_steps_per_epoch" not in source
+
+
+def test_phase_ab_comparator_checks_sample_identity_and_retained_recall() -> None:
+    source = PHASE_DIAGNOSTIC_COMPARE.read_text(encoding="utf-8")
+    for fragment in (
+        "same_first_budget_sample_ids",
+        "missed_by_proposal_pairs",
+        "retained_hypothesis_recall",
+        "PHASE_PROPOSAL_RECALL|",
+        "A/B diagnostic did not use the exact same first evidence samples",
+    ):
+        assert fragment in source
