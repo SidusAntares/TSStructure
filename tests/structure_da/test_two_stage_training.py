@@ -57,10 +57,19 @@ def test_stage2_objective_has_no_target_label_input() -> None:
 
 
 def test_round7_trainer_contains_no_target_ce_or_adversarial_path() -> None:
+    import re
+
     text = Path("methods/structure_da/stage2_trainer.py").read_text(encoding="utf-8")
-    forbidden = ("target_ce", "gradient reversal", "GRL", "DANN")
-    for token in forbidden:
-        assert token not in text
+
+    forbidden_patterns = (
+        r"\btarget_ce\b",
+        r"gradient reversal",
+        r"\bGRL\b",
+        r"\bDANN\b",
+    )
+
+    for pattern in forbidden_patterns:
+        assert re.search(pattern, text, flags=re.IGNORECASE) is None
     assert "Stage2Objective" in text
 
 

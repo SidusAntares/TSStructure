@@ -36,11 +36,12 @@ from .domain_shape_state import (
 )
 from .ema_teacher import Stage2EMATeacher
 from .phase_registration import SourceRegistrationPrototypeBank
-from .prototype_bank import SourcePrototypeBank
+from .prototype_bank import SourcePrototypeBank, support_aware_q_distance
 from .shape_transport import (
     SyntheticSourceExample,
     build_phase_only_synthetic_source_example,
     build_synthetic_source_example,
+    evaluate_synthetic_source_diagnostics,
 )
 from .source_prototype_scanner import refresh_source_fused_statistics
 from .stable_target_labels import (
@@ -1042,6 +1043,404 @@ class Stage2Trainer:
         )
         return paths
 
+    @torch.no_grad()
+    def write_final_shape_synthesis_audit(
+        self,
+        *,
+        samples_per_class: int = 3,
+        max_batches: int = 64,
+    ) -> dict[str, str]:
+        """Export the final non-gating Shape/synthesis audit for diagnostic runs.
+
+        This routine is deliberately read-only: it reuses the already-confirmed
+        Phase/Shape state, samples true-labelled *source* examples only, performs
+        no registration, and never calls ``optimizer.step``.  The exported JSON
+        answers two questions that are intentionally stronger than the aggregate
+        ``rho_shape`` statistic:
+
+        1. do the valid class residuals ``R_c`` point in the same direction as
+           the shared ``Delta``; and
+        2. does the actual source->target synthesis remain finite, preserve the
+           source label, apply exactly the confirmed Phase coordinate map, and
+           move q geometry toward the observed target class center when one is
+           available?
+        """
+        if self.statistics is None:
+            raise RuntimeError("Stage-2 statistics are unavailable")
+        if isinstance(samples_per_class, bool) or samples_per_class < 1:
+            raise ValueError("samples_per_class must be a positive integer")
+        if isinstance(max_batches, bool) or max_batches < 1:
+            raise ValueError("max_batches must be a positive integer")
+
+        os.makedirs(self.output_dir, exist_ok=True)
+        json_path = os.path.join(self.output_dir, "stage2_shape_synthesis_audit.json")
+        tensor_path = os.path.join(self.output_dir, "stage2_shape_synthesis_audit.pt")
+
+        phase_state = self.statistics.phase_state
+        shape_state = self.statistics.shape_state
+        payload: dict = {
+            "phase_decision": phase_state.decision_status.value,
+            "phase_m": int(phase_state.m),
+            "shape_status": shape_state.status.value,
+            "lambda_delta": float(self.config.lambda_delta),
+            "optimizer_steps": int(self.successful_optimizer_steps),
+            "shape": {},
+            "synthesis": {},
+        }
+        tensor_payload: dict = {}
+
+        if shape_state.delta is None:
+            payload["shape"] = {"available": False, "reason": "delta_unavailable"}
+            payload["synthesis"] = {"available": False, "reason": "delta_unavailable"}
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+            torch.save(tensor_payload, tensor_path)
+            return {"json": json_path, "tensors": tensor_path}
+
+        delta = shape_state.delta.detach().to(device=self.device, dtype=torch.float32)
+        weights = _integration_weights(self.student, self.device).to(delta)
+
+        def weighted_inner(left: Tensor, right: Tensor) -> Tensor:
+            return (weights * (left * right).sum(dim=-1)).sum()
+
+        def weighted_norm(value: Tensor) -> Tensor:
+            return torch.sqrt(weighted_inner(value, value).clamp_min(0.0))
+
+        delta_norm_t = weighted_norm(delta)
+        delta_norm = float(delta_norm_t.item())
+        valid_centers = [item for item in shape_state.class_centers if item.valid]
+        interaction_by_class = {
+            int(class_id): interaction.detach().to(delta)
+            for class_id, interaction in zip(shape_state.valid_classes, shape_state.interactions)
+        }
+        class_rows: list[dict] = []
+        tensor_payload["delta"] = delta.detach().cpu()
+        tensor_payload["class_rows"] = {}
+
+        for center in valid_centers:
+            class_id = int(center.class_id)
+            residual = center.residual_q.detach().to(delta)
+            interaction = interaction_by_class[class_id]
+            residual_norm_t = weighted_norm(residual)
+            interaction_norm_t = weighted_norm(interaction)
+            denominator = residual_norm_t * delta_norm_t
+            cosine = (
+                float((weighted_inner(residual, delta) / denominator).item())
+                if float(denominator.item()) > 1e-12
+                else None
+            )
+
+            source_q = self.source_prototype_bank.shape_srvf[class_id].detach().to(delta)
+            source_support = self.source_prototype_bank.shape_support[class_id].detach().to(delta)
+            target_q = center.center_q.detach().to(delta)
+            target_support = center.center_support.detach().to(delta)
+
+            def distance_to_target(candidate_q: Tensor) -> float | None:
+                output = support_aware_q_distance(
+                    candidate_q.unsqueeze(0),
+                    target_q.unsqueeze(0),
+                    source_support.unsqueeze(0),
+                    target_support.unsqueeze(0),
+                    weights,
+                )
+                if not bool(output.valid[0, 0].item()):
+                    return None
+                return float(output.distance[0, 0].item())
+
+            before = distance_to_target(source_q)
+            lambda_after = distance_to_target(source_q + float(self.config.lambda_delta) * delta)
+            full_after = distance_to_target(source_q + delta)
+            common_support = (source_support * target_support).clamp(0.0, 1.0)
+            active_common_support = common_support > 1e-6
+            row = {
+                "class_id": class_id,
+                "sample_count": int(center.sample_count),
+                "effective_weight": float(center.effective_weight),
+                "source_distance": float(center.source_distance),
+                "common_support_mean": float(common_support.mean().item()),
+                "common_support_active_rate": float(active_common_support.float().mean().item()),
+                "residual_norm": float(residual_norm_t.item()),
+                "interaction_norm": float(interaction_norm_t.item()),
+                "interaction_over_delta": (
+                    float(interaction_norm_t.item()) / delta_norm if delta_norm > 0.0 else None
+                ),
+                "cos_residual_delta": cosine,
+                "distance_to_target_before": before,
+                "distance_to_target_after_lambda_delta": lambda_after,
+                "distance_to_target_after_full_delta": full_after,
+                "lambda_delta_improved": (
+                    None if before is None or lambda_after is None else lambda_after <= before
+                ),
+                "full_delta_improved": (
+                    None if before is None or full_after is None else full_after <= before
+                ),
+            }
+            class_rows.append(row)
+            tensor_payload["class_rows"][class_id] = {
+                "source_q": source_q.cpu(),
+                "source_support": source_support.cpu(),
+                "target_center_q": target_q.cpu(),
+                "target_center_support": target_support.cpu(),
+                "common_support": common_support.cpu(),
+                "residual_q": residual.cpu(),
+                "interaction_q": interaction.cpu(),
+            }
+
+        cosines = [row["cos_residual_delta"] for row in class_rows if row["cos_residual_delta"] is not None]
+        if valid_centers:
+            common_support_stack = torch.stack([
+                (
+                    self.source_prototype_bank.shape_support[int(center.class_id)].detach().to(delta)
+                    * center.center_support.detach().to(delta)
+                ).clamp(0.0, 1.0)
+                for center in valid_centers
+            ])
+            supported_class_count = (common_support_stack > 1e-6).sum(dim=0)
+            insufficient_support_mask = supported_class_count < 2
+            delta_energy_total = weighted_inner(delta, delta)
+            delta_energy_low_support = (
+                weights * insufficient_support_mask.to(delta.dtype) * delta.square().sum(dim=-1)
+            ).sum()
+            low_support_delta_energy_ratio = (
+                float((delta_energy_low_support / delta_energy_total).item())
+                if float(delta_energy_total.item()) > 1e-12
+                else 0.0
+            )
+            min_supported_classes = int(supported_class_count.min().item())
+            mean_supported_classes = float(supported_class_count.float().mean().item())
+        else:
+            low_support_delta_energy_ratio = None
+            min_supported_classes = 0
+            mean_supported_classes = 0.0
+        payload["shape"] = {
+            "available": True,
+            "rho_shape": shape_state.rho_shape,
+            "delta_norm": delta_norm,
+            "leave_one_out_drift": shape_state.leave_one_out_drift,
+            "center_drift": shape_state.center_drift,
+            "confirmation_age": int(shape_state.confirmation_age),
+            "valid_classes": list(shape_state.valid_classes),
+            "min_cos_residual_delta": min(cosines) if cosines else None,
+            "mean_cos_residual_delta": sum(cosines) / len(cosines) if cosines else None,
+            "low_support_delta_energy_ratio": low_support_delta_energy_ratio,
+            "min_supported_classes_per_grid_point": min_supported_classes,
+            "mean_supported_classes_per_grid_point": mean_supported_classes,
+            "all_full_delta_improved": all(
+                row["full_delta_improved"] is True
+                for row in class_rows
+                if row["full_delta_improved"] is not None
+            ),
+            "class_rows": class_rows,
+        }
+
+        # Synthesis is meaningful only after the actual training preconditions
+        # are satisfied.  The audit never relaxes these preconditions.
+        if not _adaptation_available(self.statistics):
+            payload["synthesis"] = {"available": False, "reason": "adaptation_unavailable"}
+        elif shape_state.status is not DomainShapeStatus.CONFIRMED:
+            payload["synthesis"] = {"available": False, "reason": "shape_not_confirmed"}
+        else:
+            confirmed_source_classes: set[int]
+            if phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED:
+                confirmed_source_classes = set(range(int(self.source_prototype_bank.ready.numel())))
+            else:
+                confirmed_source_classes = {
+                    int(class_id)
+                    for group in phase_state.groups
+                    if group.status is PhaseGroupStatus.CONFIRMED
+                    for class_id in group.member_classes
+                }
+
+            counts = {class_id: 0 for class_id in sorted(confirmed_source_classes)}
+            rows: list[dict] = []
+            examples_for_tensor: dict[int, dict] = {}
+            previous_mode = self.student.training
+            self.student.eval()
+            try:
+                for batch_index, batch in enumerate(self.source_loader):
+                    if batch_index >= max_batches:
+                        break
+                    (
+                        source_logits,
+                        _source_fused,
+                        source_labels,
+                        _trend,
+                        _structure,
+                        positions,
+                        mask,
+                        structure_geometry,
+                    ) = self._source_forward(batch)
+                    sample_ids = _source_sample_ids(batch, source_labels.shape[0])
+
+                    pending: list[tuple[int, SyntheticSourceExample]] = []
+                    for row_index in range(source_labels.shape[0]):
+                        class_id = int(source_labels[row_index].item())
+                        if class_id not in counts or counts[class_id] >= samples_per_class:
+                            continue
+                        example = build_synthetic_source_example(
+                            source_sample_id=sample_ids[row_index],
+                            class_id=class_id,
+                            source_structure_function=structure_geometry.functional.function[row_index],
+                            source_q_shape=structure_geometry.srvf[row_index],
+                            source_q_support=structure_geometry.support_confidence[row_index],
+                            source_positions=positions[row_index],
+                            mask=mask[row_index],
+                            phase_state=phase_state,
+                            domain_shape_state=shape_state,
+                            decomposition=self.student.backbone.decomposition,
+                            lambda_delta=self.config.lambda_delta,
+                        )
+                        if example is not None:
+                            pending.append((row_index, example))
+
+                    if not pending:
+                        if counts and all(value >= samples_per_class for value in counts.values()):
+                            break
+                        continue
+
+                    synthetic_batch = _stack_synthetic(
+                        [item[1] for item in pending],
+                        [structure_geometry.structure_valid[item[0]].detach() for item in pending],
+                        device=self.device,
+                    )
+                    assert synthetic_batch is not None
+                    synthetic_raw = self.student.temporal_module.raw_encoder(
+                        trend=synthetic_batch["trend"],
+                        structure=synthetic_batch["structure"],
+                        positions=synthetic_batch["positions"],
+                        mask=synthetic_batch["mask"],
+                    )
+                    synthetic_logits = self.student.classifier(synthetic_raw.fused_repr)
+
+                    for local_index, (source_index, example) in enumerate(pending):
+                        class_id = int(example.class_id)
+                        diagnostics = evaluate_synthetic_source_diagnostics(
+                            example=example,
+                            source_q_shape=structure_geometry.srvf[source_index],
+                            source_logits=source_logits[source_index],
+                            synthetic_logits=synthetic_logits[local_index],
+                            source_positions=positions[source_index],
+                            phase_state=phase_state,
+                            domain_shape_state=shape_state,
+                            source_prototype_bank=self.source_prototype_bank,
+                        )
+                        source_prediction = int(source_logits[source_index].argmax().item())
+                        synthetic_prediction = int(synthetic_logits[local_index].argmax().item())
+                        source_q = structure_geometry.srvf[source_index].detach().to(example.q_shape)
+                        q_shift_error = weighted_norm(
+                            (example.q_shape - source_q) - float(self.config.lambda_delta) * delta
+                        )
+                        valid_position_mask = example.mask
+                        position_delta = (
+                            example.target_style_positions[valid_position_mask]
+                            - positions[source_index].to(example.target_style_positions)[valid_position_mask]
+                        )
+                        row = {
+                            "source_sample_id": int(example.source_sample_id),
+                            "class_id": class_id,
+                            "group_id": int(example.group_id),
+                            "source_prediction": source_prediction,
+                            "synthetic_prediction": synthetic_prediction,
+                            "source_correct": source_prediction == class_id,
+                            "synthetic_correct": synthetic_prediction == class_id,
+                            "prediction_changed": source_prediction != synthetic_prediction,
+                            "finite": bool(diagnostics.finite),
+                            "valid_support": bool(diagnostics.valid_support),
+                            "label_preserved": bool(diagnostics.label_preserved),
+                            "target_shape_distance_before": diagnostics.target_shape_distance_before,
+                            "target_shape_distance_after": diagnostics.target_shape_distance_after,
+                            "target_shape_improved": diagnostics.target_shape_improved,
+                            "phase_leakage": diagnostics.phase_leakage,
+                            "shape_class_separation_margin": diagnostics.shape_class_separation_margin,
+                            "classifier_margin": diagnostics.classifier_margin,
+                            "q_shift_error": float(q_shift_error.item()),
+                            "position_shift_mean_abs": (
+                                float(position_delta.abs().mean().item()) if position_delta.numel() else 0.0
+                            ),
+                            "position_shift_max_abs": (
+                                float(position_delta.abs().max().item()) if position_delta.numel() else 0.0
+                            ),
+                        }
+                        rows.append(row)
+                        counts[class_id] += 1
+                        if class_id not in examples_for_tensor:
+                            examples_for_tensor[class_id] = {
+                                "source_sample_id": int(example.source_sample_id),
+                                "source_q": source_q.cpu(),
+                                "synthetic_q": example.q_shape.detach().cpu(),
+                                "source_positions": positions[source_index].detach().cpu(),
+                                "target_style_positions": example.target_style_positions.detach().cpu(),
+                                "mask": example.mask.detach().cpu(),
+                                "trend_tokens": example.trend_tokens.detach().cpu(),
+                                "structure_tokens": example.structure_tokens.detach().cpu(),
+                                "source_logits": source_logits[source_index].detach().cpu(),
+                                "synthetic_logits": synthetic_logits[local_index].detach().cpu(),
+                            }
+                    if counts and all(value >= samples_per_class for value in counts.values()):
+                        break
+            finally:
+                self.student.train(previous_mode)
+
+            tensor_payload["synthetic_examples"] = examples_for_tensor
+            generated = len(rows)
+            center_rows = [row for row in rows if row["target_shape_improved"] is not None]
+            payload["synthesis"] = {
+                "available": True,
+                "requested_samples_per_class": int(samples_per_class),
+                "max_batches": int(max_batches),
+                "confirmed_source_classes": sorted(confirmed_source_classes),
+                "sample_counts": {str(key): value for key, value in counts.items()},
+                "generated": generated,
+                "all_finite": bool(rows) and all(row["finite"] for row in rows),
+                "all_valid_support": bool(rows) and all(row["valid_support"] for row in rows),
+                "source_accuracy": (
+                    sum(row["source_correct"] for row in rows) / generated if generated else None
+                ),
+                "synthetic_accuracy": (
+                    sum(row["synthetic_correct"] for row in rows) / generated if generated else None
+                ),
+                "label_preserved_rate": (
+                    sum(row["label_preserved"] for row in rows) / generated if generated else None
+                ),
+                "prediction_changed_rate": (
+                    sum(row["prediction_changed"] for row in rows) / generated if generated else None
+                ),
+                "target_shape_improved_rate": (
+                    sum(row["target_shape_improved"] is True for row in center_rows) / len(center_rows)
+                    if center_rows
+                    else None
+                ),
+                "max_phase_leakage": max(
+                    (row["phase_leakage"] for row in rows if row["phase_leakage"] is not None),
+                    default=None,
+                ),
+                "min_shape_class_separation_margin": min(
+                    (
+                        row["shape_class_separation_margin"]
+                        for row in rows
+                        if row["shape_class_separation_margin"] is not None
+                    ),
+                    default=None,
+                ),
+                "min_classifier_margin": min(
+                    (row["classifier_margin"] for row in rows if row["classifier_margin"] is not None),
+                    default=None,
+                ),
+                "max_q_shift_error": max((row["q_shift_error"] for row in rows), default=None),
+                "rows": rows,
+            }
+
+        with open(json_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=False)
+        torch.save(tensor_payload, tensor_path)
+        print(
+            "STAGE2_SHAPE_SYNTHESIS_AUDIT|"
+            f"json={json_path}|tensors={tensor_path}"
+            f"|shape_status={shape_state.status.value}"
+            f"|synthetic_examples={payload['synthesis'].get('generated', 0)}"
+        )
+        return {"json": json_path, "tensors": tensor_path}
+
     def write_shape_diagnostics(self, epoch: int, *, suffix: str = "") -> None:
         if self.statistics is None:
             raise RuntimeError("Stage-2 statistics are unavailable")
@@ -1278,6 +1677,8 @@ def run_stage2_statistics_diagnostic(trainer) -> Stage2StatisticsSnapshot:
     trainer.write_shape_diagnostics(0, suffix="initial")
     if hasattr(trainer, "write_calibration_statistics"):
         trainer.write_calibration_statistics()
+    if hasattr(trainer, "write_final_shape_synthesis_audit"):
+        trainer.write_final_shape_synthesis_audit()
     stable = snapshot.stable_labels
     print(
         "STAGE2_DIAGNOSTIC_COMPLETE|"
