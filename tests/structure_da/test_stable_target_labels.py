@@ -325,3 +325,361 @@ def test_confirmed_phase_scan_no_longer_requires_individual_dp_hypotheses(monkey
     assert result.num_samples == 1
     assert [(item.sample_id, item.class_id) for item in result.stable_labels] == [(20, 1)]
     assert result.num_candidate_views == 1
+
+
+def _roundc_phase_config(**overrides):
+    from methods.structure_da.domain_phase_state import DomainPhaseConfig
+
+    values = dict(
+        phase_min_samples_per_class=1.0,
+        phase_class_dispersion_max=1.0,
+        phase_class_diameter_max=1.0,
+        phase_group_dispersion_max=1.0,
+        phase_group_diameter_max=0.5,
+        phase_group_core_separation=0.1,
+        phase_global_radius=2.0,
+        phase_confirmation_patience=2,
+        phase_center_drift_max=1.0,
+    )
+    values.update(overrides)
+    return DomainPhaseConfig(**values)
+
+
+def _roundc_pairwise(sample_id: int, class_id: int, gamma: torch.Tensor, *, eligible=True):
+    from methods.structure_da.target_hypothesis_scan import PairwiseClassAlignment
+
+    return PairwiseClassAlignment(
+        sample_id=sample_id,
+        class_id=class_id,
+        gamma=gamma.detach().clone(),
+        t_identity_error=1.0,
+        t_registered_error=0.5,
+        t_gain_ratio=0.5,
+        pre_common_support_t=1.0,
+        common_support_t=1.0,
+        gamma_finite=True,
+        gamma_endpoint_error=0.0,
+        gamma_strictly_increasing=True,
+        gamma_min_increment=0.01,
+        gamma_max_local_speed=2.0,
+        gamma_roughness=0.0,
+        phase_deviation=0.1,
+        q_shape_distance=0.1,
+        q_distance_percentile=0.1,
+        common_support_shape=1.0,
+        numerically_valid=True,
+        phase_evidence_eligible=eligible,
+        reject_reasons=(),
+    )
+
+
+def _roundc_candidate(sample_id: int, class_id: int, *, ambiguous=False):
+    from methods.structure_da.target_hypothesis_scan import CandidatePseudoLabel
+
+    return CandidatePseudoLabel(
+        sample_id=sample_id,
+        class_id=class_id,
+        q_shape_distance=0.1,
+        q_distance_percentile=0.1,
+        phase_evidence_eligible=True,
+        ambiguous=ambiguous,
+    )
+
+
+def _roundc_scan_result(*, sample_id=20, class_id=1, gamma=None):
+    gamma = torch.linspace(0.0, 1.0, 128).pow(1.5) if gamma is None else gamma
+    return replace(
+        _hypothesis_result(num_samples=1),
+        pairwise_alignments=(_roundc_pairwise(sample_id, class_id, gamma),),
+        candidate_pseudo_labels=(_roundc_candidate(sample_id, class_id),),
+        scanned_sample_ids=(sample_id,),
+    )
+
+
+def _roundc_nonidentity_state(group):
+    from methods.structure_da.domain_phase_state import PhaseDecisionStatus
+
+    return replace(
+        _state(group),
+        decision_status=PhaseDecisionStatus.NONIDENTITY_CONFIRMED,
+        decision_stability_age=2,
+    )
+
+
+def _roundc_loader(label=0):
+    return [
+        {
+            "index": torch.tensor([20]),
+            "pixels": torch.zeros(1, 5, 2, 4),
+            "valid_pixels": torch.ones(1, 5, 4, dtype=torch.bool),
+            "positions": torch.linspace(0.0, 365.0, 5),
+            "label": torch.tensor([label]),
+        }
+    ]
+
+
+def test_roundc_formal_scan_preserves_primary_candidate_identity(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+
+    group = _group(0, (1, 2), PhaseGroupStatus.CONFIRMED, power=1.5)
+    state = _roundc_nonidentity_state(group)
+    scan = _roundc_scan_result(gamma=group.center_gamma.float())
+    seen_classes = []
+    original_evaluate = module.evaluate_stable_target_candidate
+
+    def fake_evaluate(*, view, view_index, class_id, source_prototype_bank, config):
+        seen_classes.append(class_id)
+        # The classifier/fused/q validators reject the original candidate.  The
+        # formal scan must abstain rather than invent class 2 from the same group.
+        return replace(
+            original_evaluate(
+                view=_view(sample_ids=(20,), member_classes=(1, 2)),
+                view_index=0,
+                class_id=1,
+                source_prototype_bank=_bank(),
+                config=_config(),
+            ),
+            sample_id=20,
+            class_id=class_id,
+            group_id=view.group_id,
+            passed_classifier=False,
+            accepted=False,
+            reject_reason="classifier",
+        )
+
+    def fake_view(**kwargs):
+        return _view(
+            sample_ids=tuple(int(x) for x in kwargs["sample_ids"].tolist()),
+            group_id=kwargs["group_id"],
+            member_classes=kwargs["member_classes"],
+            winning_class=1,
+        )
+
+    monkeypatch.setattr(module, "evaluate_stable_target_candidate", fake_evaluate)
+    monkeypatch.setattr(module, "build_phase_calibrated_view", fake_view)
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    result = module.scan_stable_target_labels_from_candidates(
+        ema_teacher=ema,
+        target_loader=_roundc_loader(),
+        hypothesis_result=scan,
+        phase_state=state,
+        phase_config=_roundc_phase_config(),
+        source_prototype_bank=_bank(),
+        config=_config(),
+        sample_ids=(20,),
+    )
+    assert seen_classes == [1]
+    assert [(item.sample_id, item.class_id) for item in result.candidates] == [(20, 1)]
+    assert result.stable_labels == ()
+
+
+def test_roundc_formal_scan_uses_group_center_not_individual_candidate_gamma(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+
+    group = _group(0, (1, 2), PhaseGroupStatus.CONFIRMED, power=1.5)
+    candidate_gamma = group.center_gamma.float().pow(1.01)
+    scan = _roundc_scan_result(gamma=candidate_gamma)
+    state = _roundc_nonidentity_state(group)
+    seen_gamma = []
+
+    def fake_view(**kwargs):
+        seen_gamma.append(kwargs["center_gamma"].detach().cpu().double())
+        return _view(
+            sample_ids=(20,),
+            group_id=kwargs["group_id"],
+            member_classes=kwargs["member_classes"],
+            winning_class=1,
+        )
+
+    monkeypatch.setattr(module, "build_phase_calibrated_view", fake_view)
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    result = module.scan_stable_target_labels_from_candidates(
+        ema_teacher=ema,
+        target_loader=_roundc_loader(),
+        hypothesis_result=scan,
+        phase_state=state,
+        phase_config=_roundc_phase_config(phase_group_diameter_max=1.0),
+        source_prototype_bank=_bank(),
+        config=_config(),
+        sample_ids=(20,),
+    )
+    assert len(result.stable_labels) == 1
+    torch.testing.assert_close(seen_gamma[0], group.center_gamma)
+    assert not torch.equal(seen_gamma[0].float(), candidate_gamma)
+    torch.testing.assert_close(
+        result.stable_labels[0].aligned_q_shape,
+        _bank().shape_srvf[1],
+    )
+
+
+def test_roundc_phase_incompatible_primary_candidate_is_rejected_before_class_gates(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+
+    group = _group(0, (1, 2), PhaseGroupStatus.CONFIRMED, power=2.0)
+    scan = _roundc_scan_result(gamma=torch.linspace(0.0, 1.0, 128).pow(0.3))
+    state = _roundc_nonidentity_state(group)
+    calls = []
+    monkeypatch.setattr(
+        module,
+        "build_phase_calibrated_view",
+        lambda **kwargs: calls.append(kwargs) or _view(),
+    )
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    result = module.scan_stable_target_labels_from_candidates(
+        ema_teacher=ema,
+        target_loader=_roundc_loader(),
+        hypothesis_result=scan,
+        phase_state=state,
+        phase_config=_roundc_phase_config(phase_group_diameter_max=0.01),
+        source_prototype_bank=_bank(),
+        config=_config(),
+        sample_ids=(20,),
+    )
+    assert calls == []
+    assert result.num_phase_compatible == 0
+    assert result.num_phase_incompatible == 1
+    assert result.stable_labels == ()
+    assert result.candidates[0].reject_reason == "phase_residual"
+
+
+def test_roundc_identity_confirmed_uses_identity_group_center(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+    from methods.structure_da.domain_phase_state import DomainPhaseState, PhaseDecisionStatus
+
+    identity = torch.linspace(0.0, 1.0, 128)
+    scan = _roundc_scan_result(gamma=identity)
+    state = DomainPhaseState(
+        scan_index=1,
+        m=0,
+        class_centers=(),
+        valid_phase_classes=(1, 2),
+        groups=(),
+        rejected_classes=(),
+        decision_status=PhaseDecisionStatus.IDENTITY_CONFIRMED,
+        decision_stability_age=2,
+        identity_evidence_classes=(1, 2),
+        identity_evidence_count=4.0,
+    )
+    seen = []
+
+    def fake_view(**kwargs):
+        seen.append((kwargs["group_id"], kwargs["center_gamma"].detach().clone()))
+        return _view(
+            sample_ids=(20,),
+            group_id=kwargs["group_id"],
+            member_classes=kwargs["member_classes"],
+            winning_class=1,
+        )
+
+    monkeypatch.setattr(module, "build_phase_calibrated_view", fake_view)
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    result = module.scan_stable_target_labels_from_candidates(
+        ema_teacher=ema,
+        target_loader=_roundc_loader(label=2),
+        hypothesis_result=scan,
+        phase_state=state,
+        phase_config=_roundc_phase_config(
+            phase_identity_radius=0.05,
+            phase_identity_gain_ratio_min=0.95,
+        ),
+        source_prototype_bank=_bank(),
+        config=_config(),
+        sample_ids=(20,),
+    )
+    assert [(item.sample_id, item.class_id, item.group_id) for item in result.stable_labels] == [
+        (20, 1, -1)
+    ]
+    assert seen[0][0] == -1
+    torch.testing.assert_close(seen[0][1], identity.double())
+
+
+def test_roundc_confirmed_phase_can_resolve_existing_primary_secondary_ambiguity(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+    from methods.structure_da.target_hypothesis_scan import CandidatePseudoLabel
+
+    group = _group(0, (1, 2), PhaseGroupStatus.CONFIRMED, power=1.5)
+    state = _roundc_nonidentity_state(group)
+    primary_gamma = torch.linspace(0.0, 1.0, 128).pow(0.3)
+    secondary_gamma = group.center_gamma.float()
+    candidate = CandidatePseudoLabel(
+        sample_id=20,
+        class_id=1,
+        q_shape_distance=0.10,
+        q_distance_percentile=0.1,
+        phase_evidence_eligible=True,
+        ambiguous=True,
+        secondary_class_id=2,
+        secondary_q_shape_distance=0.11,
+        secondary_phase_evidence_eligible=True,
+    )
+    scan = replace(
+        _hypothesis_result(num_samples=1),
+        pairwise_alignments=(
+            _roundc_pairwise(20, 1, primary_gamma),
+            _roundc_pairwise(20, 2, secondary_gamma),
+        ),
+        candidate_pseudo_labels=(candidate,),
+        scanned_sample_ids=(20,),
+    )
+
+    def fake_view(**kwargs):
+        return _view(
+            sample_ids=(20,),
+            group_id=kwargs["group_id"],
+            member_classes=kwargs["member_classes"],
+            winning_class=2,
+        )
+
+    monkeypatch.setattr(module, "build_phase_calibrated_view", fake_view)
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    result = module.scan_stable_target_labels_from_candidates(
+        ema_teacher=ema,
+        target_loader=_roundc_loader(),
+        hypothesis_result=scan,
+        phase_state=state,
+        phase_config=_roundc_phase_config(phase_group_diameter_max=0.05),
+        source_prototype_bank=_bank(),
+        config=_config(),
+        sample_ids=(20,),
+    )
+    assert [(item.sample_id, item.class_id) for item in result.stable_labels] == [(20, 2)]
+    primary = next(item for item in result.candidates if item.class_id == 1)
+    secondary = next(item for item in result.candidates if item.class_id == 2)
+    assert primary.phase_compatible is False
+    assert secondary.phase_compatible is True
+
+
+def test_roundc_postconfirmation_phase_check_does_not_require_estimation_eligibility(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+
+    group = _group(0, (1, 2), PhaseGroupStatus.CONFIRMED, power=1.5)
+    state = _roundc_nonidentity_state(group)
+    scan = replace(
+        _roundc_scan_result(gamma=group.center_gamma.float()),
+        pairwise_alignments=(
+            _roundc_pairwise(20, 1, group.center_gamma.float(), eligible=False),
+        ),
+    )
+
+    def fake_view(**kwargs):
+        return _view(
+            sample_ids=(20,),
+            group_id=kwargs["group_id"],
+            member_classes=kwargs["member_classes"],
+            winning_class=1,
+        )
+
+    monkeypatch.setattr(module, "build_phase_calibrated_view", fake_view)
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    result = module.scan_stable_target_labels_from_candidates(
+        ema_teacher=ema,
+        target_loader=_roundc_loader(),
+        hypothesis_result=scan,
+        phase_state=state,
+        phase_config=_roundc_phase_config(),
+        source_prototype_bank=_bank(),
+        config=_config(),
+        sample_ids=(20,),
+    )
+    assert result.num_phase_compatible == 1
+    assert [(item.sample_id, item.class_id) for item in result.stable_labels] == [(20, 1)]

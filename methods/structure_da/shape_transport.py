@@ -8,7 +8,12 @@ import math
 import torch
 from torch import Tensor, nn
 
-from .domain_phase_state import DomainPhaseState, PhaseGroup, PhaseGroupStatus
+from .domain_phase_state import (
+    DomainPhaseState,
+    PhaseDecisionStatus,
+    PhaseGroup,
+    PhaseGroupStatus,
+)
 from .domain_shape_state import DomainShapeState, DomainShapeStatus
 from .prototype_bank import SourcePrototypeBank, support_aware_q_distance
 
@@ -313,6 +318,12 @@ def build_phase_only_synthetic_source_example(
     source-to-target direction ``gamma(source_position)``.  G0, provisional
     groups and M=0 return ``None``.
     """
+    if phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED:
+        # Identity Phase contains no temporal domain effect.  A phase-only copy
+        # would be identical to original source and is not an adaptation sample.
+        return None
+    if phase_state.decision_status is not PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
+        return None
     group = _confirmed_group_for_class(phase_state, class_id)
     if group is None:
         return None
@@ -363,8 +374,16 @@ def build_synthetic_source_example(
     lambda_delta = _validate_lambda_delta(lambda_delta)
     if domain_shape_state.status is not DomainShapeStatus.CONFIRMED:
         return None
-    group = _confirmed_group_for_class(phase_state, class_id)
-    if group is None:
+    identity_phase = phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED
+    if identity_phase:
+        group = None
+        synthetic_group_id = -1
+    elif phase_state.decision_status is PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
+        group = _confirmed_group_for_class(phase_state, class_id)
+        if group is None:
+            return None
+        synthetic_group_id = int(group.group_id)
+    else:
         return None
     if not isinstance(source_q_shape, Tensor) or source_q_shape.ndim != 2:
         raise ValueError("source_q_shape must have shape [K,D]")
@@ -409,13 +428,15 @@ def build_synthetic_source_example(
     trend_tokens = _sample_curve_at_positions(
         trend_curve, positions, mask_local
     ).detach()
-    target_style_positions = map_source_positions_to_target(
-        positions, mask_local, group.center_gamma
+    target_style_positions = (
+        positions.detach()
+        if identity_phase
+        else map_source_positions_to_target(positions, mask_local, group.center_gamma)
     )
     return SyntheticSourceExample(
         source_sample_id=int(source_sample_id),
         class_id=int(class_id),
-        group_id=int(group.group_id),
+        group_id=synthetic_group_id,
         trend_tokens=trend_tokens,
         structure_tokens=structure_tokens,
         target_style_positions=target_style_positions,

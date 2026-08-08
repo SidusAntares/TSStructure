@@ -335,29 +335,14 @@ def _real_trainer(shape_status: DomainShapeStatus) -> Stage2Trainer:
     return trainer
 
 
-def test_m0_source_only_step_respects_gradient_boundary() -> None:
+def test_unconfirmed_phase_forbids_source_only_stage2_optimizer_step() -> None:
     trainer = _real_trainer(DomainShapeStatus.UNAVAILABLE)
     before = {name: p.detach().clone() for name, p in trainer.student.named_parameters()}
-    frozen_buffers = {
-        name: value.detach().clone()
-        for name, value in trainer.student.backbone.named_buffers()
-    }
-    metrics = trainer.train_step(_batch())
-    assert metrics["synthetic_count"] == 0.0
-    assert metrics["optimizer_step_succeeded"] == 1.0
-    trainable = set(trainer.policy.trainable_parameter_names)
-    changed_trainable = []
+    with pytest.raises(RuntimeError, match="forbidden without confirmed structural adaptation evidence"):
+        trainer.train_step(_batch())
     for name, parameter in trainer.student.named_parameters():
-        changed = not torch.equal(before[name], parameter.detach())
-        if name in trainable:
-            changed_trainable.append(changed)
-        else:
-            assert not changed, name
-            assert parameter.grad is None
-    assert any(changed_trainable)
-    for name, value in trainer.student.backbone.named_buffers():
-        torch.testing.assert_close(value, frozen_buffers[name])
-    assert all(parameter.grad is None for parameter in trainer.ema_teacher.model().parameters())
+        torch.testing.assert_close(parameter.detach(), before[name])
+    assert trainer.successful_optimizer_steps == 0
 
 
 def test_confirmed_phase_without_shape_generates_phase_only_source() -> None:
@@ -402,14 +387,14 @@ def test_source_fused_refresh_preserves_all_geometry_fields() -> None:
 
 
 def test_statistics_object_is_not_replaced_inside_a_minibatch() -> None:
-    trainer = _real_trainer(DomainShapeStatus.UNAVAILABLE)
+    trainer = _real_trainer(DomainShapeStatus.REJECTED)
     frozen = trainer.statistics
     trainer.train_step(_batch())
     assert trainer.statistics is frozen
 
 
 def test_amp_skipped_optimizer_step_does_not_update_ema() -> None:
-    trainer = _real_trainer(DomainShapeStatus.UNAVAILABLE)
+    trainer = _real_trainer(DomainShapeStatus.REJECTED)
     calls = []
     original_update = trainer.ema_teacher.update_after_optimizer_step
 
@@ -649,3 +634,106 @@ def test_statistics_diagnostic_never_trains_or_updates_optimizer() -> None:
     assert trainer.successful_optimizer_steps == 0
     assert trainer.train_calls == 0
     assert trainer.diagnostics == [(0, "initial")]
+
+
+def _identity_phase_state_for_trainer() -> DomainPhaseState:
+    return DomainPhaseState(
+        scan_index=1,
+        m=0,
+        class_centers=(),
+        valid_phase_classes=(0, 1, 2),
+        groups=(),
+        rejected_classes=(),
+        decision_status=PhaseDecisionStatus.IDENTITY_CONFIRMED,
+        decision_stability_age=2,
+        identity_evidence_classes=(0, 1, 2),
+        identity_evidence_count=6.0,
+    )
+
+
+def test_identity_confirmed_and_shape_confirmed_runs_shape_only_synthesis() -> None:
+    trainer = _real_trainer(DomainShapeStatus.CONFIRMED)
+    trainer.statistics = Stage2StatisticsSnapshot(
+        phase_state=_identity_phase_state_for_trainer(),
+        stable_labels=_empty_stable(),
+        shape_state=_shape_state(DomainShapeStatus.CONFIRMED, torch.zeros(5, 4)),
+    )
+    metrics = trainer.train_step(_batch())
+    assert metrics["synthetic_count"] == pytest.approx(6.0)
+    assert metrics["optimizer_step_succeeded"] == 1.0
+
+
+class _AbstainScheduleTrainer:
+    def __init__(self, snapshot) -> None:
+        self.snapshot = snapshot
+        self.config = SimpleNamespace(total_epochs=60, adaptation_block_epochs=20)
+        self.ema_teacher = _FakeEMA()
+        self.successful_optimizer_steps = 0
+        self.train_epochs = []
+        self.saved = []
+        self.diagnostics = []
+
+    def initialize_statistics(self):
+        return self.snapshot
+
+    def train_epoch(self, epoch):
+        self.train_epochs.append(epoch)
+        raise AssertionError("abstain path must not execute any Stage-2 optimizer epoch")
+
+    def write_shape_diagnostics(self, epoch, *, suffix=""):
+        self.diagnostics.append((epoch, suffix))
+
+    def save_ema_checkpoint(self, filename, *, epoch, target_val):
+        self.saved.append((filename, epoch, target_val))
+
+
+def test_unconfirmed_phase_returns_stage1_model_without_stage2_optimizer_steps() -> None:
+    snapshot = Stage2StatisticsSnapshot(
+        phase_state=_phase_state(confirmed=False),
+        stable_labels=_empty_stable(),
+        shape_state=_shape_state(DomainShapeStatus.UNAVAILABLE),
+    )
+    trainer = _AbstainScheduleTrainer(snapshot)
+    val_calls = []
+    test_calls = []
+    result = run_stage2_training(
+        trainer,
+        evaluate_target_val=lambda _teacher, epoch: val_calls.append(epoch) or {},
+        evaluate_target_test=lambda _teacher, epoch: test_calls.append(epoch) or {
+            "accuracy": 0.5,
+            "macro_f1": 0.4,
+        },
+    )
+    assert trainer.train_epochs == []
+    assert trainer.successful_optimizer_steps == 0
+    assert val_calls == []
+    assert test_calls == [0]
+    assert trainer.saved == [("stage2_last_ema.pt", 0, None)]
+    assert trainer.diagnostics == [(0, "no_adaptation")]
+    assert result.adaptation_performed is False
+    assert result.abstain_reason == "phase_unconfirmed"
+    assert result.best_target_val_epoch is None
+
+
+def test_identity_confirmed_without_shape_also_abstains() -> None:
+    snapshot = Stage2StatisticsSnapshot(
+        phase_state=_identity_phase_state_for_trainer(),
+        stable_labels=_empty_stable(),
+        shape_state=_shape_state(DomainShapeStatus.REJECTED),
+    )
+    trainer = _AbstainScheduleTrainer(snapshot)
+    result = run_stage2_training(
+        trainer,
+        evaluate_target_val=lambda _teacher, _epoch: (_ for _ in ()).throw(
+            AssertionError("target val must not select a no-adaptation checkpoint")
+        ),
+        evaluate_target_test=lambda _teacher, epoch: {
+            "accuracy": 0.5,
+            "macro_f1": 0.4,
+            "epoch": epoch,
+        },
+    )
+    assert trainer.train_epochs == []
+    assert result.adaptation_performed is False
+    assert result.abstain_reason == "identity_phase_without_confirmed_shape"
+    assert result.final_diagnostic_target_test["epoch"] == 0

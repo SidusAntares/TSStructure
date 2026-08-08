@@ -510,6 +510,117 @@ def _confirmed_groups(state: DomainPhaseState) -> tuple[PhaseGroup, ...]:
 
 
 @torch.no_grad()
+def evaluate_sample_class_phase_compatibility(
+    *,
+    sample_id: int,
+    class_id: int,
+    alignment: PairwiseClassAlignment | None,
+    state: DomainPhaseState,
+    config: DomainPhaseConfig,
+    require_phase_evidence_eligible: bool = True,
+) -> CandidatePhaseCompatibility:
+    """Compare one cached sample/class gamma with the confirmed Domain Phase.
+
+    ``require_phase_evidence_eligible=True`` is the conservative Round-B mode
+    used when collecting evidence capable of changing the Domain Phase model.
+    Stable-label validation may set it to ``False``: once Domain Phase has been
+    confirmed, a numerically valid candidate gamma can be checked against the
+    group center even if that sample was not reliable enough to *estimate* the
+    domain-level Phase in the first place.
+    """
+    sample_id = int(sample_id)
+    class_id = int(class_id)
+    gamma = None if alignment is None else alignment.gamma
+    if state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED:
+        if (
+            alignment is None
+            or gamma is None
+            or not alignment.numerically_valid
+            or config.phase_identity_radius is None
+        ):
+            return CandidatePhaseCompatibility(
+                sample_id=sample_id,
+                class_id=class_id,
+                status=CandidatePhaseCompatibilityStatus.UNUSABLE,
+                assigned_group_id=None,
+                nearest_group_id=None,
+                phase_distance_to_group=None,
+                gamma=None if gamma is None else gamma.detach().cpu().double(),
+            )
+        identity = _identity_like(gamma)
+        distance = float(phase_distance(gamma, identity).item())
+        compatible = distance <= float(config.phase_identity_radius)
+        return CandidatePhaseCompatibility(
+            sample_id=sample_id,
+            class_id=class_id,
+            status=(
+                CandidatePhaseCompatibilityStatus.COMPATIBLE
+                if compatible
+                else CandidatePhaseCompatibilityStatus.RESIDUAL
+            ),
+            assigned_group_id=-1 if compatible else None,
+            nearest_group_id=-1,
+            phase_distance_to_group=distance,
+            gamma=gamma.detach().cpu().double(),
+        )
+
+    confirmed = _confirmed_groups(state)
+    if not confirmed:
+        return CandidatePhaseCompatibility(
+            sample_id=sample_id,
+            class_id=class_id,
+            status=CandidatePhaseCompatibilityStatus.NO_CONFIRMED_GROUP,
+            assigned_group_id=None,
+            nearest_group_id=None,
+            phase_distance_to_group=None,
+            gamma=None if gamma is None else gamma.detach().cpu().double(),
+        )
+    if (
+        alignment is None
+        or gamma is None
+        or not alignment.numerically_valid
+        or (require_phase_evidence_eligible and not alignment.phase_evidence_eligible)
+    ):
+        return CandidatePhaseCompatibility(
+            sample_id=sample_id,
+            class_id=class_id,
+            status=CandidatePhaseCompatibilityStatus.UNUSABLE,
+            assigned_group_id=None,
+            nearest_group_id=None,
+            phase_distance_to_group=None,
+            gamma=None if gamma is None else gamma.detach().cpu().double(),
+        )
+
+    assigned = next(
+        (group for group in confirmed if class_id in group.member_classes),
+        None,
+    )
+    distances = [
+        (float(phase_distance(gamma, group.center_gamma).item()), group)
+        for group in confirmed
+    ]
+    _nearest_distance, nearest = min(distances, key=lambda item: item[0])
+    comparison_group = assigned or nearest
+    comparison_distance = float(
+        phase_distance(gamma, comparison_group.center_gamma).item()
+    )
+    compatible = comparison_distance <= config.phase_group_diameter_max
+    return CandidatePhaseCompatibility(
+        sample_id=sample_id,
+        class_id=class_id,
+        status=(
+            CandidatePhaseCompatibilityStatus.COMPATIBLE
+            if compatible
+            else CandidatePhaseCompatibilityStatus.RESIDUAL
+        ),
+        assigned_group_id=None if assigned is None else assigned.group_id,
+        nearest_group_id=nearest.group_id,
+        phase_distance_to_group=comparison_distance,
+        gamma=gamma.detach().cpu().double(),
+    )
+
+
+@torch.no_grad()
 def evaluate_candidate_phase_compatibility(
     scan_result: TargetHypothesisScanResult,
     state: DomainPhaseState,
@@ -517,79 +628,23 @@ def evaluate_candidate_phase_compatibility(
 ) -> tuple[CandidatePhaseCompatibility, ...]:
     """Compare each primary candidate gamma with confirmed Domain Phase groups.
 
-    This does not relabel the target sample.  It only states whether the
-    geometry-first candidate Phase evidence agrees with the already-confirmed
-    domain-level group center.  Reliable far candidates are retained as
-    residual evidence instead of being silently discarded.
+    This Round-B evidence path keeps ``phase_evidence_eligible`` as a hard
+    requirement because residuals may alter the Domain Phase model itself.
+    Round-C stable-label validation calls the single-pair helper above with the
+    weaker, post-confirmation semantics.
     """
     lookup = _alignment_lookup(scan_result)
-    confirmed = _confirmed_groups(state)
-    output: list[CandidatePhaseCompatibility] = []
-    for candidate in scan_result.candidate_pseudo_labels:
-        key = (int(candidate.sample_id), int(candidate.class_id))
-        alignment = lookup.get(key)
-        gamma = None if alignment is None else alignment.gamma
-        if not confirmed:
-            output.append(
-                CandidatePhaseCompatibility(
-                    sample_id=key[0],
-                    class_id=key[1],
-                    status=CandidatePhaseCompatibilityStatus.NO_CONFIRMED_GROUP,
-                    assigned_group_id=None,
-                    nearest_group_id=None,
-                    phase_distance_to_group=None,
-                    gamma=None if gamma is None else gamma.detach().cpu().double(),
-                )
-            )
-            continue
-        if (
-            alignment is None
-            or gamma is None
-            or not alignment.phase_evidence_eligible
-        ):
-            output.append(
-                CandidatePhaseCompatibility(
-                    sample_id=key[0],
-                    class_id=key[1],
-                    status=CandidatePhaseCompatibilityStatus.UNUSABLE,
-                    assigned_group_id=None,
-                    nearest_group_id=None,
-                    phase_distance_to_group=None,
-                    gamma=None if gamma is None else gamma.detach().cpu().double(),
-                )
-            )
-            continue
-
-        assigned = next(
-            (group for group in confirmed if key[1] in group.member_classes),
-            None,
+    return tuple(
+        evaluate_sample_class_phase_compatibility(
+            sample_id=int(candidate.sample_id),
+            class_id=int(candidate.class_id),
+            alignment=lookup.get((int(candidate.sample_id), int(candidate.class_id))),
+            state=state,
+            config=config,
+            require_phase_evidence_eligible=True,
         )
-        distances = [
-            (float(phase_distance(gamma, group.center_gamma).item()), group)
-            for group in confirmed
-        ]
-        _nearest_distance, nearest = min(distances, key=lambda item: item[0])
-        comparison_group = assigned or nearest
-        comparison_distance = float(
-            phase_distance(gamma, comparison_group.center_gamma).item()
-        )
-        compatible = comparison_distance <= config.phase_group_diameter_max
-        output.append(
-            CandidatePhaseCompatibility(
-                sample_id=key[0],
-                class_id=key[1],
-                status=(
-                    CandidatePhaseCompatibilityStatus.COMPATIBLE
-                    if compatible
-                    else CandidatePhaseCompatibilityStatus.RESIDUAL
-                ),
-                assigned_group_id=None if assigned is None else assigned.group_id,
-                nearest_group_id=nearest.group_id,
-                phase_distance_to_group=comparison_distance,
-                gamma=gamma.detach().cpu().double(),
-            )
-        )
-    return tuple(output)
+        for candidate in scan_result.candidate_pseudo_labels
+    )
 
 
 def collect_residual_phase_evidence(

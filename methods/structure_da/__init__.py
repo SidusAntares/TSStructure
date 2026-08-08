@@ -53,6 +53,7 @@ from .domain_phase_state import (
     collect_residual_phase_evidence,
     detect_residual_phase_group,
     evaluate_candidate_phase_compatibility,
+    evaluate_sample_class_phase_compatibility,
     update_domain_phase_state,
 )
 from .domain_shape_state import (
@@ -63,10 +64,12 @@ from .domain_shape_state import (
     update_domain_shape_state,
 )
 from .confirmed_phase_view import (
+    IDENTITY_PHASE_GROUP_ID,
     ConfirmedPhaseView,
     align_target_positions_to_source,
     build_confirmed_class_to_group_map,
     build_confirmed_phase_view,
+    build_phase_calibrated_view,
 )
 from .ema_teacher import Stage2EMATeacher
 from .phase_registration import (
@@ -141,6 +144,7 @@ from .stable_target_labels import (
     StableTargetLabelScanResult,
     evaluate_stable_target_candidate,
     scan_stable_target_labels,
+    scan_stable_target_labels_from_candidates,
     scan_stable_target_labels_from_confirmed_phase,
 )
 from .target_hypothesis_scan import (
@@ -171,6 +175,7 @@ __all__ = [
     "ContinuousTime2Vec",
     "ContributionDiagnostics",
     "ConfirmedPhaseView",
+    "IDENTITY_PHASE_GROUP_ID",
     "DecompositionDiagnostics",
     "DecompositionOutput",
     "DomainPhaseConfig",
@@ -214,6 +219,7 @@ __all__ = [
     "StableTargetLabel",
     "StableTargetLabelScanResult",
     "scan_stable_target_labels_from_confirmed_phase",
+    "scan_stable_target_labels_from_candidates",
     "Stage1LossOutput",
     "Stage1Objective",
     "Stage2EMATeacher",
@@ -246,6 +252,7 @@ __all__ = [
     "build_source_registration_prototypes",
     "build_confirmed_class_to_group_map",
     "build_confirmed_phase_view",
+    "build_phase_calibrated_view",
     "check_gamma_legality",
     "compute_decomposition_diagnostics",
     "compute_gamma_diagnostics",
@@ -258,6 +265,7 @@ __all__ = [
     "deterministic_class_selection",
     "empirical_cdf",
     "evaluate_candidate_phase_compatibility",
+    "evaluate_sample_class_phase_compatibility",
     "evaluate_registration_geometry",
     "evaluate_stable_target_candidate",
     "evaluate_synthetic_source_diagnostics",

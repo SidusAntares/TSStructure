@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import torch
@@ -10,14 +10,24 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .confirmed_phase_view import (
+    IDENTITY_PHASE_GROUP_ID,
     ConfirmedPhaseView,
     build_confirmed_class_to_group_map,
     build_confirmed_phase_view,
+    build_phase_calibrated_view,
 )
-from .domain_phase_state import DomainPhaseState, PhaseGroup, PhaseGroupStatus
+from .domain_phase_state import (
+    CandidatePhaseCompatibilityStatus,
+    DomainPhaseConfig,
+    DomainPhaseState,
+    PhaseDecisionStatus,
+    PhaseGroup,
+    PhaseGroupStatus,
+    evaluate_sample_class_phase_compatibility,
+)
 from .ema_teacher import Stage2EMATeacher
 from .prototype_bank import SourcePrototypeBank, support_aware_q_distance
-from .target_hypothesis_scan import TargetHypothesisScanResult
+from .target_hypothesis_scan import CandidatePseudoLabel, TargetHypothesisScanResult
 
 
 @dataclass(frozen=True)
@@ -69,6 +79,10 @@ class StableTargetCandidate:
     passed_q: bool
     accepted: bool
     reject_reason: str | None
+    phase_compatible: bool = False
+    phase_distance_to_group: float | None = None
+    candidate_q_shape_distance: float | None = None
+    candidate_ambiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,6 +109,8 @@ class StableTargetLabelScanResult:
     num_stable_labels: int
     num_ambiguous_rejected: int
     stable_class_counts: tuple[int, ...]
+    num_phase_compatible: int = 0
+    num_phase_incompatible: int = 0
 
 
 def _passes_gate(
@@ -300,6 +316,334 @@ def _subset_batch(batch: dict, rows: list[int], batch_size: int) -> dict:
         else:
             subset[name] = value
     return subset
+
+
+def _candidate_phase_rejection(
+    candidate: CandidatePseudoLabel,
+    *,
+    phase_status: CandidatePhaseCompatibilityStatus,
+    phase_distance: float | None,
+) -> StableTargetCandidate:
+    nan = float("nan")
+    return StableTargetCandidate(
+        sample_id=int(candidate.sample_id),
+        class_id=int(candidate.class_id),
+        group_id=IDENTITY_PHASE_GROUP_ID,
+        cls_confidence=nan,
+        cls_margin=nan,
+        fused_distance=nan,
+        fused_confidence=nan,
+        fused_margin=nan,
+        q_distance=nan,
+        q_confidence=nan,
+        q_margin=nan,
+        q_common_support=nan,
+        passed_classifier=False,
+        passed_fused=False,
+        passed_q=False,
+        accepted=False,
+        reject_reason=f"phase_{phase_status.value}",
+        phase_compatible=False,
+        phase_distance_to_group=phase_distance,
+        candidate_q_shape_distance=float(candidate.q_shape_distance),
+        candidate_ambiguous=bool(candidate.ambiguous),
+    )
+
+
+def _identity_gamma_from_compatibility(compatibility) -> Tensor:
+    for item in compatibility:
+        if item.gamma is not None:
+            return torch.linspace(0.0, 1.0, item.gamma.numel(), dtype=torch.float64)
+    raise RuntimeError("identity-confirmed stable-label scan requires cached candidate gammas")
+
+
+@torch.no_grad()
+def scan_stable_target_labels_from_candidates(
+    *,
+    ema_teacher: Stage2EMATeacher,
+    target_loader,
+    hypothesis_result: TargetHypothesisScanResult,
+    phase_state: DomainPhaseState,
+    phase_config: DomainPhaseConfig,
+    source_prototype_bank: SourcePrototypeBank,
+    config: StableLabelConfig,
+    sample_ids: tuple[int, ...] | None = None,
+) -> StableTargetLabelScanResult:
+    """Confirm or correct the Round-A candidate set under confirmed Domain Phase.
+
+    The formal path never searches arbitrary classes.  A non-ambiguous sample
+    contributes only its primary geometry-first candidate.  A near-tie may also
+    contribute the single Round-A secondary candidate; confirmed Domain Phase
+    can therefore resolve that *existing ambiguity* without allowing the
+    classifier to invent a new class.
+
+    Individual sample/class gammas are used only for Phase compatibility.  Any
+    Shape stored in a stable label is recomputed with the confirmed group center
+    (or explicit identity), preserving target-domain intrinsic phase variation.
+    """
+    num_classes = int(source_prototype_bank.ready.numel())
+    requested = None if sample_ids is None else set(int(item) for item in sample_ids)
+    requested_count = hypothesis_result.num_samples if requested is None else len(requested)
+    if phase_state.decision_status is PhaseDecisionStatus.UNCONFIRMED:
+        return _empty_result(requested_count, num_classes)
+
+    primary_by_sample: dict[int, CandidatePseudoLabel] = {}
+    for candidate in hypothesis_result.candidate_pseudo_labels:
+        sample_id = int(candidate.sample_id)
+        if requested is not None and sample_id not in requested:
+            continue
+        if sample_id in primary_by_sample:
+            raise ValueError(f"duplicate primary candidate pseudo-label for sample {sample_id}")
+        primary_by_sample[sample_id] = candidate
+
+    alignment_lookup = {
+        (int(item.sample_id), int(item.class_id)): item
+        for item in hypothesis_result.pairwise_alignments
+    }
+    confirmed_groups = {
+        group.group_id: group
+        for group in phase_state.groups
+        if group.status is PhaseGroupStatus.CONFIRMED
+    }
+    ready_classes = tuple(
+        int(i)
+        for i in torch.nonzero(
+            source_prototype_bank.ready.detach().cpu(), as_tuple=False
+        ).flatten().tolist()
+    )
+
+    option_by_key: dict[tuple[int, int], CandidatePseudoLabel] = {}
+    compatibility_by_key = {}
+    rejected_candidates: list[StableTargetCandidate] = []
+    view_spec_by_key: dict[tuple[int, int], tuple[int, Tensor, tuple[int, ...]]] = {}
+
+    for sample_id, primary in primary_by_sample.items():
+        options = [primary]
+        if (
+            primary.ambiguous
+            and primary.secondary_class_id is not None
+            and primary.secondary_q_shape_distance is not None
+        ):
+            options.append(
+                replace(
+                    primary,
+                    class_id=int(primary.secondary_class_id),
+                    q_shape_distance=float(primary.secondary_q_shape_distance),
+                    phase_evidence_eligible=bool(
+                        primary.secondary_phase_evidence_eligible
+                        if primary.secondary_phase_evidence_eligible is not None
+                        else False
+                    ),
+                    secondary_class_id=None,
+                    secondary_q_shape_distance=None,
+                    secondary_phase_evidence_eligible=None,
+                )
+            )
+
+        for option in options:
+            key = (sample_id, int(option.class_id))
+            option_by_key[key] = option
+            compatibility = evaluate_sample_class_phase_compatibility(
+                sample_id=sample_id,
+                class_id=int(option.class_id),
+                alignment=alignment_lookup.get(key),
+                state=phase_state,
+                config=phase_config,
+                # Estimating Domain Phase required stricter evidence.  Once the
+                # domain-level Phase is fixed, numerically valid candidates may
+                # be checked against it and then judged on the calibrated view.
+                require_phase_evidence_eligible=False,
+            )
+            compatibility_by_key[key] = compatibility
+            if compatibility.status is not CandidatePhaseCompatibilityStatus.COMPATIBLE:
+                rejected_candidates.append(
+                    _candidate_phase_rejection(
+                        option,
+                        phase_status=compatibility.status,
+                        phase_distance=compatibility.phase_distance_to_group,
+                    )
+                )
+                continue
+
+            if phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED:
+                if compatibility.gamma is None:
+                    rejected_candidates.append(
+                        _candidate_phase_rejection(
+                            option,
+                            phase_status=CandidatePhaseCompatibilityStatus.UNUSABLE,
+                            phase_distance=compatibility.phase_distance_to_group,
+                        )
+                    )
+                    continue
+                identity_gamma = torch.linspace(
+                    0.0, 1.0, compatibility.gamma.numel(), dtype=torch.float64
+                )
+                view_spec_by_key[key] = (
+                    IDENTITY_PHASE_GROUP_ID,
+                    identity_gamma,
+                    ready_classes,
+                )
+                continue
+
+            group_id = compatibility.assigned_group_id
+            group = None if group_id is None else confirmed_groups.get(int(group_id))
+            if group is None or int(option.class_id) not in group.member_classes:
+                rejected_candidates.append(
+                    _candidate_phase_rejection(
+                        option,
+                        phase_status=CandidatePhaseCompatibilityStatus.NO_CONFIRMED_GROUP,
+                        phase_distance=compatibility.phase_distance_to_group,
+                    )
+                )
+                view_spec_by_key.pop(key, None)
+                continue
+            view_spec_by_key[key] = (
+                group.group_id,
+                group.center_gamma,
+                group.member_classes,
+            )
+
+    teacher = ema_teacher.model()
+    teacher.eval()
+    view_lookup: dict[tuple[int, int], tuple[ConfirmedPhaseView, int]] = {}
+    considered_samples: set[int] = set()
+    candidate_view_count = 0
+    fallback_index = 0
+
+    for batch in target_loader:
+        pixels = batch.get("pixels")
+        if not isinstance(pixels, Tensor):
+            raise ValueError("target batch must contain tensor pixels")
+        batch_size = int(pixels.shape[0])
+        batch_ids = batch.get("index")
+        if not isinstance(batch_ids, Tensor) or batch_ids.shape != (batch_size,):
+            batch_ids = torch.arange(
+                fallback_index, fallback_index + batch_size, dtype=torch.long
+            )
+        batch_ids = batch_ids.detach().to(device="cpu", dtype=torch.long)
+        fallback_index += batch_size
+        if requested is None:
+            considered_samples.update(int(item) for item in batch_ids.tolist())
+        else:
+            considered_samples.update(
+                int(item) for item in batch_ids.tolist() if int(item) in requested
+            )
+
+        rows_by_group: dict[int, list[int]] = {}
+        group_specs: dict[int, tuple[Tensor, tuple[int, ...]]] = {}
+        for row in range(batch_size):
+            sample_id = int(batch_ids[row].item())
+            seen_groups: set[int] = set()
+            for (candidate_sample, _class_id), spec in view_spec_by_key.items():
+                if candidate_sample != sample_id:
+                    continue
+                group_id, center_gamma, member_classes = spec
+                if group_id in seen_groups:
+                    continue
+                seen_groups.add(group_id)
+                rows_by_group.setdefault(group_id, []).append(row)
+                group_specs[group_id] = (center_gamma, member_classes)
+
+        for group_id in sorted(rows_by_group):
+            rows = rows_by_group[group_id]
+            center_gamma, member_classes = group_specs[group_id]
+            batch_sample_ids = torch.tensor(
+                [int(batch_ids[row].item()) for row in rows], dtype=torch.long
+            )
+            view = build_phase_calibrated_view(
+                model=teacher,
+                batch=_subset_batch(batch, rows, batch_size),
+                sample_ids=batch_sample_ids,
+                group_id=group_id,
+                member_classes=member_classes,
+                center_gamma=center_gamma,
+            )
+            candidate_view_count += len(rows)
+            for view_index, sample_id in enumerate(view.sample_ids.tolist()):
+                view_lookup[(int(sample_id), group_id)] = (view, view_index)
+
+    if requested is not None and considered_samples != requested:
+        missing = sorted(requested - considered_samples)
+        raise ValueError(
+            "target statistics loader is missing requested sample ids: "
+            + ",".join(str(item) for item in missing[:10])
+        )
+
+    candidates = list(rejected_candidates)
+    accepted_by_sample: dict[int, list[tuple[StableTargetCandidate, ConfirmedPhaseView, int]]] = {}
+    phase_compatible_samples: set[int] = set()
+    for key in sorted(view_spec_by_key):
+        sample_id, class_id = key
+        group_id = view_spec_by_key[key][0]
+        source = view_lookup.get((sample_id, group_id))
+        if source is None:
+            continue
+        option = option_by_key[key]
+        compatibility = compatibility_by_key[key]
+        view, view_index = source
+        evaluated = evaluate_stable_target_candidate(
+            view=view,
+            view_index=view_index,
+            class_id=class_id,
+            source_prototype_bank=source_prototype_bank,
+            config=config,
+        )
+        evaluated = replace(
+            evaluated,
+            phase_compatible=True,
+            phase_distance_to_group=compatibility.phase_distance_to_group,
+            candidate_q_shape_distance=float(option.q_shape_distance),
+            candidate_ambiguous=bool(option.ambiguous),
+        )
+        candidates.append(evaluated)
+        phase_compatible_samples.add(sample_id)
+        if evaluated.accepted:
+            accepted_by_sample.setdefault(sample_id, []).append(
+                (evaluated, view, view_index)
+            )
+
+    stable_labels: list[StableTargetLabel] = []
+    class_counts = [0] * num_classes
+    ambiguous_rejected = 0
+    for sample_id in sorted(accepted_by_sample):
+        accepted = accepted_by_sample[sample_id]
+        if len(accepted) != 1:
+            ambiguous_rejected += 1
+            continue
+        evaluated, view, view_index = accepted[0]
+        stable_labels.append(
+            StableTargetLabel(
+                sample_id=evaluated.sample_id,
+                class_id=evaluated.class_id,
+                group_id=evaluated.group_id,
+                aligned_q_shape=view.aligned_q_shape[view_index].detach(),
+                aligned_q_support=view.aligned_q_support[view_index].detach(),
+                fused_repr=view.fused_repr[view_index].detach(),
+                confidence_summary=min(
+                    evaluated.cls_confidence,
+                    evaluated.fused_confidence,
+                    evaluated.q_confidence,
+                ),
+            )
+        )
+        class_counts[evaluated.class_id] += 1
+
+    candidates.sort(key=lambda item: (item.sample_id, item.class_id))
+    return StableTargetLabelScanResult(
+        candidates=tuple(candidates),
+        stable_labels=tuple(stable_labels),
+        num_samples=requested_count,
+        num_without_confirmed_phase=requested_count - len(phase_compatible_samples),
+        num_candidate_views=candidate_view_count,
+        num_classifier_pass=sum(item.passed_classifier for item in candidates),
+        num_fused_pass=sum(item.passed_fused for item in candidates),
+        num_q_pass=sum(item.passed_q for item in candidates),
+        num_stable_labels=len(stable_labels),
+        num_ambiguous_rejected=ambiguous_rejected,
+        stable_class_counts=tuple(class_counts),
+        num_phase_compatible=len(phase_compatible_samples),
+        num_phase_incompatible=max(0, requested_count - len(phase_compatible_samples)),
+    )
 
 
 @torch.no_grad()

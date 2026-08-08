@@ -5,6 +5,7 @@ import torch
 from methods.structure_da.decomposition import SymmetricTimeKernelDecomposition
 from methods.structure_da.domain_phase_state import (
     DomainPhaseState,
+    PhaseDecisionStatus,
     PhaseGroup,
     PhaseGroupStatus,
 )
@@ -61,6 +62,12 @@ def _phase_state(status=PhaseGroupStatus.CONFIRMED, *, include_class=True):
         valid_phase_classes=members,
         groups=(group,),
         rejected_classes=(),
+        decision_status=(
+            PhaseDecisionStatus.NONIDENTITY_CONFIRMED
+            if status is PhaseGroupStatus.CONFIRMED
+            else PhaseDecisionStatus.UNCONFIRMED
+        ),
+        decision_stability_age=2 if status is PhaseGroupStatus.CONFIRMED else 0,
     )
 
 
@@ -122,7 +129,12 @@ def test_source_to_target_phase_uses_gamma_not_inverse_gamma() -> None:
     assert not torch.allclose(mapped, inverse_values)
 
 
-def _build(phase_state, shape_status=DomainShapeStatus.CONFIRMED):
+def _build(
+    phase_state,
+    shape_status=DomainShapeStatus.CONFIRMED,
+    *,
+    delta: torch.Tensor | None = None,
+):
     grid = torch.linspace(0.0, 1.0, 9)
     velocity = torch.tensor([1.0, 0.5])
     norm = torch.linalg.vector_norm(velocity)
@@ -137,7 +149,9 @@ def _build(phase_state, shape_status=DomainShapeStatus.CONFIRMED):
         source_positions=torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0]),
         mask=torch.ones(5, dtype=torch.bool),
         phase_state=phase_state,
-        domain_shape_state=_shape_state(torch.zeros_like(q), status=shape_status),
+        domain_shape_state=_shape_state(
+            torch.zeros_like(q) if delta is None else delta, status=shape_status
+        ),
         decomposition=SymmetricTimeKernelDecomposition(),
         lambda_delta=1.0,
     )
@@ -169,3 +183,54 @@ def test_synthetic_example_uses_frozen_slow_operator_and_keeps_true_class() -> N
     assert example.trend_tokens.shape == example.structure_tokens.shape == (5, 2)
     assert torch.isfinite(example.trend_tokens).all()
     assert torch.isfinite(example.structure_tokens).all()
+
+
+def _identity_phase_state():
+    from methods.structure_da.domain_phase_state import PhaseDecisionStatus
+
+    return DomainPhaseState(
+        scan_index=1,
+        m=0,
+        class_centers=(),
+        valid_phase_classes=(0, 1),
+        groups=(),
+        rejected_classes=(),
+        decision_status=PhaseDecisionStatus.IDENTITY_CONFIRMED,
+        decision_stability_age=2,
+        identity_evidence_classes=(0, 1),
+        identity_evidence_count=4.0,
+    )
+
+
+def test_identity_confirmed_shape_synthesis_changes_shape_but_not_positions() -> None:
+    phase = _identity_phase_state()
+    grid = torch.linspace(0.0, 1.0, 9)
+    velocity = torch.tensor([1.0, 0.5])
+    norm = torch.linalg.vector_norm(velocity)
+    source_q = (velocity / torch.sqrt(norm)).expand(9, -1).clone()
+    delta = torch.full_like(source_q, 0.05)
+    example = _build(phase, delta=delta)
+    assert example is not None
+    assert example.group_id == -1
+    torch.testing.assert_close(example.q_shape, source_q + delta)
+    torch.testing.assert_close(
+        example.target_style_positions,
+        torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0]),
+    )
+
+
+def test_identity_confirmed_without_shape_has_no_phase_only_synthetic() -> None:
+    from methods.structure_da.shape_transport import build_phase_only_synthetic_source_example
+
+    positions = torch.linspace(0.0, 1.0, 5)
+    assert build_phase_only_synthetic_source_example(
+        source_sample_id=1,
+        class_id=0,
+        source_trend_tokens=torch.zeros(5, 2),
+        source_structure_tokens=torch.zeros(5, 2),
+        source_q_shape=torch.zeros(5, 2),
+        source_q_support=torch.ones(5),
+        source_positions=positions,
+        mask=torch.ones(5, dtype=torch.bool),
+        phase_state=_identity_phase_state(),
+    ) is None

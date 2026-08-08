@@ -46,7 +46,7 @@ from .source_prototype_scanner import refresh_source_fused_statistics
 from .stable_target_labels import (
     StableLabelConfig,
     StableTargetLabelScanResult,
-    scan_stable_target_labels_from_confirmed_phase,
+    scan_stable_target_labels_from_candidates,
 )
 from .stage2_objective import Stage2Objective, Stage2ObjectiveConfig
 from .stage2_parameter_policy import Stage2ParameterPolicy
@@ -162,6 +162,8 @@ class Stage2RunResult:
     best_target_val_f1: float
     best_target_val_epoch: int | None
     final_diagnostic_target_test: dict | None
+    adaptation_performed: bool = True
+    abstain_reason: str | None = None
 
 
 def _integration_weights(model: nn.Module, device: torch.device) -> Tensor:
@@ -208,7 +210,19 @@ def _stack_synthetic(
 
 
 def _confirmed_phase_exists(state: DomainPhaseState) -> bool:
-    return state.decision_status is PhaseDecisionStatus.NONIDENTITY_CONFIRMED
+    return state.decision_status in (
+        PhaseDecisionStatus.IDENTITY_CONFIRMED,
+        PhaseDecisionStatus.NONIDENTITY_CONFIRMED,
+    )
+
+
+def _adaptation_available(snapshot: Stage2StatisticsSnapshot) -> bool:
+    decision = snapshot.phase_state.decision_status
+    if decision is PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
+        return True
+    if decision is PhaseDecisionStatus.IDENTITY_CONFIRMED:
+        return snapshot.shape_state.status is DomainShapeStatus.CONFIRMED
+    return False
 
 
 def _phase_groups_log_value(state: DomainPhaseState) -> str:
@@ -360,6 +374,8 @@ def _stable_label_payload(result: StableTargetLabelScanResult) -> dict:
         "num_samples": result.num_samples,
         "num_stable_labels": result.num_stable_labels,
         "stable_class_counts": tuple(result.stable_class_counts),
+        "num_phase_compatible": result.num_phase_compatible,
+        "num_phase_incompatible": result.num_phase_incompatible,
         "labels": tuple(
             {
                 "sample_id": item.sample_id,
@@ -368,6 +384,65 @@ def _stable_label_payload(result: StableTargetLabelScanResult) -> dict:
                 "confidence_summary": item.confidence_summary,
             }
             for item in result.stable_labels
+        ),
+        "candidates": tuple(
+            {
+                "sample_id": item.sample_id,
+                "class_id": item.class_id,
+                "group_id": item.group_id,
+                "phase_compatible": item.phase_compatible,
+                "phase_distance_to_group": item.phase_distance_to_group,
+                "candidate_q_shape_distance": item.candidate_q_shape_distance,
+                "candidate_ambiguous": item.candidate_ambiguous,
+                "passed_classifier": item.passed_classifier,
+                "passed_fused": item.passed_fused,
+                "passed_q": item.passed_q,
+                "accepted": item.accepted,
+                "reject_reason": item.reject_reason,
+            }
+            for item in result.candidates
+        ),
+    }
+
+
+def _target_hypothesis_payload(result: TargetHypothesisScanResult) -> dict:
+    """Checkpoint the frozen Round-A/B evidence without rerunning registration."""
+    return {
+        "num_samples": result.num_samples,
+        "scanned_sample_ids": tuple(result.scanned_sample_ids),
+        "candidate_pseudo_labels": tuple(
+            {
+                "sample_id": item.sample_id,
+                "class_id": item.class_id,
+                "q_shape_distance": item.q_shape_distance,
+                "q_distance_percentile": item.q_distance_percentile,
+                "phase_evidence_eligible": item.phase_evidence_eligible,
+                "ambiguous": item.ambiguous,
+                "secondary_class_id": item.secondary_class_id,
+                "secondary_q_shape_distance": item.secondary_q_shape_distance,
+                "secondary_phase_evidence_eligible": item.secondary_phase_evidence_eligible,
+            }
+            for item in result.candidate_pseudo_labels
+        ),
+        "pairwise_alignments": tuple(
+            {
+                "sample_id": item.sample_id,
+                "class_id": item.class_id,
+                "gamma": None if item.gamma is None else item.gamma.detach().cpu(),
+                "t_identity_error": item.t_identity_error,
+                "t_registered_error": item.t_registered_error,
+                "t_gain_ratio": item.t_gain_ratio,
+                "pre_common_support_t": item.pre_common_support_t,
+                "common_support_t": item.common_support_t,
+                "q_shape_distance": item.q_shape_distance,
+                "q_distance_percentile": item.q_distance_percentile,
+                "common_support_shape": item.common_support_shape,
+                "numerically_valid": item.numerically_valid,
+                "phase_evidence_eligible": item.phase_evidence_eligible,
+                "reject_reasons": tuple(item.reject_reasons),
+                "solver_error": item.solver_error,
+            }
+            for item in result.pairwise_alignments
         ),
     }
 
@@ -499,10 +574,14 @@ class Stage2Trainer:
         *,
         sample_ids: tuple[int, ...],
     ) -> tuple[StableTargetLabelScanResult, DomainShapeState]:
-        stable_result = scan_stable_target_labels_from_confirmed_phase(
+        if self.hypothesis_cache is None:
+            raise RuntimeError("target hypothesis cache is unavailable")
+        stable_result = scan_stable_target_labels_from_candidates(
             ema_teacher=self.ema_teacher,
             target_loader=self.target_statistics_loader,
+            hypothesis_result=self.hypothesis_cache.result,
             phase_state=phase_state,
+            phase_config=self.config.phase,
             source_prototype_bank=self.source_prototype_bank,
             config=self.config.stable_labels,
             sample_ids=sample_ids,
@@ -584,6 +663,8 @@ class Stage2Trainer:
                     f"budget={budget}|stable_labels={stable_result.num_stable_labels}"
                     f"|stable_coverage={stable_coverage:.4f}"
                     f"|candidate_views={stable_result.num_candidate_views}"
+                    f"|phase_compatible={stable_result.num_phase_compatible}"
+                    f"|phase_incompatible={stable_result.num_phase_incompatible}"
                     f"|cls_pass={stable_result.num_classifier_pass}"
                     f"|fused_pass={stable_result.num_fused_pass}"
                     f"|q_pass={stable_result.num_q_pass}"
@@ -671,6 +752,8 @@ class Stage2Trainer:
             f"|confirmed_phase={str(_confirmed_phase_exists(previous.phase_state)).lower()}"
             f"|stable_labels={stable_result.num_stable_labels}"
             f"|stable_coverage={stable_coverage:.4f}"
+            f"|phase_compatible={stable_result.num_phase_compatible}"
+            f"|phase_incompatible={stable_result.num_phase_incompatible}"
             f"|cls_pass={stable_result.num_classifier_pass}"
             f"|fused_pass={stable_result.num_fused_pass}"
             f"|q_pass={stable_result.num_q_pass}"
@@ -814,6 +897,10 @@ class Stage2Trainer:
     def train_step(self, batch: dict) -> dict[str, float]:
         if self.statistics is None:
             raise RuntimeError("Stage-2 statistics must be initialized before training")
+        if not _adaptation_available(self.statistics):
+            raise RuntimeError(
+                "Stage-2 optimizer step is forbidden without confirmed structural adaptation evidence"
+            )
         self._set_student_training_modes()
         self.optimizer.zero_grad(set_to_none=True)
         (
@@ -999,6 +1086,21 @@ class Stage2Trainer:
                 }
                 for item in hypothesis.hypotheses
             ],
+            "candidate_pseudo_labels": None if hypothesis is None else [
+                {
+                    "sample_id": item.sample_id,
+                    "class_id": item.class_id,
+                    "q_shape_distance": item.q_shape_distance,
+                    "q_distance_percentile": item.q_distance_percentile,
+                    "phase_evidence_eligible": item.phase_evidence_eligible,
+                    "ambiguous": item.ambiguous,
+                    "secondary_class_id": item.secondary_class_id,
+                    "secondary_q_shape_distance": item.secondary_q_shape_distance,
+                }
+                for item in hypothesis.candidate_pseudo_labels
+            ],
+            "stable_phase_compatible": stable.num_phase_compatible,
+            "stable_phase_incompatible": stable.num_phase_incompatible,
         }
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
@@ -1121,6 +1223,11 @@ class Stage2Trainer:
                 else tuple(self.hypothesis_cache.result.scanned_sample_ids)
             ),
             "shape_evidence_sample_ids": tuple(self.shape_evidence_sample_ids),
+            "target_hypothesis_state": (
+                None
+                if self.hypothesis_cache is None
+                else _target_hypothesis_payload(self.hypothesis_cache.result)
+            ),
             "stable_label_state": _stable_label_payload(self.statistics.stable_labels),
             "runtime_config": self.runtime_config,
             "stage2_config": {
@@ -1170,8 +1277,34 @@ def run_stage2_training(
     Target-test metrics are deliberately write-only with respect to training
     decisions: only target validation Macro-F1 selects the analysis checkpoint.
     """
-    trainer.initialize_statistics()
+    snapshot = trainer.initialize_statistics()
     print("STAGE2_INIT_COMPLETE|statistics_ready=true")
+    if isinstance(snapshot, Stage2StatisticsSnapshot) and not _adaptation_available(snapshot):
+        decision = snapshot.phase_state.decision_status
+        if decision is PhaseDecisionStatus.UNCONFIRMED:
+            reason = "phase_unconfirmed"
+        else:
+            reason = "identity_phase_without_confirmed_shape"
+        print(
+            "STAGE2_ABSTAIN|"
+            f"reason={reason}|phase_decision={decision.value}"
+            f"|shape_status={snapshot.shape_state.status.value}"
+            "|optimizer_steps=0|retain_stage1_best=true"
+        )
+        trainer.write_shape_diagnostics(0, suffix="no_adaptation")
+        trainer.save_ema_checkpoint(
+            "stage2_last_ema.pt",
+            epoch=0,
+            target_val=None,
+        )
+        final_test = evaluate_target_test(trainer.ema_teacher.model(), 0)
+        return Stage2RunResult(
+            best_target_val_f1=float("nan"),
+            best_target_val_epoch=None,
+            final_diagnostic_target_test=final_test,
+            adaptation_performed=False,
+            abstain_reason=reason,
+        )
     total_epochs = trainer.config.total_epochs
     block_epochs = trainer.config.adaptation_block_epochs
     best_f1 = float("-inf")
@@ -1218,4 +1351,6 @@ def run_stage2_training(
         best_target_val_f1=best_f1,
         best_target_val_epoch=best_epoch,
         final_diagnostic_target_test=final_test,
+        adaptation_performed=True,
+        abstain_reason=None,
     )

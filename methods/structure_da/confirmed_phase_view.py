@@ -1,4 +1,4 @@
-"""Confirmed group phase views produced by the frozen geometry and EMA teacher."""
+"""Domain-Phase calibrated target views produced by frozen geometry and EMA teacher."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ from torch import Tensor, nn
 from .domain_phase_state import DomainPhaseState, PhaseGroup, PhaseGroupStatus
 from .phase_registration import resample_gamma, warp_q_gamma, warp_support_gamma
 from .temporal_registration import invert_monotone_warp
+
+
+IDENTITY_PHASE_GROUP_ID = -1
 
 
 @dataclass(frozen=True)
@@ -95,15 +98,33 @@ def _batch_tensor(batch: dict, name: str, device: torch.device):
 
 
 @torch.no_grad()
-def build_confirmed_phase_view(
+def build_phase_calibrated_view(
     *,
     model: nn.Module,
     batch: dict,
     sample_ids: Tensor,
-    group: PhaseGroup,
+    group_id: int,
+    member_classes: tuple[int, ...],
+    center_gamma: Tensor,
 ) -> ConfirmedPhaseView:
-    if group.status is not PhaseGroupStatus.CONFIRMED:
-        raise ValueError("only confirmed phase groups can produce target views")
+    """Build a target view using one confirmed domain-level Phase transform.
+
+    ``center_gamma`` is always the *domain-level* calibration applied to the
+    target view.  It may be a confirmed non-identity group center or the
+    explicit identity transform when ``PhaseDecisionStatus.IDENTITY_CONFIRMED``
+    has already been established.  Individual sample/class gammas are never
+    used to build this view.
+    """
+    if not isinstance(center_gamma, Tensor) or center_gamma.ndim != 1:
+        raise ValueError("center_gamma must have shape [K_gamma]")
+    gamma_cpu = center_gamma.detach().to(device="cpu", dtype=torch.float64)
+    if gamma_cpu.numel() < 2 or not torch.isfinite(gamma_cpu).all().item():
+        raise ValueError("center_gamma must be finite and contain at least two points")
+    if not torch.all(gamma_cpu[1:] > gamma_cpu[:-1]).item():
+        raise ValueError("center_gamma must be strictly increasing")
+    if abs(float(gamma_cpu[0])) > 1e-6 or abs(float(gamma_cpu[-1]) - 1.0) > 1e-6:
+        raise ValueError("center_gamma must preserve [0,1] endpoints")
+
     device = _model_device(model)
     pixels = _batch_tensor(batch, "pixels", device)
     valid_pixels = _batch_tensor(batch, "valid_pixels", device)
@@ -123,7 +144,7 @@ def build_confirmed_phase_view(
     aligned_positions = align_target_positions_to_source(
         backbone.normalized_positions,
         backbone.time_mask,
-        group.center_gamma,
+        center_gamma,
     )
     output = model.forward_from_backbone(
         backbone,
@@ -133,17 +154,17 @@ def build_confirmed_phase_view(
         return_geometry=True,
     )
     if output.geometry is None:
-        raise RuntimeError("confirmed phase view requires functional geometry")
+        raise RuntimeError("phase-calibrated view requires functional geometry")
     shape_grid = output.geometry.canonical_grid
     reg_grid = torch.linspace(
         0.0,
         1.0,
-        group.center_gamma.numel(),
+        center_gamma.numel(),
         device=shape_grid.device,
         dtype=shape_grid.dtype,
     )
     gamma_shape = resample_gamma(
-        group.center_gamma.to(device=shape_grid.device, dtype=shape_grid.dtype),
+        center_gamma.to(device=shape_grid.device, dtype=shape_grid.dtype),
         reg_grid,
         shape_grid,
     )
@@ -166,9 +187,9 @@ def build_confirmed_phase_view(
 
     return ConfirmedPhaseView(
         sample_ids=sample_ids.detach().to(device="cpu", dtype=torch.long),
-        group_id=group.group_id,
-        member_classes=group.member_classes,
-        center_gamma=group.center_gamma.detach().to(device="cpu", dtype=torch.float64),
+        group_id=int(group_id),
+        member_classes=tuple(int(item) for item in member_classes),
+        center_gamma=gamma_cpu,
         aligned_positions=detached(aligned_positions),
         logits=detached(output.logits),
         probabilities=detached(probabilities),
@@ -178,4 +199,24 @@ def build_confirmed_phase_view(
         aligned_q_shape=detached(aligned_q),
         aligned_q_support=detached(aligned_support),
         q_valid=detached(output.geometry.structure_valid),
+    )
+
+
+@torch.no_grad()
+def build_confirmed_phase_view(
+    *,
+    model: nn.Module,
+    batch: dict,
+    sample_ids: Tensor,
+    group: PhaseGroup,
+) -> ConfirmedPhaseView:
+    if group.status is not PhaseGroupStatus.CONFIRMED:
+        raise ValueError("only confirmed phase groups can produce target views")
+    return build_phase_calibrated_view(
+        model=model,
+        batch=batch,
+        sample_ids=sample_ids,
+        group_id=group.group_id,
+        member_classes=group.member_classes,
+        center_gamma=group.center_gamma,
     )
