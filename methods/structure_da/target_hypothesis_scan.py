@@ -95,7 +95,8 @@ class PairwiseClassAlignment:
     ``numerically_valid`` means the solver returned a finite, endpoint-valid,
     strictly increasing gamma that can be used to evaluate Shape.  The stricter
     ``phase_evidence_eligible`` flag additionally applies the configured
-    support/deformation/gain/Shape-range reliability gates.
+    support/deformation/gain and Shape-computability reliability gates.  Source
+    q-range exceedance is retained as a diagnostic, not a Phase-discovery gate.
     """
 
     sample_id: int
@@ -918,12 +919,15 @@ class TargetPhaseHypothesisScanner:
                 reasons.append("gain")
             if evaluated is None:
                 reasons.append("shape_support")
-            else:
-                if pct is None:
-                    reasons.append("q_cdf_unavailable")
-                if q_dist is not None and q_dist > float(self.source_cache.q_outer[class_id].item()):
-                    reasons.append("shape_outer")
+            elif pct is None:
+                reasons.append("q_cdf_unavailable")
 
+            # Source q95 is intentionally diagnostic-only here.  Domain Shape
+            # shift can move a correctly matched target sample outside the
+            # source within-class q range; using that range as a prerequisite
+            # for discovering Domain Phase creates a circular dependency.
+            # ``outer_rejected`` is still counted above for calibration and
+            # downstream stable-label analysis.
             eligible = numerically_valid and not reasons
             alignment = PairwiseClassAlignment(
                 sample_id=solved_pair.sample_id,

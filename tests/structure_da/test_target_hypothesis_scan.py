@@ -518,7 +518,7 @@ def test_near_tie_keeps_at_most_two_phase_hypotheses() -> None:
     assert [item.evidence_weight for item in hypotheses] == pytest.approx([0.5, 0.5])
 
 
-def test_outer_range_failure_keeps_candidate_pseudo_label_but_not_phase_evidence() -> None:
+def test_other_reliability_failure_keeps_candidate_pseudo_label_but_not_phase_evidence() -> None:
     candidate, hypotheses = scan_module._select_candidate_and_hypotheses(
         [
             _alignment(
@@ -526,7 +526,7 @@ def test_outer_range_failure_keeps_candidate_pseudo_label_but_not_phase_evidence
                 q_distance=0.10,
                 q_percentile=1.0,
                 eligible=False,
-                reasons=("shape_outer",),
+                reasons=("gain",),
             ),
             _alignment(class_id=1, q_distance=0.50, q_percentile=0.2),
         ],
@@ -574,7 +574,7 @@ def test_support_gate_does_not_prune_classes_before_pseudo_label() -> None:
     assert result.num_pre_support_rejected == 2 * 3
 
 
-def test_actual_outer_gate_marks_reliability_without_erasing_candidate_label() -> None:
+def test_source_outer_range_is_diagnostic_only_for_phase_discovery() -> None:
     model = _model().eval()
     shape_extractor, reg_extractor = _extractors(model)
     loader = DataLoader(TinyParcelDataset(n=3, labels=False), batch_size=3)
@@ -584,11 +584,11 @@ def test_actual_outer_gate_marks_reliability_without_erasing_candidate_label() -
         reg_extractor=reg_extractor, adapter=_IdentityAdapter(),
     )
     assert len(result.candidate_pseudo_labels) == 3
-    assert all(not item.phase_evidence_eligible for item in result.candidate_pseudo_labels)
-    assert result.hypotheses == ()
+    assert all(item.phase_evidence_eligible for item in result.candidate_pseudo_labels)
+    assert len(result.hypotheses) >= 3
     assert result.num_outer_rejected == 3 * 3
     assert all(
-        "shape_outer" in item.reject_reasons
+        "shape_outer" not in item.reject_reasons
         for item in result.pairwise_alignments
         if item.q_shape_distance is not None
     )

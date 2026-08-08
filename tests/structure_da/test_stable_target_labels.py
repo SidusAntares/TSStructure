@@ -512,6 +512,55 @@ def test_roundc_formal_scan_uses_group_center_not_individual_candidate_gamma(mon
     )
 
 
+def test_roundc_compatible_nonmember_class_can_use_confirmed_group_center(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+
+    group = _group(0, (1, 2), PhaseGroupStatus.CONFIRMED, power=1.5)
+    state = _roundc_nonidentity_state(group)
+    scan = _roundc_scan_result(
+        class_id=0,
+        gamma=group.center_gamma.float(),
+    )
+    seen = []
+
+    def fake_view(**kwargs):
+        seen.append(
+            (
+                kwargs["group_id"],
+                kwargs["member_classes"],
+                kwargs["center_gamma"].detach().clone(),
+            )
+        )
+        return _view(
+            sample_ids=(20,),
+            group_id=kwargs["group_id"],
+            member_classes=kwargs["member_classes"],
+            winning_class=0,
+        )
+
+    monkeypatch.setattr(module, "build_phase_calibrated_view", fake_view)
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    result = module.scan_stable_target_labels_from_candidates(
+        ema_teacher=ema,
+        target_loader=_roundc_loader(),
+        hypothesis_result=scan,
+        phase_state=state,
+        phase_config=_roundc_phase_config(phase_group_diameter_max=0.05),
+        source_prototype_bank=_bank(),
+        config=_config(),
+        sample_ids=(20,),
+    )
+
+    assert group.member_classes == (1, 2)
+    assert seen[0][0] == 0
+    assert seen[0][1] == (1, 2)
+    torch.testing.assert_close(seen[0][2], group.center_gamma)
+    assert result.num_phase_compatible == 1
+    assert [(item.sample_id, item.class_id, item.group_id) for item in result.stable_labels] == [
+        (20, 0, 0)
+    ]
+
+
 def test_roundc_phase_incompatible_primary_candidate_is_rejected_before_class_gates(monkeypatch) -> None:
     import methods.structure_da.stable_target_labels as module
 

@@ -212,6 +212,61 @@ def test_confirmation_requires_stable_membership_and_small_group_drift() -> None
     assert changed.groups[0].confirmation_age == 1
 
 
+def test_progressive_membership_growth_preserves_confirmation_age() -> None:
+    from methods.structure_da.domain_phase_state import (
+        PhaseDecisionStatus,
+        PhaseGroupStatus,
+    )
+
+    config = _config(phase_center_drift_max=0.12)
+    first = _update([(0, 0.98), (1, 1.0)], config=config)
+    assert first.groups[0].member_classes == (0, 1)
+    assert first.groups[0].confirmation_age == 1
+
+    second = _update(
+        [(0, 0.98), (1, 1.0), (2, 1.02)],
+        config=config,
+        previous_state=first,
+    )
+    assert second.groups[0].member_classes == (0, 1, 2)
+    assert second.groups[0].status is PhaseGroupStatus.CONFIRMED
+    assert second.groups[0].confirmation_age == 2
+    assert second.decision_stability_age == 2
+    assert second.decision_status is PhaseDecisionStatus.NONIDENTITY_CONFIRMED
+
+    third = _update(
+        [(0, 0.98), (1, 1.0), (2, 1.02), (3, 1.04)],
+        config=config,
+        previous_state=second,
+    )
+    assert third.groups[0].member_classes == (0, 1, 2, 3)
+    assert third.groups[0].status is PhaseGroupStatus.CONFIRMED
+    assert third.groups[0].confirmation_age == 3
+    assert third.decision_stability_age == 3
+    assert third.decision_status is PhaseDecisionStatus.NONIDENTITY_CONFIRMED
+
+
+def test_progressive_member_replacement_still_resets_confirmation() -> None:
+    from methods.structure_da.domain_phase_state import PhaseGroupStatus
+
+    config = _config(phase_center_drift_max=0.12)
+    first = _update([(0, 0.98), (1, 1.0), (2, 1.02)], config=config)
+    second = _update(
+        [(0, 0.98), (1, 1.0), (2, 1.02)],
+        config=config,
+        previous_state=first,
+    )
+    changed = _update(
+        [(0, 0.98), (1, 1.0), (3, 1.02)],
+        config=config,
+        previous_state=second,
+    )
+    assert changed.groups[0].member_classes == (0, 1, 3)
+    assert changed.groups[0].status is PhaseGroupStatus.PROVISIONAL
+    assert changed.groups[0].confirmation_age == 1
+    assert changed.decision_stability_age == 1
+
+
 def test_group_center_drift_over_threshold_resets_confirmation() -> None:
     from methods.structure_da.domain_phase_state import PhaseGroupStatus
 
@@ -414,6 +469,36 @@ def test_identity_requires_explicit_calibrated_evidence_and_stability() -> None:
     assert second.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED
 
 
+def test_identity_support_growth_preserves_decision_stability_age() -> None:
+    from methods.structure_da.domain_phase_state import PhaseDecisionStatus, update_domain_phase_state
+
+    config = _config(
+        phase_identity_radius=0.02,
+        phase_identity_gain_ratio_min=0.98,
+    )
+    first_scan = _scan_with_pairwise(
+        [
+            _pairwise_alignment(0, 0, 1.0, gain_ratio=0.99, eligible=False),
+            _pairwise_alignment(1, 1, 1.0, gain_ratio=0.995, eligible=False),
+        ]
+    )
+    first = update_domain_phase_state(first_scan, config)
+    assert first.identity_evidence_classes == (0, 1)
+    assert first.decision_stability_age == 1
+
+    grown_scan = _scan_with_pairwise(
+        [
+            _pairwise_alignment(0, 0, 1.0, gain_ratio=0.99, eligible=False),
+            _pairwise_alignment(1, 1, 1.0, gain_ratio=0.995, eligible=False),
+            _pairwise_alignment(2, 2, 1.0, gain_ratio=0.992, eligible=False),
+        ]
+    )
+    second = update_domain_phase_state(grown_scan, config, previous_state=first)
+    assert second.identity_evidence_classes == (0, 1, 2)
+    assert second.decision_stability_age == 2
+    assert second.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED
+
+
 def _confirmed_m1_state(power: float = 1.0):
     from methods.structure_da.domain_phase_state import (
         DomainPhaseState,
@@ -445,6 +530,21 @@ def _confirmed_m1_state(power: float = 1.0):
         decision_status=PhaseDecisionStatus.NONIDENTITY_CONFIRMED,
         decision_stability_age=2,
     )
+
+
+def test_compatible_nonmember_candidate_is_assigned_to_nearest_confirmed_group() -> None:
+    from methods.structure_da.domain_phase_state import (
+        CandidatePhaseCompatibilityStatus,
+        evaluate_candidate_phase_compatibility,
+    )
+
+    state = _confirmed_m1_state(power=1.0)
+    scan = _scan_with_pairwise([_pairwise_alignment(10, 2, 1.01)])
+    compatibility = evaluate_candidate_phase_compatibility(scan, state, _config())
+    assert len(compatibility) == 1
+    assert compatibility[0].status is CandidatePhaseCompatibilityStatus.COMPATIBLE
+    assert compatibility[0].assigned_group_id == 0
+    assert compatibility[0].nearest_group_id == 0
 
 
 def test_single_far_candidate_is_residual_but_cannot_create_second_group() -> None:

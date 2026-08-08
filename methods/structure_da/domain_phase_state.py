@@ -396,21 +396,51 @@ def _try_m2(
     return (ordered[0], ordered[1]), tuple(sorted(rejected))
 
 
+def _match_previous_group(
+    members: tuple[int, ...],
+    previous_groups: tuple[PhaseGroup, ...],
+    used_group_ids: set[int],
+) -> PhaseGroup | None:
+    """Match a current group to a prior group without penalizing support growth.
+
+    Progressive evidence is nested.  A newly supported class may therefore join
+    an otherwise unchanged Domain-Phase group as the evidence budget grows.
+    Such monotone membership growth strengthens the same group and must not reset
+    confirmation age.  By contrast, losing an old member or moving it to another
+    group is a structural change and intentionally fails this subset match.
+    """
+    current = set(members)
+    matches = [
+        group
+        for group in previous_groups
+        if group.group_id not in used_group_ids
+        and set(group.member_classes).issubset(current)
+    ]
+    if not matches:
+        return None
+    # Groups are disjoint, so a valid match is normally unique.  Prefer the most
+    # informative prior group defensively if malformed/synthetic states overlap.
+    return max(matches, key=lambda group: (len(group.member_classes), -group.group_id))
+
+
 def _materialize_groups(
     candidates: tuple[_GroupCandidate, ...],
     class_centers: tuple[PhaseClassCenter, ...],
     previous_state: DomainPhaseState | None,
     config: DomainPhaseConfig,
 ) -> tuple[PhaseGroup, ...]:
-    previous_by_members = {}
+    previous_groups: tuple[PhaseGroup, ...] = ()
     if previous_state is not None and previous_state.m == len(candidates):
-        previous_by_members = {
-            group.member_classes: group for group in previous_state.groups
-        }
+        previous_groups = previous_state.groups
+    used_previous_group_ids: set[int] = set()
     groups: list[PhaseGroup] = []
     for group_id, candidate in enumerate(candidates):
         members = tuple(sorted(class_centers[index].class_id for index in candidate.member_indices))
-        prior = previous_by_members.get(members)
+        prior = _match_previous_group(
+            members, previous_groups, used_previous_group_ids
+        )
+        if prior is not None:
+            used_previous_group_ids.add(prior.group_id)
         drift = (
             float(phase_distance(candidate.center_gamma, prior.center_gamma).item())
             if prior is not None
@@ -613,7 +643,11 @@ def evaluate_sample_class_phase_compatibility(
             if compatible
             else CandidatePhaseCompatibilityStatus.RESIDUAL
         ),
-        assigned_group_id=None if assigned is None else assigned.group_id,
+        # Founding membership is evidence for estimating a group, not a
+        # prerequisite for using an already-confirmed Domain Phase.  A
+        # numerically valid candidate from another class is assigned to the
+        # nearest confirmed group when its gamma is geometrically compatible.
+        assigned_group_id=comparison_group.group_id if compatible else None,
         nearest_group_id=nearest.group_id,
         phase_distance_to_group=comparison_distance,
         gamma=gamma.detach().cpu().double(),
@@ -754,12 +788,18 @@ def _decision_stability_age(
     identity_classes: tuple[int, ...],
 ) -> int:
     if groups:
+        # ``_materialize_groups`` gives a non-None center_drift only when a
+        # current group can be matched to a prior group whose old members are
+        # all still present.  confirmation_age > 1 additionally proves that the
+        # matched center stayed inside the configured drift tolerance.  Hence
+        # newly joining supporting classes do not reset the domain-level model
+        # age, while member loss/reassignment or center drift still does.
         if (
             previous_state is not None
-            and previous_state.groups
-            and _model_signature(groups) == _model_signature(previous_state.groups)
+            and previous_state.m == len(groups)
+            and len(previous_state.groups) == len(groups)
             and all(
-                group.center_drift is not None
+                group.center_drift is not None and group.confirmation_age > 1
                 for group in groups
             )
         ):
@@ -769,7 +809,8 @@ def _decision_stability_age(
         if (
             previous_state is not None
             and previous_state.m == 0
-            and previous_state.identity_evidence_classes == identity_classes
+            and previous_state.identity_evidence_classes
+            and set(previous_state.identity_evidence_classes).issubset(identity_classes)
         ):
             return previous_state.decision_stability_age + 1
         return 1

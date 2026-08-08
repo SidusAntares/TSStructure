@@ -151,14 +151,11 @@ def evaluate_stable_target_candidate(
     config: StableLabelConfig,
 ) -> StableTargetCandidate:
     sample_id = int(view.sample_ids[view_index].item())
-    if class_id not in view.member_classes:
-        return StableTargetCandidate(
-            sample_id, class_id, view.group_id,
-            float("nan"), float("nan"), float("nan"), float("nan"), float("nan"),
-            float("nan"), float("nan"), float("nan"), float("nan"),
-            False, False, False, False, "class_not_in_confirmed_group",
-        )
-
+    # ``view.member_classes`` records the classes that supplied enough evidence
+    # to *confirm* this Domain-Phase group.  Post-confirmation candidate
+    # validation may legitimately test another source class whose cached gamma
+    # is compatible with the same group center, so founding membership is not a
+    # stable-label gate.
     probabilities = view.probabilities[view_index]
     cls_confidence, cls_margin = _probability_margin(probabilities, class_id)
     passed_classifier = (
@@ -487,7 +484,7 @@ def scan_stable_target_labels_from_candidates(
 
             group_id = compatibility.assigned_group_id
             group = None if group_id is None else confirmed_groups.get(int(group_id))
-            if group is None or int(option.class_id) not in group.member_classes:
+            if group is None:
                 rejected_candidates.append(
                     _candidate_phase_rejection(
                         option,
