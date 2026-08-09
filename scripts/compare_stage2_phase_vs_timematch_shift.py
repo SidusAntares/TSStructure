@@ -16,6 +16,9 @@ estimation* semantics:
   encoder;
 * the source-trained model is evaluated on 100 target batches by default;
 * the initial shift is the candidate maximizing Inception Score.
+* TimeMatch allocates a temporal-shift buffer around its positional table; the
+  Scalar audit therefore permits Time2Vec extrapolation beyond [0,1] without
+  clamping, but only inside this diagnostic script.
 
 In TSStructure the PSE/decomposition backbone is computed once for each target
 batch.  A global additive shift does not change pairwise temporal differences,
@@ -41,6 +44,8 @@ import json
 import math
 import random
 import sys
+import types
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -66,6 +71,152 @@ from transforms import Normalize, RandomSamplePixels, ToTensor
 
 TIMEMATCH_REPOSITORY = "https://github.com/jnyborg/timematch"
 TIMEMATCH_PAPER = "https://doi.org/10.1016/j.isprsjprs.2022.04.018"
+
+
+def _shared_time_encoder(model):
+    try:
+        encoder = model.temporal_module.raw_encoder.shared_ltae.shared_time_encoder
+    except AttributeError as error:
+        raise RuntimeError(
+            "model does not expose the expected shared ContinuousTime2Vec encoder"
+        ) from error
+    required = (
+        "linear_weight",
+        "linear_bias",
+        "frequencies",
+        "phase",
+        "time_reference",
+        "time_scale",
+    )
+    missing = [name for name in required if not hasattr(encoder, name)]
+    if missing:
+        raise RuntimeError(
+            "shared time encoder is incompatible with this diagnostic: missing "
+            + ", ".join(missing)
+        )
+    return encoder
+
+
+def _resolve_unbounded_time2vec_inputs(
+    encoder,
+    positions: Tensor,
+    time_mask: Optional[Tensor],
+) -> Tuple[Tensor, Tensor]:
+    """Resolve Time2Vec inputs without the production [0,1] range gate."""
+    if not isinstance(positions, Tensor):
+        raise ValueError("positions must be a torch.Tensor")
+    if not positions.is_floating_point() or positions.is_complex():
+        raise ValueError("positions must be a real floating-point tensor")
+    if positions.ndim == 1:
+        sequence_length = positions.shape[0]
+        if isinstance(time_mask, Tensor) and time_mask.ndim == 2:
+            batch_size = time_mask.shape[0]
+        else:
+            batch_size = 1
+        resolved_positions = positions.unsqueeze(0).expand(batch_size, -1)
+    elif positions.ndim == 2:
+        batch_size, sequence_length = positions.shape
+        resolved_positions = positions
+    else:
+        raise ValueError("positions must have shape [L] or [B, L]")
+
+    if time_mask is None:
+        resolved_mask = torch.ones(
+            batch_size,
+            sequence_length,
+            dtype=torch.bool,
+            device=positions.device,
+        )
+    else:
+        if not isinstance(time_mask, Tensor):
+            raise ValueError("time_mask must be a torch.Tensor or None")
+        if time_mask.ndim == 1:
+            if time_mask.shape != (sequence_length,):
+                raise ValueError("time_mask must have shape [L] or [B, L]")
+            resolved_mask = time_mask.unsqueeze(0).expand(batch_size, -1)
+        elif time_mask.ndim == 2:
+            if time_mask.shape != (batch_size, sequence_length):
+                raise ValueError("time_mask must have shape [L] or [B, L]")
+            resolved_mask = time_mask
+        else:
+            raise ValueError("time_mask must have shape [L] or [B, L]")
+        if time_mask.is_complex() or (
+            time_mask.dtype != torch.bool
+            and (
+                not torch.isfinite(time_mask).all().item()
+                or not torch.all((time_mask == 0) | (time_mask == 1)).item()
+            )
+        ):
+            raise ValueError("time_mask must contain only finite 0/1 values")
+        resolved_mask = resolved_mask.to(device=positions.device, dtype=torch.bool)
+
+    if resolved_positions.device != encoder.linear_weight.device:
+        raise ValueError("positions device must match module parameters")
+    if resolved_positions.dtype != encoder.linear_weight.dtype:
+        raise ValueError("positions dtype must match module parameters")
+    valid_positions = resolved_positions[resolved_mask]
+    if not torch.isfinite(valid_positions).all().item():
+        raise ValueError("valid positions must be finite")
+    return resolved_positions, resolved_mask
+
+
+def _unbounded_time2vec_forward(
+    encoder,
+    positions: Tensor,
+    *,
+    time_mask: Optional[Tensor] = None,
+) -> Tensor:
+    """Evaluate the learned Time2Vec formula beyond [0,1] for this audit only."""
+    resolved_positions, resolved_mask = _resolve_unbounded_time2vec_inputs(
+        encoder, positions, time_mask
+    )
+    safe_positions = torch.where(
+        resolved_mask,
+        resolved_positions,
+        torch.zeros_like(resolved_positions),
+    )
+    normalized = (safe_positions - encoder.time_reference) / encoder.time_scale
+    linear = encoder.linear_weight * normalized + encoder.linear_bias
+    periodic = torch.sin(
+        normalized.unsqueeze(-1) * encoder.frequencies + encoder.phase
+    )
+    encoding = torch.cat([linear.unsqueeze(-1), periodic], dim=-1)
+    encoding = torch.where(
+        resolved_mask.unsqueeze(-1),
+        encoding,
+        torch.zeros_like(encoding),
+    )
+    if not torch.isfinite(encoding).all().item():
+        raise ValueError("time encoding must contain only finite values")
+    return encoding
+
+
+@contextmanager
+def _timematch_time_extrapolation(model):
+    """Temporarily enable TimeMatch-like out-of-year timestamps.
+
+    Official TimeMatch adds integer shifts directly to day indices and its
+    positional table contains an explicit temporal-shift buffer. Production
+    TSStructure instead rejects and clamps normalized positions outside [0,1].
+    Clamping would not represent a global translation, so only the Scalar audit
+    view temporarily evaluates the same learned Time2Vec formula without that
+    boundary restriction. Model parameters are untouched.
+    """
+    encoder = _shared_time_encoder(model)
+    had_instance_forward = "forward" in encoder.__dict__
+    previous_forward = encoder.__dict__.get("forward")
+
+    def _forward(this, positions: Tensor, *, time_mask: Optional[Tensor] = None) -> Tensor:
+        return _unbounded_time2vec_forward(this, positions, time_mask=time_mask)
+
+    encoder.forward = types.MethodType(_forward, encoder)
+    try:
+        yield
+    finally:
+        if had_instance_forward:
+            encoder.forward = previous_forward
+        else:
+            del encoder.forward
 
 
 def _scalar_positions(backbone, shift_days: float, time_scale_days: float) -> Tensor:
@@ -195,13 +346,14 @@ def _estimate_timematch_scalar_shift(
             shifted_positions = _scalar_positions(
                 backbone, shift_days, time_scale_days
             )
-            output = model.forward_from_backbone(
-                backbone,
-                batch["positions"],
-                batch.get("extra"),
-                temporal_positions_override=shifted_positions,
-                return_geometry=False,
-            )
+            with _timematch_time_extrapolation(model):
+                output = model.forward_from_backbone(
+                    backbone,
+                    batch["positions"],
+                    batch.get("extra"),
+                    temporal_positions_override=shifted_positions,
+                    return_geometry=False,
+                )
             shift_probs.append(torch.softmax(output.logits.float(), dim=-1).cpu())
         probability_batches.append(torch.stack(shift_probs, dim=1))  # [B,S,C]
         label_batches.append(batch["label"].detach().cpu().long())
@@ -337,13 +489,14 @@ def _attach_scalar_view(
             time_mask=batch.get("time_mask"),
         )
         scalar_positions = _scalar_positions(backbone, shift_days, time_scale_days)
-        output = model.forward_from_backbone(
-            backbone,
-            batch["positions"],
-            batch.get("extra"),
-            temporal_positions_override=scalar_positions,
-            return_geometry=False,
-        )
+        with _timematch_time_extrapolation(model):
+            output = model.forward_from_backbone(
+                backbone,
+                batch["positions"],
+                batch.get("extra"),
+                temporal_positions_override=scalar_positions,
+                return_geometry=False,
+            )
         labels = batch["label"].detach().cpu().long()
         parcels = batch["parcel_index"].detach().cpu().long()
         for row in range(len(labels)):
@@ -594,6 +747,7 @@ def _write_readme(
         "- 默认扫描 100 个 target batch；",
         "- 用 Inception Score 最大的 shift 作为无监督选择结果；",
         "- target true label 只用于本目录中的 oracle accuracy / Macro-F1 曲线，绝不参与 shift 选择。",
+        "- 实现边界：TimeMatch 的位置编码显式预留 temporal-shift buffer，因此平移后的日期可以越过原年度边界；TSStructure 正式 ContinuousTime2Vec 只允许 `[0,1]`。为避免错误 clamp，本诊断仅在 Scalar 分支临时使用同一组已学习 Time2Vec 参数做区间外外推；No-shift 与 Domain Phase 仍走正式路径，模型参数不变。",
         "",
         f"本次 IS 选择：`{selected:+d}` 天。",
         f"本次 oracle-accuracy 最优 shift：`{int(shift_result['oracle_best_accuracy_shift_days']):+d}` 天。",
