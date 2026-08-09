@@ -263,6 +263,9 @@ def _write_readme(
 
 输入模式：`{input_mode}`
 
+样本范围：完整 closed-set target population。true label 仅用于每类均匀抽样，
+不参与参数更新、shift 选择或任何训练。
+
 模型 checkpoint：
 
 `{checkpoint}`
@@ -486,15 +489,35 @@ def run(args: argparse.Namespace) -> dict:
                 + ",".join(str(v) for v in unknown)
             )
 
-    target_meta = phasevis._metadata_train_dataset(
+    # This is a mechanistic, no-training diagnostic.  Use the full eligible
+    # closed-set target population for deterministic per-class sampling instead
+    # of reconstructing the Stage-1 target split.  Target labels are used only
+    # to balance the diagnostic sample; they never update parameters or choose
+    # a temporal transform.  This also makes the audit independent of fragile
+    # split-reconstruction details in a saved Stage-1 run.
+    target_population = phasevis._eligible_parcels(
         data_root,
         target,
         classes,
-        train_indices[target],
         closed_set=closed_set,
         combine_spring_and_winter=combine,
         time_coordinate_mode=time_mode,
     )
+    if target_population.size == 0:
+        raise ValueError("closed-set target population is empty")
+    target_meta = phasevis._metadata_train_dataset(
+        data_root,
+        target,
+        classes,
+        set(int(value) for value in target_population.tolist()),
+        closed_set=closed_set,
+        combine_spring_and_winter=combine,
+        time_coordinate_mode=time_mode,
+    )
+    if len(target_meta) == 0:
+        raise ValueError(
+            "eligible target parcels were found but the diagnostic metadata dataset is empty"
+        )
     target_parcels = phasevis._uniform_selected_parcels(
         target_meta, requested_classes, args.samples_per_class
     )
@@ -633,6 +656,8 @@ def run(args: argparse.Namespace) -> dict:
         "timematch_pe_period": float(args.timematch_pe_period),
         "timematch_pe_max_shift": float(args.timematch_pe_max_shift),
         "samples_per_class": int(args.samples_per_class),
+        "sampling_scope": "full_closed_set_target_population",
+        "target_population_size": int(target_population.size),
         "diagnostic_rows": len(sample_rows),
         "posthoc_fixed_pe_is_not_performance_ablation": True,
     }
