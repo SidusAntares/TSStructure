@@ -250,6 +250,13 @@ def _confirmed_group_for_class(
     phase_state: DomainPhaseState,
     class_id: int,
 ) -> PhaseGroup | None:
+    """Return a founding-member group for legacy callers.
+
+    This helper is intentionally *not* the general Phase-usage rule.  A class
+    need not be a founding member in order to use an already-confirmed Domain
+    Phase; formal Stage-2 usage can pass an explicit confirmed ``phase_group``
+    selected from compatibility/stable-label evidence.
+    """
     if not isinstance(phase_state, DomainPhaseState) or phase_state.m == 0:
         return None
     matches = [
@@ -261,6 +268,31 @@ def _confirmed_group_for_class(
     if len(matches) > 1:
         raise ValueError(f"class {class_id} belongs to multiple confirmed phase groups")
     return matches[0] if matches else None
+
+
+def _validated_explicit_phase_group(
+    phase_state: DomainPhaseState,
+    phase_group: PhaseGroup | None,
+) -> PhaseGroup | None:
+    if phase_group is None:
+        return None
+    if phase_group.status is not PhaseGroupStatus.CONFIRMED:
+        raise ValueError("explicit phase_group must be confirmed")
+    matches = [
+        group
+        for group in phase_state.groups
+        if group.status is PhaseGroupStatus.CONFIRMED
+        and group.group_id == phase_group.group_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("explicit phase_group must belong to phase_state")
+    state_group = matches[0]
+    if not torch.equal(
+        state_group.center_gamma.detach().cpu().double(),
+        phase_group.center_gamma.detach().cpu().double(),
+    ):
+        raise ValueError("explicit phase_group center_gamma disagrees with phase_state")
+    return state_group
 
 
 def _sample_curve_at_positions(curve: Tensor, positions: Tensor, mask: Tensor) -> Tensor:
@@ -310,6 +342,7 @@ def build_phase_only_synthetic_source_example(
     source_positions: Tensor,
     mask: Tensor,
     phase_state: DomainPhaseState,
+    phase_group: PhaseGroup | None = None,
 ) -> SyntheticSourceExample | None:
     """Construct a confirmed-phase target-style source without Shape transport.
 
@@ -324,7 +357,9 @@ def build_phase_only_synthetic_source_example(
         return None
     if phase_state.decision_status is not PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
         return None
-    group = _confirmed_group_for_class(phase_state, class_id)
+    group = _validated_explicit_phase_group(phase_state, phase_group)
+    if group is None:
+        group = _confirmed_group_for_class(phase_state, class_id)
     if group is None:
         return None
     if source_trend_tokens.ndim != 2 or source_structure_tokens.shape != source_trend_tokens.shape:
@@ -363,6 +398,7 @@ def build_synthetic_source_example(
     domain_shape_state: DomainShapeState,
     decomposition: nn.Module,
     lambda_delta: float,
+    phase_group: PhaseGroup | None = None,
 ) -> SyntheticSourceExample | None:
     """Construct one phase+Shape target-style source example.
 
@@ -379,7 +415,9 @@ def build_synthetic_source_example(
         group = None
         synthetic_group_id = -1
     elif phase_state.decision_status is PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
-        group = _confirmed_group_for_class(phase_state, class_id)
+        group = _validated_explicit_phase_group(phase_state, phase_group)
+        if group is None:
+            group = _confirmed_group_for_class(phase_state, class_id)
         if group is None:
             return None
         synthetic_group_id = int(group.group_id)
@@ -545,7 +583,15 @@ def evaluate_synthetic_source_diagnostics(
         if before is not None and after is not None:
             improved = after <= before
 
-    group = _confirmed_group_for_class(phase_state, class_id)
+    group = next(
+        (
+            item
+            for item in phase_state.groups
+            if item.status is PhaseGroupStatus.CONFIRMED
+            and int(item.group_id) == int(example.group_id)
+        ),
+        None,
+    )
     phase_leakage = None
     if group is not None:
         expected = map_source_positions_to_target(

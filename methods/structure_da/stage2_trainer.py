@@ -218,6 +218,50 @@ def _confirmed_phase_exists(state: DomainPhaseState) -> bool:
     )
 
 
+def _synthetic_phase_groups_for_class(
+    snapshot: Stage2StatisticsSnapshot,
+    class_id: int,
+) -> tuple[PhaseGroup, ...]:
+    """Resolve confirmed Phase groups usable by one source class.
+
+    ``member_classes`` identifies the classes that supplied evidence for a
+    group's estimation.  It is not a downstream usage mask.  With one confirmed
+    non-identity group the domain-level Phase is therefore usable by every
+    source class.  With multiple confirmed groups, stable target labels provide
+    the downstream class/group assignment for non-founding classes; founding
+    membership remains only a fallback when no stable assignment exists.
+    """
+    state = snapshot.phase_state
+    if state.decision_status is not PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
+        return ()
+    confirmed = tuple(
+        group for group in state.groups if group.status is PhaseGroupStatus.CONFIRMED
+    )
+    if not confirmed:
+        return ()
+    if len(confirmed) == 1:
+        return confirmed
+
+    by_id = {int(group.group_id): group for group in confirmed}
+    stable_group_ids = sorted(
+        {
+            int(label.group_id)
+            for label in snapshot.stable_labels.stable_labels
+            if int(label.class_id) == int(class_id)
+            and int(label.group_id) in by_id
+        }
+    )
+    if stable_group_ids:
+        return tuple(by_id[group_id] for group_id in stable_group_ids)
+
+    founding = tuple(
+        group for group in confirmed if int(class_id) in group.member_classes
+    )
+    if len(founding) > 1:
+        raise ValueError(f"class {class_id} belongs to multiple confirmed phase groups")
+    return founding
+
+
 def _adaptation_available(snapshot: Stage2StatisticsSnapshot) -> bool:
     decision = snapshot.phase_state.decision_status
     if decision is PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
@@ -858,35 +902,44 @@ class Stage2Trainer:
         valid_flags: list[Tensor] = []
         for row in range(labels.shape[0]):
             class_id = int(labels[row].item())
-            if shape_confirmed:
-                example = build_synthetic_source_example(
-                    source_sample_id=sample_ids[row],
-                    class_id=class_id,
-                    source_structure_function=structure_geometry.functional.function[row],
-                    source_q_shape=structure_geometry.srvf[row],
-                    source_q_support=structure_geometry.support_confidence[row],
-                    source_positions=positions[row],
-                    mask=mask[row],
-                    phase_state=phase_state,
-                    domain_shape_state=shape_state,
-                    decomposition=self.student.backbone.decomposition,
-                    lambda_delta=self.config.lambda_delta,
-                )
+            if phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED:
+                phase_groups: tuple[PhaseGroup | None, ...] = (None,)
             else:
-                example = build_phase_only_synthetic_source_example(
-                    source_sample_id=sample_ids[row],
-                    class_id=class_id,
-                    source_trend_tokens=trend[row],
-                    source_structure_tokens=structure[row],
-                    source_q_shape=structure_geometry.srvf[row],
-                    source_q_support=structure_geometry.support_confidence[row],
-                    source_positions=positions[row],
-                    mask=mask[row],
-                    phase_state=phase_state,
+                phase_groups = tuple(
+                    _synthetic_phase_groups_for_class(self.statistics, class_id)
                 )
-            if example is not None:
-                examples.append(example)
-                valid_flags.append(structure_geometry.structure_valid[row].detach())
+            for phase_group in phase_groups:
+                if shape_confirmed:
+                    example = build_synthetic_source_example(
+                        source_sample_id=sample_ids[row],
+                        class_id=class_id,
+                        source_structure_function=structure_geometry.functional.function[row],
+                        source_q_shape=structure_geometry.srvf[row],
+                        source_q_support=structure_geometry.support_confidence[row],
+                        source_positions=positions[row],
+                        mask=mask[row],
+                        phase_state=phase_state,
+                        domain_shape_state=shape_state,
+                        decomposition=self.student.backbone.decomposition,
+                        lambda_delta=self.config.lambda_delta,
+                        phase_group=phase_group,
+                    )
+                else:
+                    example = build_phase_only_synthetic_source_example(
+                        source_sample_id=sample_ids[row],
+                        class_id=class_id,
+                        source_trend_tokens=trend[row],
+                        source_structure_tokens=structure[row],
+                        source_q_shape=structure_geometry.srvf[row],
+                        source_q_support=structure_geometry.support_confidence[row],
+                        source_positions=positions[row],
+                        mask=mask[row],
+                        phase_state=phase_state,
+                        phase_group=phase_group,
+                    )
+                if example is not None:
+                    examples.append(example)
+                    valid_flags.append(structure_geometry.structure_valid[row].detach())
         return _stack_synthetic(examples, valid_flags, device=self.device)
 
     def _set_student_training_modes(self) -> None:

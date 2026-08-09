@@ -11,3 +11,4 @@ data/
 .ipynb_checkpoints
 .vscode/
 /sync_to_server.sh
+.pytest_tmp/

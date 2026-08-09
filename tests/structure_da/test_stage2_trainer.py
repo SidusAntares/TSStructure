@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -363,6 +364,49 @@ def test_confirmed_phase_and_shape_runs_round6_synthesis_path() -> None:
     assert metrics["synthetic_count"] == pytest.approx(6.0)
     assert metrics["synthetic_cls"] >= 0.0
     assert metrics["synthetic_consistency"] >= 0.0
+
+
+
+
+def test_single_confirmed_group_is_usable_by_nonmember_source_classes() -> None:
+    trainer = _real_trainer(DomainShapeStatus.REJECTED)
+    phase = trainer.statistics.phase_state
+    group = replace(phase.groups[0], member_classes=(0, 1), class_count=2)
+    trainer.statistics = replace(
+        trainer.statistics,
+        phase_state=replace(
+            phase,
+            groups=(group,),
+            valid_phase_classes=(0, 1),
+        ),
+    )
+    metrics = trainer.train_step(_batch())
+    # The batch contains all three source classes.  Class 2 did not found the
+    # group, but the sole confirmed domain-level Phase is still applied to it.
+    assert metrics["synthetic_count"] == pytest.approx(6.0)
+
+
+def test_multiple_groups_allow_nonmember_usage_from_stable_assignment() -> None:
+    import methods.structure_da.stage2_trainer as module
+
+    phase = _phase_state(confirmed=True)
+    base = phase.groups[0]
+    group0 = replace(base, group_id=0, member_classes=(0, 1), class_count=2)
+    group1 = replace(
+        base,
+        group_id=1,
+        member_classes=(2, 3),
+        class_count=2,
+        center_gamma=base.center_gamma.pow(1.1),
+    )
+    snapshot = SimpleNamespace(
+        phase_state=replace(phase, m=2, groups=(group0, group1)),
+        stable_labels=SimpleNamespace(
+            stable_labels=(SimpleNamespace(class_id=4, group_id=1),)
+        ),
+    )
+    groups = module._synthetic_phase_groups_for_class(snapshot, 4)
+    assert tuple(group.group_id for group in groups) == (1,)
 
 
 def test_source_fused_refresh_preserves_all_geometry_fields() -> None:

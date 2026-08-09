@@ -171,6 +171,41 @@ def test_g0_or_provisional_phase_cannot_create_phase_shape_example() -> None:
     assert _build(_phase_state(include_class=False)) is None
 
 
+
+
+def test_explicit_confirmed_group_can_be_used_by_nonmember_source_class() -> None:
+    phase = _phase_state(include_class=False)
+    group = phase.groups[0]
+    grid = torch.linspace(0.0, 1.0, 9)
+    velocity = torch.tensor([1.0, 0.5])
+    norm = torch.linalg.vector_norm(velocity)
+    q = (velocity / torch.sqrt(norm)).expand(9, -1).clone()
+    structure = grid[:, None] * velocity
+    example = build_synthetic_source_example(
+        source_sample_id=7,
+        class_id=0,
+        source_structure_function=structure,
+        source_q_shape=q,
+        source_q_support=torch.ones(9),
+        source_positions=torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0]),
+        mask=torch.ones(5, dtype=torch.bool),
+        phase_state=phase,
+        domain_shape_state=_shape_state(torch.zeros_like(q)),
+        decomposition=SymmetricTimeKernelDecomposition(),
+        lambda_delta=1.0,
+        phase_group=group,
+    )
+    assert example is not None
+    assert example.class_id == 0
+    assert example.group_id == group.group_id
+    expected = map_source_positions_to_target(
+        torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0]),
+        torch.ones(5, dtype=torch.bool),
+        group.center_gamma,
+    )
+    torch.testing.assert_close(example.target_style_positions, expected)
+
+
 def test_unconfirmed_domain_shape_cannot_create_synthetic_example() -> None:
     assert _build(_phase_state(), DomainShapeStatus.PROVISIONAL) is None
 
