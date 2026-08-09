@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Second-layer A diagnostic: where temporal-position sensitivity is attenuated.
 
-No training is performed.  For the same frozen Stage-1 model and target samples,
-trace a scalar -21 day shift and the confirmed Domain Phase through:
+No training is performed. For the same frozen Stage-1 model and target samples,
+trace a scalar calendar shift through the temporal stack. If a supplied calibration
+checkpoint contains a confirmed Domain Phase, that transform is audited as an
+additional optional view; a confirmed Phase is not required for this second-layer
+diagnostic.
 
     time encoding -> branch token -> key -> attention -> pooled representation
 
@@ -23,6 +26,7 @@ import argparse
 import csv
 import json
 import math
+import random
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
@@ -41,7 +45,9 @@ for _path in (SCRIPT_DIR, REPOSITORY_ROOT):
         sys.path.insert(0, str(_path))
 
 import compare_stage2_phase_vs_timematch_shift as layer1
+import evaluate_stage1_time_encoder_shift as stage1eval
 import visualize_stage2_phase_alignment as phasevis
+import train as train_module
 from models.ltae import ContinuousTime2Vec, TimeMatchFixedSinusoidal
 
 
@@ -241,14 +247,23 @@ def _write_readme(
     target: str,
     shift_days: float,
     samples: int,
+    phase_available: bool,
+    input_mode: str,
 ) -> None:
+    phase_line = (
+        "3. confirmed Domain Phase 的 `gamma^-1(t_target)`（额外诊断）。"
+        if phase_available
+        else "3. 本次没有 confirmed non-identity Domain Phase，因此不计算 Domain Phase 分支。"
+    )
     text = f"""# 第二层 A：时间位置编码逐层敏感度诊断
 
 ## 1. 本次实验目的
 
 本目录不是新的训练结果，而是 **0-step / no-gradient** 诊断。
 
-固定同一个 Stage-1 checkpoint：
+输入模式：`{input_mode}`
+
+模型 checkpoint：
 
 `{checkpoint}`
 
@@ -258,9 +273,9 @@ def _write_readme(
 
 1. 原始时间位置；
 2. TimeMatch-style 固定平移 `{shift_days:+.1f}` 天；
-3. 当前 confirmed Domain Phase 的 `gamma^-1(t_target)`。
+{phase_line}
 
-目标是定位时间校正从哪一层开始被削弱：
+第二层的核心问题是固定 calendar shift 从哪一层开始被削弱：
 
 ```text
 time position
@@ -270,6 +285,9 @@ time position
 → attention distribution
 → pooled LTAE representation
 ```
+
+因此 **Domain Phase 不是运行本诊断的前置条件**。第一层已经单独比较过
+scalar shift 与 Domain Phase；本目录主要审计时间编码和 LTAE 对 scalar shift 的响应。
 
 本次共记录 {samples} 条 `encoder × branch × transform` 样本诊断行。
 
@@ -297,9 +315,7 @@ TimeMatch PE 是否优于 Time2Vec。真正的性能比较必须重新训练 Sta
 
 ### `sensitivity_samples.csv`
 
-每行是一条：
-
-`样本 × encoder × T/S branch × scalar/domain_phase`
+每行是一条 `样本 × encoder × T/S branch × transform`。
 
 主要指标：
 
@@ -316,118 +332,160 @@ TimeMatch PE 是否优于 Time2Vec。真正的性能比较必须重新训练 Sta
 
 ## 4. 图片
 
-`plots/time_encoding_response.png`
-：时间编码自身对 scalar / Domain Phase 的响应。
+`plots/time_encoding_response.png`：时间编码自身响应。
 
-`plots/key_response.png`
-：时间变化经过 key projection 后还剩多少。
+`plots/key_response.png`：时间变化经过 key projection 后还剩多少。
 
-`plots/attention_response.png`
-：真正 attention distribution 改变多少。
+`plots/attention_response.png`：真正 attention distribution 改变多少。
 
-`plots/representation_response.png`
-：最终 pooled T/S representation 改变多少。
+`plots/representation_response.png`：最终 pooled T/S representation 改变多少。
 
 ## 5. 判读
 
-如果：
-
-```text
-Time2Vec encoding change 很小
-而 TimeMatch fixed PE change 明显大
-```
-
+如果 `Time2Vec encoding change` 很小而 `TimeMatch fixed PE change` 明显大，
 优先说明当前 Time2Vec 本身缺乏 calendar-shift 敏感度。
 
-如果：
+如果 Time2Vec encoding change 明显但 key change 很小，说明 Stage-1 学出的
+key projection 在抑制时间编码方向。
 
-```text
-Time2Vec encoding change 明显
-但 key change 很小
-```
-
-说明 Stage-1 学出的 key projection 在抑制时间编码方向。
-
-如果：
-
-```text
-key change 明显
-但 attention TV 很小 / cosine 接近 1
-```
-
-说明 master query + softmax 后时间变化被进一步削弱。
+如果 key change 明显但 attention TV 很小 / cosine 接近 1，说明 master query +
+softmax 后时间变化被进一步削弱。
 
 如果直到 representation 都有明显变化，但 source-target alignment / classifier 改善仍弱，
-问题才更靠近后续表示融合与分类器，而不是时间编码本身。
+问题才更靠近后续表示融合与分类器。
 """
     path.write_text(text, encoding="utf-8")
 
 
 @torch.no_grad()
 def run(args: argparse.Namespace) -> dict:
-    checkpoint_path = args.checkpoint.resolve()
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    runtime = checkpoint.get("runtime_config")
-    if not isinstance(runtime, dict):
-        raise ValueError("checkpoint must contain runtime_config")
-
-    source = str(runtime["source"])
-    target = str(runtime["target"])
-    classes = [str(v) for v in runtime["classes"]]
-    data_root = str(args.data_root or runtime["data_root"])
-    seed = int(runtime["seed"])
-    closed_set = bool(phasevis._runtime_value(runtime, "closed_set", True))
-    combine = bool(phasevis._runtime_value(runtime, "combine_spring_and_winter", False))
-    time_mode = str(
-        phasevis._runtime_value(runtime, "time_coordinate_mode", "canonical_day_of_year")
-    )
-    val_ratio = float(phasevis._runtime_value(runtime, "val_ratio", 0.1))
-    test_ratio = float(phasevis._runtime_value(runtime, "test_ratio", 0.2))
-    calendar_days = float(phasevis._runtime_value(runtime, "time_scale", 365.0))
-
-    groups = phasevis._checkpoint_group_payloads(checkpoint)
-    class_to_group = phasevis._class_to_group(groups)
-    available_classes = tuple(sorted(class_to_group))
-    requested_classes = (
-        available_classes if args.classes is None else tuple(args.classes)
-    )
-    unknown = sorted(set(requested_classes) - set(available_classes))
-    if unknown:
-        raise ValueError(
-            "this diagnostic currently uses confirmed Phase member classes only: "
-            + ",".join(str(v) for v in unknown)
-        )
-
     device = torch.device(args.device)
-    model = phasevis._build_model(runtime, checkpoint, device).eval()
-    shared = model.temporal_module.raw_encoder.shared_ltae
+    groups: List[dict] = []
+    class_to_group: Dict[int, dict] = {}
+    phase_available = False
 
-    source_all = phasevis._eligible_parcels(
-        data_root,
-        source,
-        classes,
-        closed_set=closed_set,
-        combine_spring_and_winter=combine,
-        time_coordinate_mode=time_mode,
-    )
-    target_all = phasevis._eligible_parcels(
-        data_root,
-        target,
-        classes,
-        closed_set=closed_set,
-        combine_spring_and_winter=combine,
-        time_coordinate_mode=time_mode,
-    )
-    train_indices = phasevis._reconstruct_fold_train_indices(
-        source_all,
-        target_all,
-        source=source,
-        target=target,
-        seed=seed,
-        val_ratio=val_ratio,
-        test_ratio=test_ratio,
-        fold=args.fold,
-    )
+    if args.run_dir is not None:
+        run_dir = args.run_dir.resolve()
+        config_path = run_dir / "train_config.json"
+        checkpoint_path = run_dir / f"fold_{args.fold}" / "stage1_best.pt"
+        if not config_path.is_file():
+            raise FileNotFoundError(config_path)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(checkpoint_path)
+
+        config_data = json.loads(config_path.read_text(encoding="utf-8"))
+        config = argparse.Namespace(**config_data)
+        config.output_dir = str(run_dir)
+        config.model = "structure_da"
+        if args.data_root is not None:
+            config.data_root = str(args.data_root)
+        if not hasattr(config, "time_encoder_type"):
+            config.time_encoder_type = "continuous_time2vec"
+        if not hasattr(config, "timematch_pe_period"):
+            config.timematch_pe_period = 1000.0
+        if not hasattr(config, "timematch_pe_max_shift"):
+            config.timematch_pe_max_shift = 100.0
+
+        random.seed(config.seed)
+        np.random.seed(config.seed)
+        torch.manual_seed(config.seed)
+        eligible_indices, _ = train_module.prepare_data_protocol(config)
+        random.seed(config.seed)
+        splits = train_module.create_train_val_test_folds(
+            [config.source, config.target],
+            config.num_folds,
+            eligible_indices,
+            config.val_ratio,
+            config.test_ratio,
+        )[args.fold]
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        model = stage1eval._build_model(config, checkpoint, device).eval()
+
+        source = str(config.source)
+        target = str(config.target)
+        classes = [str(v) for v in config.classes]
+        data_root = str(config.data_root)
+        seed = int(config.seed)
+        closed_set = bool(config.closed_set)
+        combine = bool(config.combine_spring_and_winter)
+        time_mode = str(config.time_coordinate_mode)
+        calendar_days = float(config.time_scale)
+        train_indices = splits
+        input_mode = "stage1_run"
+    else:
+        checkpoint_path = args.checkpoint.resolve()
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        runtime = checkpoint.get("runtime_config")
+        if not isinstance(runtime, dict):
+            raise ValueError("calibration checkpoint must contain runtime_config")
+
+        source = str(runtime["source"])
+        target = str(runtime["target"])
+        classes = [str(v) for v in runtime["classes"]]
+        data_root = str(args.data_root or runtime["data_root"])
+        seed = int(runtime["seed"])
+        closed_set = bool(phasevis._runtime_value(runtime, "closed_set", True))
+        combine = bool(phasevis._runtime_value(runtime, "combine_spring_and_winter", False))
+        time_mode = str(
+            phasevis._runtime_value(runtime, "time_coordinate_mode", "canonical_day_of_year")
+        )
+        val_ratio = float(phasevis._runtime_value(runtime, "val_ratio", 0.1))
+        test_ratio = float(phasevis._runtime_value(runtime, "test_ratio", 0.2))
+        calendar_days = float(phasevis._runtime_value(runtime, "time_scale", 365.0))
+        model = phasevis._build_model(runtime, checkpoint, device).eval()
+
+        try:
+            groups = phasevis._checkpoint_group_payloads(checkpoint)
+        except ValueError as error:
+            if "no confirmed non-identity Domain Phase group" not in str(error):
+                raise
+            groups = []
+        class_to_group = phasevis._class_to_group(groups) if groups else {}
+        phase_available = bool(class_to_group)
+
+        source_all = phasevis._eligible_parcels(
+            data_root,
+            source,
+            classes,
+            closed_set=closed_set,
+            combine_spring_and_winter=combine,
+            time_coordinate_mode=time_mode,
+        )
+        target_all = phasevis._eligible_parcels(
+            data_root,
+            target,
+            classes,
+            closed_set=closed_set,
+            combine_spring_and_winter=combine,
+            time_coordinate_mode=time_mode,
+        )
+        train_indices = phasevis._reconstruct_fold_train_indices(
+            source_all,
+            target_all,
+            source=source,
+            target=target,
+            seed=seed,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            fold=args.fold,
+        )
+        input_mode = "calibration_checkpoint"
+
+    shared = model.temporal_module.raw_encoder.shared_ltae
+    all_classes = tuple(range(len(classes)))
+    if args.classes is None:
+        requested_classes = (
+            tuple(sorted(class_to_group)) if phase_available else all_classes
+        )
+    else:
+        requested_classes = tuple(args.classes)
+        unknown = sorted(set(requested_classes) - set(all_classes))
+        if unknown:
+            raise ValueError(
+                "requested class ids are outside the closed set: "
+                + ",".join(str(v) for v in unknown)
+            )
+
     target_meta = phasevis._metadata_train_dataset(
         data_root,
         target,
@@ -455,7 +513,7 @@ def run(args: argparse.Namespace) -> dict:
         model,
         target_loader,
         device=device,
-        target=True,
+        target=phase_available,
         class_to_group=class_to_group,
     )
 
@@ -478,11 +536,9 @@ def run(args: argparse.Namespace) -> dict:
                 pos0 + float(args.shift_days) / calendar_days,
                 torch.zeros_like(pos0),
             )
-            phase = record["positions_after"].to(device=device).unsqueeze(0)
-            views = {
-                "scalar_shift": scalar,
-                "domain_phase": phase,
-            }
+            views = {"scalar_shift": scalar}
+            if phase_available and "positions_after" in record:
+                views["domain_phase"] = record["positions_after"].to(device=device).unsqueeze(0)
             components = {
                 "trend": record["trend_tokens"].to(device=device).unsqueeze(0),
                 "structure": record["structure_tokens"].to(device=device).unsqueeze(0),
@@ -520,7 +576,7 @@ def run(args: argparse.Namespace) -> dict:
                                 "class_id": int(class_id),
                                 "class_name": classes[class_id],
                                 "parcel_index": int(record["parcel_index"]),
-                                "phase_group_id": int(record["group_id"]),
+                                "phase_group_id": int(record.get("group_id", -1)),
                                 "encoder": encoder_name,
                                 "branch": branch,
                                 "transform": transform,
@@ -566,11 +622,14 @@ def run(args: argparse.Namespace) -> dict:
         args.dpi,
     )
     manifest = {
+        "input_mode": input_mode,
         "checkpoint": str(checkpoint_path),
         "source": source,
         "target": target,
         "classes": list(requested_classes),
         "shift_days": float(args.shift_days),
+        "phase_available": phase_available,
+        "phase_group_count": len(groups),
         "timematch_pe_period": float(args.timematch_pe_period),
         "timematch_pe_max_shift": float(args.timematch_pe_max_shift),
         "samples_per_class": int(args.samples_per_class),
@@ -585,10 +644,12 @@ def run(args: argparse.Namespace) -> dict:
         target=target,
         shift_days=args.shift_days,
         samples=len(sample_rows),
+        phase_available=phase_available,
+        input_mode=input_mode,
     )
     print(
         "SECOND_LAYER_TIME_SENSITIVITY_COMPLETE|"
-        f"rows={len(sample_rows)}|output={out}",
+        f"rows={len(sample_rows)}|phase_available={str(phase_available).lower()}|output={out}",
         flush=True,
     )
     return manifest
@@ -596,7 +657,9 @@ def run(args: argparse.Namespace) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True, type=Path)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--checkpoint", type=Path)
+    source.add_argument("--run-dir", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--data-root", default=None, type=Path)
     parser.add_argument("--device", default="cuda:0")
