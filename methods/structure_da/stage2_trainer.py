@@ -1033,6 +1033,30 @@ class Stage2Trainer:
             shape_state=self.statistics.shape_state,
             source_prototype_bank=self.source_prototype_bank,
         )
+        # Diagnostic-only calibration needs a model/statistics snapshot that can
+        # be consumed by post-hoc visualization without running any optimizer
+        # step.  In diagnostic-only mode the student still equals the Stage-1
+        # checkpoint, while the Phase/Shape state has just been estimated from
+        # the corrected geometry.
+        state_path = os.path.join(self.output_dir, "stage2_calibration_state.pt")
+        torch.save(
+            {
+                "stage": "stage2_calibration",
+                "epoch": 0,
+                "state_dict": {
+                    key: value.detach().cpu()
+                    for key, value in self.student.state_dict().items()
+                },
+                "runtime_config": dict(self.runtime_config),
+                "phase_state": _phase_state_payload(self.statistics.phase_state),
+                "shape_state": _shape_state_payload(self.statistics.shape_state),
+                "source_prototype_bank": _bank_to_cpu(self.source_prototype_bank),
+                "successful_optimizer_steps": int(self.successful_optimizer_steps),
+            },
+            state_path,
+        )
+        paths = dict(paths)
+        paths["state"] = state_path
         print(
             "STAGE2_CALIBRATION_EXPORT|"
             f"summary={paths['summary']}"
@@ -1040,6 +1064,7 @@ class Stage2Trainer:
             f"|candidates={paths['candidates']}"
             f"|stable_candidates={paths['stable_candidates']}"
             f"|geometry={paths['geometry']}"
+            f"|state={paths['state']}"
         )
         return paths
 

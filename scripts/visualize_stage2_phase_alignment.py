@@ -16,10 +16,15 @@ non-identity Domain Phase group it visualizes:
    where the target-after panel changes only the observation positions passed
    to Time2Vec/LTAE (values are unchanged);
 4. class-level before/after support-aware distances to the frozen source
-   prototype; and
-5. the confirmed Domain Phase gamma itself and its displacement in days.
+   prototype;
+5. Time2Vec/LTAE fused, trend and structure representation distances before
+   and after applying gamma^{-1} to target observation positions; and
+6. the confirmed Domain Phase gamma itself and its displacement in days.
 
-PCA bases are fitted from SOURCE rows only, then frozen for all target views.
+The preferred input is ``stage2_calibration_state.pt`` written by a
+diagnostic-only Stage-2 calibration run, so the model weights are still the
+Stage-1 checkpoint and only the no-grad Phase/Shape statistics have been
+added. PCA bases are fitted from SOURCE rows only, then frozen for all target views.
 This prevents the alignment under examination from rotating the visualization
 basis itself.
 """
@@ -361,10 +366,42 @@ def _collect_geometry(
         )
         if output.geometry is None:
             raise RuntimeError("phase visualization requires functional geometry")
-        trend_tokens, structure_tokens = model._trend_and_structure(backbone)
+
         labels = batch["label"].detach().cpu().long()
         parcels = batch["parcel_index"].detach().cpu().long()
+        trend_tokens, structure_tokens = model._trend_and_structure(backbone)
         grid = output.geometry.canonical_grid.detach()
+
+        aligned_positions_batch: Optional[Tensor] = None
+        aligned_output = None
+        if target:
+            aligned_positions_batch = backbone.normalized_positions.clone()
+            grouped_rows: Dict[int, List[int]] = {}
+            group_payloads: Dict[int, dict] = {}
+            for row in range(len(labels)):
+                class_id = int(labels[row].item())
+                group = class_to_group.get(class_id)
+                if group is None:
+                    continue
+                group_id = int(group["group_id"])
+                grouped_rows.setdefault(group_id, []).append(row)
+                group_payloads[group_id] = group
+            for group_id, rows in grouped_rows.items():
+                index = torch.tensor(rows, device=device, dtype=torch.long)
+                group = group_payloads[group_id]
+                aligned_positions_batch[index] = align_target_positions_to_source(
+                    backbone.normalized_positions[index],
+                    backbone.time_mask[index],
+                    group["center_gamma"],
+                )
+            aligned_output = model.forward_from_backbone(
+                backbone,
+                positions,
+                extra,
+                temporal_positions_override=aligned_positions_batch,
+                return_geometry=False,
+            )
+
         for row in range(len(labels)):
             class_id = int(labels[row].item())
             record = {
@@ -380,22 +417,20 @@ def _collect_geometry(
                 "trend_valid": bool(output.geometry.trend_valid[row].item()),
                 "shape_valid": bool(output.geometry.structure_valid[row].item()),
                 "grid": grid.detach().cpu(),
+                "fused_repr_before": output.fused_repr[row].detach().cpu(),
+                "trend_repr_before": output.trend_repr[row].detach().cpu(),
+                "structure_repr_before": output.structure_repr[row].detach().cpu(),
+                "logits_before": output.logits[row].detach().cpu(),
             }
             if target:
                 group = class_to_group.get(class_id)
-                if group is None:
+                if group is None or aligned_output is None or aligned_positions_batch is None:
                     continue
                 gamma_grid = _resampled_group_gamma(group, grid)
-                gamma_grid_direct = _direct_resample_gamma(group, grid)
-                aligned_positions = align_target_positions_to_source(
-                    backbone.normalized_positions[row : row + 1],
-                    backbone.time_mask[row : row + 1],
-                    group["center_gamma"],
-                )[0]
+                gamma_grid_reference = _direct_resample_gamma(group, grid)
                 record.update({
                     "group_id": int(group["group_id"]),
-                    "positions_after": aligned_positions.detach().cpu(),
-                    # CURRENT IMPLEMENTATION: uses repository resample_gamma.
+                    "positions_after": aligned_positions_batch[row].detach().cpu(),
                     "trend_q_after": warp_q_gamma(
                         output.geometry.trend_srvf[row], gamma_grid
                     ).squeeze(0).detach().cpu(),
@@ -408,21 +443,12 @@ def _collect_geometry(
                     "shape_support_after": warp_support_gamma(
                         output.geometry.structure_support[row], gamma_grid, grid
                     ).detach().cpu(),
-                    # AUDIT REFERENCE: directly evaluates gamma(u) on the Shape grid.
-                    "trend_q_after_direct": warp_q_gamma(
-                        output.geometry.trend_srvf[row], gamma_grid_direct
-                    ).squeeze(0).detach().cpu(),
-                    "trend_support_after_direct": warp_support_gamma(
-                        output.geometry.trend_support[row], gamma_grid_direct, grid
-                    ).detach().cpu(),
-                    "shape_q_after_direct": warp_q_gamma(
-                        output.geometry.structure_srvf[row], gamma_grid_direct
-                    ).squeeze(0).detach().cpu(),
-                    "shape_support_after_direct": warp_support_gamma(
-                        output.geometry.structure_support[row], gamma_grid_direct, grid
-                    ).detach().cpu(),
-                    "gamma_grid_current": gamma_grid.detach().cpu(),
-                    "gamma_grid_direct": gamma_grid_direct.detach().cpu(),
+                    "fused_repr_after": aligned_output.fused_repr[row].detach().cpu(),
+                    "trend_repr_after": aligned_output.trend_repr[row].detach().cpu(),
+                    "structure_repr_after": aligned_output.structure_repr[row].detach().cpu(),
+                    "logits_after": aligned_output.logits[row].detach().cpu(),
+                    "gamma_grid": gamma_grid.detach().cpu(),
+                    "gamma_grid_reference": gamma_grid_reference.detach().cpu(),
                 })
             _append_record(records, class_id, record)
     for class_id in records:
@@ -547,6 +573,113 @@ def _distance_stats(
     }
 
 
+def _representation_center(records: Sequence[dict], key: str) -> Tensor:
+    if not records:
+        raise ValueError("representation center requires at least one record")
+    return torch.stack([record[key].float() for record in records], dim=0).mean(dim=0)
+
+
+def _representation_distances(
+    records: Sequence[dict],
+    *,
+    before_key: str,
+    after_key: str,
+    prototype: Tensor,
+) -> Tuple[Tensor, Tensor, dict]:
+    if not records:
+        raise ValueError("representation distances require at least one record")
+    prototype = prototype.detach().cpu().float()
+    before_repr = torch.stack([record[before_key].float() for record in records], dim=0)
+    after_repr = torch.stack([record[after_key].float() for record in records], dim=0)
+    before = torch.linalg.vector_norm(before_repr - prototype.unsqueeze(0), dim=-1)
+    after = torch.linalg.vector_norm(after_repr - prototype.unsqueeze(0), dim=-1)
+    before_mean = float(before.mean().item())
+    after_mean = float(after.mean().item())
+    stats = {
+        "before_mean": before_mean,
+        "before_median": float(before.median().item()),
+        "after_mean": after_mean,
+        "after_median": float(after.median().item()),
+        "mean_relative_reduction": (before_mean - after_mean) / max(before_mean, 1e-12),
+        "improvement_rate": float((after < before).float().mean().item()),
+    }
+    return before, after, stats
+
+
+def _classification_stats(records: Sequence[dict], class_id: int) -> dict:
+    logits_before = torch.stack([record["logits_before"].float() for record in records])
+    logits_after = torch.stack([record["logits_after"].float() for record in records])
+    probs_before = torch.softmax(logits_before, dim=-1)
+    probs_after = torch.softmax(logits_after, dim=-1)
+    pred_before = logits_before.argmax(dim=-1)
+    pred_after = logits_after.argmax(dim=-1)
+    return {
+        "true_probability_before_mean": float(probs_before[:, class_id].mean().item()),
+        "true_probability_after_mean": float(probs_after[:, class_id].mean().item()),
+        "accuracy_before": float((pred_before == class_id).float().mean().item()),
+        "accuracy_after": float((pred_after == class_id).float().mean().item()),
+    }
+
+
+def _position_shift_stats(records: Sequence[dict]) -> dict:
+    signed: List[Tensor] = []
+    absolute: List[Tensor] = []
+    for record in records:
+        mask = record["mask"].bool()
+        delta = (record["positions_after"][mask] - record["positions"][mask]).float() * 365.0
+        if delta.numel():
+            signed.append(delta)
+            absolute.append(delta.abs())
+    if not signed:
+        return {
+            "signed_mean_days": None,
+            "signed_median_days": None,
+            "absolute_mean_days": None,
+            "absolute_median_days": None,
+            "max_absolute_days": None,
+        }
+    signed_values = torch.cat(signed)
+    absolute_values = torch.cat(absolute)
+    return {
+        "signed_mean_days": float(signed_values.mean().item()),
+        "signed_median_days": float(signed_values.median().item()),
+        "absolute_mean_days": float(absolute_values.mean().item()),
+        "absolute_median_days": float(absolute_values.median().item()),
+        "max_absolute_days": float(absolute_values.max().item()),
+    }
+
+
+def _plot_representation_distance(
+    output_path: Path,
+    *,
+    title: str,
+    metrics: Sequence[Tuple[str, Tensor, Tensor]],
+    dpi: int,
+) -> None:
+    figure, axes = plt.subplots(2, 2, figsize=(9.0, 8.0), constrained_layout=True)
+    for axis, (label, before, after) in zip(axes.flat, metrics):
+        x = before.detach().cpu().numpy()
+        y = after.detach().cpu().numpy()
+        low = float(min(np.min(x), np.min(y)))
+        high = float(max(np.max(x), np.max(y)))
+        if low == high:
+            pad = max(abs(low) * 0.05, 1e-6)
+            low -= pad
+            high += pad
+        axis.scatter(x, y, s=20, alpha=0.7)
+        axis.plot([low, high], [low, high], linestyle="--", linewidth=1.2, label="no change")
+        improvement = float(np.mean(y < x))
+        axis.set_title(f"{label} — improved {improvement * 100:.1f}%")
+        axis.set_xlabel("distance before Phase")
+        axis.set_ylabel("distance after Phase")
+        axis.grid(alpha=0.18)
+        axis.legend(loc="best")
+    figure.suptitle(title + " — points below diagonal are closer to source")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+
+
 def _robust_limits(arrays: Iterable[np.ndarray], lower: float, upper: float) -> Tuple[float, float]:
     values = np.concatenate([
         np.asarray(value)[np.isfinite(value)] for value in arrays
@@ -596,14 +729,13 @@ def _plot_q_spaghetti(
     source_pc = [_project(item[f"{q_prefix}_before"], pca_mean, pca_components) for item in source_display]
     before_pc = [_project(item[f"{q_prefix}_before"], pca_mean, pca_components) for item in target_display]
     after_pc = [_project(item[f"{q_prefix}_after"], pca_mean, pca_components) for item in target_display]
-    direct_pc = [_project(item[f"{q_prefix}_after_direct"], pca_mean, pca_components) for item in target_display]
 
     for mode in ("full", "robust"):
         figure, axes = plt.subplots(
-            2, 4, figsize=(17.0, 7.0), sharex=True, sharey="row", constrained_layout=True
+            2, 3, figsize=(13.2, 7.0), sharex=True, sharey="row", constrained_layout=True
         )
         for component in range(2):
-            all_values = [value[:, component] for value in source_pc + before_pc + after_pc + direct_pc]
+            all_values = [value[:, component] for value in source_pc + before_pc + after_pc]
             if mode == "robust":
                 ylim = _robust_limits(all_values, robust_lower, robust_upper)
             else:
@@ -614,8 +746,7 @@ def _plot_q_spaghetti(
             panels = (
                 ("Source", source_display, source_pc, f"{support_prefix}_before"),
                 ("Target before Phase", target_display, before_pc, f"{support_prefix}_before"),
-                ("Target after CURRENT code", target_display, after_pc, f"{support_prefix}_after"),
-                ("Target after direct gamma(u) resample", target_display, direct_pc, f"{support_prefix}_after_direct"),
+                ("Target after confirmed Phase", target_display, after_pc, f"{support_prefix}_after"),
             )
             for column, (panel_title, records, projected, support_key) in enumerate(panels):
                 axis = axes[component, column]
@@ -636,7 +767,7 @@ def _plot_q_spaghetti(
                     axis.set_xlabel("canonical day of year")
                 if column == 0:
                     axis.set_ylabel(f"PC{component + 1}")
-                if component == 0 and column == 3:
+                if component == 0 and column == 2:
                     axis.legend(loc="best")
         figure.suptitle(title)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -663,19 +794,14 @@ def _plot_q_mean_overlay(
     after_center, _ = _support_weighted_center(
         target, f"{q_prefix}_after", f"{support_prefix}_after"
     )
-    direct_center, _ = _support_weighted_center(
-        target, f"{q_prefix}_after_direct", f"{support_prefix}_after_direct"
-    )
     source_pc = _project(source_prototype.cpu(), pca_mean, pca_components)
     before_pc = _project(before_center, pca_mean, pca_components)
     after_pc = _project(after_center, pca_mean, pca_components)
-    direct_pc = _project(direct_center, pca_mean, pca_components)
     figure, axes = plt.subplots(2, 1, figsize=(8.5, 6.5), sharex=True, constrained_layout=True)
     for component, axis in enumerate(axes):
         axis.plot(grid, source_pc[:, component], linewidth=2.0, label="source prototype")
         axis.plot(grid, before_pc[:, component], linewidth=2.0, label="target before")
-        axis.plot(grid, after_pc[:, component], linewidth=2.0, label="target after CURRENT code")
-        axis.plot(grid, direct_pc[:, component], linewidth=2.0, label="target after direct gamma(u)")
+        axis.plot(grid, after_pc[:, component], linewidth=2.0, label="target after Phase")
         axis.set_ylabel(f"PC{component + 1}")
         axis.grid(alpha=0.18)
     axes[0].legend(loc="best")
@@ -807,6 +933,97 @@ def _json_dump(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
+
+
+def _write_chinese_readme(
+    path: Path,
+    *,
+    checkpoint_path: Path,
+    source: str,
+    target: str,
+    seed: int,
+    fold: int,
+    summary_rows: Sequence[dict],
+    group_summaries: Sequence[dict],
+) -> None:
+    lines: List[str] = []
+    lines.append("# Domain Phase 对齐可视化结果说明")
+    lines.append("")
+    lines.append("本目录用于检查已确认的 Domain Phase 是否真正改善 source-target 同类对齐。目标域真实标签只用于离线 oracle 可视化配对，不参与训练、伪标签、Domain Phase 或 Domain Shape 的估计。")
+    lines.append("")
+    lines.append("## 本次运行")
+    lines.append("")
+    lines.append(f"- source: `{source}`")
+    lines.append(f"- target: `{target}`")
+    lines.append(f"- seed: `{seed}`")
+    lines.append(f"- fold: `{fold}`")
+    lines.append(f"- checkpoint: `{checkpoint_path}`")
+    lines.append("")
+    lines.append("## Phase 方向")
+    lines.append("")
+    lines.append("保存的 `gamma` 定义为 source→target，即 `gamma(u_source)=u_target`。因此：")
+    lines.append("")
+    lines.append("- target 送入 Time2Vec/LTAE 的时间位置使用 `gamma^{-1}(t_target)`；")
+    lines.append("- target SRVF/Shape 回到 source 公共时间坐标时使用 `(q_target, gamma)`；")
+    lines.append("- `gamma_resample_max_abs_difference` 是正式 `resample_gamma` 与独立线性插值参考实现的差值，修复后应接近 0。")
+    lines.append("")
+    lines.append("## 文件夹说明")
+    lines.append("")
+    lines.append("| 路径 | 含义 | 主要看什么 |")
+    lines.append("|---|---|---|")
+    lines.append("| `phase_groups/` | 已确认 Domain Phase 的 `gamma` 与位移（天） | `gamma(t)-t` 是否像合理的域级时间偏移 |")
+    lines.append("| `shape_spaghetti/` | source、target-before、target-after 的 Shape-SRVF PCA spaghetti | Phase 后 target Shape 是否整体向 source 靠近 |")
+    lines.append("| `shape_mean_overlay/` | source prototype 与 target 类中心 before/after 叠加 | 类中心层面是否改善 |")
+    lines.append("| `trend_spaghetti/` | Trend-SRVF 的同类 before/after | 作为 Phase 估计来源，Trend 本身是否被正确对齐 |")
+    lines.append("| `ltae_position_spaghetti/` | Structure token 值不变，只显示 LTAE 使用的时间横坐标 | `gamma^{-1}(t_target)` 是否真正移动了观测时间位置 |")
+    lines.append("| `ltae_representation_distance/` | LTAE 表示 before/after 到 source 同类中心的距离散点 | 点在对角线下方表示 Phase 后表示更接近 source |")
+    lines.append("")
+    lines.append("## 数据文件说明")
+    lines.append("")
+    lines.append("| 文件 | 含义 |")
+    lines.append("|---|---|")
+    lines.append("| `phase_alignment_summary.csv` | 每个类别的 Shape、Trend、LTAE 表示 before/after 汇总指标 |")
+    lines.append("| `ltae_representation_samples.csv` | 每个 target 样本的 LTAE 距离、位置移动、分类概率 before/after |")
+    lines.append("| `phase_alignment_manifest.json` | 本次运行参数、Phase 方向、PCA 信息和完整汇总 |")
+    lines.append("| `source_only_projection_basis.npz` | 只用 source 拟合并冻结的 PCA basis，保证 target before/after 共用同一投影 |")
+    lines.append("")
+    if group_summaries:
+        lines.append("## Domain Phase 摘要")
+        lines.append("")
+        lines.append("| group | classes | 内部中位 source→target shift / 天 | P10 | P90 |")
+        lines.append("|---:|---|---:|---:|---:|")
+        for item in group_summaries:
+            classes = ",".join(str(v) for v in item["member_classes"])
+            lines.append(
+                f"| {item['group_id']} | {classes} | "
+                f"{item['source_to_target_shift_days_interior_median']:.2f} | "
+                f"{item['source_to_target_shift_days_interior_p10']:.2f} | "
+                f"{item['source_to_target_shift_days_interior_p90']:.2f} |"
+            )
+        lines.append("")
+    lines.append("## 每类关键结果")
+    lines.append("")
+    lines.append("`reduction > 0` 表示距离下降；`improve rate` 表示样本中 after 距离小于 before 的比例。")
+    lines.append("")
+    lines.append("| class | Shape mean | Trend mean | LTAE fused mean | fused improve rate |")
+    lines.append("|---|---:|---:|---:|---:|")
+    for row in summary_rows:
+        lines.append(
+            f"| {row['class_id']} {row['class_name']} | "
+            f"{row['shape_before_mean']:.3f}→{row['shape_after_mean']:.3f} | "
+            f"{row['trend_before_mean']:.3f}→{row['trend_after_mean']:.3f} | "
+            f"{row['ltae_fused_before_mean']:.3f}→{row['ltae_fused_after_mean']:.3f} | "
+            f"{100.0 * row['ltae_fused_improvement_rate']:.1f}% |"
+        )
+    lines.append("")
+    lines.append("## 如何判断")
+    lines.append("")
+    lines.append("1. `gamma_resample_max_abs_difference` 应接近 0；否则说明 Shape-grid 上的 gamma 重采样仍有方向/实现不一致。")
+    lines.append("2. `Shape/Trend mean before→after` 若下降且 improvement rate 较高，说明函数几何对齐有效。")
+    lines.append("3. 最关键的是 `LTAE fused mean before→after`：若下降且多数样本位于 `ltae_representation_distance/` 对角线下方，说明时间位置校正确实改善了分类器输入表示的 source-target 同类距离。")
+    lines.append("4. 若 Shape/Trend 改善但 LTAE fused 不改善，说明 Phase 几何正确，但 Time2Vec/LTAE 没有把位置校正转化为更好的表示。")
+    lines.append("5. 若三者都不改善，应继续检查 Domain Phase 的估计本身，而不是优先调训练超参数。")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 def run(args: argparse.Namespace) -> dict:
     checkpoint_path = args.checkpoint.resolve()
@@ -942,6 +1159,7 @@ def run(args: argparse.Namespace) -> dict:
     source_shape_support = bank["shape_support"].detach().cpu()
     source_trend_proto = bank["trend_srvf"].detach().cpu()
     source_trend_support = bank["trend_support"].detach().cpu()
+    source_fused_proto = bank["fused"].detach().cpu()
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -959,6 +1177,7 @@ def run(args: argparse.Namespace) -> dict:
     )
 
     summary_rows: List[dict] = []
+    sample_rows: List[dict] = []
     for class_id in requested_classes:
         source_class = source_records.get(class_id, [])
         target_class = target_records.get(class_id, [])
@@ -972,21 +1191,13 @@ def run(args: argparse.Namespace) -> dict:
         name = classes[class_id]
         stem = _class_stem(class_id, name)
         group_id = int(class_to_group[class_id]["group_id"])
+
         shape_stats = _distance_stats(
             target_class,
             q_before_key="shape_q_before",
             support_before_key="shape_support_before",
             q_after_key="shape_q_after",
             support_after_key="shape_support_after",
-            prototype_q=source_shape_proto[class_id],
-            prototype_support=source_shape_support[class_id],
-        )
-        shape_direct_stats = _distance_stats(
-            target_class,
-            q_before_key="shape_q_before",
-            support_before_key="shape_support_before",
-            q_after_key="shape_q_after_direct",
-            support_after_key="shape_support_after_direct",
             prototype_q=source_shape_proto[class_id],
             prototype_support=source_shape_support[class_id],
         )
@@ -999,18 +1210,43 @@ def run(args: argparse.Namespace) -> dict:
             prototype_q=source_trend_proto[class_id],
             prototype_support=source_trend_support[class_id],
         )
-        trend_direct_stats = _distance_stats(
+
+        source_fused_sampled = _representation_center(source_class, "fused_repr_before")
+        source_trend_sampled = _representation_center(source_class, "trend_repr_before")
+        source_structure_sampled = _representation_center(source_class, "structure_repr_before")
+        fused_before, fused_after, fused_stats = _representation_distances(
             target_class,
-            q_before_key="trend_q_before",
-            support_before_key="trend_support_before",
-            q_after_key="trend_q_after_direct",
-            support_after_key="trend_support_after_direct",
-            prototype_q=source_trend_proto[class_id],
-            prototype_support=source_trend_support[class_id],
+            before_key="fused_repr_before",
+            after_key="fused_repr_after",
+            prototype=source_fused_proto[class_id],
         )
-        gamma_current = target_class[0]["gamma_grid_current"]
-        gamma_direct = target_class[0]["gamma_grid_direct"]
-        gamma_resample_max_abs_difference = float((gamma_current - gamma_direct).abs().max().item())
+        fused_sampled_before, fused_sampled_after, fused_sampled_stats = _representation_distances(
+            target_class,
+            before_key="fused_repr_before",
+            after_key="fused_repr_after",
+            prototype=source_fused_sampled,
+        )
+        trend_repr_before, trend_repr_after, trend_repr_stats = _representation_distances(
+            target_class,
+            before_key="trend_repr_before",
+            after_key="trend_repr_after",
+            prototype=source_trend_sampled,
+        )
+        structure_repr_before, structure_repr_after, structure_repr_stats = _representation_distances(
+            target_class,
+            before_key="structure_repr_before",
+            after_key="structure_repr_after",
+            prototype=source_structure_sampled,
+        )
+        cls_stats = _classification_stats(target_class, class_id)
+        position_stats = _position_shift_stats(target_class)
+
+        gamma_current = target_class[0]["gamma_grid"]
+        gamma_reference = target_class[0]["gamma_grid_reference"]
+        gamma_resample_max_abs_difference = float(
+            (gamma_current - gamma_reference).abs().max().item()
+        )
+
         row = {
             "class_id": class_id,
             "class_name": name,
@@ -1025,11 +1261,6 @@ def run(args: argparse.Namespace) -> dict:
             "shape_improvement_rate": shape_stats["improvement_rate"],
             "shape_class_center_before": shape_stats["class_center_before"],
             "shape_class_center_after": shape_stats["class_center_after"],
-            "shape_direct_after_mean": shape_direct_stats["after_mean"],
-            "shape_direct_after_median": shape_direct_stats["after_median"],
-            "shape_direct_mean_relative_reduction": shape_direct_stats["mean_relative_reduction"],
-            "shape_direct_improvement_rate": shape_direct_stats["improvement_rate"],
-            "shape_direct_class_center_after": shape_direct_stats["class_center_after"],
             "trend_before_mean": trend_stats["before_mean"],
             "trend_after_mean": trend_stats["after_mean"],
             "trend_before_median": trend_stats["before_median"],
@@ -1038,24 +1269,77 @@ def run(args: argparse.Namespace) -> dict:
             "trend_improvement_rate": trend_stats["improvement_rate"],
             "trend_class_center_before": trend_stats["class_center_before"],
             "trend_class_center_after": trend_stats["class_center_after"],
-            "trend_direct_after_mean": trend_direct_stats["after_mean"],
-            "trend_direct_after_median": trend_direct_stats["after_median"],
-            "trend_direct_mean_relative_reduction": trend_direct_stats["mean_relative_reduction"],
-            "trend_direct_improvement_rate": trend_direct_stats["improvement_rate"],
-            "trend_direct_class_center_after": trend_direct_stats["class_center_after"],
+            "ltae_fused_before_mean": fused_stats["before_mean"],
+            "ltae_fused_after_mean": fused_stats["after_mean"],
+            "ltae_fused_mean_relative_reduction": fused_stats["mean_relative_reduction"],
+            "ltae_fused_improvement_rate": fused_stats["improvement_rate"],
+            "ltae_fused_sampled_before_mean": fused_sampled_stats["before_mean"],
+            "ltae_fused_sampled_after_mean": fused_sampled_stats["after_mean"],
+            "ltae_fused_sampled_improvement_rate": fused_sampled_stats["improvement_rate"],
+            "ltae_trend_before_mean": trend_repr_stats["before_mean"],
+            "ltae_trend_after_mean": trend_repr_stats["after_mean"],
+            "ltae_trend_improvement_rate": trend_repr_stats["improvement_rate"],
+            "ltae_structure_before_mean": structure_repr_stats["before_mean"],
+            "ltae_structure_after_mean": structure_repr_stats["after_mean"],
+            "ltae_structure_improvement_rate": structure_repr_stats["improvement_rate"],
+            "true_probability_before_mean": cls_stats["true_probability_before_mean"],
+            "true_probability_after_mean": cls_stats["true_probability_after_mean"],
+            "oracle_accuracy_before": cls_stats["accuracy_before"],
+            "oracle_accuracy_after": cls_stats["accuracy_after"],
+            "position_shift_signed_mean_days": position_stats["signed_mean_days"],
+            "position_shift_absolute_mean_days": position_stats["absolute_mean_days"],
+            "position_shift_max_absolute_days": position_stats["max_absolute_days"],
             "gamma_resample_max_abs_difference": gamma_resample_max_abs_difference,
         }
         summary_rows.append(row)
+
+        for index, record in enumerate(target_class):
+            mask = record["mask"].bool()
+            position_delta = (
+                record["positions_after"][mask] - record["positions"][mask]
+            ).float() * 365.0
+            logits_before = record["logits_before"].float()
+            logits_after = record["logits_after"].float()
+            probs_before = torch.softmax(logits_before, dim=-1)
+            probs_after = torch.softmax(logits_after, dim=-1)
+            sample_rows.append(
+                {
+                    "class_id": class_id,
+                    "class_name": name,
+                    "parcel_index": int(record["parcel_index"]),
+                    "group_id": group_id,
+                    "position_shift_signed_mean_days": float(position_delta.mean().item()) if position_delta.numel() else None,
+                    "position_shift_absolute_mean_days": float(position_delta.abs().mean().item()) if position_delta.numel() else None,
+                    "position_shift_max_absolute_days": float(position_delta.abs().max().item()) if position_delta.numel() else None,
+                    "fused_distance_before": float(fused_before[index].item()),
+                    "fused_distance_after": float(fused_after[index].item()),
+                    "fused_distance_improved": bool(fused_after[index] < fused_before[index]),
+                    "fused_sampled_distance_before": float(fused_sampled_before[index].item()),
+                    "fused_sampled_distance_after": float(fused_sampled_after[index].item()),
+                    "trend_repr_distance_before": float(trend_repr_before[index].item()),
+                    "trend_repr_distance_after": float(trend_repr_after[index].item()),
+                    "structure_repr_distance_before": float(structure_repr_before[index].item()),
+                    "structure_repr_distance_after": float(structure_repr_after[index].item()),
+                    "true_probability_before": float(probs_before[class_id].item()),
+                    "true_probability_after": float(probs_after[class_id].item()),
+                    "prediction_before": int(logits_before.argmax().item()),
+                    "prediction_after": int(logits_after.argmax().item()),
+                    "correct_before": bool(logits_before.argmax().item() == class_id),
+                    "correct_after": bool(logits_after.argmax().item() == class_id),
+                }
+            )
+
         print(
             "PHASE_ALIGNMENT_CLASS|"
             f"class={class_id}:{name}|group={group_id}|"
-            f"shape_current={shape_stats['before_mean']:.6g}->{shape_stats['after_mean']:.6g}|"
-            f"shape_direct={shape_stats['before_mean']:.6g}->{shape_direct_stats['after_mean']:.6g}|"
-            f"trend_current={trend_stats['before_mean']:.6g}->{trend_stats['after_mean']:.6g}|"
-            f"trend_direct={trend_stats['before_mean']:.6g}->{trend_direct_stats['after_mean']:.6g}|"
+            f"shape={shape_stats['before_mean']:.6g}->{shape_stats['after_mean']:.6g}|"
+            f"trend={trend_stats['before_mean']:.6g}->{trend_stats['after_mean']:.6g}|"
+            f"ltae_fused={fused_stats['before_mean']:.6g}->{fused_stats['after_mean']:.6g}|"
+            f"ltae_improve_rate={fused_stats['improvement_rate']:.4f}|"
             f"gamma_resample_diff={gamma_resample_max_abs_difference:.6g}",
             flush=True,
         )
+
         _plot_q_spaghetti(
             output_dir / "shape_spaghetti" / f"{stem}.png",
             title=f"Shape-SRVF Phase alignment — class {class_id}: {name}",
@@ -1109,14 +1393,28 @@ def run(args: argparse.Namespace) -> dict:
             robust_upper=args.robust_upper,
             dpi=args.dpi,
         )
+        _plot_representation_distance(
+            output_dir / "ltae_representation_distance" / f"{stem}.png",
+            title=f"LTAE representation Phase alignment — class {class_id}: {name}",
+            metrics=(
+                ("Fused / formal source prototype", fused_before, fused_after),
+                ("Fused / sampled source center", fused_sampled_before, fused_sampled_after),
+                ("Trend repr / sampled source center", trend_repr_before, trend_repr_after),
+                ("Structure repr / sampled source center", structure_repr_before, structure_repr_after),
+            ),
+            dpi=args.dpi,
+        )
 
     if not summary_rows:
         raise RuntimeError("no class produced a Phase-alignment diagnostic")
     _write_csv(output_dir / "phase_alignment_summary.csv", summary_rows)
+    _write_csv(output_dir / "ltae_representation_samples.csv", sample_rows)
     group_summaries = _plot_phase_groups(output_dir, groups, args.dpi)
     manifest = {
         "checkpoint": str(checkpoint_path),
+        "checkpoint_stage": checkpoint.get("stage"),
         "checkpoint_epoch": checkpoint.get("epoch"),
+        "successful_optimizer_steps": checkpoint.get("successful_optimizer_steps"),
         "source": source,
         "target": target,
         "seed": seed,
@@ -1128,12 +1426,16 @@ def run(args: argparse.Namespace) -> dict:
         "target_label_usage": "oracle post-hoc visualization only; never used by training or Domain Phase estimation",
         "phase_direction": {
             "group_gamma": "source_to_target",
-            "target_alignment": "target positions use gamma inverse; target q should use warp_q_gamma(q, gamma)",
+            "target_ltae_alignment": "target positions use gamma inverse",
+            "target_srvf_alignment": "target q uses warp_q_gamma(q, gamma)",
         },
-        "resample_audit": {
-            "current": "repository resample_gamma output used by current Stage-2 code",
-            "direct": "piecewise-linear evaluation of saved gamma(u) on the 64-point Shape grid; no inversion",
-            "purpose": "diagnose whether current gamma resampling preserves the registration direction",
+        "resample_self_check": {
+            "reference": "independent piecewise-linear evaluation of saved gamma(u) on the Shape grid",
+            "expected": "gamma_resample_max_abs_difference approximately zero",
+        },
+        "ltae_representation_diagnostic": {
+            "primary": "Euclidean distance from target fused_repr to formal checkpoint source fused prototype before/after gamma^-1 position correction",
+            "branch_diagnostics": "trend_repr and structure_repr use selected source true-class sample means because the formal bank stores only fused prototypes",
         },
         "pca_fit_scope": "source-only selected true-class rows; basis frozen before projecting target before/after views",
         "shape_pca_explained_variance_ratio": shape_ratio.tolist(),
@@ -1143,9 +1445,19 @@ def run(args: argparse.Namespace) -> dict:
         "class_summary": summary_rows,
     }
     _json_dump(output_dir / "phase_alignment_manifest.json", manifest)
+    _write_chinese_readme(
+        output_dir / "README_中文说明.md",
+        checkpoint_path=checkpoint_path,
+        source=source,
+        target=target,
+        seed=seed,
+        fold=fold,
+        summary_rows=summary_rows,
+        group_summaries=group_summaries,
+    )
     print(
         "PHASE_ALIGNMENT_VIS_COMPLETE|"
-        f"output={output_dir}|classes={len(summary_rows)}",
+        f"output={output_dir}|classes={len(summary_rows)}|samples={len(sample_rows)}",
         flush=True,
     )
     return manifest

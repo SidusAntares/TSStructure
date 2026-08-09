@@ -149,18 +149,58 @@ def warp_support_gamma(support: Tensor, gamma: Tensor, grid: Tensor) -> Tensor:
 
 
 def resample_gamma(gamma_reg: Tensor, reg_grid: Tensor, target_grid: Tensor) -> Tensor:
-    """Monotonically resample a gamma function onto a different grid."""
+    """Evaluate ``gamma_reg(reg_grid)`` on ``target_grid`` by linear interpolation.
+
+    ``gamma_reg`` has the registration direction ``u_source -> u_target``.
+    Resampling must preserve that direction.  In particular, this helper must
+    *not* call :func:`invert_monotone_warp`, because that would evaluate
+    ``gamma^{-1}`` and reverse the SRVF group action used by
+    :func:`warp_q_gamma`.
+    """
     if gamma_reg.ndim != 1 or gamma_reg.shape != reg_grid.shape:
         raise ValueError("gamma_reg must have shape [K_reg]")
     if target_grid.ndim != 1:
         raise ValueError("target_grid must be one-dimensional")
-    # invert_monotone_warp evaluates a piecewise-linear warp at arbitrary
-    # queries. gamma_reg maps reg_grid -> reg_grid; evaluating at target_grid
-    # points gives the resampled gamma.
-    from .temporal_registration import invert_monotone_warp
+    if gamma_reg.numel() < 2:
+        raise ValueError("gamma_reg must contain at least two points")
+    if not gamma_reg.is_floating_point() or not reg_grid.is_floating_point():
+        raise ValueError("gamma_reg and reg_grid must use floating-point dtypes")
+    if not target_grid.is_floating_point():
+        raise ValueError("target_grid must use a floating-point dtype")
 
-    gamma_reg = gamma_reg.to(device=target_grid.device, dtype=target_grid.dtype)
-    return invert_monotone_warp(gamma_reg, query=target_grid)
+    gamma = gamma_reg.to(device=target_grid.device, dtype=target_grid.dtype)
+    source_grid = reg_grid.to(device=target_grid.device, dtype=target_grid.dtype)
+    query = target_grid.contiguous()
+
+    if not torch.isfinite(gamma).all().item():
+        raise ValueError("gamma_reg must contain only finite values")
+    if not torch.isfinite(source_grid).all().item() or not torch.isfinite(query).all().item():
+        raise ValueError("grids must contain only finite values")
+    if torch.any(source_grid[1:] <= source_grid[:-1]).item():
+        raise ValueError("reg_grid must be strictly increasing")
+    if torch.any(query[1:] <= query[:-1]).item():
+        raise ValueError("target_grid must be strictly increasing")
+    tolerance = 1e-6
+    if (
+        torch.any(query < source_grid[0] - tolerance).item()
+        or torch.any(query > source_grid[-1] + tolerance).item()
+    ):
+        raise ValueError("target_grid must lie inside reg_grid range")
+
+    query = query.clamp(min=float(source_grid[0]), max=float(source_grid[-1]))
+    upper = torch.searchsorted(source_grid.contiguous(), query, right=True).clamp(
+        min=1, max=source_grid.numel() - 1
+    )
+    lower = upper - 1
+    x0 = source_grid[lower]
+    x1 = source_grid[upper]
+    y0 = gamma[lower]
+    y1 = gamma[upper]
+    fraction = (query - x0) / (x1 - x0).clamp_min(1e-12)
+    result = y0 + fraction * (y1 - y0)
+    result = torch.where(query == source_grid[0], gamma[0], result)
+    result = torch.where(query == source_grid[-1], gamma[-1], result)
+    return result
 
 
 @dataclass(frozen=True)

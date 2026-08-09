@@ -125,14 +125,22 @@ def test_warp_support_gamma_does_not_multiply_sqrt_derivative(grid) -> None:
     assert (warped - 1.0).abs().max().item() < 1e-2
 
 
-def test_resample_gamma_to_target_grid(grid) -> None:
+def test_resample_gamma_to_target_grid_preserves_forward_direction(grid) -> None:
     gamma = grid ** 1.5
     target_grid = torch.linspace(0, 1, 32)
     resampled = resample_gamma(gamma, grid, target_grid)
+    expected_forward = target_grid ** 1.5
+    expected_inverse = target_grid ** (2.0 / 3.0)
+
     assert resampled.shape == (32,)
     assert resampled[0].item() == pytest.approx(0.0, abs=1e-6)
     assert resampled[-1].item() == pytest.approx(1.0, abs=1e-6)
-    assert torch.all(resampled[1:] >= resampled[:-1])
+    assert torch.all(resampled[1:] > resampled[:-1])
+    torch.testing.assert_close(resampled, expected_forward, rtol=0.0, atol=1e-4)
+
+    forward_error = (resampled - expected_forward).abs().max().item()
+    inverse_error = (resampled - expected_inverse).abs().max().item()
+    assert forward_error < inverse_error * 0.01
 
 
 def test_gamma_legality_rejects_nan(grid) -> None:
