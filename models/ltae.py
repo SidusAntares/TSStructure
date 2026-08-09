@@ -242,6 +242,139 @@ class ContinuousTime2Vec(nn.Module):
         return encoding
 
 
+class TimeMatchFixedSinusoidal(nn.Module):
+    """Continuous evaluation of TimeMatch's frozen sinusoidal day encoding.
+
+    The original TimeMatch implementation precomputes the standard sinusoidal
+    table on integer day indices and freezes it.  TSStructure's confirmed Domain
+    Phase can produce fractional-day coordinates, so this module evaluates the
+    same formula analytically instead of rounding to an embedding index.
+
+    Inputs use the same normalized coordinate supplied to the current raw LTAE.
+    ``calendar_scale_days`` maps that coordinate back to TimeMatch's day index.
+    Values outside the canonical [0, 1] year are intentionally allowed: a
+    TimeMatch-style scalar calendar translation can move observations beyond the
+    nominal year while remaining a valid position for the sinusoidal formula.
+    """
+
+    def __init__(
+        self,
+        output_dim: int,
+        *,
+        time_reference: float = 0.0,
+        time_scale: float = 1.0,
+        calendar_scale_days: float = 365.0,
+        position_offset_days: float = 100.0,
+        period: float = 1000.0,
+    ) -> None:
+        super().__init__()
+        if isinstance(output_dim, bool) or not isinstance(output_dim, int) or output_dim < 2:
+            raise ValueError("output_dim must be an integer at least 2")
+        for name, value in (
+            ("time_reference", time_reference),
+            ("time_scale", time_scale),
+            ("calendar_scale_days", calendar_scale_days),
+            ("position_offset_days", position_offset_days),
+            ("period", period),
+        ):
+            try:
+                converted = float(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{name} must be finite and greater than zero") from error
+            if not math.isfinite(converted):
+                raise ValueError(f"{name} must be finite and greater than zero")
+            if name in {"time_scale", "calendar_scale_days", "period"} and converted <= 0:
+                raise ValueError(f"{name} must be finite and greater than zero")
+            if name == "position_offset_days" and converted < 0:
+                raise ValueError("position_offset_days must be finite and nonnegative")
+        self.output_dim = output_dim
+        self.time_reference = float(time_reference)
+        self.time_scale = float(time_scale)
+        self.calendar_scale_days = float(calendar_scale_days)
+        self.position_offset_days = float(position_offset_days)
+        self.period = float(period)
+        frequencies = torch.exp(
+            torch.arange(0, output_dim, 2, dtype=torch.float32)
+            * (-math.log(self.period) / output_dim)
+        )
+        self.register_buffer("frequencies", frequencies, persistent=True)
+
+    def _resolve_inputs(
+        self, positions: torch.Tensor, time_mask: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not isinstance(positions, torch.Tensor):
+            raise ValueError("positions must be a torch.Tensor")
+        if not positions.is_floating_point() or positions.is_complex():
+            raise ValueError("positions must be a real floating-point tensor")
+        if positions.ndim == 1:
+            sequence_length = positions.shape[0]
+            if time_mask is not None and isinstance(time_mask, torch.Tensor) and time_mask.ndim == 2:
+                batch_size = time_mask.shape[0]
+            else:
+                batch_size = 1
+            resolved_positions = positions.unsqueeze(0).expand(batch_size, -1)
+        elif positions.ndim == 2:
+            batch_size, sequence_length = positions.shape
+            resolved_positions = positions
+        else:
+            raise ValueError("positions must have shape [L] or [B, L]")
+        resolved_mask = (
+            torch.ones(
+                batch_size,
+                sequence_length,
+                dtype=torch.bool,
+                device=positions.device,
+            )
+            if time_mask is None
+            else _resolve_time_mask(
+                time_mask,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                device=positions.device,
+            )
+        )
+        if resolved_positions.device != self.frequencies.device:
+            raise ValueError("positions device must match module buffers")
+        if resolved_positions.dtype != self.frequencies.dtype:
+            raise ValueError("positions dtype must match module buffers")
+        valid_positions = resolved_positions[resolved_mask]
+        if not torch.isfinite(valid_positions).all().item():
+            raise ValueError("valid positions must be finite")
+        return resolved_positions, resolved_mask
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        *,
+        time_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        resolved_positions, resolved_mask = self._resolve_inputs(positions, time_mask)
+        safe_positions = torch.where(
+            resolved_mask, resolved_positions, torch.zeros_like(resolved_positions)
+        )
+        normalized = (safe_positions - self.time_reference) / self.time_scale
+        day_positions = (
+            normalized * self.calendar_scale_days + self.position_offset_days
+        )
+        angles = day_positions.unsqueeze(-1) * self.frequencies
+        encoding = torch.zeros(
+            *day_positions.shape,
+            self.output_dim,
+            dtype=day_positions.dtype,
+            device=day_positions.device,
+        )
+        encoding[..., 0::2] = torch.sin(angles)
+        cosine_width = encoding[..., 1::2].shape[-1]
+        if cosine_width:
+            encoding[..., 1::2] = torch.cos(angles[..., :cosine_width])
+        encoding = torch.where(
+            resolved_mask.unsqueeze(-1), encoding, torch.zeros_like(encoding)
+        )
+        if not torch.isfinite(encoding).all().item():
+            raise ValueError("time encoding must contain only finite values")
+        return encoding
+
+
 class TrendStructureSharedLTAE(nn.Module):
     """Encode T/S with a shared input projection and branch-specific norms."""
 
@@ -259,6 +392,10 @@ class TrendStructureSharedLTAE(nn.Module):
         time_reference: float = 0.0,
         time_scale: float = 365.0,
         max_initial_frequency: float = 16.0,
+        time_encoder_type: str = "continuous_time2vec",
+        timematch_pe_period: float = 1000.0,
+        timematch_pe_max_shift: float = 100.0,
+        calendar_scale_days: float = 365.0,
     ) -> None:
         super().__init__()
         integer_values = {
@@ -300,12 +437,31 @@ class TrendStructureSharedLTAE(nn.Module):
         )
         self.trend_input_norm = nn.LayerNorm(d_model)
         self.structure_input_norm = nn.LayerNorm(d_model)
-        self.shared_time_encoder = ContinuousTime2Vec(
-            d_model,
-            time_reference=time_reference,
-            time_scale=time_scale,
-            max_initial_frequency=max_initial_frequency,
-        )
+        if time_encoder_type not in {
+            "continuous_time2vec",
+            "timematch_fixed_sinusoidal",
+        }:
+            raise ValueError(
+                "time_encoder_type must be 'continuous_time2vec' or "
+                "'timematch_fixed_sinusoidal'"
+            )
+        self.time_encoder_type = time_encoder_type
+        if time_encoder_type == "continuous_time2vec":
+            self.shared_time_encoder = ContinuousTime2Vec(
+                d_model,
+                time_reference=time_reference,
+                time_scale=time_scale,
+                max_initial_frequency=max_initial_frequency,
+            )
+        else:
+            self.shared_time_encoder = TimeMatchFixedSinusoidal(
+                d_model,
+                time_reference=time_reference,
+                time_scale=time_scale,
+                calendar_scale_days=calendar_scale_days,
+                position_offset_days=timematch_pe_max_shift,
+                period=timematch_pe_period,
+            )
         self.attention_heads = MultiHeadAttention(
             n_head=n_head, d_k=d_k, d_in=d_model
         )

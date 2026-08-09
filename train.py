@@ -410,6 +410,10 @@ def _source_prototype_bank_from_checkpoint(state: dict, device: torch.device) ->
 
 
 def main(config):
+    if getattr(config, "stage1_only", False) and (
+        config.eval or config.overall or getattr(config, "stage2_only", False)
+    ):
+        raise ValueError("--stage1_only cannot be combined with --eval, --overall or --stage2_only")
     if getattr(config, "stage2_only", False) and (config.eval or config.overall):
         raise ValueError("--stage2_only cannot be combined with --eval or --overall")
     if getattr(config, "stage1_checkpoint", None) and not getattr(
@@ -440,7 +444,11 @@ def main(config):
         overall_performance(config)
         return
 
-    stage2_runtime_config = None if config.eval else build_stage2_config(config)
+    stage2_runtime_config = (
+        None
+        if config.eval or getattr(config, "stage1_only", False)
+        else build_stage2_config(config)
+    )
     all_folds_have_formal_test = True
 
     for fold_num, splits in enumerate(folds):
@@ -464,23 +472,29 @@ def main(config):
             source_val_loader, _ = create_evaluation_loaders(
                 config.source, splits, config, sample_pixels_val
             )
-            target_val_loader, target_test_loader = create_evaluation_loaders(
-                config.target, splits, config, sample_pixels_val
-            )
-            target_statistics_raw_loader = create_target_statistics_loader(
-                config,
-                splits,
-                max_samples=stage2_runtime_config.phase_evidence_max_samples,
-            )
-            print(
-                "STAGE2_STATISTICS_SUBSET|"
-                f"total={target_statistics_raw_loader.stage2_total_target_train}"
-                f"|selected={target_statistics_raw_loader.stage2_selected_samples}"
-                "|strategy=evenly_spaced_full_target_train"
-            )
-            target_statistics_loader = DeviceBatchLoader(
-                target_statistics_raw_loader, device
-            )
+            if getattr(config, "stage1_only", False):
+                target_val_loader = None
+                target_test_loader = None
+                target_statistics_loader = None
+            else:
+                assert stage2_runtime_config is not None
+                target_val_loader, target_test_loader = create_evaluation_loaders(
+                    config.target, splits, config, sample_pixels_val
+                )
+                target_statistics_raw_loader = create_target_statistics_loader(
+                    config,
+                    splits,
+                    max_samples=stage2_runtime_config.phase_evidence_max_samples,
+                )
+                print(
+                    "STAGE2_STATISTICS_SUBSET|"
+                    f"total={target_statistics_raw_loader.stage2_total_target_train}"
+                    f"|selected={target_statistics_raw_loader.stage2_selected_samples}"
+                    "|strategy=evenly_spaced_full_target_train"
+                )
+                target_statistics_loader = DeviceBatchLoader(
+                    target_statistics_raw_loader, device
+                )
 
         source_loader = None
         source_scan_loader = None
@@ -533,6 +547,9 @@ def main(config):
             dropout=config.dropout,
             classifier_hidden=_int_list(config.classifier_hidden),
             max_initial_frequency=config.time2vec_max_frequency,
+            time_encoder_type=config.time_encoder_type,
+            timematch_pe_period=config.timematch_pe_period,
+            timematch_pe_max_shift=config.timematch_pe_max_shift,
         )
         model.to(device)
 
@@ -560,9 +577,10 @@ def main(config):
         assert source_loader is not None
         assert source_scan_loader is not None
         assert source_val_loader is not None
-        assert target_statistics_loader is not None
-        assert target_val_loader is not None
-        assert stage2_runtime_config is not None
+        if not getattr(config, "stage1_only", False):
+            assert target_statistics_loader is not None
+            assert target_val_loader is not None
+            assert stage2_runtime_config is not None
 
         print(model)
         print('Number of Stage-1 trainable parameters:', get_num_trainable_params(model))
@@ -582,6 +600,15 @@ def main(config):
                 feature_snapshot_manager,
                 source_scan_loader=source_scan_loader,
             )
+            if getattr(config, "stage1_only", False):
+                writer.close()
+                all_folds_have_formal_test = False
+                print(
+                    "STAGE1_ONLY_EXIT|"
+                    f"checkpoint={os.path.join(config.fold_dir, 'stage1_best.pt')}|"
+                    "stage2_skipped=true"
+                )
+                continue
 
         # Formal Stage-1 -> Stage-2 boundary. A Stage-2-only resume deliberately
         # reuses this exact boundary: load the selected source-val checkpoint,
@@ -1035,6 +1062,11 @@ def _stage1_config_dict(config) -> dict:
         "tau_q",
         "num_classes",
         "canonical_grid_size",
+        "time_encoder_type",
+        "time2vec_max_frequency",
+        "timematch_pe_period",
+        "timematch_pe_max_shift",
+        "time_scale",
     )
     return {name: getattr(config, name, None) for name in names}
 
@@ -1403,6 +1435,11 @@ if __name__ == '__main__':
     parser.add_argument('--tau_q', default=0.1, type=float,
                         help='temperature for the Shape geometry class distribution')
 
+    parser.add_argument(
+        '--stage1_only', action='store_true',
+        help='train and finalize Stage 1, then exit before any Stage-2 setup or scan',
+    )
+
     # Stage-2 orchestration. Scientific thresholds/weights intentionally have
     # no defaults; provide them explicitly or through --stage2_config JSON.
     parser.add_argument('--stage2_config', default=None, type=str)
@@ -1510,7 +1547,25 @@ if __name__ == '__main__':
     parser.add_argument('--ltae_mlp', default='256,128', type=_comma_separated_ints)
     parser.add_argument('--dropout', default=0.2, type=float)
     parser.add_argument('--classifier_hidden', default='64,32', type=_comma_separated_ints)
+    parser.add_argument(
+        '--time_encoder_type',
+        default='continuous_time2vec',
+        choices=['continuous_time2vec', 'timematch_fixed_sinusoidal'],
+        help='raw T/S LTAE temporal encoding ablation',
+    )
     parser.add_argument('--time2vec_max_frequency', default=16.0, type=float)
+    parser.add_argument(
+        '--timematch_pe_period',
+        default=1000.0,
+        type=float,
+        help='T parameter of the fixed TimeMatch sinusoidal positional encoding',
+    )
+    parser.add_argument(
+        '--timematch_pe_max_shift',
+        default=100.0,
+        type=float,
+        help='TimeMatch positional-table day offset (official default: 100)',
+    )
 
     # Optimization / precision
     parser.add_argument('--amp', default=False, type=bool_flag)

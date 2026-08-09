@@ -33,6 +33,10 @@ class SharedTrendStructureLTAE(nn.Module):
         time_reference: float = 0.0,
         time_scale: float = 365.0,
         max_initial_frequency: float = 16.0,
+        time_encoder_type: str = "continuous_time2vec",
+        timematch_pe_period: float = 1000.0,
+        timematch_pe_max_shift: float = 100.0,
+        calendar_scale_days: float = 365.0,
     ) -> None:
         super().__init__()
         self.shared_ltae = TrendStructureSharedLTAE(
@@ -45,6 +49,10 @@ class SharedTrendStructureLTAE(nn.Module):
             time_reference=time_reference,
             time_scale=time_scale,
             max_initial_frequency=max_initial_frequency,
+            time_encoder_type=time_encoder_type,
+            timematch_pe_period=timematch_pe_period,
+            timematch_pe_max_shift=timematch_pe_max_shift,
+            calendar_scale_days=calendar_scale_days,
         )
         self.component_dim = self.shared_ltae.component_dim
 

@@ -54,6 +54,9 @@ class TSStructureModel(nn.Module):
         dropout: float = 0.2,
         classifier_hidden: Sequence[int] = (64, 32),
         max_initial_frequency: float = 16.0,
+        time_encoder_type: str = "continuous_time2vec",
+        timematch_pe_period: float = 1000.0,
+        timematch_pe_max_shift: float = 100.0,
     ) -> None:
         super().__init__()
         if isinstance(num_classes, bool) or not isinstance(num_classes, int) or num_classes < 2:
@@ -83,6 +86,10 @@ class TSStructureModel(nn.Module):
             time_reference=0.0,
             time_scale=1.0,
             max_initial_frequency=max_initial_frequency,
+            time_encoder_type=time_encoder_type,
+            timematch_pe_period=timematch_pe_period,
+            timematch_pe_max_shift=timematch_pe_max_shift,
+            calendar_scale_days=time_scale,
         )
         trend_geometry = TemporalSRVFExtractor(
             feature_dim=feature_dim,

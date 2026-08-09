@@ -75,26 +75,11 @@ TIMEMATCH_PAPER = "https://doi.org/10.1016/j.isprsjprs.2022.04.018"
 
 def _shared_time_encoder(model):
     try:
-        encoder = model.temporal_module.raw_encoder.shared_ltae.shared_time_encoder
+        return model.temporal_module.raw_encoder.shared_ltae.shared_time_encoder
     except AttributeError as error:
         raise RuntimeError(
-            "model does not expose the expected shared ContinuousTime2Vec encoder"
+            "model does not expose the expected shared temporal encoder"
         ) from error
-    required = (
-        "linear_weight",
-        "linear_bias",
-        "frequencies",
-        "phase",
-        "time_reference",
-        "time_scale",
-    )
-    missing = [name for name in required if not hasattr(encoder, name)]
-    if missing:
-        raise RuntimeError(
-            "shared time encoder is incompatible with this diagnostic: missing "
-            + ", ".join(missing)
-        )
-    return encoder
 
 
 def _resolve_unbounded_time2vec_inputs(
@@ -203,6 +188,21 @@ def _timematch_time_extrapolation(model):
     boundary restriction. Model parameters are untouched.
     """
     encoder = _shared_time_encoder(model)
+    required = (
+        "linear_weight",
+        "linear_bias",
+        "frequencies",
+        "phase",
+        "time_reference",
+        "time_scale",
+    )
+    if not all(hasattr(encoder, name) for name in required):
+        # Fixed analytic encoders already support out-of-year positions and need
+        # no monkey patch.  This keeps the same scalar-shift scanner reusable
+        # for the TimeMatch fixed-PE Stage-1 ablation.
+        yield
+        return
+
     had_instance_forward = "forward" in encoder.__dict__
     previous_forward = encoder.__dict__.get("forward")
 
