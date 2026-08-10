@@ -1,26 +1,20 @@
-"""Pure temporal module combining raw encoding and functional geometry.
-
-This module keeps no source/target state: no running references, no accepted
-warps, no EMA buffers and no geometry loss. Forward only computes the raw
-shared-LTAE representation and, optionally, the deterministic functional
-geometry of the trend and structure components.
-"""
+"""Phase-only temporal module with separated task and functional-geometry paths."""
 
 from __future__ import annotations
 
 from torch import Tensor, nn
 
 from .representation import FunctionalGeometryOutput, RawTemporalRepresentation
-from .temporal_head import SharedTrendStructureLTAE
+from .temporal_head import LatentTemporalLTAE
 from .temporal_srvf import TemporalSRVFExtractor
 
 
-class TrendStructureTemporalModule(nn.Module):
-    """Encode raw T/S representations and extract functional geometry."""
+class PhaseOnlyTemporalModule(nn.Module):
+    """Classify complete PSE latents while T/S decomposition serves geometry only."""
 
     def __init__(
         self,
-        raw_encoder: SharedTrendStructureLTAE,
+        raw_encoder: LatentTemporalLTAE,
         trend_geometry: TemporalSRVFExtractor,
         structure_geometry: TemporalSRVFExtractor,
     ) -> None:
@@ -55,6 +49,7 @@ class TrendStructureTemporalModule(nn.Module):
 
     def forward(
         self,
+        latent: Tensor,
         trend: Tensor,
         structure: Tensor,
         positions: Tensor,
@@ -63,18 +58,8 @@ class TrendStructureTemporalModule(nn.Module):
         raw_positions: Tensor | None = None,
         return_geometry: bool = True,
     ) -> tuple[RawTemporalRepresentation, FunctionalGeometryOutput | None]:
-        """Return ``(raw, geometry)``; geometry is ``None`` when disabled.
-
-        Args:
-            trend: Temporal trend tokens with shape ``[B, L, D]``.
-            structure: Temporal structure tokens with shape ``[B, L, D]``.
-            positions: Backbone-normalized shared physical positions ``[B, L]``.
-            mask: Boolean validity mask with shape ``[B, L]``.
-            return_geometry: Whether to run the functional-geometry path.
-        """
         raw = self.raw_encoder(
-            trend=trend,
-            structure=structure,
+            latent=latent,
             positions=positions if raw_positions is None else raw_positions,
             mask=mask,
         )

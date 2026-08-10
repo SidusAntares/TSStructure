@@ -22,7 +22,7 @@ class StructureBackboneOutput:
     tokens: Tensor
     time_mask: Tensor
     normalized_positions: Tensor
-    decomposition: DecompositionOutput
+    decomposition: DecompositionOutput | None
 
 
 def _resolve_time_mask(
@@ -168,6 +168,8 @@ class StructureBackbone(nn.Module):
         positions: Tensor,
         extra: Tensor | None,
         time_mask: Tensor | None = None,
+        *,
+        compute_decomposition: bool = True,
     ) -> StructureBackboneOutput:
         tokens = self.pixel_set_encoder(
             pixels,
@@ -198,10 +200,10 @@ class StructureBackbone(nn.Module):
             dtype=position_dtype,
             device=tokens.device,
         )
-        decomposition = self.decomposition(
-            tokens,
-            normalized_positions,
-            resolved_time_mask,
+        decomposition = (
+            self.decomposition(tokens, normalized_positions, resolved_time_mask)
+            if compute_decomposition
+            else None
         )
         return StructureBackboneOutput(
             tokens=tokens,

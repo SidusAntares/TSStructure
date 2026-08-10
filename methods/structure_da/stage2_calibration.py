@@ -1,9 +1,8 @@
-"""Read-only Stage-2 calibration exports for the Round-C inference chain.
+"""Read-only Stage-2 calibration exports for the Phase-only inference chain.
 
-The exporter never changes Phase/Shape state and never performs an optimizer
-step.  It serializes the raw all-class pairwise geometry acquired by Round A,
-plus the current Phase/Stable/Shape state, so statistical thresholds can be
-calibrated from measured scales instead of inferred from training outcomes.
+The exporter never changes Phase state and never performs an optimizer step.
+It serializes the raw all-class pairwise geometry plus the current Phase/Stable
+state so statistical thresholds can be calibrated from measured scales.
 """
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ import torch
 from torch import Tensor
 
 from .domain_phase_state import DomainPhaseState
-from .domain_shape_state import DomainShapeState
 from .phase_geometry import phase_distance
 from .prototype_bank import SourcePrototypeBank
 from .stable_target_labels import StableTargetLabelScanResult
@@ -290,28 +288,6 @@ def _stable_rows(result: StableTargetLabelScanResult, bank: SourcePrototypeBank)
     return rows
 
 
-def _shape_payload(state: DomainShapeState) -> dict:
-    return {
-        "scan_index": int(state.scan_index),
-        "status": state.status.value,
-        "valid_classes": list(state.valid_classes),
-        "rho_shape": state.rho_shape,
-        "leave_one_out_drift": state.leave_one_out_drift,
-        "center_drift": state.center_drift,
-        "confirmation_age": int(state.confirmation_age),
-        "class_centers": [
-            {
-                "class_id": int(center.class_id),
-                "sample_count": int(center.sample_count),
-                "effective_weight": float(center.effective_weight),
-                "source_distance": _json_number(center.source_distance),
-                "valid": bool(center.valid),
-                "reject_reason": center.reject_reason,
-            }
-            for center in state.class_centers
-        ],
-    }
-
 
 def export_stage2_calibration_statistics(
     *,
@@ -319,7 +295,6 @@ def export_stage2_calibration_statistics(
     hypothesis_result: TargetHypothesisScanResult,
     phase_state: DomainPhaseState,
     stable_result: StableTargetLabelScanResult,
-    shape_state: DomainShapeState,
     source_prototype_bank: SourcePrototypeBank,
 ) -> dict[str, str]:
     """Export deterministic, read-only calibration artifacts."""
@@ -448,7 +423,7 @@ def export_stage2_calibration_statistics(
             "q_distance_over_outer": _distribution(row.get("q_distance_over_outer") for row in stable_rows),
             "q_margin": _distribution(row.get("q_margin") for row in stable_rows),
         },
-        "shape_state": _shape_payload(shape_state),
+        "domain_shape": "disabled",
         "files": {
             "pairwise_csv": os.path.basename(pairwise_path),
             "candidate_csv": os.path.basename(candidate_path),

@@ -25,12 +25,10 @@ from evaluation import evaluation
 from methods.structure_da import (
     DeviceBatchLoader,
     DomainPhaseConfig,
-    DomainShapeConfig,
     PhaseHypothesisScanConfig,
     SourceClassificationTrainer,
     SourcePrototypeBank,
     StableLabelConfig,
-    Stage1Objective,
     Stage2EMATeacher,
     Stage2ObjectiveConfig,
     Stage2Trainer,
@@ -52,13 +50,19 @@ from utils.train_utils import bool_flag
 
 
 def load_structure_da_state_dict(model, state_dict):
-    """Load current checkpoints and reject removed global-alignment weights clearly."""
+    """Load only checkpoints matching the current Phase-only task topology."""
 
     legacy_keys = sorted(key for key in state_dict if key.startswith("alignment."))
     if legacy_keys:
         raise RuntimeError(
             "checkpoint is incompatible: it contains the removed global fused-feature "
             "domain alignment branch (alignment.*); retrain with the current model"
+        )
+    if any("temporal_module.raw_encoder.shared_ltae." in key for key in state_dict):
+        raise RuntimeError(
+            "checkpoint is incompatible with Phase-only TSStructure: it was trained "
+            "with the removed dual T/S classification LTAE. Retrain Stage 1 with "
+            "PSE -> single LTAE -> classifier before Stage 2."
         )
     model.load_state_dict(state_dict)
 
@@ -151,7 +155,7 @@ def _evenly_spaced_subset_indices(total: int, maximum: int) -> list[int]:
 def create_target_statistics_loader(config, splits, *, max_samples: int | None = None):
     """Deterministic representative target-train loader for Stage-2 statistics.
 
-    Domain Phase/Shape are population statistics, not per-target predictions.
+    Domain Phase is a population statistic, not a per-target prediction.
     The loader therefore covers the full target-train index range with a fixed
     representative subset when ``max_samples`` is smaller than the dataset.
     No target label is used for selection.
@@ -282,15 +286,7 @@ def _missing_stage2_configuration(config) -> list[str]:
         "stage2_phase_center_drift_max",
         "stage2_stable_tau_f",
         "stage2_stable_tau_q",
-        "stage2_shape_min_valid_classes",
-        "stage2_shape_min_samples_per_class",
-        "stage2_shape_shared_ratio_min",
-        "stage2_shape_leave_one_out_drift_max",
-        "stage2_shape_center_drift_max",
-        "stage2_shape_effect_norm_max",
-        "stage2_shape_confirmation_patience",
         "stage2_ema_decay",
-        "stage2_lambda_delta",
     )
     missing = [name for name in required if getattr(config, name, None) is None]
     gate_pairs = (
@@ -357,15 +353,6 @@ def build_stage2_config(config) -> Stage2TrainerConfig:
             q_confidence_min=config.stage2_q_confidence_min,
             q_margin_min=config.stage2_q_margin_min,
         ),
-        shape=DomainShapeConfig(
-            shape_min_valid_classes=config.stage2_shape_min_valid_classes,
-            shape_min_samples_per_class=config.stage2_shape_min_samples_per_class,
-            shape_shared_ratio_min=config.stage2_shape_shared_ratio_min,
-            shape_leave_one_out_drift_max=config.stage2_shape_leave_one_out_drift_max,
-            shape_center_drift_max=config.stage2_shape_center_drift_max,
-            shape_effect_norm_max=config.stage2_shape_effect_norm_max,
-            shape_confirmation_patience=config.stage2_shape_confirmation_patience,
-        ),
         objective=Stage2ObjectiveConfig(
             lambda_target=(
                 1.0
@@ -379,9 +366,7 @@ def build_stage2_config(config) -> Stage2TrainerConfig:
             ),
         ),
         ema_decay=config.stage2_ema_decay,
-        lambda_delta=config.stage2_lambda_delta,
         total_epochs=config.stage2_epochs,
-        adaptation_block_epochs=config.stage2_block_epochs,
         steps_per_epoch=config.stage2_steps_per_epoch,
         amp_enabled=bool(getattr(config, "amp", False)),
         amp_dtype=getattr(config, "amp_dtype", "float16"),
@@ -591,8 +576,7 @@ def main(config):
                 f"|source_loader_steps={len(source_loader)}"
                 f"|stage1_epochs={config.stage1_epochs}"
                 f"|stage2_epochs={config.stage2_epochs}"
-                f"|stage2_block_epochs={config.stage2_block_epochs}"
-                f"|warmup_epochs={config.source_warmup_epochs}"
+                "|classification_path=pse_single_ltae"
                 f"|amp={str(amp_enabled).lower()}"
                 f"|amp_dtype={getattr(config, 'amp_dtype', 'float16')}"
             )
@@ -625,6 +609,11 @@ def main(config):
             timematch_pe_max_shift=config.timematch_pe_max_shift,
         )
         model.to(device)
+        print(
+            "MODEL_PROTOCOL|classification=pse_single_ltae"
+            "|geometry=decomposition_ts_srvf"
+            "|phase_only=true|domain_phase=enabled"
+        )
 
         if config.eval:
             stage2_last = os.path.join(config.fold_dir, "stage2_last_ema.pt")
@@ -878,16 +867,24 @@ def train_source_classification(
     feature_snapshot_manager=None,
     source_scan_loader=None,
 ):
+    """Stage-1 source-only CE on the complete PSE -> single-LTAE path.
+
+    Functional decomposition/SRVF geometry is deliberately outside the
+    classification gradient path. Source geometry/prototype statistics are
+    constructed only when finalizing the selected Stage-1 checkpoint.
+    """
     epochs = config.stage1_epochs
-    warmup_epochs = config.source_warmup_epochs
     steps_per_epoch = getattr(config, "steps_per_epoch", None)
     if steps_per_epoch is None or steps_per_epoch <= 0:
         steps_per_epoch = len(source_loader)
     if isinstance(steps_per_epoch, bool) or steps_per_epoch < 1:
         raise ValueError("--steps_per_epoch must be a positive integer or None")
 
+    stage1_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
     optimizer = torch.optim.Adam(
-        model.parameters(),
+        stage1_parameters,
         lr=config.lr,
         weight_decay=config.weight_decay,
     )
@@ -901,93 +898,53 @@ def train_source_classification(
             or getattr(config, "amp_dtype", "float16") == "bfloat16"
         )
     )
-    objective = Stage1Objective(
-        num_classes=config.num_classes,
-        lambda_q=config.lambda_q,
-        lambda_f=config.lambda_f,
-        lambda_q_to_cls=config.lambda_q_to_cls,
-        margin_q=config.margin_q,
-        margin_f=config.margin_f,
-        tau_q=config.tau_q,
-    )
     trainer = SourceClassificationTrainer(
         model,
         optimizer,
         device=device,
         amp_enabled=amp_enabled,
         amp_dtype=getattr(config, "amp_dtype", "float16"),
-        objective=objective,
     )
 
+    print(
+        "STAGE1_PROTOCOL|classification_path=pse_single_ltae"
+        "|objective=source_ce|decomposition_gradient_path=false"
+        "|geometry_scan=checkpoint_finalize_only"
+    )
     best_f1 = float("-inf")
-    bank: SourcePrototypeBank | None = None
-    bank_version = 0
     stage1_dir = config.fold_dir
     tmp_best_path = os.path.join(stage1_dir, "stage1_best_model_tmp.pt")
 
-    # A non-warmup epoch must always start with a bank produced by a
-    # deterministic full-source scan.  The normal protocol builds the first
-    # bank at the end of the final warmup epoch; if warmup is disabled, build
-    # it once before epoch 1 instead.
-    if epochs > 0 and warmup_epochs <= 0:
-        if source_scan_loader is None:
-            raise RuntimeError("source_scan_loader is required for prototype refresh")
-        print("PROTOTYPE_REFRESH|epoch=0")
-        bank = build_source_prototype_bank(
-            model,
-            source_scan_loader,
-            config.num_classes,
-            device=device,
-        )
-        bank_version += 1
-        print(
-            f"PROTOTYPE_READY|epoch=0|version={bank_version}"
-            f"|ready_classes={len(bank.ready_classes())}"
-        )
-
     for epoch in range(epochs):
-        warmup = epoch < warmup_epochs
         model.train()
         meters = defaultdict(float)
         steps = 0
         for batch in source_loader:
             if steps >= steps_per_epoch:
                 break
-            metrics = trainer.train_step(batch, warmup=warmup, bank=bank)
+            metrics = trainer.train_step(batch)
             for name, value in metrics.items():
                 meters[name] += value
             steps += 1
+            scheduler.step()
             if steps % config.log_step == 0:
                 avg = {name: value / steps for name, value in meters.items()}
                 print(
                     f"TRAIN_STEP|epoch={epoch + 1}/{epochs}|step={steps}/{steps_per_epoch}"
-                    f"|warmup={str(warmup).lower()}"
                     f"|loss={avg['loss']:.4f}|cls={avg['classification_loss']:.4f}"
-                    f"|q_proto={avg['q_proto_loss']:.4f}|f_proto={avg['f_proto_loss']:.4f}"
-                    f"|q_to_cls={avg['q_to_cls_loss']:.4f}|accuracy={avg['accuracy']:.4f}"
+                    f"|accuracy={avg['accuracy']:.4f}"
                 )
         if steps == 0:
             raise RuntimeError("source training loader produced no batches")
         averages = {name: value / steps for name, value in meters.items()}
         print(
             f"TRAIN_EPOCH|epoch={epoch + 1}/{epochs}|steps={steps}"
-            f"|warmup={str(warmup).lower()}"
             f"|loss={averages['loss']:.4f}|cls={averages['classification_loss']:.4f}"
-            f"|q_proto={averages['q_proto_loss']:.4f}|f_proto={averages['f_proto_loss']:.4f}"
-            f"|q_to_cls={averages['q_to_cls_loss']:.4f}"
-            f"|q_valid={int(averages['q_valid_count'])}"
-            f"|f_valid={int(averages['f_valid_count'])}"
-            f"|consistency_valid={int(averages['consistency_valid_count'])}"
             f"|accuracy={averages['accuracy']:.4f}"
         )
         for name, value in averages.items():
             writer.add_scalar(f"train/{name}", value, epoch)
-        ready_classes = 0 if bank is None else len(bank.ready_classes())
-        print(
-            f"STAGE1_EPOCH|epoch={epoch + 1}/{epochs}|warmup={str(warmup).lower()}"
-            f"|prototype_ready_classes={ready_classes}|prototype_version={bank_version}"
-        )
-        scheduler.step()
+
         if feature_snapshot_manager is not None:
             snapshot_result = feature_snapshot_manager.capture(epoch + 1)
             if (
@@ -998,10 +955,11 @@ def train_source_classification(
                 writer.add_scalar("diagnostics/feature_snapshot_failed", 1, epoch)
 
         model.eval()
+        previous_best = best_f1
         best_f1, metrics = _source_validation(
             best_f1, best_model_path, config, device, epoch, model, source_val_loader, writer
         )
-        if metrics["macro_f1"] >= best_f1:
+        if best_f1 > previous_best:
             torch.save(
                 {
                     "epoch": epoch,
@@ -1015,27 +973,8 @@ def train_source_classification(
                 tmp_best_path,
             )
 
-        # Refresh at epoch boundaries only.  In particular, the final warmup
-        # epoch must produce the bank consumed by the first non-warmup epoch.
-        # Every subsequent non-warmup epoch refreshes the bank for the next
-        # epoch; no mini-batch ever mutates or replaces it.
-        next_epoch_is_non_warmup = (epoch + 1) >= warmup_epochs
-        if epoch < epochs - 1 and next_epoch_is_non_warmup:
-            if source_scan_loader is None:
-                raise RuntimeError("source_scan_loader is required for prototype refresh")
-            print(f"PROTOTYPE_REFRESH|epoch={epoch + 1}")
-            bank = build_source_prototype_bank(
-                model,
-                source_scan_loader,
-                config.num_classes,
-                device=device,
-            )
-            bank_version += 1
-            print(
-                f"PROTOTYPE_READY|epoch={epoch + 1}|version={bank_version}"
-                f"|ready_classes={len(bank.ready_classes())}"
-            )
-
+    if source_scan_loader is None:
+        raise RuntimeError("source_scan_loader is required to finalize Phase geometry")
     _finalize_stage1_checkpoints(
         model,
         optimizer,
@@ -1047,7 +986,6 @@ def train_source_classification(
         source_scan_loader,
     )
     return best_f1
-
 
 def _finalize_stage1_checkpoints(
     model,
@@ -1152,13 +1090,6 @@ def _to_cpu_examples(examples: list[dict]) -> list[dict]:
 def _stage1_config_dict(config) -> dict:
     names = (
         "stage1_epochs",
-        "source_warmup_epochs",
-        "lambda_q",
-        "lambda_f",
-        "lambda_q_to_cls",
-        "margin_q",
-        "margin_f",
-        "tau_q",
         "num_classes",
         "canonical_grid_size",
         "time_encoder_type",
@@ -1167,7 +1098,16 @@ def _stage1_config_dict(config) -> dict:
         "timematch_pe_max_shift",
         "time_scale",
     )
-    return {name: getattr(config, name, None) for name in names}
+    payload = {name: getattr(config, name, None) for name in names}
+    payload.update(
+        {
+            "classification_path": "pse_single_ltae",
+            "stage1_objective": "source_ce",
+            "decomposition_gradient_path": False,
+            "phase_only": True,
+        }
+    )
+    return payload
 
 
 def _source_validation(
@@ -1518,22 +1458,6 @@ if __name__ == '__main__':
     parser.add_argument('--steps_per_epoch', default=None, type=int,
                         help='limit the number of training steps per epoch; default uses the full source loader')
 
-    # Stage-1 prototype supervision
-    parser.add_argument('--source_warmup_epochs', default=5, type=int,
-                        help='epochs of CE-only warmup before prototype supervision starts')
-    parser.add_argument('--lambda_q', default=0.1, type=float,
-                        help='weight of the Shape prototype relative-margin loss')
-    parser.add_argument('--lambda_f', default=0.1, type=float,
-                        help='weight of the fused-feature prototype relative-margin loss')
-    parser.add_argument('--lambda_q_to_cls', default=0.1, type=float,
-                        help='weight of the q-to-classifier consistency KL')
-    parser.add_argument('--margin_q', default=0.1, type=float,
-                        help='relative margin for the Shape prototype loss')
-    parser.add_argument('--margin_f', default=0.1, type=float,
-                        help='relative margin for the fused-feature prototype loss')
-    parser.add_argument('--tau_q', default=0.1, type=float,
-                        help='temperature for the Shape geometry class distribution')
-
     parser.add_argument(
         '--stage1_only', action='store_true',
         help='train and finalize Stage 1, then exit before any Stage-2 setup or scan',
@@ -1564,7 +1488,6 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument('--stage2_epochs', default=60, type=int)
-    parser.add_argument('--stage2_block_epochs', default=20, type=int)
     parser.add_argument('--stage2_steps_per_epoch', default=None, type=int)
     parser.add_argument(
         '--stage2_phase_evidence_initial_samples', default=None, type=int,
@@ -1572,7 +1495,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--stage2_phase_evidence_max_samples', default=None, type=int,
-        help='maximum target evidence cached for progressive Domain Phase/Shape statistics',
+        help='maximum target evidence cached for progressive Domain Phase statistics',
     )
     parser.add_argument(
         '--stage2_registration_workers', default=None, type=int,
@@ -1616,14 +1539,6 @@ if __name__ == '__main__':
     parser.add_argument('--stage2_q_confidence_min', default=None, type=float)
     parser.add_argument('--stage2_q_margin_min', default=None, type=float)
 
-    parser.add_argument('--stage2_shape_min_valid_classes', default=None, type=int)
-    parser.add_argument('--stage2_shape_min_samples_per_class', default=None, type=int)
-    parser.add_argument('--stage2_shape_shared_ratio_min', default=None, type=float)
-    parser.add_argument('--stage2_shape_leave_one_out_drift_max', default=None, type=float)
-    parser.add_argument('--stage2_shape_center_drift_max', default=None, type=float)
-    parser.add_argument('--stage2_shape_effect_norm_max', default=None, type=float)
-    parser.add_argument('--stage2_shape_confirmation_patience', default=None, type=int)
-
     parser.add_argument(
         '--stage2_lambda_target', default=None, type=float,
         help='weight of Stable-Labeled native-target Focal loss (default: 1.0)',
@@ -1644,17 +1559,7 @@ if __name__ == '__main__':
         ),
     )
 
-    # Legacy Round-7 objective knobs are still accepted in old JSON/CLI files
-    # for configuration compatibility, but the TimeMatch-style Stage-2
-    # objective no longer consumes them.
-    parser.add_argument('--stage2_lambda_src_proto', default=None, type=float)
-    parser.add_argument('--stage2_lambda_src_cons', default=None, type=float)
-    parser.add_argument('--stage2_lambda_syn', default=None, type=float)
-    parser.add_argument('--stage2_lambda_syn_cons', default=None, type=float)
-    parser.add_argument('--stage2_objective_tau_q', default=None, type=float)
-    parser.add_argument('--stage2_fused_margin', default=None, type=float)
     parser.add_argument('--stage2_ema_decay', default=None, type=float)
-    parser.add_argument('--stage2_lambda_delta', default=None, type=float)
 
     # Model hyperparameters
     parser.add_argument('--canonical_grid_size', default=64, type=int)
@@ -1673,7 +1578,7 @@ if __name__ == '__main__':
         '--time_encoder_type',
         default='continuous_time2vec',
         choices=['continuous_time2vec', 'timematch_fixed_sinusoidal'],
-        help='raw T/S LTAE temporal encoding ablation',
+        help='single-stream PSE-latent LTAE temporal encoding',
     )
     parser.add_argument('--time2vec_max_frequency', default=16.0, type=float)
     parser.add_argument(

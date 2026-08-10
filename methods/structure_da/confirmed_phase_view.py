@@ -25,8 +25,6 @@ class ConfirmedPhaseView:
     logits: Tensor
     probabilities: Tensor
     fused_repr: Tensor
-    trend_repr: Tensor
-    structure_repr: Tensor
     aligned_q_shape: Tensor
     aligned_q_support: Tensor
     q_valid: Tensor
@@ -81,6 +79,44 @@ def align_target_positions_to_source(
         if valid.numel() > 1 and not torch.all(valid[1:] > valid[:-1]).item():
             raise ValueError("aligned valid positions must remain strictly increasing")
     return aligned.to(device=positions.device, dtype=positions.dtype).detach()
+
+
+def _evaluate_piecewise_linear(values: Tensor, query: Tensor) -> Tensor:
+    if values.ndim != 1 or values.numel() < 2:
+        raise ValueError("values must have shape [K] with K>=2")
+    if query.ndim != 1:
+        raise ValueError("query must have shape [L]")
+    scaled = query * (values.numel() - 1)
+    lower = torch.floor(scaled).to(dtype=torch.long).clamp(0, values.numel() - 2)
+    upper = lower + 1
+    fraction = (scaled - lower.to(dtype=query.dtype)).to(dtype=values.dtype)
+    result = values[lower] + fraction * (values[upper] - values[lower])
+    return torch.where(query == 1.0, values[-1].expand_as(result), result)
+
+
+def map_source_positions_to_target(
+    positions: Tensor,
+    mask: Tensor,
+    center_gamma: Tensor,
+) -> Tensor:
+    """Apply source-to-target ``gamma`` to native source positions."""
+    if not isinstance(positions, Tensor) or positions.ndim != 1:
+        raise ValueError("positions must have shape [L]")
+    if not isinstance(mask, Tensor) or mask.shape != positions.shape:
+        raise ValueError("mask must have shape [L]")
+    mask = mask.to(device=positions.device, dtype=torch.bool)
+    gamma = center_gamma.detach().to(device=positions.device, dtype=positions.dtype)
+    if gamma.ndim != 1 or gamma.numel() < 2:
+        raise ValueError("center_gamma must have shape [K]")
+    if not torch.isfinite(gamma).all().item() or not torch.all(gamma[1:] > gamma[:-1]).item():
+        raise ValueError("center_gamma must be finite and strictly increasing")
+    safe = torch.where(mask, positions.clamp(0.0, 1.0), torch.zeros_like(positions))
+    mapped = _evaluate_piecewise_linear(gamma, safe)
+    mapped = torch.where(mask, mapped, torch.zeros_like(mapped))
+    valid = mapped[mask]
+    if valid.numel() > 1 and not torch.all(valid[1:] > valid[:-1]).item():
+        raise ValueError("mapped valid positions must remain strictly increasing")
+    return mapped.detach()
 
 
 def _model_device(model: nn.Module) -> torch.device:
@@ -194,8 +230,6 @@ def build_phase_calibrated_view(
         logits=detached(output.logits),
         probabilities=detached(probabilities),
         fused_repr=detached(output.fused_repr),
-        trend_repr=detached(output.trend_repr),
-        structure_repr=detached(output.structure_repr),
         aligned_q_shape=detached(aligned_q),
         aligned_q_support=detached(aligned_support),
         q_valid=detached(output.geometry.structure_valid),

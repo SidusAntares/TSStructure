@@ -52,7 +52,8 @@ def test_stage2_trainer_has_native_target_student_path_and_no_adversarial_path()
         ).Stage2Trainer._target_forward_native
     )
     assert "temporal_positions_override" not in target_api.parameters
-    assert "native target positions only" in text
+    assert "native_positions" in text
+    assert "compute_decomposition=False" in text
 
 
 def test_train_wires_timematch_style_stage2_controls() -> None:
@@ -61,13 +62,11 @@ def test_train_wires_timematch_style_stage2_controls() -> None:
         "--stage2_config",
         "--stage2_registration_lambda",
         "--stage2_phase_confirmation_patience",
-        "--stage2_shape_confirmation_patience",
         "--stage2_lambda_target",
         "--stage2_focal_gamma",
         "--stage2_lr",
         "--stage2_target_time_keep_ratio",
         "--stage2_ema_decay",
-        "--stage2_lambda_delta",
     ):
         assert flag in text
     assert "create_target_stage2_train_loader" in text
@@ -88,14 +87,40 @@ def test_formal_timematch_stage2_config_freezes_optimization_recipe() -> None:
     import json
 
     payload = json.loads(
-        Path("configs/stage2_timematch_v1.json").read_text(encoding="utf-8")
+        Path("configs/stage2_phase_only_v1.json").read_text(encoding="utf-8")
     )
     assert payload["stage2_lr"] == pytest.approx(1e-4)
     assert payload["stage2_ema_decay"] == pytest.approx(0.9999)
     assert payload["stage2_focal_gamma"] == pytest.approx(1.0)
     assert payload["stage2_lambda_target"] == pytest.approx(1.0)
     assert payload["stage2_target_time_keep_ratio"] == pytest.approx(0.8)
+    assert not any(key.startswith("stage2_shape_") for key in payload)
+    assert "stage2_lambda_delta" not in payload
 
+
+
+def test_phase_only_train_surface_removes_legacy_shape_and_prototype_controls() -> None:
+    text = Path("train.py").read_text(encoding="utf-8")
+    for flag in (
+        "--source_warmup_epochs",
+        "--lambda_q",
+        "--lambda_f",
+        "--lambda_q_to_cls",
+        "--margin_q",
+        "--margin_f",
+        "--tau_q",
+        "--stage2_block_epochs",
+        "--stage2_lambda_src_proto",
+        "--stage2_lambda_src_cons",
+        "--stage2_lambda_syn",
+        "--stage2_lambda_syn_cons",
+        "--stage2_objective_tau_q",
+    ):
+        assert flag not in text
+    assert "parser.add_argument('--stage2_fused_margin'," not in text
+    assert not Path("methods/structure_da/domain_shape_state.py").exists()
+    assert not Path("methods/structure_da/shape_transport.py").exists()
+    assert not Path("methods/structure_da/stage1_objective.py").exists()
 
 def test_stage2_only_checkpoint_defaults_to_current_fold(tmp_path) -> None:
     pytest.importorskip("zarr")

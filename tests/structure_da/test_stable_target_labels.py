@@ -80,8 +80,6 @@ def _view(
         logits=logits,
         probabilities=torch.softmax(logits, dim=-1),
         fused_repr=fused,
-        trend_repr=torch.zeros(batch, 1),
-        structure_repr=torch.zeros(batch, 1),
         aligned_q_shape=q,
         aligned_q_support=torch.ones(batch, 4),
         q_valid=torch.ones(batch, dtype=torch.bool),

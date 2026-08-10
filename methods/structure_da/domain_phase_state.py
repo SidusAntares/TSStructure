@@ -655,7 +655,7 @@ def evaluate_candidate_phase_compatibility(
 
     This Round-B evidence path keeps ``phase_evidence_eligible`` as a hard
     requirement because residuals may alter the Domain Phase model itself.
-    Round-C stable-label validation calls the single-pair helper above with the
+    Phase-only stable-label validation calls the single-pair helper above with the
     weaker, post-confirmation semantics.
     """
     lookup = _alignment_lookup(scan_result)

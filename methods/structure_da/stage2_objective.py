@@ -5,7 +5,7 @@ The Student is optimized from exactly two semantic branches:
 1. target-style source samples carrying true source labels;
 2. native target samples carrying stop-gradient Stable Labels.
 
-Domain Phase/Shape are used to construct supervision or target-style source
+Domain Phase is used to construct supervision or target-style source
 inputs. They are not additional differentiable losses in this objective.
 """
 

@@ -1,4 +1,4 @@
-"""End-to-end two-stage structure model: source-only CE classification path."""
+"""Phase-only TSStructure: TimeMatch-like task path plus frozen functional geometry."""
 
 from __future__ import annotations
 
@@ -10,20 +10,17 @@ from torch import Tensor, nn
 from models.decoder import get_decoder
 
 from .backbone import StructureBackbone, StructureBackboneOutput
-from .representation import (
-    FunctionalGeometryOutput,
-    TSStructureForwardOutput,
-)
-from .temporal_head import SharedTrendStructureLTAE
-from .temporal_module import TrendStructureTemporalModule
+from .representation import FunctionalGeometryOutput, TSStructureForwardOutput
+from .temporal_head import LatentTemporalLTAE
+from .temporal_module import PhaseOnlyTemporalModule
 from .temporal_srvf import TemporalSRVFExtractor
 
 
 class TSStructureModel(nn.Module):
-    """Backbone -> decomposition -> shared LTAE raw path -> classifier.
+    """PSE -> single LTAE -> classifier, with parallel T/S SRVF geometry.
 
-    The forward chain is single-path and domain-free: it never accepts a
-    source/target pair, domain labels, warp candidates or quality flags.
+    The decomposition never feeds the classifier.  It exists only to construct
+    trend/structure functional geometry used by Domain Phase and Stable Labels.
     """
 
     def __init__(
@@ -75,8 +72,13 @@ class TSStructureModel(nn.Module):
             time_reference=time_reference,
             time_scale=time_scale,
         )
+        # Phase-only contract: decomposition is a fixed statistical operator.
+        # It never receives task-classification gradients.
+        for parameter in self.backbone.decomposition.parameters():
+            parameter.requires_grad_(False)
+
         feature_dim = self.backbone.feature_dim
-        raw_encoder = SharedTrendStructureLTAE(
+        raw_encoder = LatentTemporalLTAE(
             in_channels=feature_dim,
             n_head=n_head,
             d_k=d_k,
@@ -109,13 +111,13 @@ class TSStructureModel(nn.Module):
             time_reference=0.0,
             time_scale=1.0,
         )
-        self.temporal_module = TrendStructureTemporalModule(
+        self.temporal_module = PhaseOnlyTemporalModule(
             raw_encoder=raw_encoder,
             trend_geometry=trend_geometry,
             structure_geometry=structure_geometry,
         )
         self.classifier = get_decoder(
-            [2 * raw_encoder.component_dim, *classifier_hidden], num_classes
+            [raw_encoder.output_dim, *classifier_hidden], num_classes
         )
 
     def forward_backbone(
@@ -126,13 +128,19 @@ class TSStructureModel(nn.Module):
         extra: Tensor | None = None,
         *,
         time_mask: Tensor | None = None,
+        compute_decomposition: bool = True,
     ) -> StructureBackboneOutput:
-        return self.backbone(pixels, valid_pixels, positions, extra, time_mask)
+        return self.backbone(
+            pixels, valid_pixels, positions, extra, time_mask,
+            compute_decomposition=compute_decomposition,
+        )
 
     @staticmethod
     def _trend_and_structure(
         backbone: StructureBackboneOutput,
     ) -> tuple[Tensor, Tensor]:
+        if backbone.decomposition is None:
+            raise RuntimeError("functional geometry requires decomposition")
         trend = backbone.decomposition.trend
         structure = trend + backbone.decomposition.dynamics
         mask = backbone.time_mask[:, :, None]
@@ -148,32 +156,53 @@ class TSStructureModel(nn.Module):
         extra: Tensor | None = None,
         *,
         temporal_positions_override: Tensor | None = None,
-        return_geometry: bool = True,
+        return_geometry: bool = False,
     ) -> TSStructureForwardOutput:
         del extra, positions
-        trend, structure = self._trend_and_structure(backbone)
         mask = backbone.time_mask
+        raw_positions = (
+            backbone.normalized_positions
+            if temporal_positions_override is None
+            else temporal_positions_override
+        )
+        if not return_geometry:
+            raw = self.temporal_module.raw_encoder(
+                latent=backbone.tokens, positions=raw_positions, mask=mask
+            )
+            logits = self.classifier(raw.fused_repr)
+            return TSStructureForwardOutput(
+                logits=logits,
+                fused_repr=raw.fused_repr,
+                latent=backbone.tokens,
+                trend=None,
+                structure=None,
+                dynamics=None,
+                residual=None,
+                positions=backbone.normalized_positions,
+                mask=mask,
+                geometry=None,
+            )
+
+        trend, structure = self._trend_and_structure(backbone)
         raw, geometry = self.temporal_module(
+            latent=backbone.tokens,
             trend=trend,
             structure=structure,
             positions=backbone.normalized_positions,
             mask=mask,
             raw_positions=temporal_positions_override,
-            return_geometry=return_geometry,
+            return_geometry=True,
         )
         logits = self.classifier(raw.fused_repr)
-        dynamics = backbone.decomposition.dynamics
-        residual = backbone.decomposition.residual
+        assert backbone.decomposition is not None
         return TSStructureForwardOutput(
             logits=logits,
             fused_repr=raw.fused_repr,
-            trend_repr=raw.trend_repr,
-            structure_repr=raw.structure_repr,
             latent=backbone.tokens,
             trend=trend,
             structure=structure,
-            dynamics=dynamics,
-            residual=residual,
+            dynamics=backbone.decomposition.dynamics,
+            residual=backbone.decomposition.residual,
             positions=backbone.normalized_positions,
             mask=mask,
             geometry=geometry,
@@ -188,10 +217,11 @@ class TSStructureModel(nn.Module):
         *,
         time_mask: Tensor | None = None,
         temporal_positions_override: Tensor | None = None,
-        return_geometry: bool = True,
+        return_geometry: bool = False,
     ) -> TSStructureForwardOutput:
         backbone = self.forward_backbone(
-            pixels, valid_pixels, positions, extra, time_mask=time_mask
+            pixels, valid_pixels, positions, extra, time_mask=time_mask,
+            compute_decomposition=return_geometry,
         )
         return self.forward_from_backbone(
             backbone,
@@ -209,11 +239,6 @@ class TSStructureModel(nn.Module):
         *,
         time_mask: Tensor | None = None,
     ) -> FunctionalGeometryOutput:
-        """Return only the functional geometry of one batch.
-
-        The backbone runs once; the geometry extractors reuse the same
-        decomposition without a second PSE pass.
-        """
         output = self.forward(
             pixels,
             valid_pixels,

@@ -3,10 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from methods.structure_da import RawTemporalRepresentation, SharedTrendStructureLTAE
+from methods.structure_da import LatentTemporalLTAE, RawTemporalRepresentation
 
 
-def _ltae(**overrides) -> SharedTrendStructureLTAE:
+def _ltae(**overrides) -> LatentTemporalLTAE:
     values = dict(
         in_channels=4,
         n_head=2,
@@ -14,58 +14,44 @@ def _ltae(**overrides) -> SharedTrendStructureLTAE:
         n_neurons=(8, 5),
         dropout=0.0,
         d_model=8,
-        time_reference=0.0,
-        time_scale=10.0,
         max_initial_frequency=4.0,
     )
     values.update(overrides)
-    return SharedTrendStructureLTAE(**values)
+    return LatentTemporalLTAE(**values)
 
 
 def _inputs():
     torch.manual_seed(3)
-    trend = torch.randn(2, 4, 4)
-    structure = torch.randn(2, 4, 4)
-    positions = torch.tensor([[0.25, 2.5, 5.0, 9.75], [0.0, 1.0, 2.0, 3.0]])
+    latent = torch.randn(2, 4, 4)
+    positions = torch.tensor([[0.025, 0.25, 0.5, 0.975], [0.0, 0.1, 0.2, 0.3]])
     mask = torch.tensor([[True, True, True, True], [False, False, False, False]])
-    return trend, structure, positions, mask
+    return latent, positions, mask
 
 
-def test_shared_ltae_returns_raw_representation_with_exact_concat() -> None:
+def test_single_ltae_returns_one_task_embedding() -> None:
     ltae = _ltae().eval()
-    trend, structure, positions, mask = _inputs()
-
-    raw = ltae(trend, structure, positions, mask)
-
+    latent, positions, mask = _inputs()
+    raw = ltae(latent, positions, mask)
     assert isinstance(raw, RawTemporalRepresentation)
-    assert raw.trend_repr.shape == (2, 5)
-    assert raw.structure_repr.shape == (2, 5)
-    assert raw.fused_repr.shape == (2, 10)
+    assert raw.fused_repr.shape == (2, 5)
     assert raw.positions_used.shape == (2, 4)
-    torch.testing.assert_close(
-        raw.fused_repr,
-        torch.cat([raw.trend_repr, raw.structure_repr], dim=-1),
-        rtol=0,
-        atol=0,
-    )
-    assert torch.count_nonzero(raw.trend_repr[1]) == 0
+    assert torch.count_nonzero(raw.fused_repr[1]) == 0
 
 
-def test_shared_ltae_uses_shared_projection_and_private_norms() -> None:
+def test_single_ltae_has_one_projection_and_norm_chain() -> None:
     ltae = _ltae()
-    shared = ltae.shared_ltae
-    assert shared.trend_input_projection is shared.structure_input_projection
-    assert shared.trend_input_norm is not shared.structure_input_norm
-    assert shared.trend_output_norm is not shared.structure_output_norm
-    assert hasattr(shared, "shared_time_encoder")
-    assert hasattr(shared, "attention_heads")
-    assert not hasattr(shared, "stems")
+    assert hasattr(ltae, "input_projection")
+    assert hasattr(ltae, "input_norm")
+    assert hasattr(ltae, "time_encoder")
+    assert hasattr(ltae, "attention_heads")
+    assert hasattr(ltae, "projection")
+    assert hasattr(ltae, "output_norm")
+    assert not hasattr(ltae, "trend_input_norm")
+    assert not hasattr(ltae, "structure_input_norm")
 
 
-def test_shared_ltae_rejects_gamma_and_phase_inputs() -> None:
+def test_single_ltae_rejects_removed_ts_arguments() -> None:
     ltae = _ltae()
-    trend, structure, positions, mask = _inputs()
+    latent, positions, mask = _inputs()
     with pytest.raises(TypeError):
-        ltae(trend, structure, positions, mask, gamma=torch.linspace(0, 1, 4))
-    with pytest.raises(TypeError):
-        ltae(trend, structure, positions, mask, phase_valid=torch.ones(2, dtype=torch.bool))
+        ltae(latent, positions, mask, gamma=torch.linspace(0, 1, 4))

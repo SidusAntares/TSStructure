@@ -1,15 +1,9 @@
-"""Shared data structures for the two-stage structure model.
-
-The module holds only unambiguous dataclasses used by the single forward
-chain: the raw classification representation, the functional geometry output
-and the top-level model output. No trainable module lives here.
-"""
+"""Data structures for the Phase-only TSStructure model."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-import torch
 from torch import Tensor
 
 
@@ -22,37 +16,25 @@ def _require_floating(name: str, tensor: Tensor) -> None:
 
 @dataclass(frozen=True)
 class RawTemporalRepresentation:
-    """Raw per-component and fused classification embeddings."""
+    """Single-stream classification embedding from the full PSE latent process."""
 
-    trend_repr: Tensor
-    structure_repr: Tensor
     fused_repr: Tensor
     positions_used: Tensor
 
     def __post_init__(self) -> None:
-        for name in ("trend_repr", "structure_repr"):
-            _require_floating(name, getattr(self, name))
-        if self.trend_repr.shape != self.structure_repr.shape:
-            raise ValueError(
-                "trend_repr and structure_repr must have identical shapes"
-            )
-        if self.fused_repr.shape != (
-            self.trend_repr.shape[0],
-            2 * self.trend_repr.shape[-1],
-        ):
-            raise ValueError(
-                "fused_repr must have shape [B, 2 * component_dim]"
-            )
         _require_floating("fused_repr", self.fused_repr)
-        if not isinstance(self.positions_used, Tensor) or not self.positions_used.is_floating_point():
-            raise ValueError("positions_used must be a floating-point tensor")
-        if self.positions_used.shape[0] != self.trend_repr.shape[0]:
+        if self.fused_repr.ndim != 2:
+            raise ValueError("fused_repr must have shape [B, d]")
+        _require_floating("positions_used", self.positions_used)
+        if self.positions_used.ndim != 2:
+            raise ValueError("positions_used must have shape [B, L]")
+        if self.positions_used.shape[0] != self.fused_repr.shape[0]:
             raise ValueError("positions_used batch must match representation batch")
 
 
 @dataclass(frozen=True)
 class FunctionalGeometryOutput:
-    """Deterministic vector-valued SRVF geometry on a canonical grid."""
+    """Deterministic T/S SRVF geometry on a canonical grid."""
 
     trend_srvf: Tensor
     structure_srvf: Tensor
@@ -85,25 +67,19 @@ class FunctionalGeometryOutput:
             ("trend_valid", self.trend_valid),
             ("structure_valid", self.structure_valid),
         ):
-            if (
-                not isinstance(valid, Tensor)
-                or valid.dtype != torch.bool
-                or valid.shape != (batch_size,)
-            ):
+            if valid.dtype != __import__("torch").bool or valid.shape != (batch_size,):
                 raise ValueError(f"{name} must be a boolean tensor with shape [B]")
 
 
 @dataclass(frozen=True)
 class TSStructureForwardOutput:
-    """Everything the single forward chain produces for one batch."""
+    """Outputs of the Phase-only classification and geometry paths."""
 
     logits: Tensor
     fused_repr: Tensor
-    trend_repr: Tensor
-    structure_repr: Tensor
     latent: Tensor
-    trend: Tensor
-    structure: Tensor
+    trend: Tensor | None
+    structure: Tensor | None
     dynamics: Tensor | None
     residual: Tensor | None
     positions: Tensor

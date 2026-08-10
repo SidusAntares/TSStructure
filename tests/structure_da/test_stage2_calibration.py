@@ -7,7 +7,6 @@ from methods.structure_da.domain_phase_state import (
     DomainPhaseState,
     PhaseDecisionStatus,
 )
-from methods.structure_da.domain_shape_state import DomainShapeState, DomainShapeStatus
 from methods.structure_da.stable_target_labels import StableTargetLabelScanResult
 from methods.structure_da.stage2_calibration import export_stage2_calibration_statistics
 from methods.structure_da.prototype_bank import SourcePrototypeBank
@@ -96,18 +95,7 @@ def test_calibration_export_contains_raw_pairwise_and_unthresholded_top2_gap(tmp
         num_ambiguous_rejected=0,
         stable_class_counts=(0, 0),
     )
-    shape = DomainShapeState(
-        scan_index=0,
-        status=DomainShapeStatus.UNAVAILABLE,
-        class_centers=(),
-        valid_classes=(),
-        delta=None,
-        interactions=(),
-        rho_shape=None,
-        leave_one_out_drift=None,
-        center_drift=None,
-        confirmation_age=0,
-    )
+
 
     bank = SourcePrototypeBank(
         trend_srvf=torch.zeros(2, 8, 1),
@@ -128,7 +116,6 @@ def test_calibration_export_contains_raw_pairwise_and_unthresholded_top2_gap(tmp
         hypothesis_result=result,
         phase_state=phase,
         stable_result=stable,
-        shape_state=shape,
         source_prototype_bank=bank,
     )
     geometry = torch.load(paths["geometry"], weights_only=False)
@@ -142,6 +129,7 @@ def test_calibration_export_contains_raw_pairwise_and_unthresholded_top2_gap(tmp
     assert summary["candidate_metrics"]["raw_q_distance_gap"]["count"] == 2
     assert summary["rejection_reason_counts"] == {"gain": 2, "shape_outer": 2}
     assert summary["phase_state"]["decision_status"] == "unconfirmed"
+    assert summary["domain_shape"] == "disabled"
 
     with open(paths["candidates"], encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))

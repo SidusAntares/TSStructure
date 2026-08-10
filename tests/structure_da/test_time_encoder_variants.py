@@ -3,10 +3,8 @@ from __future__ import annotations
 import torch
 
 from models.layers import get_positional_encoding
-from models.ltae import (
-    TimeMatchFixedSinusoidal,
-    TrendStructureSharedLTAE,
-)
+from models.ltae import TimeMatchFixedSinusoidal
+from methods.structure_da import LatentTemporalLTAE
 from methods.structure_da.full_model import TSStructureModel
 
 
@@ -45,36 +43,19 @@ def test_timematch_fixed_sinusoidal_is_fixed_and_supports_fractional_days() -> N
     assert torch.isfinite(output).all().item()
 
 
-def test_shared_ltae_can_select_timematch_fixed_sinusoidal() -> None:
-    module = TrendStructureSharedLTAE(
-        in_channels=4,
-        n_head=2,
-        d_k=2,
-        n_neurons=(8, 5),
-        dropout=0.0,
-        d_model=8,
-        time_reference=0.0,
-        time_scale=1.0,
-        time_encoder_type="timematch_fixed_sinusoidal",
-        timematch_pe_period=1000.0,
-        timematch_pe_max_shift=100.0,
-        calendar_scale_days=365.0,
+def test_single_ltae_can_select_timematch_fixed_sinusoidal() -> None:
+    module = LatentTemporalLTAE(
+        in_channels=4,n_head=2,d_k=2,n_neurons=(8,5),dropout=0.0,d_model=8,
+        time_reference=0.0,time_scale=1.0,time_encoder_type="timematch_fixed_sinusoidal",
+        timematch_pe_period=1000.0,timematch_pe_max_shift=100.0,calendar_scale_days=365.0,
     ).eval()
     assert module.time_encoder_type == "timematch_fixed_sinusoidal"
-    assert isinstance(module.shared_time_encoder, TimeMatchFixedSinusoidal)
-
-    trend = torch.randn(2, 4, 4)
-    structure = torch.randn(2, 4, 4)
-    positions = torch.tensor(
-        [[0.0, 0.25, 0.5, 0.75], [0.1, 0.2, 0.3, 0.4]],
-        dtype=torch.float32,
-    )
-    mask = torch.ones(2, 4, dtype=torch.bool)
-    trend_repr, structure_repr = module(
-        trend, structure, positions, time_mask=mask
-    )
-    assert trend_repr.shape == (2, 5)
-    assert structure_repr.shape == (2, 5)
+    assert isinstance(module.time_encoder, TimeMatchFixedSinusoidal)
+    latent=torch.randn(2,4,4)
+    positions=torch.tensor([[0.0,0.25,0.5,0.75],[0.1,0.2,0.3,0.4]])
+    mask=torch.ones(2,4,dtype=torch.bool)
+    raw=module(latent,positions,mask)
+    assert raw.fused_repr.shape==(2,5)
 
 
 def test_tsstructure_model_propagates_fixed_time_encoder_choice() -> None:
@@ -99,6 +80,6 @@ def test_tsstructure_model_propagates_fixed_time_encoder_choice() -> None:
         timematch_pe_period=1000.0,
         timematch_pe_max_shift=100.0,
     )
-    encoder = model.temporal_module.raw_encoder.shared_ltae.shared_time_encoder
+    encoder = model.temporal_module.raw_encoder.time_encoder
     assert isinstance(encoder, TimeMatchFixedSinusoidal)
     assert list(encoder.parameters()) == []

@@ -7,7 +7,6 @@ from torch.utils.data import DataLoader, Dataset
 from methods.structure_da import (
     SourceClassificationTrainer,
     SourcePrototypeBank,
-    Stage1Objective,
     TSStructureModel,
     build_source_prototype_bank,
 )
@@ -70,17 +69,6 @@ def _batch(batch_size: int = 6, length: int = 5) -> dict[str, torch.Tensor]:
     }
 
 
-def _objective() -> Stage1Objective:
-    return Stage1Objective(
-        num_classes=3,
-        lambda_q=0.1,
-        lambda_f=0.1,
-        lambda_q_to_cls=0.1,
-        margin_q=0.1,
-        margin_f=0.1,
-        tau_q=0.1,
-    )
-
 
 def _bank() -> SourcePrototypeBank:
     return SourcePrototypeBank(
@@ -88,7 +76,7 @@ def _bank() -> SourcePrototypeBank:
         shape_srvf=torch.zeros(3, 5, 4),
         trend_support=torch.ones(3, 5),
         shape_support=torch.ones(3, 5),
-        fused=torch.zeros(3, 8),
+        fused=torch.zeros(3, 4),
         class_counts=torch.tensor([8, 8, 8]),
         ready=torch.ones(3, dtype=torch.bool),
         q_distance_samples=(torch.zeros(0), torch.zeros(0), torch.zeros(0)),

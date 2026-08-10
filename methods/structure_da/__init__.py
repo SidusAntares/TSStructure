@@ -1,6 +1,6 @@
 """Two-stage structure model: Stage-1 source prototype training backbone."""
 
-from models.ltae import ContinuousTime2Vec, TrendStructureSharedLTAE
+from models.ltae import ContinuousTime2Vec
 
 from .backbone import StructureBackbone, StructureBackboneOutput
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
@@ -56,17 +56,11 @@ from .domain_phase_state import (
     evaluate_sample_class_phase_compatibility,
     update_domain_phase_state,
 )
-from .domain_shape_state import (
-    DomainShapeConfig,
-    DomainShapeState,
-    DomainShapeStatus,
-    TargetShapeClassCenter,
-    update_domain_shape_state,
-)
 from .confirmed_phase_view import (
     IDENTITY_PHASE_GROUP_ID,
     ConfirmedPhaseView,
     align_target_positions_to_source,
+    map_source_positions_to_target,
     build_confirmed_class_to_group_map,
     build_confirmed_phase_view,
     build_phase_calibrated_view,
@@ -101,10 +95,8 @@ from .representation import (
 from .source_prototype_scanner import (
     build_source_prototype_bank,
     finalize_distance_statistics,
-    refresh_source_fused_statistics,
 )
 from .source_trainer import SourceClassificationTrainer, SourceTrainStepOutput
-from .stage1_objective import Stage1LossOutput, Stage1Objective
 from .stage2_trainer import (
     DeviceBatchLoader,
     Stage2RunResult,
@@ -124,18 +116,6 @@ from .stage2_objective import (
     Stage2Objective,
     Stage2ObjectiveConfig,
     Stage2ObjectiveOutput,
-)
-from .shape_transport import (
-    SyntheticSourceDiagnostics,
-    SyntheticSourceExample,
-    apply_domain_shape_effect,
-    build_phase_only_synthetic_source_example,
-    build_synthetic_source_example,
-    correct_target_shape_to_source,
-    evaluate_synthetic_source_diagnostics,
-    inverse_vector_srvf,
-    map_source_positions_to_target,
-    synthesize_source_shape_to_target,
 )
 from .stable_target_labels import (
     StableLabelConfig,
@@ -162,8 +142,8 @@ from .temporal_functional import (
     TemporalFunctionalOutput,
 )
 from .temporal_geometry import PhaseTangentOutput, warp_to_identity_tangent
-from .temporal_head import SharedTrendStructureLTAE
-from .temporal_module import TrendStructureTemporalModule
+from .temporal_head import LatentTemporalLTAE
+from .temporal_module import PhaseOnlyTemporalModule
 from .temporal_srvf import (
     SourceRunningSupportScale,
     TemporalSRVFExtractor,
@@ -180,9 +160,6 @@ __all__ = [
     "DecompositionOutput",
     "DomainPhaseConfig",
     "DomainPhaseState",
-    "DomainShapeConfig",
-    "DomainShapeState",
-    "DomainShapeStatus",
     "DiagnosticMoments",
     "DiagnosticStat",
     "FdasrsfCurveRegistrationAdapter",
@@ -206,7 +183,7 @@ __all__ = [
     "PhaseTangentOutput",
     "RawTemporalRepresentation",
     "RegistrationGeometryOutput",
-    "SharedTrendStructureLTAE",
+    "LatentTemporalLTAE",
     "SnapshotCaptureResult",
     "SourceClassificationTrainer",
     "SourcePrototypeBank",
@@ -220,8 +197,6 @@ __all__ = [
     "StableTargetLabelScanResult",
     "scan_stable_target_labels_from_confirmed_phase",
     "scan_stable_target_labels_from_candidates",
-    "Stage1LossOutput",
-    "Stage1Objective",
     "Stage2EMATeacher",
     "Stage2Objective",
     "Stage2ObjectiveConfig",
@@ -230,8 +205,6 @@ __all__ = [
     "StructureBackbone",
     "StructureBackboneOutput",
     "SupportAwareDistanceOutput",
-    "SyntheticSourceDiagnostics",
-    "SyntheticSourceExample",
     "SymmetricTimeKernelDecomposition",
     "TSStructureForwardOutput",
     "TSStructureModel",
@@ -239,16 +212,12 @@ __all__ = [
     "TargetGeometryCache",
     "TargetHypothesisScanResult",
     "TargetPhaseHypothesisScanner",
-    "TargetShapeClassCenter",
     "TemporalFunctionalLift",
     "TemporalFunctionalOutput",
     "TemporalSRVFExtractor",
     "TemporalSRVFOutput",
-    "TrendStructureSharedLTAE",
-    "TrendStructureTemporalModule",
-    "apply_domain_shape_effect",
+    "PhaseOnlyTemporalModule",
     "build_source_prototype_bank",
-    "build_synthetic_source_example",
     "build_source_registration_prototypes",
     "build_confirmed_class_to_group_map",
     "build_confirmed_phase_view",
@@ -258,7 +227,6 @@ __all__ = [
     "compute_gamma_diagnostics",
     "compute_structure_contribution_diagnostics",
     "collect_residual_phase_evidence",
-    "correct_target_shape_to_source",
     "configure_stage2_parameter_policy",
     "create_feature_snapshot_manager",
     "detect_residual_phase_group",
@@ -268,10 +236,8 @@ __all__ = [
     "evaluate_sample_class_phase_compatibility",
     "evaluate_registration_geometry",
     "evaluate_stable_target_candidate",
-    "evaluate_synthetic_source_diagnostics",
     "finalize_distance_statistics",
     "gamma_to_psi",
-    "inverse_vector_srvf",
     "load_selected_samples",
     "map_source_positions_to_target",
     "merge_contribution_diagnostics",
@@ -286,18 +252,14 @@ __all__ = [
     "sqrt_median_gamma",
     "summarize_contribution_diagnostics",
     "summarize_decomposition_diagnostics",
-    "synthesize_source_shape_to_target",
     "support_aware_q_distance",
     "warp_q_gamma",
     "warp_support_gamma",
     "warp_to_identity_tangent",
     "update_domain_phase_state",
-    "update_domain_shape_state",
     "align_target_positions_to_source",
-    "build_phase_only_synthetic_source_example",
     "build_stage2_registration_extractor",
     "DeviceBatchLoader",
-    "refresh_source_fused_statistics",
     "run_stage2_statistics_diagnostic",
     "run_stage2_training",
     "Stage2RunResult",
