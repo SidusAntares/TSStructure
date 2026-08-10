@@ -369,17 +369,18 @@ def scan_stable_target_labels_from_candidates(
     config: StableLabelConfig,
     sample_ids: tuple[int, ...] | None = None,
 ) -> StableTargetLabelScanResult:
-    """Confirm or correct the Round-A candidate set under confirmed Domain Phase.
+    """Re-evaluate cached Round-A candidates under confirmed Domain Phase.
 
-    The formal path never searches arbitrary classes.  A non-ambiguous sample
-    contributes only its primary geometry-first candidate.  A near-tie may also
-    contribute the single Round-A secondary candidate; confirmed Domain Phase
-    can therefore resolve that *existing ambiguity* without allowing the
-    classifier to invent a new class.
+    This candidate-restricted routine is retained for calibration diagnostics and
+    regression tests. The formal TimeMatch-style Stage-2 training path uses
+    :func:`scan_stable_target_labels_from_confirmed_phase`, where a confirmed
+    domain Phase may be tested by every ready class on the full target-train
+    population.
 
-    Individual sample/class gammas are used only for Phase compatibility.  Any
-    Shape stored in a stable label is recomputed with the confirmed group center
-    (or explicit identity), preserving target-domain intrinsic phase variation.
+    Individual sample/class gammas here are used only for Phase compatibility.
+    Any Shape stored in a stable label is recomputed with the confirmed group
+    center (or explicit identity), preserving target-domain intrinsic phase
+    variation.
     """
     num_classes = int(source_prototype_bank.ready.numel())
     requested = None if sample_ids is None else set(int(item) for item in sample_ids)
@@ -790,14 +791,15 @@ def scan_stable_target_labels_from_confirmed_phase(
     config: StableLabelConfig,
     sample_ids: tuple[int, ...] | None = None,
 ) -> StableTargetLabelScanResult:
-    """Scan stable labels directly under confirmed domain-level Phase groups.
+    """Scan Stable Labels directly under confirmed domain-level Phase state.
 
     Exact sample/class registration hypotheses are deliberately *not* required
-    here.  They are evidence for estimating Domain Phase.  Once a group is
-    confirmed, its center gamma defines the calibrated view; classifier, fused
-    source prototypes and q-Shape prototypes then provide the three independent
-    class gates.  This keeps Shape estimation from inheriting the cost and
-    sample-level bias of individual DP registration.
+    here. They are evidence for estimating Domain Phase. Once Phase is
+    confirmed, each confirmed center (or explicit identity) defines a calibrated
+    target view and every ready class may test that view. Teacher classifier,
+    fused source prototypes and q-Shape prototypes provide the three independent
+    gates. Founding group membership therefore affects Phase estimation, not the
+    Stable-Label hypothesis scope.
     """
     confirmed_groups = tuple(
         group
@@ -805,9 +807,20 @@ def scan_stable_target_labels_from_confirmed_phase(
         if group.status is PhaseGroupStatus.CONFIRMED
     )
     num_classes = int(source_prototype_bank.ready.numel())
+    ready_classes = tuple(
+        int(i)
+        for i in torch.nonzero(
+            source_prototype_bank.ready.detach().cpu(), as_tuple=False
+        ).flatten().tolist()
+    )
     requested = None if sample_ids is None else set(int(item) for item in sample_ids)
     requested_count = None if requested is None else len(requested)
-    if not confirmed_groups:
+    if phase_state.decision_status is PhaseDecisionStatus.UNCONFIRMED:
+        return _empty_result(0 if requested_count is None else requested_count, num_classes)
+    if (
+        phase_state.decision_status is PhaseDecisionStatus.NONIDENTITY_CONFIRMED
+        and not confirmed_groups
+    ):
         return _empty_result(0 if requested_count is None else requested_count, num_classes)
 
     teacher = ema_teacher.model()
@@ -842,26 +855,51 @@ def scan_stable_target_labels_from_confirmed_phase(
         )
         considered_samples.update(int(item) for item in row_sample_ids.tolist())
 
-        for group in confirmed_groups:
-            view = build_confirmed_phase_view(
-                model=teacher,
-                batch=_subset_batch(batch, rows, batch_size),
-                sample_ids=row_sample_ids,
-                group=group,
+        if phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED:
+            # Identity is an explicitly confirmed domain-level Phase state, not
+            # an absence of Phase evidence.  The two-point identity warp is
+            # sufficient because build_phase_calibrated_view resamples it onto
+            # the functional Shape grid.
+            identity_gamma = torch.tensor([0.0, 1.0], dtype=torch.float64)
+            views = (
+                build_phase_calibrated_view(
+                    model=teacher,
+                    batch=_subset_batch(batch, rows, batch_size),
+                    sample_ids=row_sample_ids,
+                    group_id=IDENTITY_PHASE_GROUP_ID,
+                    member_classes=ready_classes,
+                    center_gamma=identity_gamma,
+                ),
             )
+        else:
+            views = tuple(
+                build_confirmed_phase_view(
+                    model=teacher,
+                    batch=_subset_batch(batch, rows, batch_size),
+                    sample_ids=row_sample_ids,
+                    group=group,
+                )
+                for group in confirmed_groups
+            )
+
+        # Once a domain Phase center is confirmed, founding membership no
+        # longer limits its hypothesis scope.  Every ready class may be tested
+        # under every confirmed Phase; class-level routing for source synthesis
+        # is derived later from the already-gated Stable (class, group) evidence.
+        for view in views:
             candidate_view_count += len(rows)
             for view_index, sample_id_value in enumerate(view.sample_ids.tolist()):
                 sample_id = int(sample_id_value)
-                for class_id in group.member_classes:
+                for class_id in ready_classes:
                     candidate = evaluate_stable_target_candidate(
                         view=view,
                         view_index=view_index,
-                        class_id=int(class_id),
+                        class_id=class_id,
                         source_prototype_bank=source_prototype_bank,
                         config=config,
                     )
                     candidates.append(candidate)
-                    candidate_sources[(sample_id, int(class_id), group.group_id)] = (
+                    candidate_sources[(sample_id, class_id, view.group_id)] = (
                         view, view_index
                     )
 

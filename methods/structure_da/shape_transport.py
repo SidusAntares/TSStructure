@@ -18,6 +18,10 @@ from .domain_shape_state import DomainShapeState, DomainShapeStatus
 from .prototype_bank import SourcePrototypeBank, support_aware_q_distance
 
 
+IDENTITY_PHASE_GROUP_ID = -1
+NO_CONFIRMED_PHASE_ROUTE_GROUP_ID = -2
+
+
 @dataclass(frozen=True)
 class SyntheticSourceExample:
     source_sample_id: int
@@ -250,12 +254,11 @@ def _confirmed_group_for_class(
     phase_state: DomainPhaseState,
     class_id: int,
 ) -> PhaseGroup | None:
-    """Return a founding-member group for legacy callers.
+    """Return only the founding-class assignment used during Phase estimation.
 
-    This helper is intentionally *not* the general Phase-usage rule.  A class
-    need not be a founding member in order to use an already-confirmed Domain
-    Phase; formal Stage-2 usage can pass an explicit confirmed ``phase_group``
-    selected from compatibility/stable-label evidence.
+    This helper is retained for backward-compatible diagnostics. Formal Stage-2
+    synthesis must pass the class-level *usage* route explicitly so founding
+    membership is never confused with post-confirmation applicability.
     """
     if not isinstance(phase_state, DomainPhaseState) or phase_state.m == 0:
         return None
@@ -270,30 +273,29 @@ def _confirmed_group_for_class(
     return matches[0] if matches else None
 
 
-def _validated_explicit_phase_group(
+def _confirmed_group_by_id(
     phase_state: DomainPhaseState,
-    phase_group: PhaseGroup | None,
-) -> PhaseGroup | None:
-    if phase_group is None:
-        return None
-    if phase_group.status is not PhaseGroupStatus.CONFIRMED:
-        raise ValueError("explicit phase_group must be confirmed")
+    group_id: int,
+) -> PhaseGroup:
     matches = [
         group
         for group in phase_state.groups
         if group.status is PhaseGroupStatus.CONFIRMED
-        and group.group_id == phase_group.group_id
+        and int(group.group_id) == int(group_id)
     ]
     if len(matches) != 1:
-        raise ValueError("explicit phase_group must belong to phase_state")
-    state_group = matches[0]
-    if not torch.equal(
-        state_group.center_gamma.detach().cpu().double(),
-        phase_group.center_gamma.detach().cpu().double(),
-    ):
-        raise ValueError("explicit phase_group center_gamma disagrees with phase_state")
-    return state_group
+        raise ValueError(f"confirmed Phase group {group_id} is unavailable")
+    return matches[0]
 
+
+def _resolve_synthesis_group(
+    phase_state: DomainPhaseState,
+    class_id: int,
+    phase_group: PhaseGroup | None,
+) -> PhaseGroup | None:
+    if phase_group is not None:
+        return _confirmed_group_by_id(phase_state, int(phase_group.group_id))
+    return _confirmed_group_for_class(phase_state, class_id)
 
 def _sample_curve_at_positions(curve: Tensor, positions: Tensor, mask: Tensor) -> Tensor:
     safe = torch.where(mask, positions.clamp(0.0, 1.0), torch.zeros_like(positions))
@@ -343,24 +345,18 @@ def build_phase_only_synthetic_source_example(
     mask: Tensor,
     phase_state: DomainPhaseState,
     phase_group: PhaseGroup | None = None,
+    allow_no_phase_route: bool = False,
 ) -> SyntheticSourceExample | None:
-    """Construct a confirmed-phase target-style source without Shape transport.
+    """Construct the source branch under the currently confirmed Phase state.
 
-    T/S token values and q geometry are copied unchanged.  Only the temporal
-    coordinate is relabelled by the confirmed domain phase center in the
-    source-to-target direction ``gamma(source_position)``.  G0, provisional
-    groups and M=0 return ``None``.
+    A routed non-identity Phase maps source positions forward by
+    ``gamma(source_position)``. Identity-confirmed Phase keeps positions native.
+    For M=2, an unresolved class route may also keep source positions native
+    when ``allow_no_phase_route`` is true; that state is explicitly tagged as
+    ``NO_CONFIRMED_PHASE_ROUTE`` and is not an identity-Phase claim.
     """
-    if phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED:
-        # Identity Phase contains no temporal domain effect.  A phase-only copy
-        # would be identical to original source and is not an adaptation sample.
-        return None
-    if phase_state.decision_status is not PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
-        return None
-    group = _validated_explicit_phase_group(phase_state, phase_group)
-    if group is None:
-        group = _confirmed_group_for_class(phase_state, class_id)
-    if group is None:
+    decision = phase_state.decision_status
+    if decision is PhaseDecisionStatus.UNCONFIRMED:
         return None
     if source_trend_tokens.ndim != 2 or source_structure_tokens.shape != source_trend_tokens.shape:
         raise ValueError("source trend/structure tokens must share shape [L,D]")
@@ -368,13 +364,29 @@ def build_phase_only_synthetic_source_example(
         raise ValueError("source q/support must have shape [K,D] and [K]")
     if source_positions.ndim != 1 or mask.dtype != torch.bool or mask.shape != source_positions.shape:
         raise ValueError("source positions/mask must have shape [L]")
-    target_style_positions = map_source_positions_to_target(
-        source_positions.detach(), mask.detach(), group.center_gamma
-    )
+
+    group = None
+    if decision is PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
+        group = _resolve_synthesis_group(phase_state, class_id, phase_group)
+        if group is None and not allow_no_phase_route:
+            return None
+
+    if decision is PhaseDecisionStatus.IDENTITY_CONFIRMED:
+        group_id = IDENTITY_PHASE_GROUP_ID
+        target_style_positions = source_positions.detach()
+    elif group is None:
+        group_id = NO_CONFIRMED_PHASE_ROUTE_GROUP_ID
+        target_style_positions = source_positions.detach()
+    else:
+        group_id = int(group.group_id)
+        target_style_positions = map_source_positions_to_target(
+            source_positions.detach(), mask.detach(), group.center_gamma
+        )
+
     return SyntheticSourceExample(
         source_sample_id=int(source_sample_id),
         class_id=int(class_id),
-        group_id=int(group.group_id),
+        group_id=group_id,
         trend_tokens=source_trend_tokens.detach(),
         structure_tokens=source_structure_tokens.detach(),
         target_style_positions=target_style_positions,
@@ -383,7 +395,6 @@ def build_phase_only_synthetic_source_example(
         q_support=source_q_support.detach(),
         lambda_delta=0.0,
     )
-
 
 def build_synthetic_source_example(
     *,
@@ -399,28 +410,34 @@ def build_synthetic_source_example(
     decomposition: nn.Module,
     lambda_delta: float,
     phase_group: PhaseGroup | None = None,
+    allow_no_phase_route: bool = False,
 ) -> SyntheticSourceExample | None:
-    """Construct one phase+Shape target-style source example.
+    """Construct one Phase+Shape target-style source example.
 
-    The function returns ``None`` when either the Domain Shape state or the
-    source class phase group is not confirmed. Values are synthesized in the
-    source coordinate, while token positions are relabelled in the required
-    source-to-target direction ``gamma(source_position)``.
+    Domain Shape must be confirmed. A routed non-identity class uses the
+    confirmed source-to-target ``gamma(source_position)`` mapping. When M=2
+    routing is still unresolved and ``allow_no_phase_route`` is true, Shape
+    synthesis remains available while temporal positions stay unchanged and the
+    example is tagged ``NO_CONFIRMED_PHASE_ROUTE``. This is not an identity-Phase
+    claim.
     """
     lambda_delta = _validate_lambda_delta(lambda_delta)
     if domain_shape_state.status is not DomainShapeStatus.CONFIRMED:
         return None
-    identity_phase = phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED
+    decision = phase_state.decision_status
+    identity_phase = decision is PhaseDecisionStatus.IDENTITY_CONFIRMED
     if identity_phase:
         group = None
-        synthetic_group_id = -1
-    elif phase_state.decision_status is PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
-        group = _validated_explicit_phase_group(phase_state, phase_group)
-        if group is None:
-            group = _confirmed_group_for_class(phase_state, class_id)
-        if group is None:
+        synthetic_group_id = IDENTITY_PHASE_GROUP_ID
+    elif decision is PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
+        group = _resolve_synthesis_group(phase_state, class_id, phase_group)
+        if group is None and not allow_no_phase_route:
             return None
-        synthetic_group_id = int(group.group_id)
+        synthetic_group_id = (
+            NO_CONFIRMED_PHASE_ROUTE_GROUP_ID
+            if group is None
+            else int(group.group_id)
+        )
     else:
         return None
     if not isinstance(source_q_shape, Tensor) or source_q_shape.ndim != 2:
@@ -468,7 +485,7 @@ def build_synthetic_source_example(
     ).detach()
     target_style_positions = (
         positions.detach()
-        if identity_phase
+        if identity_phase or group is None
         else map_source_positions_to_target(positions, mask_local, group.center_gamma)
     )
     return SyntheticSourceExample(
@@ -583,17 +600,9 @@ def evaluate_synthetic_source_diagnostics(
         if before is not None and after is not None:
             improved = after <= before
 
-    group = next(
-        (
-            item
-            for item in phase_state.groups
-            if item.status is PhaseGroupStatus.CONFIRMED
-            and int(item.group_id) == int(example.group_id)
-        ),
-        None,
-    )
     phase_leakage = None
-    if group is not None:
+    if example.group_id >= 0:
+        group = _confirmed_group_by_id(phase_state, example.group_id)
         expected = map_source_positions_to_target(
             source_positions.detach().to(example.target_style_positions),
             example.mask,
@@ -611,6 +620,21 @@ def evaluate_synthetic_source_diagnostics(
             )
         else:
             phase_leakage = 0.0
+    elif example.group_id in (
+        IDENTITY_PHASE_GROUP_ID,
+        NO_CONFIRMED_PHASE_ROUTE_GROUP_ID,
+    ):
+        valid = example.mask
+        phase_leakage = (
+            float(
+                (
+                    example.target_style_positions[valid]
+                    - source_positions.detach().to(example.target_style_positions)[valid]
+                ).abs().max().item()
+            )
+            if torch.any(valid).item()
+            else 0.0
+        )
 
     shape_margin = None
     if (

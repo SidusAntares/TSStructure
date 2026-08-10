@@ -1,8 +1,8 @@
-"""Round-7 orchestration for the frozen TSStructure V3 Stage-2 adaptation.
+"""TimeMatch-style Stage-2 adaptation over frozen TSStructure geometry.
 
-This module wires the already-frozen Round 3--6 geometry/statistics modules to
-one blockwise training loop.  It intentionally contains no new domain loss,
-clustering rule, registration solver or pseudo-label CE.
+Domain Phase/Shape provide interpretable cross-domain supervision, while the
+Student is optimized from target-style labelled source and Stable-Labeled
+native target data. The EMA Teacher supplies target semantic evidence only.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ from torch import Tensor, nn
 from torch.optim import Optimizer
 
 from .confirmed_phase_view import (
-    build_confirmed_class_to_group_map,
-    build_confirmed_phase_view,
+    IDENTITY_PHASE_GROUP_ID,
+    build_phase_calibrated_view,
 )
 from .domain_phase_state import (
     DomainPhaseConfig,
@@ -47,7 +47,7 @@ from .source_prototype_scanner import refresh_source_fused_statistics
 from .stable_target_labels import (
     StableLabelConfig,
     StableTargetLabelScanResult,
-    scan_stable_target_labels_from_candidates,
+    scan_stable_target_labels_from_confirmed_phase,
 )
 from .stage2_objective import Stage2Objective, Stage2ObjectiveConfig
 from .stage2_parameter_policy import Stage2ParameterPolicy
@@ -110,6 +110,7 @@ class Stage2StatisticsSnapshot:
     phase_state: DomainPhaseState
     stable_labels: StableTargetLabelScanResult
     shape_state: DomainShapeState
+    phase_routes: tuple[int | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -218,58 +219,78 @@ def _confirmed_phase_exists(state: DomainPhaseState) -> bool:
     )
 
 
-def _synthetic_phase_groups_for_class(
-    snapshot: Stage2StatisticsSnapshot,
-    class_id: int,
-) -> tuple[PhaseGroup, ...]:
-    """Resolve confirmed Phase groups usable by one source class.
+def _confirmed_groups(state: DomainPhaseState) -> dict[int, object]:
+    return {
+        int(group.group_id): group
+        for group in state.groups
+        if group.status is PhaseGroupStatus.CONFIRMED
+    }
 
-    ``member_classes`` identifies the classes that supplied evidence for a
-    group's estimation.  It is not a downstream usage mask.  With one confirmed
-    non-identity group the domain-level Phase is therefore usable by every
-    source class.  With multiple confirmed groups, stable target labels provide
-    the downstream class/group assignment for non-founding classes; founding
-    membership remains only a fallback when no stable assignment exists.
+
+def _derive_phase_routes(
+    phase_state: DomainPhaseState,
+    stable_result: StableTargetLabelScanResult,
+    num_classes: int,
+) -> tuple[int | None, ...]:
+    """Derive class-level source-synthesis routing without new thresholds.
+
+    Founding classes seed the applicability map but do not form a whitelist.
+    With M=1 the sole confirmed domain Phase serves every class. With M=2,
+    non-founding classes aggregate already-gated Stable (class, group) evidence;
+    an exact tie or absence of evidence remains explicitly unresolved.
     """
-    state = snapshot.phase_state
-    if state.decision_status is not PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
-        return ()
-    confirmed = tuple(
-        group for group in state.groups if group.status is PhaseGroupStatus.CONFIRMED
-    )
-    if not confirmed:
-        return ()
-    if len(confirmed) == 1:
-        return confirmed
+    if phase_state.decision_status is not PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
+        return (None,) * num_classes
+    groups = _confirmed_groups(phase_state)
+    if not groups:
+        return (None,) * num_classes
+    if len(groups) == 1:
+        only = next(iter(groups))
+        return (only,) * num_classes
 
-    by_id = {int(group.group_id): group for group in confirmed}
-    stable_group_ids = sorted(
-        {
-            int(label.group_id)
-            for label in snapshot.stable_labels.stable_labels
-            if int(label.class_id) == int(class_id)
-            and int(label.group_id) in by_id
-        }
-    )
-    if stable_group_ids:
-        return tuple(by_id[group_id] for group_id in stable_group_ids)
+    routes: list[int | None] = [None] * num_classes
+    for group_id, group in groups.items():
+        for class_id in group.member_classes:
+            if not 0 <= int(class_id) < num_classes:
+                continue
+            existing = routes[int(class_id)]
+            if existing is not None and existing != group_id:
+                raise ValueError(
+                    f"class {class_id} is a founding member of multiple confirmed Phase groups"
+                )
+            routes[int(class_id)] = group_id
 
-    founding = tuple(
-        group for group in confirmed if int(class_id) in group.member_classes
-    )
-    if len(founding) > 1:
-        raise ValueError(f"class {class_id} belongs to multiple confirmed phase groups")
-    return founding
+    evidence: list[dict[int, float]] = [dict() for _ in range(num_classes)]
+    for item in stable_result.stable_labels:
+        class_id = int(item.class_id)
+        group_id = int(item.group_id)
+        if not 0 <= class_id < num_classes or group_id not in groups:
+            continue
+        weight = max(0.0, float(item.confidence_summary))
+        evidence[class_id][group_id] = evidence[class_id].get(group_id, 0.0) + weight
+
+    for class_id in range(num_classes):
+        if routes[class_id] is not None or not evidence[class_id]:
+            continue
+        ranked = sorted(
+            evidence[class_id].items(),
+            key=lambda pair: (-pair[1], pair[0]),
+        )
+        if len(ranked) == 1 or ranked[0][1] > ranked[1][1]:
+            routes[class_id] = ranked[0][0]
+    return tuple(routes)
 
 
 def _adaptation_available(snapshot: Stage2StatisticsSnapshot) -> bool:
     decision = snapshot.phase_state.decision_status
+    if decision is PhaseDecisionStatus.UNCONFIRMED:
+        return False
     if decision is PhaseDecisionStatus.NONIDENTITY_CONFIRMED:
         return True
-    if decision is PhaseDecisionStatus.IDENTITY_CONFIRMED:
-        return snapshot.shape_state.status is DomainShapeStatus.CONFIRMED
-    return False
-
+    return (
+        snapshot.shape_state.status is DomainShapeStatus.CONFIRMED
+        or snapshot.stable_labels.num_stable_labels > 0
+    )
 
 def _phase_groups_log_value(state: DomainPhaseState) -> str:
     if not state.groups:
@@ -531,6 +552,8 @@ class Stage2Trainer:
         output_dir: str,
         runtime_config: dict | None = None,
         writer=None,
+        target_train_loader=None,
+        target_stable_label_loader=None,
     ) -> None:
         self.student = student
         self.policy = policy
@@ -538,7 +561,20 @@ class Stage2Trainer:
         self.optimizer = optimizer
         self.source_loader = source_loader
         self.source_scan_loader = source_scan_loader
+        # ``target_statistics_loader`` is the bounded expensive-DP Phase
+        # calibration subset. Stable Labels and Student self-training may use
+        # the full target-train population once Phase is confirmed.
         self.target_statistics_loader = target_statistics_loader
+        self.target_stable_label_loader = (
+            target_statistics_loader
+            if target_stable_label_loader is None
+            else target_stable_label_loader
+        )
+        self.target_train_loader = (
+            self.target_stable_label_loader
+            if target_train_loader is None
+            else target_train_loader
+        )
         self.source_prototype_bank = source_prototype_bank
         self.source_geometry_version = int(source_prototype_bank.version)
         self.source_registration_bank = source_registration_bank
@@ -567,6 +603,7 @@ class Stage2Trainer:
         self.phase_evidence_stages = 0
         self.shape_evidence_stages = 0
         self.shape_evidence_sample_ids: tuple[int, ...] = ()
+        self.stable_label_refresh_count = 0
         self.successful_optimizer_steps = 0
         self._validate_optimizer_boundary()
 
@@ -613,42 +650,52 @@ class Stage2Trainer:
             self.hypothesis_scan_count += 1
         return self.phase_scanner
 
-    def _stable_and_shape_from_fixed_phase(
+    def _stable_from_fixed_phase(
         self,
         phase_state: DomainPhaseState,
-        previous_shape: DomainShapeState | None,
-        *,
-        sample_ids: tuple[int, ...],
-    ) -> tuple[StableTargetLabelScanResult, DomainShapeState]:
-        if self.hypothesis_cache is None:
-            raise RuntimeError("target hypothesis cache is unavailable")
-        stable_result = scan_stable_target_labels_from_candidates(
+    ) -> StableTargetLabelScanResult:
+        """Refresh Stable Labels on the full target-train population.
+
+        Exact sample/class DP registration is only Phase-estimation evidence.
+        Once Domain Phase is confirmed, its domain-level center(s) are tested
+        directly on target samples together with Teacher/fused/Shape evidence.
+        This keeps the expensive Phase calibration subset separate from the
+        native-target self-training population.
+        """
+        result = scan_stable_target_labels_from_confirmed_phase(
             ema_teacher=self.ema_teacher,
-            target_loader=self.target_statistics_loader,
-            hypothesis_result=self.hypothesis_cache.result,
+            target_loader=self.target_stable_label_loader,
             phase_state=phase_state,
-            phase_config=self.config.phase,
             source_prototype_bank=self.source_prototype_bank,
             config=self.config.stable_labels,
-            sample_ids=sample_ids,
         )
-        shape_state = update_domain_shape_state(
+        self.stable_label_refresh_count += 1
+        return result
+
+    def _shape_from_stable(
+        self,
+        stable_result: StableTargetLabelScanResult,
+        previous_shape: DomainShapeState | None,
+    ) -> DomainShapeState:
+        self.shape_evidence_stages += 1
+        self.shape_evidence_sample_ids = tuple(
+            int(item.sample_id) for item in stable_result.stable_labels
+        )
+        return update_domain_shape_state(
             stable_result,
             self.source_prototype_bank,
             self.config.shape,
             previous_state=previous_shape,
         )
-        return stable_result, shape_state
 
     @torch.no_grad()
     def initialize_statistics(self) -> Stage2StatisticsSnapshot:
-        """Acquire progressive Domain Phase evidence, then estimate Shape.
+        """Confirm Domain Phase once, then initialize Stable Labels and Shape.
 
-        Round B deliberately scans every configured nested evidence budget.
-        A confirmed group at an intermediate budget is not treated as proof
-        that the complete domain-level model order is settled: later evidence
-        may reveal a second multi-class Phase group.  Exact pairwise gammas are
-        cached by the scanner and never recomputed at block boundaries.
+        Exact pairwise registration is acquired only during this calibration.
+        The final confirmed Phase state is frozen for the whole adaptation run.
+        Stable Labels can later refresh from cached hypotheses without rerunning
+        DP; Domain Shape is refreshed only on the slower block schedule.
         """
         scanner = self._get_phase_scanner()
         phase_state: DomainPhaseState | None = None
@@ -671,11 +718,7 @@ class Stage2Trainer:
                 f"|confirmed_phase={str(_confirmed_phase_exists(phase_state)).lower()}"
                 f"|valid_classes={','.join(str(c) for c in phase_state.valid_phase_classes) or '-'}"
                 f"|groups={_phase_groups_log_value(phase_state)}"
-                f"|g0={','.join(str(c) for c in phase_state.rejected_classes) or '-'}"
                 f"|hypotheses={len(final_result.hypotheses)}"
-                f"|residual_evidence={phase_state.residual_evidence_count}"
-                f"|residual_classes={','.join(str(c) for c in phase_state.residual_evidence_classes) or '-'}"
-                f"|identity_classes={','.join(str(c) for c in phase_state.identity_evidence_classes) or '-'}"
                 f"|solver_calls={final_result.num_solver_calls}"
             )
 
@@ -685,75 +728,95 @@ class Stage2Trainer:
             source_geometry_version=self.source_geometry_version,
             result=final_result,
         )
-
-        shape_state: DomainShapeState | None = None
-        stable_result: StableTargetLabelScanResult | None = None
-        if _confirmed_phase_exists(phase_state):
-            for budget in self._phase_evidence_budgets(scanner.total_cached_samples):
-                sample_ids = scanner.sample_ids_for_budget(budget)
-                stable_result, shape_state = self._stable_and_shape_from_fixed_phase(
-                    phase_state,
-                    shape_state,
-                    sample_ids=sample_ids,
-                )
-                self.shape_evidence_stages += 1
-                self.shape_evidence_sample_ids = sample_ids
-                stable_coverage = (
-                    stable_result.num_stable_labels / stable_result.num_samples
-                    if stable_result.num_samples
-                    else 0.0
-                )
-                shape_metrics = _shape_summary(shape_state)
-                print(
-                    "STAGE2_SHAPE_EVIDENCE_STAGE|"
-                    f"budget={budget}|stable_labels={stable_result.num_stable_labels}"
-                    f"|stable_coverage={stable_coverage:.4f}"
-                    f"|candidate_views={stable_result.num_candidate_views}"
-                    f"|phase_compatible={stable_result.num_phase_compatible}"
-                    f"|phase_incompatible={stable_result.num_phase_incompatible}"
-                    f"|cls_pass={stable_result.num_classifier_pass}"
-                    f"|fused_pass={stable_result.num_fused_pass}"
-                    f"|q_pass={stable_result.num_q_pass}"
-                    f"|ambiguous={stable_result.num_ambiguous_rejected}"
-                    f"|shape_status={shape_state.status.value}"
-                    f"|shape_valid_classes={','.join(str(c) for c in shape_state.valid_classes) or '-'}"
-                    f"|rho_shape={_optional_metric(shape_state.rho_shape)}"
-                    f"|delta_norm={_optional_metric(shape_metrics['delta_norm'])}"
-                    f"|loo_drift={_optional_metric(shape_state.leave_one_out_drift)}"
-                    f"|center_drift={_optional_metric(shape_state.center_drift)}"
-                )
-                if shape_state.status is DomainShapeStatus.CONFIRMED:
-                    break
-        else:
-            self.shape_evidence_sample_ids = scanner.sample_ids_for_budget(
-                final_result.num_samples
-            )
-            stable_result, shape_state = self._stable_and_shape_from_fixed_phase(
-                phase_state,
-                None,
-                sample_ids=self.shape_evidence_sample_ids,
-            )
-
-        assert stable_result is not None
-        assert shape_state is not None
+        stable_result = self._stable_from_fixed_phase(phase_state)
+        shape_state = self._shape_from_stable(stable_result, None)
+        routes = _derive_phase_routes(
+            phase_state,
+            stable_result,
+            int(self.source_prototype_bank.ready.numel()),
+        )
         snapshot = Stage2StatisticsSnapshot(
             phase_state=phase_state,
             stable_labels=stable_result,
             shape_state=shape_state,
+            phase_routes=routes,
         )
         self.statistics = snapshot
+        stable_coverage = (
+            stable_result.num_stable_labels / stable_result.num_samples
+            if stable_result.num_samples else 0.0
+        )
         print(
             "STAGE2_STATISTICS|"
             f"scan_index={phase_state.scan_index}|phase_m={phase_state.m}"
             f"|phase_decision={phase_state.decision_status.value}"
-            f"|confirmed_phase={str(_confirmed_phase_exists(phase_state)).lower()}"
             f"|stable_labels={stable_result.num_stable_labels}"
+            f"|stable_coverage={stable_coverage:.4f}"
             f"|shape_status={shape_state.status.value}"
             f"|hypothesis_scans={self.hypothesis_scan_count}"
             f"|phase_evidence_stages={self.phase_evidence_stages}"
             f"|phase_evidence_samples={final_result.num_samples}"
-            f"|shape_evidence_stages={self.shape_evidence_stages}"
-            f"|shape_evidence_samples={len(self.shape_evidence_sample_ids)}"
+            f"|stable_refreshes={self.stable_label_refresh_count}"
+            f"|shape_refreshes={self.shape_evidence_stages}"
+        )
+        return snapshot
+
+    @torch.no_grad()
+    def refresh_stable_labels(self) -> Stage2StatisticsSnapshot:
+        """Refresh Teacher-driven Stable Labels while Phase and Shape stay fixed."""
+        if self.statistics is None:
+            return self.initialize_statistics()
+        stable_result = self._stable_from_fixed_phase(self.statistics.phase_state)
+        routes = _derive_phase_routes(
+            self.statistics.phase_state,
+            stable_result,
+            int(self.source_prototype_bank.ready.numel()),
+        )
+        snapshot = Stage2StatisticsSnapshot(
+            phase_state=self.statistics.phase_state,
+            stable_labels=stable_result,
+            shape_state=self.statistics.shape_state,
+            phase_routes=routes,
+        )
+        self.statistics = snapshot
+        coverage = (
+            stable_result.num_stable_labels / stable_result.num_samples
+            if stable_result.num_samples else 0.0
+        )
+        print(
+            "STAGE2_STABLE_LABEL_REFRESH|"
+            f"refresh={self.stable_label_refresh_count}"
+            f"|stable_labels={stable_result.num_stable_labels}"
+            f"|stable_coverage={coverage:.4f}"
+            f"|class_counts={','.join(str(v) for v in stable_result.stable_class_counts)}"
+            f"|routes={','.join('none' if v is None else str(v) for v in routes)}"
+        )
+        return snapshot
+
+    @torch.no_grad()
+    def refresh_domain_shape(self) -> Stage2StatisticsSnapshot:
+        """Refresh Domain Shape from the current Stable Labels only."""
+        if self.statistics is None:
+            raise RuntimeError("Stage-2 statistics must be initialized before Shape refresh")
+        shape_state = self._shape_from_stable(
+            self.statistics.stable_labels,
+            self.statistics.shape_state,
+        )
+        snapshot = Stage2StatisticsSnapshot(
+            phase_state=self.statistics.phase_state,
+            stable_labels=self.statistics.stable_labels,
+            shape_state=shape_state,
+            phase_routes=self.statistics.phase_routes,
+        )
+        self.statistics = snapshot
+        shape_metrics = _shape_summary(shape_state)
+        print(
+            "STAGE2_SHAPE_REFRESH|"
+            f"refresh={self.shape_evidence_stages}"
+            f"|shape_status={shape_state.status.value}"
+            f"|valid_classes={','.join(str(c) for c in shape_state.valid_classes) or '-'}"
+            f"|rho_shape={_optional_metric(shape_state.rho_shape)}"
+            f"|delta_norm={_optional_metric(shape_metrics['delta_norm'])}"
         )
         return snapshot
 
@@ -763,65 +826,29 @@ class Stage2Trainer:
         *,
         previous: Stage2StatisticsSnapshot | None,
     ) -> Stage2StatisticsSnapshot:
-        """Refresh stable-label/Shape statistics while freezing Domain Phase.
-
-        Exact registration is never repeated while source geometry is frozen.
-        A block boundary supplies a genuinely new EMA/fused representation, so
-        it may advance Domain Shape confirmation, but it cannot manufacture a
-        new Phase confirmation from replayed hypotheses.
-        """
-        if previous is None:
+        """Compatibility wrapper: refresh labels and then blockwise Shape."""
+        if previous is None or self.statistics is None:
             return self.initialize_statistics()
-        if self.hypothesis_cache is None:
-            raise RuntimeError("target hypothesis cache is unavailable")
-        stable_result, shape_state = self._stable_and_shape_from_fixed_phase(
-            previous.phase_state,
-            previous.shape_state,
-            sample_ids=self.shape_evidence_sample_ids,
-        )
-        snapshot = Stage2StatisticsSnapshot(
-            phase_state=previous.phase_state,
-            stable_labels=stable_result,
-            shape_state=shape_state,
-        )
-        self.statistics = snapshot
-        shape_metrics = _shape_summary(shape_state)
-        stable_coverage = (
-            stable_result.num_stable_labels / stable_result.num_samples
-            if stable_result.num_samples
-            else 0.0
-        )
-        print(
-            "STAGE2_STATISTICS_REFRESH|"
-            f"phase_m={previous.phase_state.m}"
-            f"|phase_decision={previous.phase_state.decision_status.value}"
-            f"|confirmed_phase={str(_confirmed_phase_exists(previous.phase_state)).lower()}"
-            f"|stable_labels={stable_result.num_stable_labels}"
-            f"|stable_coverage={stable_coverage:.4f}"
-            f"|phase_compatible={stable_result.num_phase_compatible}"
-            f"|phase_incompatible={stable_result.num_phase_incompatible}"
-            f"|cls_pass={stable_result.num_classifier_pass}"
-            f"|fused_pass={stable_result.num_fused_pass}"
-            f"|q_pass={stable_result.num_q_pass}"
-            f"|shape_status={shape_state.status.value}"
-            f"|rho_shape={_optional_metric(shape_state.rho_shape)}"
-            f"|delta_norm={_optional_metric(shape_metrics['delta_norm'])}"
-            f"|loo_drift={_optional_metric(shape_state.leave_one_out_drift)}"
-            f"|center_drift={_optional_metric(shape_state.center_drift)}"
-            f"|hypothesis_scans={self.hypothesis_scan_count}"
-        )
-        return snapshot
+        self.statistics = previous
+        self.refresh_stable_labels()
+        return self.refresh_domain_shape()
 
     @torch.no_grad()
-    def refresh_source_features_and_statistics(self) -> Stage2StatisticsSnapshot:
-        """Refresh EMA fused source state, then reuse cached target hypotheses."""
+    def refresh_source_features(self) -> None:
+        """Refresh EMA task-space source statistics without touching Phase geometry."""
         self.source_prototype_bank = refresh_source_fused_statistics(
             self.ema_teacher.model(),
             self.source_scan_loader,
             self.source_prototype_bank,
             device=self.device,
         )
-        return self.settle_statistics(previous=self.statistics)
+
+    @torch.no_grad()
+    def refresh_source_features_and_statistics(self) -> Stage2StatisticsSnapshot:
+        """Compatibility wrapper for legacy diagnostics/tests."""
+        self.refresh_source_features()
+        self.refresh_stable_labels()
+        return self.refresh_domain_shape()
 
     def _source_forward(self, batch: dict):
         pixels = _batch_tensor(batch, "pixels", self.device)
@@ -855,7 +882,7 @@ class Stage2Trainer:
         amp_on = self.config.amp_enabled and (
             self.device.type == "cuda" or amp_dtype == torch.bfloat16
         )
-        with torch.autocast(
+        with torch.no_grad(), torch.autocast(
             device_type=self.device.type,
             dtype=amp_dtype,
             enabled=amp_on,
@@ -896,51 +923,133 @@ class Stage2Trainer:
         if not _confirmed_phase_exists(phase_state):
             return None
         shape_state = self.statistics.shape_state
+        groups = _confirmed_groups(phase_state)
+        routes = self.statistics.phase_routes or _derive_phase_routes(
+            phase_state,
+            self.statistics.stable_labels,
+            int(self.source_prototype_bank.ready.numel()),
+        )
         shape_confirmed = shape_state.status is DomainShapeStatus.CONFIRMED
         sample_ids = _source_sample_ids(batch, labels.shape[0])
         examples: list[SyntheticSourceExample] = []
         valid_flags: list[Tensor] = []
         for row in range(labels.shape[0]):
             class_id = int(labels[row].item())
-            if phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED:
-                phase_groups: tuple[PhaseGroup | None, ...] = (None,)
-            else:
-                phase_groups = tuple(
-                    _synthetic_phase_groups_for_class(self.statistics, class_id)
+            route = (
+                routes[class_id]
+                if class_id < len(routes)
+                else None
+            )
+            phase_group = None if route is None else groups.get(int(route))
+            if shape_confirmed:
+                example = build_synthetic_source_example(
+                    source_sample_id=sample_ids[row],
+                    class_id=class_id,
+                    source_structure_function=structure_geometry.functional.function[row],
+                    source_q_shape=structure_geometry.srvf[row],
+                    source_q_support=structure_geometry.support_confidence[row],
+                    source_positions=positions[row],
+                    mask=mask[row],
+                    phase_state=phase_state,
+                    domain_shape_state=shape_state,
+                    decomposition=self.student.backbone.decomposition,
+                    lambda_delta=self.config.lambda_delta,
+                    phase_group=phase_group,
+                    allow_no_phase_route=True,
                 )
-            for phase_group in phase_groups:
-                if shape_confirmed:
-                    example = build_synthetic_source_example(
-                        source_sample_id=sample_ids[row],
-                        class_id=class_id,
-                        source_structure_function=structure_geometry.functional.function[row],
-                        source_q_shape=structure_geometry.srvf[row],
-                        source_q_support=structure_geometry.support_confidence[row],
-                        source_positions=positions[row],
-                        mask=mask[row],
-                        phase_state=phase_state,
-                        domain_shape_state=shape_state,
-                        decomposition=self.student.backbone.decomposition,
-                        lambda_delta=self.config.lambda_delta,
-                        phase_group=phase_group,
-                    )
-                else:
-                    example = build_phase_only_synthetic_source_example(
-                        source_sample_id=sample_ids[row],
-                        class_id=class_id,
-                        source_trend_tokens=trend[row],
-                        source_structure_tokens=structure[row],
-                        source_q_shape=structure_geometry.srvf[row],
-                        source_q_support=structure_geometry.support_confidence[row],
-                        source_positions=positions[row],
-                        mask=mask[row],
-                        phase_state=phase_state,
-                        phase_group=phase_group,
-                    )
-                if example is not None:
-                    examples.append(example)
-                    valid_flags.append(structure_geometry.structure_valid[row].detach())
+            else:
+                example = build_phase_only_synthetic_source_example(
+                    source_sample_id=sample_ids[row],
+                    class_id=class_id,
+                    source_trend_tokens=trend[row],
+                    source_structure_tokens=structure[row],
+                    source_q_shape=structure_geometry.srvf[row],
+                    source_q_support=structure_geometry.support_confidence[row],
+                    source_positions=positions[row],
+                    mask=mask[row],
+                    phase_state=phase_state,
+                    phase_group=phase_group,
+                    allow_no_phase_route=True,
+                )
+            if example is not None:
+                examples.append(example)
+                valid_flags.append(structure_geometry.structure_valid[row].detach())
         return _stack_synthetic(examples, valid_flags, device=self.device)
+
+    def _stable_target_lookup(self) -> dict[int, int]:
+        if self.statistics is None:
+            return {}
+        return {
+            int(item.sample_id): int(item.class_id)
+            for item in self.statistics.stable_labels.stable_labels
+        }
+
+    def _target_forward_native(
+        self,
+        batch: dict,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """Student target forward using native target positions only.
+
+        There is intentionally no temporal-position override argument on this
+        API. Phase-calibrated target positions belong exclusively to the
+        Teacher/Stable-Label inference path. Target ground-truth labels present
+        in the dataset batch are never read here.
+        """
+        stable_lookup = self._stable_target_lookup()
+        if not stable_lookup:
+            return None, None
+        sample_ids = batch.get("index")
+        if not isinstance(sample_ids, Tensor) or sample_ids.ndim != 1:
+            raise ValueError("target batch must contain one-dimensional tensor index")
+        selected_rows: list[int] = []
+        selected_labels: list[int] = []
+        for row, sample_id in enumerate(sample_ids.detach().cpu().tolist()):
+            label = stable_lookup.get(int(sample_id))
+            if label is not None:
+                selected_rows.append(row)
+                selected_labels.append(label)
+        if not selected_rows:
+            return None, None
+
+        pixels = _batch_tensor(batch, "pixels", self.device)
+        valid_pixels = _batch_tensor(batch, "valid_pixels", self.device)
+        positions = _batch_tensor(batch, "positions", self.device)
+        extra = _batch_tensor(batch, "extra", self.device)
+        time_mask = _batch_tensor(batch, "time_mask", self.device)
+        if pixels is None or valid_pixels is None or positions is None:
+            raise ValueError("target batch must contain pixels, valid_pixels and positions")
+        with torch.no_grad():
+            backbone = self.student.forward_backbone(
+                pixels,
+                valid_pixels,
+                positions,
+                extra,
+                time_mask=time_mask,
+            )
+            trend, structure = self.student._trend_and_structure(backbone)
+            trend = trend.detach()
+            structure = structure.detach()
+            native_positions = backbone.normalized_positions.detach()
+            mask = backbone.time_mask.detach()
+        amp_dtype = getattr(torch, self.config.amp_dtype)
+        amp_on = self.config.amp_enabled and (
+            self.device.type == "cuda" or amp_dtype == torch.bfloat16
+        )
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=amp_dtype,
+            enabled=amp_on,
+        ):
+            raw = self.student.temporal_module.raw_encoder(
+                trend=trend,
+                structure=structure,
+                positions=native_positions,
+                mask=mask,
+            )
+            logits = self.student.classifier(raw.fused_repr)
+        rows = torch.tensor(selected_rows, device=self.device, dtype=torch.long)
+        labels = torch.tensor(selected_labels, device=self.device, dtype=torch.long)
+        return logits.index_select(0, rows), labels
 
     def _set_student_training_modes(self) -> None:
         """Train only the Stage-2 task path while frozen geometry stays deterministic."""
@@ -949,27 +1058,31 @@ class Stage2Trainer:
         self.student.temporal_module.trend_geometry.eval()
         self.student.temporal_module.structure_geometry.eval()
 
-    def train_step(self, batch: dict) -> dict[str, float]:
+    def train_step(
+        self,
+        source_batch: dict,
+        target_batch: dict | None = None,
+    ) -> dict[str, float]:
         if self.statistics is None:
             raise RuntimeError("Stage-2 statistics must be initialized before training")
         if not _adaptation_available(self.statistics):
             raise RuntimeError(
-                "Stage-2 optimizer step is forbidden without confirmed structural adaptation evidence"
+                "Stage-2 optimizer step is forbidden without confirmed adaptation evidence"
             )
         self._set_student_training_modes()
         self.optimizer.zero_grad(set_to_none=True)
         (
-            source_logits,
-            source_fused,
+            _source_logits,
+            _source_fused,
             source_labels,
             trend,
             structure,
             positions,
             mask,
             structure_geometry,
-        ) = self._source_forward(batch)
-        synthetic = self._build_synthetic_batch(
-            batch,
+        ) = self._source_forward(source_batch)
+        source_to_target = self._build_synthetic_batch(
+            source_batch,
             trend=trend,
             structure=structure,
             positions=positions,
@@ -977,51 +1090,36 @@ class Stage2Trainer:
             labels=source_labels,
             structure_geometry=structure_geometry,
         )
+        if source_to_target is None or source_to_target["labels"].numel() == 0:
+            raise RuntimeError("confirmed Stage-2 state produced no source training branch")
 
-        synthetic_logits = None
-        if synthetic is not None:
-            amp_dtype = getattr(torch, self.config.amp_dtype)
-            amp_on = self.config.amp_enabled and (
-                self.device.type == "cuda" or amp_dtype == torch.bfloat16
+        amp_dtype = getattr(torch, self.config.amp_dtype)
+        amp_on = self.config.amp_enabled and (
+            self.device.type == "cuda" or amp_dtype == torch.bfloat16
+        )
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=amp_dtype,
+            enabled=amp_on,
+        ):
+            source_raw = self.student.temporal_module.raw_encoder(
+                trend=source_to_target["trend"],
+                structure=source_to_target["structure"],
+                positions=source_to_target["positions"],
+                mask=source_to_target["mask"],
             )
-            with torch.autocast(
-                device_type=self.device.type,
-                dtype=amp_dtype,
-                enabled=amp_on,
-            ):
-                synthetic_raw = self.student.temporal_module.raw_encoder(
-                    trend=synthetic["trend"],
-                    structure=synthetic["structure"],
-                    positions=synthetic["positions"],
-                    mask=synthetic["mask"],
-                )
-                synthetic_logits = self.student.classifier(synthetic_raw.fused_repr)
+            source_to_target_logits = self.student.classifier(source_raw.fused_repr)
 
-        shape_state = self.statistics.shape_state
+        native_target_logits = None
+        stable_target_labels = None
+        if target_batch is not None:
+            native_target_logits, stable_target_labels = self._target_forward_native(target_batch)
+
         objective_output = self.objective(
-            source_logits=source_logits,
-            source_fused_repr=source_fused,
-            source_labels=source_labels,
-            source_q=structure_geometry.srvf.detach(),
-            source_q_support=structure_geometry.support_confidence.detach(),
-            source_q_valid=structure_geometry.structure_valid.detach(),
-            source_prototype_bank=self.source_prototype_bank,
-            integration_weights=_integration_weights(self.student, self.device),
-            synthetic_logits=synthetic_logits,
-            synthetic_labels=None if synthetic is None else synthetic["labels"],
-            synthetic_q=None if synthetic is None else synthetic["q"],
-            synthetic_q_support=None if synthetic is None else synthetic["q_support"],
-            synthetic_q_valid=None if synthetic is None else synthetic["q_valid"],
-            domain_shape_state=(
-                shape_state
-                if synthetic is not None and shape_state.status is DomainShapeStatus.CONFIRMED
-                else None
-            ),
-            lambda_delta=(
-                self.config.lambda_delta
-                if synthetic is not None and shape_state.status is DomainShapeStatus.CONFIRMED
-                else None
-            ),
+            source_to_target_logits=source_to_target_logits,
+            source_labels=source_to_target["labels"],
+            native_target_logits=native_target_logits,
+            stable_target_labels=stable_target_labels,
         )
         previous_scale = float(self.scaler.get_scale())
         self.scaler.scale(objective_output.total).backward()
@@ -1033,15 +1131,16 @@ class Stage2Trainer:
             self.ema_teacher.update_after_optimizer_step(self.student)
             self.successful_optimizer_steps += 1
 
+        unresolved = sum(
+            route is None for route in self.statistics.phase_routes
+        ) if self.statistics.phase_routes else 0
         return {
             "loss": float(objective_output.total.detach().item()),
-            "source_cls": float(objective_output.source_cls.detach().item()),
-            "source_proto": float(objective_output.source_proto.detach().item()),
-            "source_consistency": float(objective_output.source_consistency.detach().item()),
-            "synthetic_cls": float(objective_output.synthetic_cls.detach().item()),
-            "synthetic_consistency": float(objective_output.synthetic_consistency.detach().item()),
+            "source_to_target": float(objective_output.source_to_target.detach().item()),
+            "native_target": float(objective_output.native_target.detach().item()),
             "source_count": float(objective_output.source_count),
-            "synthetic_count": float(objective_output.synthetic_count),
+            "target_count": float(objective_output.target_count),
+            "unresolved_phase_routes": float(unresolved),
             "optimizer_step_succeeded": float(step_succeeded),
         }
 
@@ -1049,10 +1148,19 @@ class Stage2Trainer:
         meters: dict[str, float] = {}
         steps = 0
         limit = self.config.steps_per_epoch or len(self.source_loader)
-        for batch in self.source_loader:
+        target_iterator = iter(self.target_train_loader)
+        for source_batch in self.source_loader:
             if steps >= limit:
                 break
-            metrics = self.train_step(batch)
+            try:
+                target_batch = next(target_iterator)
+            except StopIteration:
+                target_iterator = iter(self.target_train_loader)
+                try:
+                    target_batch = next(target_iterator)
+                except StopIteration as error:
+                    raise RuntimeError("target training loader produced no batches") from error
+            metrics = self.train_step(source_batch, target_batch)
             for key, value in metrics.items():
                 meters[key] = meters.get(key, 0.0) + value
             steps += 1
@@ -1062,12 +1170,12 @@ class Stage2Trainer:
         print(
             "STAGE2_TRAIN|"
             f"epoch={epoch}/{self.config.total_epochs}|steps={steps}"
-            f"|loss={averages['loss']:.4f}|source_cls={averages['source_cls']:.4f}"
-            f"|source_proto={averages['source_proto']:.4f}"
-            f"|source_cons={averages['source_consistency']:.4f}"
-            f"|synthetic_cls={averages['synthetic_cls']:.4f}"
-            f"|synthetic_cons={averages['synthetic_consistency']:.4f}"
-            f"|synthetic_count={averages['synthetic_count']:.2f}"
+            f"|loss={averages['loss']:.4f}"
+            f"|source_to_target={averages['source_to_target']:.4f}"
+            f"|native_target={averages['native_target']:.4f}"
+            f"|source_count={averages['source_count']:.2f}"
+            f"|target_count={averages['target_count']:.2f}"
+            f"|unresolved_routes={averages['unresolved_phase_routes']:.2f}"
             f"|optimizer_step_success={averages['optimizer_step_succeeded']:.2f}"
         )
         if self.writer is not None:
@@ -1318,18 +1426,20 @@ class Stage2Trainer:
         elif shape_state.status is not DomainShapeStatus.CONFIRMED:
             payload["synthesis"] = {"available": False, "reason": "shape_not_confirmed"}
         else:
-            confirmed_source_classes: set[int]
-            if phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED:
-                confirmed_source_classes = set(range(int(self.source_prototype_bank.ready.numel())))
-            else:
-                confirmed_source_classes = {
-                    int(class_id)
-                    for group in phase_state.groups
-                    if group.status is PhaseGroupStatus.CONFIRMED
-                    for class_id in group.member_classes
-                }
+            source_training_classes = {
+                int(class_id)
+                for class_id in torch.nonzero(
+                    self.source_prototype_bank.ready.detach().cpu(), as_tuple=False
+                ).flatten().tolist()
+            }
+            groups = _confirmed_groups(phase_state)
+            routes = self.statistics.phase_routes or _derive_phase_routes(
+                phase_state,
+                self.statistics.stable_labels,
+                int(self.source_prototype_bank.ready.numel()),
+            )
 
-            counts = {class_id: 0 for class_id in sorted(confirmed_source_classes)}
+            counts = {class_id: 0 for class_id in sorted(source_training_classes)}
             rows: list[dict] = []
             examples_for_tensor: dict[int, dict] = {}
             previous_mode = self.student.training
@@ -1360,6 +1470,8 @@ class Stage2Trainer:
                                 or counts[class_id] + pending_counts[class_id] >= samples_per_class
                         ):
                             continue
+                        route = routes[class_id] if class_id < len(routes) else None
+                        phase_group = None if route is None else groups.get(int(route))
                         example = build_synthetic_source_example(
                             source_sample_id=sample_ids[row_index],
                             class_id=class_id,
@@ -1372,6 +1484,8 @@ class Stage2Trainer:
                             domain_shape_state=shape_state,
                             decomposition=self.student.backbone.decomposition,
                             lambda_delta=self.config.lambda_delta,
+                            phase_group=phase_group,
+                            allow_no_phase_route=True,
                         )
                         if example is not None:
                             pending.append((row_index, example))
@@ -1472,7 +1586,10 @@ class Stage2Trainer:
                 "available": True,
                 "requested_samples_per_class": int(samples_per_class),
                 "max_batches": int(max_batches),
-                "confirmed_source_classes": sorted(confirmed_source_classes),
+                "source_training_classes": sorted(source_training_classes),
+                "phase_routes": [
+                    None if route is None else int(route) for route in routes
+                ],
                 "sample_counts": {str(key): value for key, value in counts.items()},
                 "generated": generated,
                 "all_finite": bool(rows) and all(row["finite"] for row in rows),
@@ -1617,13 +1734,27 @@ class Stage2Trainer:
         if self.statistics is None:
             return None
         phase_state = self.statistics.phase_state
-        class_to_group = build_confirmed_class_to_group_map(phase_state)
-        if not class_to_group:
+        groups = _confirmed_groups(phase_state)
+        routes = self.statistics.phase_routes or _derive_phase_routes(
+            phase_state,
+            self.statistics.stable_labels,
+            int(self.source_prototype_bank.ready.numel()),
+        )
+        identity_confirmed = (
+            phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED
+        )
+        if not identity_confirmed and not groups:
             torch.save(
                 {"epoch": epoch, "class_centers": {}},
                 os.path.join(self.output_dir, f"oracle_target_shape_{epoch:03d}.pt"),
             )
             return None
+        ready_classes = tuple(
+            int(class_id)
+            for class_id in torch.nonzero(
+                self.source_prototype_bank.ready.detach().cpu(), as_tuple=False
+            ).flatten().tolist()
+        )
         teacher = self.ema_teacher.model()
         sums: dict[int, Tensor] = {}
         support_sums: dict[int, Tensor] = {}
@@ -1643,13 +1774,23 @@ class Stage2Trainer:
             batch_ids = batch_ids.detach().to(device="cpu", dtype=torch.long)
             fallback_index += batch_size
             rows_by_group: dict[int, list[int]] = {}
-            groups = {}
+            group_specs: dict[int, tuple[Tensor, tuple[int, ...]]] = {}
             for row, class_id_value in enumerate(labels.tolist()):
-                group = class_to_group.get(int(class_id_value))
+                class_id = int(class_id_value)
+                if identity_confirmed:
+                    group_id = IDENTITY_PHASE_GROUP_ID
+                    rows_by_group.setdefault(group_id, []).append(row)
+                    group_specs[group_id] = (
+                        torch.tensor([0.0, 1.0], dtype=torch.float64),
+                        ready_classes,
+                    )
+                    continue
+                route = routes[class_id] if class_id < len(routes) else None
+                group = None if route is None else groups.get(int(route))
                 if group is None:
                     continue
                 rows_by_group.setdefault(group.group_id, []).append(row)
-                groups[group.group_id] = group
+                group_specs[group.group_id] = (group.center_gamma, group.member_classes)
             for group_id, rows in rows_by_group.items():
                 subset = {}
                 for key, value in batch.items():
@@ -1660,11 +1801,14 @@ class Stage2Trainer:
                 sample_ids = torch.tensor(
                     [int(batch_ids[row].item()) for row in rows], dtype=torch.long
                 )
-                view = build_confirmed_phase_view(
+                center_gamma, member_classes = group_specs[group_id]
+                view = build_phase_calibrated_view(
                     model=teacher,
                     batch=subset,
                     sample_ids=sample_ids,
-                    group=groups[group_id],
+                    group_id=group_id,
+                    member_classes=member_classes,
+                    center_gamma=center_gamma,
                 )
                 subset_labels = labels[rows]
                 for local_index, class_id_value in enumerate(subset_labels.tolist()):
@@ -1734,6 +1878,7 @@ class Stage2Trainer:
                 else _target_hypothesis_payload(self.hypothesis_cache.result)
             ),
             "stable_label_state": _stable_label_payload(self.statistics.stable_labels),
+            "phase_routes": tuple(self.statistics.phase_routes),
             "runtime_config": self.runtime_config,
             "stage2_config": {
                 key: value
@@ -1793,7 +1938,7 @@ def run_stage2_training(
         if decision is PhaseDecisionStatus.UNCONFIRMED:
             reason = "phase_unconfirmed"
         else:
-            reason = "identity_phase_without_confirmed_shape"
+            reason = "confirmed_phase_without_actionable_target_or_shape_evidence"
         print(
             "STAGE2_ABSTAIN|"
             f"reason={reason}|phase_decision={decision.value}"
@@ -1822,6 +1967,13 @@ def run_stage2_training(
     formal_diagnostic_epochs = {20, 40, 60}
 
     for epoch in range(1, total_epochs + 1):
+        if epoch > 1:
+            block_refresh = (epoch - 1) % block_epochs == 0
+            if block_refresh:
+                trainer.refresh_source_features()
+            trainer.refresh_stable_labels()
+            if block_refresh:
+                trainer.refresh_domain_shape()
         trainer.train_epoch(epoch)
         teacher = trainer.ema_teacher.model()
         val_metrics = evaluate_target_val(teacher, epoch)
@@ -1847,7 +1999,6 @@ def run_stage2_training(
             )
             final_test = evaluate_target_test(teacher, epoch)
         trainer.write_shape_diagnostics(epoch)
-        trainer.refresh_source_features_and_statistics()
         if epoch == total_epochs:
             trainer.write_shape_diagnostics(epoch, suffix="final")
 

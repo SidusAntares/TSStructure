@@ -7,7 +7,11 @@ import pytest
 import torch
 
 from methods.structure_da.confirmed_phase_view import ConfirmedPhaseView
-from methods.structure_da.domain_phase_state import PhaseGroupStatus
+from methods.structure_da.domain_phase_state import (
+    DomainPhaseState,
+    PhaseDecisionStatus,
+    PhaseGroupStatus,
+)
 from methods.structure_da.prototype_bank import SourcePrototypeBank
 from methods.structure_da.target_hypothesis_scan import (
     TargetClassPhaseHypothesis,
@@ -331,7 +335,11 @@ def test_confirmed_phase_scan_no_longer_requires_individual_dp_hypotheses(monkey
     result = module.scan_stable_target_labels_from_confirmed_phase(
         ema_teacher=ema,
         target_loader=loader,
-        phase_state=_state(group),
+        phase_state=replace(
+            _state(group),
+            decision_status=PhaseDecisionStatus.NONIDENTITY_CONFIRMED,
+            decision_stability_age=2,
+        ),
         source_prototype_bank=_bank(),
         config=_config(),
         sample_ids=(20,),
@@ -341,6 +349,102 @@ def test_confirmed_phase_scan_no_longer_requires_individual_dp_hypotheses(monkey
     assert result.num_samples == 1
     assert [(item.sample_id, item.class_id) for item in result.stable_labels] == [(20, 1)]
     assert result.num_candidate_views == 1
+
+
+def test_confirmed_phase_scan_tests_nonmember_classes_after_group_confirmation(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+
+    calls = []
+
+    def builder(*, model, batch, sample_ids, group):
+        calls.append((group.group_id, tuple(int(v) for v in sample_ids.tolist())))
+        # Class 0 did not found this group, but the confirmed domain Phase must
+        # still be available as a hypothesis for class 0.
+        return _view(
+            sample_ids=tuple(int(v) for v in sample_ids.tolist()),
+            group_id=group.group_id,
+            member_classes=group.member_classes,
+            winning_class=0,
+        )
+
+    monkeypatch.setattr(module, "build_confirmed_phase_view", builder)
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    group = _group(0, (1, 2), PhaseGroupStatus.CONFIRMED)
+    result = module.scan_stable_target_labels_from_confirmed_phase(
+        ema_teacher=ema,
+        target_loader=[
+            {
+                "index": torch.tensor([20]),
+                "pixels": torch.zeros(1, 5, 2, 4),
+                "valid_pixels": torch.ones(1, 5, 4, dtype=torch.bool),
+                "positions": torch.linspace(0.0, 365.0, 5),
+                "label": torch.tensor([2]),
+            }
+        ],
+        phase_state=replace(
+            _state(group),
+            decision_status=PhaseDecisionStatus.NONIDENTITY_CONFIRMED,
+            decision_stability_age=2,
+        ),
+        source_prototype_bank=_bank(),
+        config=_config(),
+    )
+
+    assert calls == [(0, (20,))]
+    assert [(item.sample_id, item.class_id, item.group_id) for item in result.stable_labels] == [
+        (20, 0, 0)
+    ]
+
+
+def test_confirmed_identity_phase_scans_native_target_without_group_membership(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+
+    calls = []
+
+    def builder(*, model, batch, sample_ids, group_id, member_classes, center_gamma):
+        calls.append((group_id, tuple(member_classes), center_gamma.clone()))
+        return _view(
+            sample_ids=tuple(int(v) for v in sample_ids.tolist()),
+            group_id=group_id,
+            member_classes=tuple(member_classes),
+            winning_class=2,
+        )
+
+    monkeypatch.setattr(module, "build_phase_calibrated_view", builder)
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    state = DomainPhaseState(
+        scan_index=0,
+        m=0,
+        class_centers=(),
+        valid_phase_classes=(),
+        groups=(),
+        rejected_classes=(),
+        decision_status=PhaseDecisionStatus.IDENTITY_CONFIRMED,
+        decision_stability_age=2,
+    )
+    result = module.scan_stable_target_labels_from_confirmed_phase(
+        ema_teacher=ema,
+        target_loader=[
+            {
+                "index": torch.tensor([30]),
+                "pixels": torch.zeros(1, 5, 2, 4),
+                "valid_pixels": torch.ones(1, 5, 4, dtype=torch.bool),
+                "positions": torch.linspace(0.0, 365.0, 5),
+                "label": torch.tensor([0]),
+            }
+        ],
+        phase_state=state,
+        source_prototype_bank=_bank(),
+        config=_config(),
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == -1
+    assert calls[0][1] == (0, 1, 2)
+    torch.testing.assert_close(calls[0][2], torch.tensor([0.0, 1.0], dtype=torch.float64))
+    assert [(item.sample_id, item.class_id, item.group_id) for item in result.stable_labels] == [
+        (30, 2, -1)
+    ]
 
 
 def _roundc_phase_config(**overrides):

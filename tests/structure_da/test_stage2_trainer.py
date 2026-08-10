@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +18,7 @@ from methods.structure_da import (
     PhaseHypothesisScanConfig,
     SourcePrototypeBank,
     StableLabelConfig,
+    StableTargetLabel,
     StableTargetLabelScanResult,
     Stage2EMATeacher,
     Stage2ObjectiveConfig,
@@ -38,12 +38,8 @@ from tests.structure_da.test_stage1_training_helpers import _bank, _batch, _mode
 
 def _trainer_config(**objective_overrides) -> Stage2TrainerConfig:
     objective = dict(
-        lambda_src_proto=0.1,
-        lambda_src_cons=0.1,
-        lambda_syn=1.0,
-        lambda_syn_cons=0.1,
-        tau_q=0.1,
-        fused_margin=0.1,
+        lambda_target=1.0,
+        focal_gamma=1.0,
     )
     objective.update(objective_overrides)
     return Stage2TrainerConfig(
@@ -179,6 +175,8 @@ class _FakeScheduleTrainer:
         self.train_epochs = []
         self.saved = []
         self.refresh_epochs = []
+        self.stable_refresh_epochs = []
+        self.shape_refresh_epochs = []
         self.diagnostics = []
         self.oracle_writes = []
         self.initialize_calls = 0
@@ -203,8 +201,14 @@ class _FakeScheduleTrainer:
         self.oracle_writes.append((epoch, self.oracle_variant))
         return {"ignored": self.oracle_variant}
 
-    def refresh_source_features_and_statistics(self):
+    def refresh_source_features(self):
         self.refresh_epochs.append(self.current_epoch)
+
+    def refresh_stable_labels(self):
+        self.stable_refresh_epochs.append(self.current_epoch)
+
+    def refresh_domain_shape(self):
+        self.shape_refresh_epochs.append(self.current_epoch)
 
 
 def test_exact_60_epoch_schedule_and_checkpoint_selection() -> None:
@@ -229,7 +233,9 @@ def test_exact_60_epoch_schedule_and_checkpoint_selection() -> None:
     assert trainer.train_epochs == list(range(1, 61))
     assert val_calls == list(range(1, 61))
     assert test_calls == [20, 40, 60]
-    assert trainer.refresh_epochs == [20, 40, 60]
+    assert trainer.refresh_epochs == [20, 40]
+    assert trainer.shape_refresh_epochs == [20, 40]
+    assert trainer.stable_refresh_epochs == list(range(1, 60))
     assert [item for item in trainer.saved if item[0].startswith("stage2_ema_")] == [
         ("stage2_ema_020.pt", 20),
         ("stage2_ema_040.pt", 40),
@@ -257,6 +263,8 @@ def test_target_test_and_oracle_outputs_cannot_change_training_trajectory() -> N
     second, second_result = run([0.9, 0.1, 0.8], 999)
     assert first.train_epochs == second.train_epochs
     assert first.refresh_epochs == second.refresh_epochs
+    assert first.stable_refresh_epochs == second.stable_refresh_epochs
+    assert first.shape_refresh_epochs == second.shape_refresh_epochs
     assert first.saved == second.saved
     assert first_result.best_target_val_epoch == second_result.best_target_val_epoch == 60
     # Oracle target labels are no longer scanned automatically during training.
@@ -339,7 +347,7 @@ def _real_trainer(shape_status: DomainShapeStatus) -> Stage2Trainer:
 def test_unconfirmed_phase_forbids_source_only_stage2_optimizer_step() -> None:
     trainer = _real_trainer(DomainShapeStatus.UNAVAILABLE)
     before = {name: p.detach().clone() for name, p in trainer.student.named_parameters()}
-    with pytest.raises(RuntimeError, match="forbidden without confirmed structural adaptation evidence"):
+    with pytest.raises(RuntimeError, match="forbidden without confirmed adaptation evidence"):
         trainer.train_step(_batch())
     for name, parameter in trainer.student.named_parameters():
         torch.testing.assert_close(parameter.detach(), before[name])
@@ -354,59 +362,15 @@ def test_confirmed_phase_without_shape_generates_phase_only_source() -> None:
         shape_state=_shape_state(DomainShapeStatus.REJECTED),
     )
     metrics = trainer.train_step(_batch())
-    assert metrics["synthetic_count"] == pytest.approx(6.0)
-    assert metrics["synthetic_cls"] >= 0.0
+    assert metrics["source_count"] == pytest.approx(6.0)
+    assert metrics["source_to_target"] >= 0.0
 
 
 def test_confirmed_phase_and_shape_runs_round6_synthesis_path() -> None:
     trainer = _real_trainer(DomainShapeStatus.CONFIRMED)
     metrics = trainer.train_step(_batch())
-    assert metrics["synthetic_count"] == pytest.approx(6.0)
-    assert metrics["synthetic_cls"] >= 0.0
-    assert metrics["synthetic_consistency"] >= 0.0
-
-
-
-
-def test_single_confirmed_group_is_usable_by_nonmember_source_classes() -> None:
-    trainer = _real_trainer(DomainShapeStatus.REJECTED)
-    phase = trainer.statistics.phase_state
-    group = replace(phase.groups[0], member_classes=(0, 1), class_count=2)
-    trainer.statistics = replace(
-        trainer.statistics,
-        phase_state=replace(
-            phase,
-            groups=(group,),
-            valid_phase_classes=(0, 1),
-        ),
-    )
-    metrics = trainer.train_step(_batch())
-    # The batch contains all three source classes.  Class 2 did not found the
-    # group, but the sole confirmed domain-level Phase is still applied to it.
-    assert metrics["synthetic_count"] == pytest.approx(6.0)
-
-
-def test_multiple_groups_allow_nonmember_usage_from_stable_assignment() -> None:
-    import methods.structure_da.stage2_trainer as module
-
-    phase = _phase_state(confirmed=True)
-    base = phase.groups[0]
-    group0 = replace(base, group_id=0, member_classes=(0, 1), class_count=2)
-    group1 = replace(
-        base,
-        group_id=1,
-        member_classes=(2, 3),
-        class_count=2,
-        center_gamma=base.center_gamma.pow(1.1),
-    )
-    snapshot = SimpleNamespace(
-        phase_state=replace(phase, m=2, groups=(group0, group1)),
-        stable_labels=SimpleNamespace(
-            stable_labels=(SimpleNamespace(class_id=4, group_id=1),)
-        ),
-    )
-    groups = module._synthetic_phase_groups_for_class(snapshot, 4)
-    assert tuple(group.group_id for group in groups) == (1,)
+    assert metrics["source_count"] == pytest.approx(6.0)
+    assert metrics["source_to_target"] >= 0.0
 
 
 def test_source_fused_refresh_preserves_all_geometry_fields() -> None:
@@ -515,7 +479,32 @@ def test_oracle_target_labels_are_write_only(tmp_path) -> None:
     )
 
 
-def test_phase_dp_stops_when_domain_phase_confirms_and_shape_uses_direct_evidence(monkeypatch) -> None:
+def test_stable_label_refresh_uses_full_target_loader_not_phase_dp_subset(monkeypatch) -> None:
+    import methods.structure_da.stage2_trainer as module
+
+    trainer = object.__new__(Stage2Trainer)
+    trainer.ema_teacher = SimpleNamespace(model=lambda: object())
+    trainer.target_statistics_loader = object()
+    trainer.target_stable_label_loader = object()
+    trainer.source_prototype_bank = _bank()
+    trainer.config = SimpleNamespace(stable_labels=object())
+    trainer.stable_label_refresh_count = 0
+    observed = []
+
+    def fake_scan(**kwargs):
+        observed.append(kwargs["target_loader"])
+        return _empty_stable()
+
+    monkeypatch.setattr(module, "scan_stable_target_labels_from_confirmed_phase", fake_scan)
+    result = Stage2Trainer._stable_from_fixed_phase(trainer, _phase_state(confirmed=True))
+
+    assert result.num_stable_labels == 0
+    assert observed == [trainer.target_stable_label_loader]
+    assert observed[0] is not trainer.target_statistics_loader
+    assert trainer.stable_label_refresh_count == 1
+
+
+def test_phase_calibration_finishes_before_single_initial_label_and_shape_refresh(monkeypatch) -> None:
     import methods.structure_da.stage2_trainer as module
 
     class FakeScanner:
@@ -554,9 +543,11 @@ def test_phase_dp_stops_when_domain_phase_confirms_and_shape_uses_direct_evidenc
         phase=object(),
     )
     trainer.source_geometry_version = 0
+    trainer.source_prototype_bank = _bank()
     trainer.phase_evidence_stages = 0
     trainer.hypothesis_scan_count = 1
     trainer.shape_evidence_stages = 0
+    trainer.stable_label_refresh_count = 0
     trainer.shape_evidence_sample_ids = ()
     trainer.hypothesis_cache = None
     trainer.statistics = None
@@ -570,17 +561,18 @@ def test_phase_dp_stops_when_domain_phase_confirms_and_shape_uses_direct_evidenc
 
     monkeypatch.setattr(module, "update_domain_phase_state", fake_phase)
 
-    shape_budgets = []
+    label_refreshes = []
 
-    def fake_stable_shape(phase_state, previous_shape, *, sample_ids):
+    def fake_stable(phase_state):
         assert _confirmed_phase_exists_for_test(phase_state)
-        shape_budgets.append(len(sample_ids))
-        stable = StableTargetLabelScanResult(
+        label_refreshes.append(phase_state.scan_index)
+        trainer.stable_label_refresh_count += 1
+        return StableTargetLabelScanResult(
             candidates=(),
             stable_labels=(),
-            num_samples=len(sample_ids),
+            num_samples=2048,
             num_without_confirmed_phase=0,
-            num_candidate_views=len(sample_ids),
+            num_candidate_views=2048,
             num_classifier_pass=0,
             num_fused_pass=0,
             num_q_pass=0,
@@ -588,27 +580,24 @@ def test_phase_dp_stops_when_domain_phase_confirms_and_shape_uses_direct_evidenc
             num_ambiguous_rejected=0,
             stable_class_counts=(0, 0, 0),
         )
-        status = (
-            DomainShapeStatus.CONFIRMED
-            if len(shape_budgets) >= 2
-            else DomainShapeStatus.PROVISIONAL
-        )
-        return stable, _shape_state(status)
 
-    trainer._stable_and_shape_from_fixed_phase = fake_stable_shape
+    def fake_shape(stable_result, previous_shape):
+        trainer.shape_evidence_stages += 1
+        return _shape_state(DomainShapeStatus.PROVISIONAL)
+
+    trainer._stable_from_fixed_phase = fake_stable
+    trainer._shape_from_stable = fake_shape
     snapshot = Stage2Trainer.initialize_statistics(trainer)
 
-    # Round B never treats the first confirmed group as proof that the whole
-    # domain-level model order is complete; all configured nested budgets are
-    # scanned so later evidence can reveal M=2.
+    # Domain Phase model order is settled from all configured nested evidence
+    # budgets before adaptation begins; it is not refreshed during training.
     assert scanner.scan_budgets == [64, 128, 256, 512]
     assert phase_calls == [64, 128, 256, 512]
-    # Shape confirmation starts only after the final Phase evidence state and
-    # consumes confirmed-phase views without additional DP.
-    assert shape_budgets == [64, 128]
-    assert snapshot.shape_state.status is DomainShapeStatus.CONFIRMED
-    assert trainer.shape_evidence_sample_ids == tuple(range(128))
-
+    # Stable Label and Domain Shape initialize once from the final fixed Phase.
+    assert len(label_refreshes) == 1
+    assert snapshot.shape_state.status is DomainShapeStatus.PROVISIONAL
+    # Stable-Label/Shape evidence is no longer tied to the 512-sample DP budget.
+    assert trainer.shape_evidence_sample_ids == ()
 
 def _confirmed_phase_exists_for_test(state: DomainPhaseState) -> bool:
     return any(group.status is PhaseGroupStatus.CONFIRMED for group in state.groups)
@@ -703,7 +692,7 @@ def test_identity_confirmed_and_shape_confirmed_runs_shape_only_synthesis() -> N
         shape_state=_shape_state(DomainShapeStatus.CONFIRMED, torch.zeros(5, 4)),
     )
     metrics = trainer.train_step(_batch())
-    assert metrics["synthetic_count"] == pytest.approx(6.0)
+    assert metrics["source_count"] == pytest.approx(6.0)
     assert metrics["optimizer_step_succeeded"] == 1.0
 
 
@@ -779,5 +768,131 @@ def test_identity_confirmed_without_shape_also_abstains() -> None:
     )
     assert trainer.train_epochs == []
     assert result.adaptation_performed is False
-    assert result.abstain_reason == "identity_phase_without_confirmed_shape"
+    assert result.abstain_reason == "confirmed_phase_without_actionable_target_or_shape_evidence"
     assert result.final_diagnostic_target_test["epoch"] == 0
+
+
+
+def _stable_result_with_labels(labels: list[tuple[int, int, int, float]]) -> StableTargetLabelScanResult:
+    items = tuple(
+        StableTargetLabel(
+            sample_id=sample_id,
+            class_id=class_id,
+            group_id=group_id,
+            aligned_q_shape=torch.zeros(5, 4),
+            aligned_q_support=torch.ones(5),
+            fused_repr=torch.zeros(8),
+            confidence_summary=confidence,
+        )
+        for sample_id, class_id, group_id, confidence in labels
+    )
+    counts = [0, 0, 0]
+    for item in items:
+        counts[item.class_id] += 1
+    return StableTargetLabelScanResult(
+        candidates=(),
+        stable_labels=items,
+        num_samples=6,
+        num_without_confirmed_phase=0,
+        num_candidate_views=len(items),
+        num_classifier_pass=len(items),
+        num_fused_pass=len(items),
+        num_q_pass=len(items),
+        num_stable_labels=len(items),
+        num_ambiguous_rejected=0,
+        stable_class_counts=tuple(counts),
+    )
+
+
+def test_student_native_target_uses_stable_labels_not_dataset_truth() -> None:
+    trainer = _real_trainer(DomainShapeStatus.REJECTED)
+    stable = _stable_result_with_labels([(0, 2, 0, 0.9), (3, 1, 0, 0.8)])
+    trainer.statistics = Stage2StatisticsSnapshot(
+        phase_state=_phase_state(confirmed=True),
+        stable_labels=stable,
+        shape_state=_shape_state(DomainShapeStatus.REJECTED),
+        phase_routes=(0, 0, 0),
+    )
+    batch = _batch()
+    batch["index"] = torch.arange(6)
+    batch["label"] = torch.zeros(6, dtype=torch.long)  # oracle labels must be ignored
+    logits, labels = trainer._target_forward_native(batch)
+    assert logits is not None and logits.shape[0] == 2
+    assert labels is not None
+    assert labels.tolist() == [2, 1]
+
+
+def _m2_phase_state() -> DomainPhaseState:
+    grid = torch.linspace(0.0, 1.0, 5)
+    group0 = PhaseGroup(
+        group_id=0,
+        member_classes=(0,),
+        center_gamma=grid.square(),
+        within_dispersion=0.0,
+        diameter=0.0,
+        core_radius=0.0,
+        sample_evidence_count=4.0,
+        class_count=1,
+        center_drift=0.0,
+        status=PhaseGroupStatus.CONFIRMED,
+        confirmation_age=2,
+    )
+    group1 = PhaseGroup(
+        group_id=1,
+        member_classes=(1,),
+        center_gamma=torch.sqrt(grid),
+        within_dispersion=0.0,
+        diameter=0.0,
+        core_radius=0.0,
+        sample_evidence_count=4.0,
+        class_count=1,
+        center_drift=0.0,
+        status=PhaseGroupStatus.CONFIRMED,
+        confirmation_age=2,
+    )
+    return DomainPhaseState(
+        scan_index=1,
+        m=2,
+        class_centers=(),
+        valid_phase_classes=(0, 1),
+        groups=(group0, group1),
+        rejected_classes=(2,),
+        decision_status=PhaseDecisionStatus.NONIDENTITY_CONFIRMED,
+        decision_stability_age=2,
+    )
+
+
+def test_m1_confirmed_phase_routes_all_classes_not_only_founding_members() -> None:
+    from methods.structure_da.stage2_trainer import _derive_phase_routes
+
+    phase = _phase_state(confirmed=True)
+    # Pretend only class 0 founded the group; M=1 must still serve every class.
+    group = phase.groups[0]
+    phase = DomainPhaseState(
+        **{
+            **phase.__dict__,
+            "groups": (PhaseGroup(**{**group.__dict__, "member_classes": (0,)}),),
+        }
+    )
+    assert _derive_phase_routes(phase, _empty_stable(), 3) == (0, 0, 0)
+
+
+def test_m2_nonfounding_class_routes_from_stable_group_evidence() -> None:
+    from methods.structure_da.stage2_trainer import _derive_phase_routes
+
+    stable = _stable_result_with_labels([
+        (0, 2, 1, 0.9),
+        (1, 2, 1, 0.8),
+        (2, 2, 0, 0.2),
+    ])
+    assert _derive_phase_routes(_m2_phase_state(), stable, 3) == (0, 1, 1)
+
+
+def test_m2_ambiguous_nonfounding_class_remains_unrouted() -> None:
+    from methods.structure_da.stage2_trainer import _derive_phase_routes
+
+    stable = _stable_result_with_labels([
+        (0, 2, 0, 0.8),
+        (1, 2, 1, 0.8),
+    ])
+    assert _derive_phase_routes(_m2_phase_state(), stable, 3) == (0, 1, None)

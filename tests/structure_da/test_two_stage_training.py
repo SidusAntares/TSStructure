@@ -6,91 +6,73 @@ from pathlib import Path
 import pytest
 import torch
 
-from methods.structure_da import (
-    DomainShapeStatus,
-    Stage2Objective,
-    Stage2ObjectiveConfig,
-)
-from tests.structure_da.test_stage2_objective import _bank, _source, _weights
+from methods.structure_da import Stage2Objective, Stage2ObjectiveConfig
 
 
-def test_phase_only_stage2_objective_does_not_require_fake_confirmed_delta() -> None:
-    source_logits, source_fused, labels, q, support, valid = _source()
-    synthetic_logits = torch.randn(3, 3, requires_grad=True)
+def test_stage2_objective_is_timematch_style_two_branch_loss() -> None:
     objective = Stage2Objective(
         num_classes=3,
-        config=Stage2ObjectiveConfig(
-            lambda_src_proto=0.0,
-            lambda_src_cons=0.0,
-            lambda_syn=1.0,
-            lambda_syn_cons=0.1,
-            tau_q=0.1,
-            fused_margin=0.1,
-        ),
+        config=Stage2ObjectiveConfig(lambda_target=1.0, focal_gamma=1.0),
     )
+    source_logits = torch.randn(3, 3, requires_grad=True)
+    target_logits = torch.randn(2, 3, requires_grad=True)
     output = objective(
-        source_logits=source_logits,
-        source_fused_repr=source_fused,
-        source_labels=labels,
-        source_q=q,
-        source_q_support=support,
-        source_q_valid=valid,
-        source_prototype_bank=_bank(),
-        integration_weights=_weights(),
-        synthetic_logits=synthetic_logits,
-        synthetic_labels=labels,
-        synthetic_q=q.detach(),
-        synthetic_q_support=support,
-        synthetic_q_valid=valid,
-        domain_shape_state=None,
-        lambda_delta=None,
+        source_to_target_logits=source_logits,
+        source_labels=torch.tensor([0, 1, 2], dtype=torch.long),
+        native_target_logits=target_logits,
+        stable_target_labels=torch.tensor([1, 2], dtype=torch.long),
     )
     output.total.backward()
-    assert output.synthetic_count == 3
-    assert synthetic_logits.grad is not None
+    assert output.source_count == 3
+    assert output.target_count == 2
+    assert source_logits.grad is not None
+    assert target_logits.grad is not None
 
 
-def test_stage2_objective_has_no_target_label_input() -> None:
+def test_stage2_objective_accepts_stable_target_labels_but_not_geometry_losses() -> None:
     parameters = inspect.signature(Stage2Objective.forward).parameters
-    assert "target_labels" not in parameters
-    assert "stable_target_labels" not in parameters
+    assert "stable_target_labels" in parameters
+    assert "native_target_logits" in parameters
+    assert "source_prototype_bank" not in parameters
+    assert "domain_shape_state" not in parameters
+    assert "synthetic_q" not in parameters
 
 
-def test_round7_trainer_contains_no_target_ce_or_adversarial_path() -> None:
+def test_stage2_trainer_has_native_target_student_path_and_no_adversarial_path() -> None:
     import re
 
     text = Path("methods/structure_da/stage2_trainer.py").read_text(encoding="utf-8")
-
-    forbidden_patterns = (
-        r"\btarget_ce\b",
-        r"gradient reversal",
-        r"\bGRL\b",
-        r"\bDANN\b",
-    )
-
-    for pattern in forbidden_patterns:
+    for pattern in (r"gradient reversal", r"\bGRL\b", r"\bDANN\b"):
         assert re.search(pattern, text, flags=re.IGNORECASE) is None
-    assert "Stage2Objective" in text
+    assert "def _target_forward_native(" in text
+    target_api = inspect.signature(
+        __import__(
+            "methods.structure_da.stage2_trainer",
+            fromlist=["Stage2Trainer"],
+        ).Stage2Trainer._target_forward_native
+    )
+    assert "temporal_positions_override" not in target_api.parameters
+    assert "native target positions only" in text
 
 
-def test_train_wires_stage2_without_scientific_defaults() -> None:
+def test_train_wires_timematch_style_stage2_controls() -> None:
     text = Path("train.py").read_text(encoding="utf-8")
     for flag in (
         "--stage2_config",
         "--stage2_registration_lambda",
         "--stage2_phase_confirmation_patience",
         "--stage2_shape_confirmation_patience",
-        "--stage2_lambda_src_proto",
-        "--stage2_lambda_src_cons",
-        "--stage2_lambda_syn",
-        "--stage2_lambda_syn_cons",
-        "--stage2_objective_tau_q",
-        "--stage2_fused_margin",
+        "--stage2_lambda_target",
+        "--stage2_focal_gamma",
         "--stage2_ema_decay",
         "--stage2_lambda_delta",
     ):
         assert flag in text
-    assert 'default=None' in text
+    assert "create_target_stage2_train_loader" in text
+    assert "target_stable_label_loader=target_stable_label_loader" in text
+    assert "target_train_loader=target_stage2_train_loader" in text
+    assert "|stable_label_scan=" in text
+    assert "|native_student=" in text
     assert 'load_structure_da_state_dict(model, stage1_checkpoint["model_state_dict"])' in text
     assert "configure_stage2_parameter_policy(model)" in text
     assert "Stage2EMATeacher.from_student" in text

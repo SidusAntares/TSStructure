@@ -171,41 +171,6 @@ def test_g0_or_provisional_phase_cannot_create_phase_shape_example() -> None:
     assert _build(_phase_state(include_class=False)) is None
 
 
-
-
-def test_explicit_confirmed_group_can_be_used_by_nonmember_source_class() -> None:
-    phase = _phase_state(include_class=False)
-    group = phase.groups[0]
-    grid = torch.linspace(0.0, 1.0, 9)
-    velocity = torch.tensor([1.0, 0.5])
-    norm = torch.linalg.vector_norm(velocity)
-    q = (velocity / torch.sqrt(norm)).expand(9, -1).clone()
-    structure = grid[:, None] * velocity
-    example = build_synthetic_source_example(
-        source_sample_id=7,
-        class_id=0,
-        source_structure_function=structure,
-        source_q_shape=q,
-        source_q_support=torch.ones(9),
-        source_positions=torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0]),
-        mask=torch.ones(5, dtype=torch.bool),
-        phase_state=phase,
-        domain_shape_state=_shape_state(torch.zeros_like(q)),
-        decomposition=SymmetricTimeKernelDecomposition(),
-        lambda_delta=1.0,
-        phase_group=group,
-    )
-    assert example is not None
-    assert example.class_id == 0
-    assert example.group_id == group.group_id
-    expected = map_source_positions_to_target(
-        torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0]),
-        torch.ones(5, dtype=torch.bool),
-        group.center_gamma,
-    )
-    torch.testing.assert_close(example.target_style_positions, expected)
-
-
 def test_unconfirmed_domain_shape_cannot_create_synthetic_example() -> None:
     assert _build(_phase_state(), DomainShapeStatus.PROVISIONAL) is None
 
@@ -254,11 +219,11 @@ def test_identity_confirmed_shape_synthesis_changes_shape_but_not_positions() ->
     )
 
 
-def test_identity_confirmed_without_shape_has_no_phase_only_synthetic() -> None:
+def test_identity_confirmed_phase_only_source_branch_keeps_positions() -> None:
     from methods.structure_da.shape_transport import build_phase_only_synthetic_source_example
 
     positions = torch.linspace(0.0, 1.0, 5)
-    assert build_phase_only_synthetic_source_example(
+    example = build_phase_only_synthetic_source_example(
         source_sample_id=1,
         class_id=0,
         source_trend_tokens=torch.zeros(5, 2),
@@ -268,4 +233,54 @@ def test_identity_confirmed_without_shape_has_no_phase_only_synthetic() -> None:
         source_positions=positions,
         mask=torch.ones(5, dtype=torch.bool),
         phase_state=_identity_phase_state(),
-    ) is None
+    )
+    assert example is not None
+    assert example.group_id == -1
+    torch.testing.assert_close(example.target_style_positions, positions)
+
+
+def test_nonmember_can_use_explicit_confirmed_phase_group_for_synthesis() -> None:
+    from methods.structure_da.shape_transport import build_phase_only_synthetic_source_example
+
+    phase = _phase_state(include_class=False)
+    positions = torch.linspace(0.0, 1.0, 5)
+    example = build_phase_only_synthetic_source_example(
+        source_sample_id=2,
+        class_id=0,
+        source_trend_tokens=torch.zeros(5, 2),
+        source_structure_tokens=torch.zeros(5, 2),
+        source_q_shape=torch.zeros(5, 2),
+        source_q_support=torch.ones(5),
+        source_positions=positions,
+        mask=torch.ones(5, dtype=torch.bool),
+        phase_state=phase,
+        phase_group=phase.groups[0],
+    )
+    assert example is not None
+    assert example.group_id == 0
+    assert not torch.equal(example.target_style_positions, positions)
+
+
+def test_unresolved_m2_route_is_not_identity_confirmation() -> None:
+    from methods.structure_da.shape_transport import (
+        NO_CONFIRMED_PHASE_ROUTE_GROUP_ID,
+        build_phase_only_synthetic_source_example,
+    )
+
+    phase = _phase_state(include_class=False)
+    positions = torch.linspace(0.0, 1.0, 5)
+    example = build_phase_only_synthetic_source_example(
+        source_sample_id=3,
+        class_id=0,
+        source_trend_tokens=torch.zeros(5, 2),
+        source_structure_tokens=torch.zeros(5, 2),
+        source_q_shape=torch.zeros(5, 2),
+        source_q_support=torch.ones(5),
+        source_positions=positions,
+        mask=torch.ones(5, dtype=torch.bool),
+        phase_state=phase,
+        allow_no_phase_route=True,
+    )
+    assert example is not None
+    assert example.group_id == NO_CONFIRMED_PHASE_ROUTE_GROUP_ID
+    torch.testing.assert_close(example.target_style_positions, positions)

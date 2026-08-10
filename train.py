@@ -193,6 +193,55 @@ def create_target_statistics_loader(config, splits, *, max_samples: int | None =
     return loader
 
 
+def create_target_stage2_train_loader(
+    config,
+    splits,
+    *,
+    max_samples: int | None = None,
+):
+    """Target loader for Student self-training on native temporal positions.
+
+    Formal Stage-2 adaptation uses the full target-train population. ``max_samples``
+    is retained only for explicit smoke/debug runs. Dataset true labels remain
+    present in PixelSetData for diagnostics only; Stage2Trainer never reads them
+    when constructing target supervision.
+    """
+    target_transform = transforms.Compose(
+        [RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()]
+    )
+    target_dataset = PixelSetData(
+        data_root=config.data_root,
+        dataset_name=config.target,
+        classes=config.classes,
+        transform=target_transform,
+        indices=splits[config.target]["train"],
+        with_extra=False,
+        closed_set=config.closed_set,
+        combine_spring_and_winter=config.combine_spring_and_winter,
+        time_coordinate_mode=getattr(
+            config, "time_coordinate_mode", "canonical_day_of_year"
+        ),
+    )
+    total = len(target_dataset)
+    dataset = target_dataset
+    if max_samples is not None and max_samples < total:
+        dataset = Subset(
+            target_dataset, _evenly_spaced_subset_indices(total, max_samples)
+        )
+    loader = DataLoader(
+        dataset=dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        drop_last=False,
+        pin_memory=torch.cuda.is_available(),
+        worker_init_fn=worker_init_fn,
+    )
+    loader.stage2_total_target_train = total
+    loader.stage2_selected_samples = len(dataset)
+    return loader
+
+
 def _apply_stage2_config_file(config) -> None:
     path = getattr(config, "stage2_config", None)
     if not path:
@@ -240,12 +289,6 @@ def _missing_stage2_configuration(config) -> list[str]:
         "stage2_shape_center_drift_max",
         "stage2_shape_effect_norm_max",
         "stage2_shape_confirmation_patience",
-        "stage2_lambda_src_proto",
-        "stage2_lambda_src_cons",
-        "stage2_lambda_syn",
-        "stage2_lambda_syn_cons",
-        "stage2_objective_tau_q",
-        "stage2_fused_margin",
         "stage2_ema_decay",
         "stage2_lambda_delta",
     )
@@ -324,12 +367,16 @@ def build_stage2_config(config) -> Stage2TrainerConfig:
             shape_confirmation_patience=config.stage2_shape_confirmation_patience,
         ),
         objective=Stage2ObjectiveConfig(
-            lambda_src_proto=config.stage2_lambda_src_proto,
-            lambda_src_cons=config.stage2_lambda_src_cons,
-            lambda_syn=config.stage2_lambda_syn,
-            lambda_syn_cons=config.stage2_lambda_syn_cons,
-            tau_q=config.stage2_objective_tau_q,
-            fused_margin=config.stage2_fused_margin,
+            lambda_target=(
+                1.0
+                if config.stage2_lambda_target is None
+                else config.stage2_lambda_target
+            ),
+            focal_gamma=(
+                1.0
+                if config.stage2_focal_gamma is None
+                else config.stage2_focal_gamma
+            ),
         ),
         ema_decay=config.stage2_ema_decay,
         lambda_delta=config.stage2_lambda_delta,
@@ -468,6 +515,8 @@ def main(config):
             source_val_loader = None
             target_val_loader = None
             target_statistics_loader = None
+            target_stable_label_loader = None
+            target_stage2_train_loader = None
         else:
             source_val_loader, _ = create_evaluation_loaders(
                 config.source, splits, config, sample_pixels_val
@@ -476,24 +525,43 @@ def main(config):
                 target_val_loader = None
                 target_test_loader = None
                 target_statistics_loader = None
+                target_stable_label_loader = None
+                target_stage2_train_loader = None
             else:
                 assert stage2_runtime_config is not None
                 target_val_loader, target_test_loader = create_evaluation_loaders(
                     config.target, splits, config, sample_pixels_val
                 )
+                # Expensive exact-DP Phase calibration stays bounded, but once
+                # Phase is confirmed both Stable-Label refresh and Student
+                # self-training operate on the full native target-train set.
                 target_statistics_raw_loader = create_target_statistics_loader(
                     config,
                     splits,
                     max_samples=stage2_runtime_config.phase_evidence_max_samples,
                 )
+                target_stable_label_raw_loader = create_target_statistics_loader(
+                    config,
+                    splits,
+                    max_samples=None,
+                )
+                target_stage2_train_loader = create_target_stage2_train_loader(
+                    config,
+                    splits,
+                    max_samples=None,
+                )
                 print(
-                    "STAGE2_STATISTICS_SUBSET|"
+                    "STAGE2_TARGET_POPULATION|"
                     f"total={target_statistics_raw_loader.stage2_total_target_train}"
-                    f"|selected={target_statistics_raw_loader.stage2_selected_samples}"
-                    "|strategy=evenly_spaced_full_target_train"
+                    f"|phase_calibration={target_statistics_raw_loader.stage2_selected_samples}"
+                    f"|stable_label_scan={target_stable_label_raw_loader.stage2_selected_samples}"
+                    f"|native_student={target_stage2_train_loader.stage2_selected_samples}"
                 )
                 target_statistics_loader = DeviceBatchLoader(
                     target_statistics_raw_loader, device
+                )
+                target_stable_label_loader = DeviceBatchLoader(
+                    target_stable_label_raw_loader, device
                 )
 
         source_loader = None
@@ -579,6 +647,8 @@ def main(config):
         assert source_val_loader is not None
         if not getattr(config, "stage1_only", False):
             assert target_statistics_loader is not None
+            assert target_stable_label_loader is not None
+            assert target_stage2_train_loader is not None
             assert target_val_loader is not None
             assert stage2_runtime_config is not None
 
@@ -691,6 +761,8 @@ def main(config):
             source_loader=source_loader,
             source_scan_loader=source_scan_loader,
             target_statistics_loader=target_statistics_loader,
+            target_stable_label_loader=target_stable_label_loader,
+            target_train_loader=target_stage2_train_loader,
             source_prototype_bank=source_bank,
             source_registration_bank=source_registration_bank,
             reg_extractor=reg_extractor,
@@ -1525,6 +1597,18 @@ if __name__ == '__main__':
     parser.add_argument('--stage2_shape_effect_norm_max', default=None, type=float)
     parser.add_argument('--stage2_shape_confirmation_patience', default=None, type=int)
 
+    parser.add_argument(
+        '--stage2_lambda_target', default=None, type=float,
+        help='weight of Stable-Labeled native-target Focal loss (default: 1.0)',
+    )
+    parser.add_argument(
+        '--stage2_focal_gamma', default=None, type=float,
+        help='Focal-Loss gamma for both TimeMatch-style Stage-2 branches (default: 1.0)',
+    )
+
+    # Legacy Round-7 objective knobs are still accepted in old JSON/CLI files
+    # for configuration compatibility, but the TimeMatch-style Stage-2
+    # objective no longer consumes them.
     parser.add_argument('--stage2_lambda_src_proto', default=None, type=float)
     parser.add_argument('--stage2_lambda_src_cons', default=None, type=float)
     parser.add_argument('--stage2_lambda_syn', default=None, type=float)
