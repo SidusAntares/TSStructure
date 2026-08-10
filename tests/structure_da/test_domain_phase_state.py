@@ -106,14 +106,17 @@ def test_three_close_class_centers_form_m1_before_considering_m2() -> None:
     assert state.rejected_classes == ()
 
 
-def test_m1_rejects_one_obvious_outlier_to_g0() -> None:
+def test_reliable_singleton_outlier_cannot_be_silently_dropped_from_m1() -> None:
     state = _update(
         [(0, 0.98), (1, 1.0), (2, 1.02), (3, 2.4)],
         config=_config(phase_group_diameter_max=0.18),
     )
-    assert state.m == 1
-    assert state.groups[0].member_classes == (0, 1, 2)
-    assert state.rejected_classes == (3,)
+    # Class 3 is itself class-level reliable.  M=1 therefore cannot silently
+    # discard it, while M=2 is invalid because the second group would contain
+    # only one class.  The finite-group Domain Phase remains unconfirmed.
+    assert state.m == 0
+    assert state.groups == ()
+    assert state.rejected_classes == (0, 1, 2, 3)
 
 
 def test_four_close_classes_remain_m1_when_m2_separation_is_not_supported() -> None:
@@ -128,7 +131,7 @@ def test_four_close_classes_remain_m1_when_m2_separation_is_not_supported() -> N
     assert state.groups[0].member_classes == (0, 1, 2, 3)
 
 
-def test_two_supported_separated_groups_are_not_hidden_by_feasible_m1() -> None:
+def test_feasible_m1_is_preferred_over_more_complex_m2() -> None:
     state = _update(
         [(0, 0.55), (1, 0.57), (2, 1.75), (3, 1.80)],
         config=_config(
@@ -137,8 +140,10 @@ def test_two_supported_separated_groups_are_not_hidden_by_feasible_m1() -> None:
             phase_group_core_separation=0.15,
         ),
     )
-    assert state.m == 2
-    assert [group.member_classes for group in state.groups] == [(0, 1), (2, 3)]
+    # Frozen model-selection order is M=1 first; M=2 is a refinement only
+    # after the single-center model violates its predeclared geometry bounds.
+    assert state.m == 1
+    assert state.groups[0].member_classes == (0, 1, 2, 3)
 
 
 def test_two_clear_clusters_form_deterministically_ordered_m2_when_m1_fails() -> None:
@@ -153,6 +158,53 @@ def test_two_clear_clusters_form_deterministically_ordered_m2_when_m1_fails() ->
     assert state.m == 2
     assert [group.group_id for group in state.groups] == [0, 1]
     assert [group.member_classes for group in state.groups] == [(0, 1), (2, 3)]
+
+
+def test_m2_allows_identity_like_and_nonidentity_groups_to_coexist() -> None:
+    state = _update(
+        [(0, 0.99), (1, 1.01), (2, 1.75), (3, 1.80)],
+        config=_config(
+            phase_group_diameter_max=0.12,
+            phase_group_dispersion_max=0.01,
+            phase_group_core_separation=0.20,
+        ),
+    )
+    assert state.m == 2
+    assert [group.member_classes for group in state.groups] == [(0, 1), (2, 3)]
+
+
+def test_m2_group_ids_are_matched_by_center_geometry_not_cluster_number() -> None:
+    from dataclasses import replace
+    from methods.structure_da.domain_phase_state import PhaseGroupStatus
+
+    config = _config(
+        phase_group_diameter_max=0.12,
+        phase_group_dispersion_max=0.01,
+        phase_group_core_separation=0.20,
+        phase_center_drift_max=0.08,
+    )
+    first = _update([(0, 0.55), (1, 0.57), (2, 1.75), (3, 1.80)], config=config)
+    assert first.m == 2
+    # Simulate a previous-stage numbering permutation.  The next global re-fit
+    # must align by center geometry and preserve the longitudinal IDs.
+    previous = replace(
+        first,
+        groups=(
+            replace(first.groups[1], group_id=0),
+            replace(first.groups[0], group_id=1),
+        ),
+    )
+    current = _update(
+        [(0, 0.55), (1, 0.57), (2, 1.75), (3, 1.80)],
+        config=config,
+        previous_state=previous,
+    )
+    assert current.groups[0].group_id == 0
+    assert current.groups[0].member_classes == (2, 3)
+    assert current.groups[1].group_id == 1
+    assert current.groups[1].member_classes == (0, 1)
+    assert all(group.center_drift is not None for group in current.groups)
+    assert all(group.status is PhaseGroupStatus.CONFIRMED for group in current.groups)
 
 
 def test_three_classes_or_a_single_outlier_cannot_force_m2() -> None:
@@ -185,7 +237,7 @@ def test_failed_constraints_return_m0_without_fake_identity_group() -> None:
     assert state.rejected_classes == (0, 1, 2, 3)
 
 
-def test_confirmation_requires_stable_membership_and_small_group_drift() -> None:
+def test_confirmation_identity_is_center_geometry_not_member_set() -> None:
     from methods.structure_da.domain_phase_state import PhaseGroupStatus
 
     config = _config()
@@ -199,7 +251,6 @@ def test_confirmation_requires_stable_membership_and_small_group_drift() -> None
         config=config,
         previous_state=first,
     )
-    assert second.scan_index == 1
     assert second.groups[0].status is PhaseGroupStatus.CONFIRMED
     assert second.groups[0].confirmation_age == 2
 
@@ -208,8 +259,11 @@ def test_confirmation_requires_stable_membership_and_small_group_drift() -> None
         config=config,
         previous_state=second,
     )
-    assert changed.groups[0].status is PhaseGroupStatus.PROVISIONAL
-    assert changed.groups[0].confirmation_age == 1
+    assert changed.groups[0].member_classes == (0, 1, 3)
+    assert changed.groups[0].center_drift is not None
+    assert changed.groups[0].center_drift <= config.phase_center_drift_max
+    assert changed.groups[0].status is PhaseGroupStatus.CONFIRMED
+    assert changed.groups[0].confirmation_age == 3
 
 
 def test_progressive_membership_growth_preserves_confirmation_age() -> None:
@@ -246,8 +300,8 @@ def test_progressive_membership_growth_preserves_confirmation_age() -> None:
     assert third.decision_status is PhaseDecisionStatus.NONIDENTITY_CONFIRMED
 
 
-def test_progressive_member_replacement_still_resets_confirmation() -> None:
-    from methods.structure_da.domain_phase_state import PhaseGroupStatus
+def test_progressive_member_replacement_preserves_domain_age_when_center_is_stable() -> None:
+    from methods.structure_da.domain_phase_state import PhaseDecisionStatus, PhaseGroupStatus
 
     config = _config(phase_center_drift_max=0.12)
     first = _update([(0, 0.98), (1, 1.0), (2, 1.02)], config=config)
@@ -262,9 +316,10 @@ def test_progressive_member_replacement_still_resets_confirmation() -> None:
         previous_state=second,
     )
     assert changed.groups[0].member_classes == (0, 1, 3)
-    assert changed.groups[0].status is PhaseGroupStatus.PROVISIONAL
-    assert changed.groups[0].confirmation_age == 1
-    assert changed.decision_stability_age == 1
+    assert changed.groups[0].status is PhaseGroupStatus.CONFIRMED
+    assert changed.groups[0].confirmation_age == 3
+    assert changed.decision_stability_age == 3
+    assert changed.decision_status is PhaseDecisionStatus.NONIDENTITY_CONFIRMED
 
 
 def test_group_center_drift_over_threshold_resets_confirmation() -> None:

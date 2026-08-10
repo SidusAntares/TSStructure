@@ -280,12 +280,12 @@ def _identity_like(gamma: Tensor) -> Tensor:
 
 
 def _group_is_feasible(group: _GroupCandidate, config: DomainPhaseConfig) -> bool:
+    """Return whether one class-level Phase group satisfies frozen geometry bounds."""
     return (
         len(group.member_indices) >= config.phase_min_classes_per_group
         and group.within_dispersion <= config.phase_group_dispersion_max
         and group.diameter <= config.phase_group_diameter_max
-        and float(phase_distance(group.center_gamma, _identity_like(group.center_gamma)).item())
-        <= config.phase_global_radius
+        and group.core_radius <= config.phase_global_radius
     )
 
 
@@ -293,134 +293,127 @@ def _try_m1(
     valid_indices: tuple[int, ...],
     class_centers: tuple[PhaseClassCenter, ...],
     config: DomainPhaseConfig,
-) -> tuple[_GroupCandidate, tuple[int, ...]] | None:
-    gammas = torch.stack([class_centers[index].center_gamma for index in valid_indices])
-    robust_center = sqrt_median_gamma(gammas)
-    core = tuple(
-        index
-        for index in valid_indices
-        if float(phase_distance(class_centers[index].center_gamma, robust_center).item())
-        <= config.phase_group_diameter_max
+) -> _GroupCandidate | None:
+    """Globally test whether all reliable class centers admit one Phase center.
+
+    Class-level validity is decided before group model selection.  A class that
+    is already reliable at that level is therefore not silently discarded as a
+    group-level outlier: if one center cannot explain all reliable classes, the
+    model must be refined to M=2 or remain unconfirmed.
+    """
+    if len(valid_indices) < config.phase_min_classes_per_group:
+        return None
+    group = _group_metrics(valid_indices, class_centers)
+    return group if _group_is_feasible(group, config) else None
+
+
+def _m2_partition_objective(
+    groups: tuple[_GroupCandidate, _GroupCandidate],
+) -> float:
+    total = sum(len(group.member_indices) for group in groups)
+    if total <= 0:
+        return float("inf")
+    return float(
+        sum(len(group.member_indices) * group.within_dispersion for group in groups)
+        / total
     )
-    if len(core) < config.phase_min_classes_per_group:
-        return None
-    group = _group_metrics(core, class_centers)
-    if not _group_is_feasible(group, config):
-        return None
-    outliers = tuple(index for index in valid_indices if index not in core)
-    return group, outliers
-
-
-def _farthest_pair(
-    valid_indices: tuple[int, ...], class_centers: tuple[PhaseClassCenter, ...]
-) -> tuple[int, int]:
-    best_pair = (valid_indices[0], valid_indices[1])
-    best_distance = -1.0
-    for position, left in enumerate(valid_indices):
-        for right in valid_indices[position + 1 :]:
-            distance = float(
-                phase_distance(
-                    class_centers[left].center_gamma,
-                    class_centers[right].center_gamma,
-                ).item()
-            )
-            if distance > best_distance:
-                best_distance = distance
-                best_pair = (left, right)
-    return best_pair
 
 
 def _try_m2(
     valid_indices: tuple[int, ...],
     class_centers: tuple[PhaseClassCenter, ...],
     config: DomainPhaseConfig,
-) -> tuple[tuple[_GroupCandidate, _GroupCandidate], tuple[int, ...]] | None:
-    if len(valid_indices) < 4:
-        return None
-    seed_left, seed_right = _farthest_pair(valid_indices, class_centers)
-    centers = (
-        class_centers[seed_left].center_gamma,
-        class_centers[seed_right].center_gamma,
-    )
-    previous_membership: tuple[tuple[int, ...], tuple[int, ...]] | None = None
-    membership: tuple[tuple[int, ...], tuple[int, ...]]
-    for _ in range(50):
-        assigned = [[], []]
-        for index in valid_indices:
-            gamma = class_centers[index].center_gamma
-            distances = (
-                float(phase_distance(gamma, centers[0]).item()),
-                float(phase_distance(gamma, centers[1]).item()),
-            )
-            assigned[0 if distances[0] <= distances[1] else 1].append(index)
-        membership = (tuple(assigned[0]), tuple(assigned[1]))
-        if not membership[0] or not membership[1]:
-            return None
-        if membership == previous_membership:
-            break
-        centers = tuple(
-            sqrt_mean_gamma(
-                torch.stack([class_centers[index].center_gamma for index in members])
-            )
-            for members in membership
-        )
-        previous_membership = membership
+) -> tuple[_GroupCandidate, _GroupCandidate] | None:
+    """Globally select the best admissible two-group partition of class centers.
 
-    retained: list[tuple[int, ...]] = []
-    rejected: list[int] = []
-    for group_index, members in enumerate(membership):
-        kept = tuple(
-            index
-            for index in members
-            if float(
-                phase_distance(class_centers[index].center_gamma, centers[group_index]).item()
-            )
-            <= config.phase_group_diameter_max
-        )
-        rejected.extend(index for index in members if index not in kept)
-        retained.append(kept)
-    if any(len(members) < config.phase_min_classes_per_group for members in retained):
-        return None
-    groups = tuple(_group_metrics(members, class_centers) for members in retained)
-    if not all(_group_is_feasible(group, config) for group in groups):
-        return None
-    separation = float(phase_distance(groups[0].center_gamma, groups[1].center_gamma).item())
-    if not (
-        separation > groups[0].core_radius + groups[1].core_radius
-        and separation >= config.phase_group_core_separation
-    ):
-        return None
-    ordered = tuple(
-        sorted(groups, key=lambda group: min(class_centers[i].class_id for i in group.member_indices))
-    )
-    return (ordered[0], ordered[1]), tuple(sorted(rejected))
-
-
-def _match_previous_group(
-    members: tuple[int, ...],
-    previous_groups: tuple[PhaseGroup, ...],
-    used_group_ids: set[int],
-) -> PhaseGroup | None:
-    """Match a current group to a prior group without penalizing support growth.
-
-    Progressive evidence is nested.  A newly supported class may therefore join
-    an otherwise unchanged Domain-Phase group as the evidence budget grows.
-    Such monotone membership growth strengthens the same group and must not reset
-    confirmation age.  By contrast, losing an old member or moving it to another
-    group is a structural change and intentionally fails this subset match.
+    The number of closed-set classes is small (10 for the current TimeMatch
+    tasks), so exhaustive class-level partition search is both deterministic and
+    negligible compared with exact sample/class registration.  The first class
+    index is anchored in group 1 to remove complementary duplicate partitions.
     """
-    current = set(members)
-    matches = [
-        group
-        for group in previous_groups
-        if group.group_id not in used_group_ids
-        and set(group.member_classes).issubset(current)
-    ]
-    if not matches:
+    from itertools import combinations
+
+    minimum = int(config.phase_min_classes_per_group)
+    count = len(valid_indices)
+    if count < 2 * minimum:
         return None
-    # Groups are disjoint, so a valid match is normally unique.  Prefer the most
-    # informative prior group defensively if malformed/synthetic states overlap.
-    return max(matches, key=lambda group: (len(group.member_classes), -group.group_id))
+
+    anchor = valid_indices[0]
+    remaining = valid_indices[1:]
+    valid_set = set(valid_indices)
+    best: tuple[_GroupCandidate, _GroupCandidate] | None = None
+    best_objective = float("inf")
+    best_signature: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+
+    for left_size in range(minimum, count - minimum + 1):
+        for tail in combinations(remaining, left_size - 1):
+            left_indices = tuple(sorted((anchor, *tail)))
+            left_set = set(left_indices)
+            right_indices = tuple(sorted(valid_set - left_set))
+            if len(right_indices) < minimum:
+                continue
+
+            left = _group_metrics(left_indices, class_centers)
+            right = _group_metrics(right_indices, class_centers)
+            if not (_group_is_feasible(left, config) and _group_is_feasible(right, config)):
+                continue
+
+            separation = float(phase_distance(left.center_gamma, right.center_gamma).item())
+            if separation < config.phase_group_core_separation:
+                continue
+
+            groups = (left, right)
+            objective = _m2_partition_objective(groups)
+            signature = tuple(
+                sorted(
+                    tuple(sorted(class_centers[i].class_id for i in group.member_indices))
+                    for group in groups
+                )
+            )
+            if (
+                objective < best_objective - 1e-12
+                or (
+                    abs(objective - best_objective) <= 1e-12
+                    and (best_signature is None or signature < best_signature)
+                )
+            ):
+                best = groups
+                best_objective = objective
+                best_signature = signature
+
+    if best is None:
+        return None
+    # Deterministic order for the first stage.  Cross-stage IDs are aligned by
+    # center geometry in ``_materialize_groups`` rather than member identity.
+    return tuple(
+        sorted(
+            best,
+            key=lambda group: min(
+                class_centers[index].class_id for index in group.member_indices
+            ),
+        )
+    )
+
+
+def _ordered_candidates_for_previous_geometry(
+    candidates: tuple[_GroupCandidate, ...],
+    previous_groups: tuple[PhaseGroup, ...],
+) -> tuple[_GroupCandidate, ...]:
+    """Resolve M=2 label permutation by minimum cross-stage center drift."""
+    if len(candidates) != len(previous_groups) or len(candidates) <= 1:
+        return candidates
+    if len(candidates) != 2:
+        raise ValueError("Domain Phase currently supports at most two groups")
+    prior = tuple(sorted(previous_groups, key=lambda group: group.group_id))
+    direct = sum(
+        float(phase_distance(candidates[i].center_gamma, prior[i].center_gamma).item()) ** 2
+        for i in range(2)
+    )
+    swapped = sum(
+        float(phase_distance(candidates[1 - i].center_gamma, prior[i].center_gamma).item()) ** 2
+        for i in range(2)
+    )
+    return candidates if direct <= swapped else (candidates[1], candidates[0])
 
 
 def _materialize_groups(
@@ -429,18 +422,17 @@ def _materialize_groups(
     previous_state: DomainPhaseState | None,
     config: DomainPhaseConfig,
 ) -> tuple[PhaseGroup, ...]:
+    """Materialize groups while defining identity by center geometry, not members."""
     previous_groups: tuple[PhaseGroup, ...] = ()
     if previous_state is not None and previous_state.m == len(candidates):
-        previous_groups = previous_state.groups
-    used_previous_group_ids: set[int] = set()
+        previous_groups = tuple(sorted(previous_state.groups, key=lambda group: group.group_id))
+        candidates = _ordered_candidates_for_previous_geometry(candidates, previous_groups)
+
     groups: list[PhaseGroup] = []
-    for group_id, candidate in enumerate(candidates):
+    for position, candidate in enumerate(candidates):
         members = tuple(sorted(class_centers[index].class_id for index in candidate.member_indices))
-        prior = _match_previous_group(
-            members, previous_groups, used_previous_group_ids
-        )
-        if prior is not None:
-            used_previous_group_ids.add(prior.group_id)
+        prior = previous_groups[position] if position < len(previous_groups) else None
+        group_id = prior.group_id if prior is not None else position
         drift = (
             float(phase_distance(candidate.center_gamma, prior.center_gamma).item())
             if prior is not None
@@ -473,8 +465,7 @@ def _materialize_groups(
                 confirmation_age=age,
             )
         )
-    return tuple(groups)
-
+    return tuple(sorted(groups, key=lambda group: group.group_id))
 
 def _alignment_lookup(
     scan_result: TargetHypothesisScanResult,
@@ -748,10 +739,9 @@ def detect_residual_phase_group(
         return None
     center_tuple = tuple(centers)
     valid_indices = tuple(range(len(center_tuple)))
-    candidate = _try_m1(valid_indices, center_tuple, config)
-    if candidate is None:
+    group = _try_m1(valid_indices, center_tuple, config)
+    if group is None:
         return None
-    group, _outliers = candidate
     confirmed = _confirmed_groups(state)
     for existing in confirmed:
         separation = float(
@@ -777,10 +767,6 @@ def detect_residual_phase_group(
     )
 
 
-def _model_signature(groups: tuple[PhaseGroup, ...]) -> tuple[tuple[int, ...], ...]:
-    return tuple(sorted(tuple(group.member_classes) for group in groups))
-
-
 def _decision_stability_age(
     groups: tuple[PhaseGroup, ...],
     previous_state: DomainPhaseState | None,
@@ -788,12 +774,10 @@ def _decision_stability_age(
     identity_classes: tuple[int, ...],
 ) -> int:
     if groups:
-        # ``_materialize_groups`` gives a non-None center_drift only when a
-        # current group can be matched to a prior group whose old members are
-        # all still present.  confirmation_age > 1 additionally proves that the
-        # matched center stayed inside the configured drift tolerance.  Hence
-        # newly joining supporting classes do not reset the domain-level model
-        # age, while member loss/reassignment or center drift still does.
+        # Estimation is globally re-fit from current evidence at every stage,
+        # while confirmation is longitudinal.  Membership may grow, shrink, or
+        # move between groups; only matched center drift and model order define
+        # persistence of the Domain-Phase model.
         if (
             previous_state is not None
             and previous_state.m == len(groups)
@@ -827,41 +811,32 @@ def _build_grouped_state(
     config: DomainPhaseConfig,
     previous_state: DomainPhaseState | None,
 ) -> DomainPhaseState:
-    # M=2 is evaluated before M=1.  The existing separation/core constraints
-    # are the structural guard against splitting one coherent group merely
-    # because two clusters always fit more tightly than one.
-    m2 = _try_m2(valid_indices, class_centers, config) if len(valid_indices) >= 4 else None
-    if m2 is not None:
-        candidates, outlier_indices = m2
-        groups = _materialize_groups(candidates, class_centers, previous_state, config)
-        rejected = invalid_classes | {
-            class_centers[index].class_id for index in outlier_indices
-        }
-        active = {class_id for group in groups for class_id in group.member_classes}
-        rejected.update(set(valid_classes) - active)
-        return DomainPhaseState(
-            scan_index=scan_index,
-            m=2,
-            class_centers=class_centers,
-            valid_phase_classes=valid_classes,
-            groups=groups,
-            rejected_classes=tuple(sorted(rejected)),
-        )
-
+    # Frozen model-selection semantics: test the simplest M=1 model first.  A
+    # failure means insufficient single-center capacity, not absence of Domain
+    # Phase, so all reliable class centers are then globally repartitioned under
+    # the admissible M=2 model.  Only failure of both models yields M=0 here.
     m1 = _try_m1(valid_indices, class_centers, config)
     if m1 is not None:
-        candidate, outlier_indices = m1
-        groups = _materialize_groups((candidate,), class_centers, previous_state, config)
-        rejected = invalid_classes | {
-            class_centers[index].class_id for index in outlier_indices
-        }
+        groups = _materialize_groups((m1,), class_centers, previous_state, config)
         return DomainPhaseState(
             scan_index=scan_index,
             m=1,
             class_centers=class_centers,
             valid_phase_classes=valid_classes,
             groups=groups,
-            rejected_classes=tuple(sorted(rejected)),
+            rejected_classes=tuple(sorted(invalid_classes)),
+        )
+
+    m2 = _try_m2(valid_indices, class_centers, config)
+    if m2 is not None:
+        groups = _materialize_groups(m2, class_centers, previous_state, config)
+        return DomainPhaseState(
+            scan_index=scan_index,
+            m=2,
+            class_centers=class_centers,
+            valid_phase_classes=valid_classes,
+            groups=groups,
+            rejected_classes=tuple(sorted(invalid_classes)),
         )
 
     return DomainPhaseState(
@@ -872,7 +847,6 @@ def _build_grouped_state(
         groups=(),
         rejected_classes=tuple(sorted(center.class_id for center in class_centers)),
     )
-
 
 @torch.no_grad()
 def update_domain_phase_state(
@@ -932,11 +906,10 @@ def update_domain_phase_state(
         config,
     )
     residuals = collect_residual_phase_evidence(compatibility)
-    residual_group = detect_residual_phase_group(
-        compatibility,
-        provisional,
-        config,
-    )
+    # Residual sample-level candidates are retained as diagnostics only.
+    # The frozen Split theory performs model-order selection exclusively on
+    # reliable class-level Phase centers, so residual sample clusters cannot
+    # override a globally admissible M=1/M=2 class-level model.
     residual_classes = tuple(sorted({item.class_id for item in residuals}))
 
     decision = PhaseDecisionStatus.UNCONFIRMED
@@ -948,7 +921,6 @@ def update_domain_phase_state(
         if (
             all_confirmed
             and stability_age >= config.phase_confirmation_patience
-            and residual_group is None
         ):
             decision = PhaseDecisionStatus.NONIDENTITY_CONFIRMED
     elif (

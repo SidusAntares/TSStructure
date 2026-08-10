@@ -296,9 +296,23 @@ def _phase_groups_log_value(state: DomainPhaseState) -> str:
     if not state.groups:
         return "-"
     return ";".join(
-        f"{group.group_id}:{group.status.value}:{','.join(str(c) for c in group.member_classes)}"
+        f"{group.group_id}:{group.status.value}"
+        f":classes={','.join(str(c) for c in group.member_classes)}"
+        f":disp={group.within_dispersion:.6g}"
+        f":diam={group.diameter:.6g}"
+        f":radius={group.core_radius:.6g}"
+        f":drift={_optional_metric(group.center_drift)}"
         for group in state.groups
     )
+
+
+def _phase_rejections_log_value(state: DomainPhaseState) -> str:
+    rejected = [
+        f"{center.class_id}:{center.reject_reason or 'group_model'}"
+        for center in state.class_centers
+        if center.class_id in state.rejected_classes
+    ]
+    return ",".join(rejected) if rejected else "-"
 
 
 def _optional_metric(value: float | None) -> str:
@@ -325,6 +339,19 @@ def _phase_summary(state: DomainPhaseState) -> dict:
         "rejected_classes": list(state.rejected_classes),
         "g0_classes": list(state.rejected_classes),
         "confirmed_group_membership": confirmed_membership,
+        "class_centers": [
+            {
+                "class_id": center.class_id,
+                "candidate_count": center.candidate_count,
+                "effective_evidence_count": center.effective_evidence_count,
+                "dispersion": center.dispersion,
+                "diameter": center.diameter,
+                "center_drift": center.center_drift,
+                "valid": center.valid,
+                "reject_reason": center.reject_reason,
+            }
+            for center in state.class_centers
+        ],
         "groups": [
             {
                 "group_id": group.group_id,
@@ -332,6 +359,9 @@ def _phase_summary(state: DomainPhaseState) -> dict:
                 "status": group.status.value,
                 "confirmation_age": group.confirmation_age,
                 "center_drift": group.center_drift,
+                "within_dispersion": group.within_dispersion,
+                "diameter": group.diameter,
+                "core_radius": group.core_radius,
             }
             for group in state.groups
         ],
@@ -717,6 +747,7 @@ class Stage2Trainer:
                 f"|decision_age={phase_state.decision_stability_age}"
                 f"|confirmed_phase={str(_confirmed_phase_exists(phase_state)).lower()}"
                 f"|valid_classes={','.join(str(c) for c in phase_state.valid_phase_classes) or '-'}"
+                f"|rejected={_phase_rejections_log_value(phase_state)}"
                 f"|groups={_phase_groups_log_value(phase_state)}"
                 f"|hypotheses={len(final_result.hypotheses)}"
                 f"|solver_calls={final_result.num_solver_calls}"
