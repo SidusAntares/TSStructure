@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -308,12 +309,22 @@ def test_phase_only_helper_changes_only_positions() -> None:
     assert not torch.equal(example.target_style_positions, positions)
 
 
-def _real_trainer(shape_status: DomainShapeStatus) -> Stage2Trainer:
+def _real_trainer(
+    shape_status: DomainShapeStatus,
+    *,
+    target_time_keep_ratio: float = 0.8,
+    with_scheduler: bool = False,
+) -> Stage2Trainer:
     model = _model()
     policy = configure_stage2_parameter_policy(model)
     params = dict(model.named_parameters())
     optimizer = torch.optim.Adam(
         [params[name] for name in policy.trainable_parameter_names], lr=1e-3
+    )
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10, eta_min=0.0)
+        if with_scheduler
+        else None
     )
     ema = Stage2EMATeacher.from_student(model, policy, decay=0.9)
     bank: SourcePrototypeBank = _bank()
@@ -322,13 +333,17 @@ def _real_trainer(shape_status: DomainShapeStatus) -> Stage2Trainer:
         policy=policy,
         ema_teacher=ema,
         optimizer=optimizer,
+        scheduler=scheduler,
         source_loader=[],
         source_scan_loader=[],
         target_statistics_loader=[],
         source_prototype_bank=bank,
         source_registration_bank=None,
         reg_extractor=None,
-        config=_trainer_config(),
+        config=replace(
+            _trainer_config(),
+            target_time_keep_ratio=target_time_keep_ratio,
+        ),
         device=torch.device("cpu"),
         output_dir="/tmp",
     )
@@ -820,6 +835,30 @@ def test_student_native_target_uses_stable_labels_not_dataset_truth() -> None:
     assert logits is not None and logits.shape[0] == 2
     assert labels is not None
     assert labels.tolist() == [2, 1]
+
+
+def test_student_strong_target_mask_preserves_native_axis_and_masks_time_steps() -> None:
+    trainer = _real_trainer(
+        DomainShapeStatus.REJECTED,
+        target_time_keep_ratio=0.6,
+    )
+    base = torch.ones(3, 10, dtype=torch.bool)
+    torch.manual_seed(7)
+    strong = trainer._strong_native_target_time_mask(base)
+    assert strong.dtype is torch.bool
+    assert strong.shape == base.shape
+    assert strong.sum(dim=1).tolist() == [6, 6, 6]
+    assert torch.all(strong <= base)
+
+
+def test_stage2_scheduler_steps_after_successful_optimizer_step() -> None:
+    trainer = _real_trainer(
+        DomainShapeStatus.REJECTED,
+        with_scheduler=True,
+    )
+    initial_lr = float(trainer.optimizer.param_groups[0]["lr"])
+    trainer.train_step(_batch())
+    assert float(trainer.optimizer.param_groups[0]["lr"]) < initial_lr
 
 
 def _m2_phase_state() -> DomainPhaseState:

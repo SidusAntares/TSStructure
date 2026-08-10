@@ -64,6 +64,8 @@ def test_train_wires_timematch_style_stage2_controls() -> None:
         "--stage2_shape_confirmation_patience",
         "--stage2_lambda_target",
         "--stage2_focal_gamma",
+        "--stage2_lr",
+        "--stage2_target_time_keep_ratio",
         "--stage2_ema_decay",
         "--stage2_lambda_delta",
     ):
@@ -76,7 +78,23 @@ def test_train_wires_timematch_style_stage2_controls() -> None:
     assert 'load_structure_da_state_dict(model, stage1_checkpoint["model_state_dict"])' in text
     assert "configure_stage2_parameter_policy(model)" in text
     assert "Stage2EMATeacher.from_student" in text
+    assert "CosineAnnealingLR" in text
+    assert "scheduler=stage2_scheduler" in text
+    assert 'lr=stage2_lr' in text
     assert "run_stage2_training(" in text
+
+
+def test_formal_timematch_stage2_config_freezes_optimization_recipe() -> None:
+    import json
+
+    payload = json.loads(
+        Path("configs/stage2_timematch_v1.json").read_text(encoding="utf-8")
+    )
+    assert payload["stage2_lr"] == pytest.approx(1e-4)
+    assert payload["stage2_ema_decay"] == pytest.approx(0.9999)
+    assert payload["stage2_focal_gamma"] == pytest.approx(1.0)
+    assert payload["stage2_lambda_target"] == pytest.approx(1.0)
+    assert payload["stage2_target_time_keep_ratio"] == pytest.approx(0.8)
 
 
 def test_stage2_only_checkpoint_defaults_to_current_fold(tmp_path) -> None:

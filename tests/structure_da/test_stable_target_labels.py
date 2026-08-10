@@ -349,6 +349,11 @@ def test_confirmed_phase_scan_no_longer_requires_individual_dp_hypotheses(monkey
     assert result.num_samples == 1
     assert [(item.sample_id, item.class_id) for item in result.stable_labels] == [(20, 1)]
     assert result.num_candidate_views == 1
+    assert result.oracle_num_evaluated == 1
+    assert result.oracle_accuracy == pytest.approx(0.0)
+    assert result.oracle_macro_f1 == pytest.approx(0.0)
+    assert result.oracle_support == (1, 0, 0)
+    assert dict(result.gate_rejection_counts)["accepted"] == 1
 
 
 def test_confirmed_phase_scan_tests_nonmember_classes_after_group_confirmation(monkeypatch) -> None:
@@ -394,6 +399,49 @@ def test_confirmed_phase_scan_tests_nonmember_classes_after_group_confirmation(m
     assert [(item.sample_id, item.class_id, item.group_id) for item in result.stable_labels] == [
         (20, 0, 0)
     ]
+    assert result.oracle_num_evaluated == 1
+    assert result.oracle_accuracy == pytest.approx(0.0)
+    assert result.oracle_recall[2] == pytest.approx(0.0)
+
+
+def test_confirmed_phase_oracle_is_diagnostic_only_and_reports_correct_label(monkeypatch) -> None:
+    import methods.structure_da.stable_target_labels as module
+
+    def builder(*, model, batch, sample_ids, group):
+        return _view(
+            sample_ids=tuple(int(v) for v in sample_ids.tolist()),
+            group_id=group.group_id,
+            member_classes=group.member_classes,
+            winning_class=1,
+        )
+
+    monkeypatch.setattr(module, "build_confirmed_phase_view", builder)
+    ema = SimpleNamespace(model=lambda: torch.nn.Linear(1, 1).eval())
+    group = _group(0, (1, 2), PhaseGroupStatus.CONFIRMED)
+    result = module.scan_stable_target_labels_from_confirmed_phase(
+        ema_teacher=ema,
+        target_loader=[
+            {
+                "index": torch.tensor([20]),
+                "pixels": torch.zeros(1, 5, 2, 4),
+                "valid_pixels": torch.ones(1, 5, 4, dtype=torch.bool),
+                "positions": torch.linspace(0.0, 365.0, 5),
+                "label": torch.tensor([1]),
+            }
+        ],
+        phase_state=replace(
+            _state(group),
+            decision_status=PhaseDecisionStatus.NONIDENTITY_CONFIRMED,
+            decision_stability_age=2,
+        ),
+        source_prototype_bank=_bank(),
+        config=_config(),
+    )
+    assert [(item.sample_id, item.class_id) for item in result.stable_labels] == [(20, 1)]
+    assert result.oracle_accuracy == pytest.approx(1.0)
+    assert result.oracle_precision[1] == pytest.approx(1.0)
+    assert result.oracle_recall[1] == pytest.approx(1.0)
+    assert result.oracle_support[1] == 1
 
 
 def test_confirmed_identity_phase_scans_native_target_without_group_membership(monkeypatch) -> None:

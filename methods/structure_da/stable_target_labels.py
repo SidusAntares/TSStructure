@@ -111,6 +111,99 @@ class StableTargetLabelScanResult:
     stable_class_counts: tuple[int, ...]
     num_phase_compatible: int = 0
     num_phase_incompatible: int = 0
+    # Oracle diagnostics only. These fields are computed from target ground
+    # truth already present in the experimental dataset, but they are never
+    # consumed by Stable-Label gating, Phase/Shape estimation, routing or
+    # optimization.
+    oracle_num_evaluated: int = 0
+    oracle_accuracy: float | None = None
+    oracle_macro_f1: float | None = None
+    oracle_precision: tuple[float, ...] = ()
+    oracle_recall: tuple[float, ...] = ()
+    oracle_f1: tuple[float, ...] = ()
+    oracle_support: tuple[int, ...] = ()
+    gate_rejection_counts: tuple[tuple[str, int], ...] = ()
+
+
+def _stable_label_oracle_metrics(
+    stable_labels: list[StableTargetLabel],
+    true_labels_by_sample: dict[int, int],
+    num_classes: int,
+) -> tuple[
+    int,
+    float | None,
+    float | None,
+    tuple[float, ...],
+    tuple[float, ...],
+    tuple[float, ...],
+    tuple[int, ...],
+]:
+    """Compute closed-set Stable-Label quality for diagnostics only."""
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.long)
+    evaluated = 0
+    for item in stable_labels:
+        true_label = true_labels_by_sample.get(int(item.sample_id))
+        if true_label is None:
+            continue
+        predicted = int(item.class_id)
+        if not 0 <= true_label < num_classes or not 0 <= predicted < num_classes:
+            continue
+        confusion[true_label, predicted] += 1
+        evaluated += 1
+    if evaluated == 0:
+        return (
+            0,
+            None,
+            None,
+            (0.0,) * num_classes,
+            (0.0,) * num_classes,
+            (0.0,) * num_classes,
+            (0,) * num_classes,
+        )
+
+    diagonal = confusion.diag().to(dtype=torch.float64)
+    predicted_count = confusion.sum(dim=0).to(dtype=torch.float64)
+    true_count = confusion.sum(dim=1).to(dtype=torch.float64)
+    precision = torch.where(
+        predicted_count > 0,
+        diagonal / predicted_count,
+        torch.zeros_like(diagonal),
+    )
+    recall = torch.where(
+        true_count > 0,
+        diagonal / true_count,
+        torch.zeros_like(diagonal),
+    )
+    denominator = precision + recall
+    f1 = torch.where(
+        denominator > 0,
+        2.0 * precision * recall / denominator,
+        torch.zeros_like(denominator),
+    )
+    accuracy = float(diagonal.sum().item() / evaluated)
+    # Keep the same closed-set class support as the downstream Macro-F1: a
+    # vanished Stable-Label class contributes zero instead of disappearing
+    # from the diagnostic average.
+    macro_f1 = float(f1.mean().item())
+    return (
+        evaluated,
+        accuracy,
+        macro_f1,
+        tuple(float(value) for value in precision.tolist()),
+        tuple(float(value) for value in recall.tolist()),
+        tuple(float(value) for value in f1.tolist()),
+        tuple(int(value) for value in true_count.to(dtype=torch.long).tolist()),
+    )
+
+
+def _gate_rejection_counts(
+    candidates: list[StableTargetCandidate],
+) -> tuple[tuple[str, int], ...]:
+    counts: dict[str, int] = {}
+    for item in candidates:
+        key = "accepted" if item.accepted else (item.reject_reason or "rejected")
+        counts[key] = counts.get(key, 0) + 1
+    return tuple(sorted(counts.items()))
 
 
 def _passes_gate(
@@ -828,6 +921,7 @@ def scan_stable_target_labels_from_confirmed_phase(
     candidates: list[StableTargetCandidate] = []
     candidate_sources: dict[tuple[int, int, int], tuple[ConfirmedPhaseView, int]] = {}
     considered_samples: set[int] = set()
+    true_labels_by_sample: dict[int, int] = {}
     candidate_view_count = 0
     fallback_index = 0
 
@@ -854,6 +948,15 @@ def scan_stable_target_labels_from_confirmed_phase(
             [int(batch_ids[row].item()) for row in rows], dtype=torch.long
         )
         considered_samples.update(int(item) for item in row_sample_ids.tolist())
+        # Target truth is captured only for post-hoc oracle diagnostics. It is
+        # intentionally not read by any candidate generation or gate below.
+        batch_labels = batch.get("label")
+        if isinstance(batch_labels, Tensor) and batch_labels.shape == (batch_size,):
+            batch_labels = batch_labels.detach().to(device="cpu", dtype=torch.long)
+            for row in rows:
+                true_labels_by_sample[int(batch_ids[row].item())] = int(
+                    batch_labels[row].item()
+                )
 
         if phase_state.decision_status is PhaseDecisionStatus.IDENTITY_CONFIRMED:
             # Identity is an explicitly confirmed domain-level Phase state, not
@@ -945,6 +1048,19 @@ def scan_stable_target_labels_from_confirmed_phase(
         class_counts[candidate.class_id] += 1
 
     num_samples = len(considered_samples)
+    (
+        oracle_num_evaluated,
+        oracle_accuracy,
+        oracle_macro_f1,
+        oracle_precision,
+        oracle_recall,
+        oracle_f1,
+        oracle_support,
+    ) = _stable_label_oracle_metrics(
+        stable_labels,
+        true_labels_by_sample,
+        num_classes,
+    )
     return StableTargetLabelScanResult(
         candidates=tuple(candidates),
         stable_labels=tuple(stable_labels),
@@ -957,4 +1073,12 @@ def scan_stable_target_labels_from_confirmed_phase(
         num_stable_labels=len(stable_labels),
         num_ambiguous_rejected=ambiguous_rejected,
         stable_class_counts=tuple(class_counts),
+        oracle_num_evaluated=oracle_num_evaluated,
+        oracle_accuracy=oracle_accuracy,
+        oracle_macro_f1=oracle_macro_f1,
+        oracle_precision=oracle_precision,
+        oracle_recall=oracle_recall,
+        oracle_f1=oracle_f1,
+        oracle_support=oracle_support,
+        gate_rejection_counts=_gate_rejection_counts(candidates),
     )

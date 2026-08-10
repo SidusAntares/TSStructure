@@ -396,6 +396,11 @@ def build_stage2_config(config) -> Stage2TrainerConfig:
             else config.stage2_phase_evidence_max_samples
         ),
         evidence_seed=int(config.seed),
+        target_time_keep_ratio=(
+            0.8
+            if config.stage2_target_time_keep_ratio is None
+            else config.stage2_target_time_keep_ratio
+        ),
     )
 
 
@@ -745,19 +750,41 @@ def main(config):
         stage2_parameters = [
             named_parameters[name] for name in policy.trainable_parameter_names
         ]
+        stage2_lr = 1e-4 if config.stage2_lr is None else float(config.stage2_lr)
+        if not np.isfinite(stage2_lr) or stage2_lr <= 0.0:
+            raise ValueError("--stage2_lr must be finite and greater than zero")
         stage2_optimizer = torch.optim.Adam(
             stage2_parameters,
-            lr=config.lr,
+            lr=stage2_lr,
             weight_decay=config.weight_decay,
+        )
+        stage2_steps_per_epoch = (
+            stage2_runtime_config.steps_per_epoch
+            if stage2_runtime_config.steps_per_epoch is not None
+            else len(source_loader)
+        )
+        stage2_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            stage2_optimizer,
+            T_max=stage2_runtime_config.total_epochs * stage2_steps_per_epoch,
+            eta_min=0.0,
         )
         ema_teacher = Stage2EMATeacher.from_student(
             model, policy, decay=stage2_runtime_config.ema_decay
+        )
+        print(
+            "STAGE2_OPTIMIZATION|"
+            f"lr={stage2_lr:.8g}"
+            f"|ema_decay={stage2_runtime_config.ema_decay:.8g}"
+            "|scheduler=cosine_stepwise"
+            f"|scheduler_t_max={stage2_runtime_config.total_epochs * stage2_steps_per_epoch}"
+            f"|target_time_keep_ratio={stage2_runtime_config.target_time_keep_ratio:.4f}"
         )
         stage2_trainer = Stage2Trainer(
             student=model,
             policy=policy,
             ema_teacher=ema_teacher,
             optimizer=stage2_optimizer,
+            scheduler=stage2_scheduler,
             source_loader=source_loader,
             source_scan_loader=source_scan_loader,
             target_statistics_loader=target_statistics_loader,
@@ -1604,6 +1631,17 @@ if __name__ == '__main__':
     parser.add_argument(
         '--stage2_focal_gamma', default=None, type=float,
         help='Focal-Loss gamma for both TimeMatch-style Stage-2 branches (default: 1.0)',
+    )
+    parser.add_argument(
+        '--stage2_lr', default=None, type=float,
+        help='Stage-2 Student learning rate (TimeMatch-style default: 1e-4)',
+    )
+    parser.add_argument(
+        '--stage2_target_time_keep_ratio', default=None, type=float,
+        help=(
+            'fraction of native target acquisitions retained in the Student '
+            'strong view; timestamps are never shifted (default: 0.8)'
+        ),
     )
 
     # Legacy Round-7 objective knobs are still accepted in old JSON/CLI files

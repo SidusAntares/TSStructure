@@ -77,6 +77,7 @@ class Stage2TrainerConfig:
     phase_evidence_initial_samples: int = 64
     phase_evidence_max_samples: int = 512
     evidence_seed: int = 0
+    target_time_keep_ratio: float = 0.8
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.ema_decay)) or not 0.0 <= float(self.ema_decay) < 1.0:
@@ -103,6 +104,11 @@ class Stage2TrainerConfig:
             raise ValueError(
                 "phase_evidence_initial_samples cannot exceed phase_evidence_max_samples"
             )
+        if (
+            not math.isfinite(float(self.target_time_keep_ratio))
+            or not 0.0 < float(self.target_time_keep_ratio) <= 1.0
+        ):
+            raise ValueError("target_time_keep_ratio must lie in (0,1]")
 
 
 @dataclass(frozen=True)
@@ -473,6 +479,14 @@ def _stable_label_payload(result: StableTargetLabelScanResult) -> dict:
         "stable_class_counts": tuple(result.stable_class_counts),
         "num_phase_compatible": result.num_phase_compatible,
         "num_phase_incompatible": result.num_phase_incompatible,
+        "oracle_num_evaluated": result.oracle_num_evaluated,
+        "oracle_accuracy": result.oracle_accuracy,
+        "oracle_macro_f1": result.oracle_macro_f1,
+        "oracle_precision": tuple(result.oracle_precision),
+        "oracle_recall": tuple(result.oracle_recall),
+        "oracle_f1": tuple(result.oracle_f1),
+        "oracle_support": tuple(result.oracle_support),
+        "gate_rejection_counts": tuple(result.gate_rejection_counts),
         "labels": tuple(
             {
                 "sample_id": item.sample_id,
@@ -571,6 +585,7 @@ class Stage2Trainer:
         policy: Stage2ParameterPolicy,
         ema_teacher: Stage2EMATeacher,
         optimizer: Optimizer,
+        scheduler=None,
         source_loader,
         source_scan_loader,
         target_statistics_loader,
@@ -589,6 +604,7 @@ class Stage2Trainer:
         self.policy = policy
         self.ema_teacher = ema_teacher
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.source_loader = source_loader
         self.source_scan_loader = source_scan_loader
         # ``target_statistics_loader`` is the bounded expensive-DP Phase
@@ -702,6 +718,61 @@ class Stage2Trainer:
         self.stable_label_refresh_count += 1
         return result
 
+    def _log_stable_label_diagnostics(
+        self,
+        result: StableTargetLabelScanResult,
+        *,
+        refresh: int,
+    ) -> None:
+        """Log oracle Stable-Label quality without feeding truth back to training."""
+        accuracy = _optional_metric(result.oracle_accuracy)
+        macro_f1 = _optional_metric(result.oracle_macro_f1)
+        precision = ",".join(f"{value:.4f}" for value in result.oracle_precision) or "-"
+        recall = ",".join(f"{value:.4f}" for value in result.oracle_recall) or "-"
+        support = ",".join(str(value) for value in result.oracle_support) or "-"
+        rejection_counts = ",".join(
+            f"{name}:{count}" for name, count in result.gate_rejection_counts
+        ) or "-"
+        print(
+            "STAGE2_STABLE_LABEL_ORACLE|"
+            f"refresh={refresh}"
+            f"|oracle_only=true"
+            f"|evaluated={result.oracle_num_evaluated}"
+            f"|accuracy={accuracy}"
+            f"|macro_f1={macro_f1}"
+            f"|precision={precision}"
+            f"|recall={recall}"
+            f"|support={support}"
+            f"|gate_rejections={rejection_counts}"
+        )
+        writer = getattr(self, "writer", None)
+        if writer is not None:
+            if result.oracle_accuracy is not None:
+                writer.add_scalar(
+                    "stage2/stable_label_oracle_accuracy",
+                    result.oracle_accuracy,
+                    refresh,
+                )
+            if result.oracle_macro_f1 is not None:
+                writer.add_scalar(
+                    "stage2/stable_label_oracle_macro_f1",
+                    result.oracle_macro_f1,
+                    refresh,
+                )
+            for class_id, (class_precision, class_recall) in enumerate(
+                zip(result.oracle_precision, result.oracle_recall)
+            ):
+                writer.add_scalar(
+                    f"stage2/stable_label_oracle_precision_class_{class_id}",
+                    class_precision,
+                    refresh,
+                )
+                writer.add_scalar(
+                    f"stage2/stable_label_oracle_recall_class_{class_id}",
+                    class_recall,
+                    refresh,
+                )
+
     def _shape_from_stable(
         self,
         stable_result: StableTargetLabelScanResult,
@@ -790,6 +861,10 @@ class Stage2Trainer:
             f"|stable_refreshes={self.stable_label_refresh_count}"
             f"|shape_refreshes={self.shape_evidence_stages}"
         )
+        self._log_stable_label_diagnostics(
+            stable_result,
+            refresh=self.stable_label_refresh_count,
+        )
         return snapshot
 
     @torch.no_grad()
@@ -821,6 +896,10 @@ class Stage2Trainer:
             f"|stable_coverage={coverage:.4f}"
             f"|class_counts={','.join(str(v) for v in stable_result.stable_class_counts)}"
             f"|routes={','.join('none' if v is None else str(v) for v in routes)}"
+        )
+        self._log_stable_label_diagnostics(
+            stable_result,
+            refresh=self.stable_label_refresh_count,
         )
         return snapshot
 
@@ -1015,6 +1094,41 @@ class Stage2Trainer:
             for item in self.statistics.stable_labels.stable_labels
         }
 
+    def _strong_native_target_time_mask(
+        self,
+        base_mask: Tensor,
+    ) -> Tensor:
+        """Randomly mask target time steps without changing native positions.
+
+        Teacher/Stable-Label inference always sees the deterministic full target
+        sequence. Only the Student target branch receives this strong view. The
+        time axis itself is untouched; masked acquisitions simply do not
+        participate in PSE/decomposition/LTAE pooling for this optimizer step.
+        """
+        if base_mask.ndim != 2:
+            raise ValueError("base target time mask must have shape [B,L]")
+        base_mask = base_mask.to(device=self.device, dtype=torch.bool)
+        keep_ratio = float(self.config.target_time_keep_ratio)
+        if keep_ratio >= 1.0:
+            return base_mask
+
+        strong = torch.zeros_like(base_mask)
+        for row in range(base_mask.shape[0]):
+            valid = torch.nonzero(base_mask[row], as_tuple=False).flatten()
+            valid_count = int(valid.numel())
+            if valid_count == 0:
+                continue
+            min_keep = min(2, valid_count)
+            keep_count = max(min_keep, int(math.ceil(valid_count * keep_ratio)))
+            keep_count = min(valid_count, keep_count)
+            if keep_count == valid_count:
+                chosen = valid
+            else:
+                permutation = torch.randperm(valid_count, device=self.device)
+                chosen = valid.index_select(0, permutation[:keep_count])
+            strong[row, chosen] = True
+        return strong
+
     def _target_forward_native(
         self,
         batch: dict,
@@ -1049,13 +1163,42 @@ class Stage2Trainer:
         time_mask = _batch_tensor(batch, "time_mask", self.device)
         if pixels is None or valid_pixels is None or positions is None:
             raise ValueError("target batch must contain pixels, valid_pixels and positions")
+        batch_size = int(pixels.shape[0])
+        rows = torch.tensor(selected_rows, device=self.device, dtype=torch.long)
+
+        def select_rows(value: Tensor | None) -> Tensor | None:
+            if value is None:
+                return None
+            if value.ndim > 0 and value.shape[0] == batch_size:
+                return value.index_select(0, rows)
+            return value
+
+        pixels = select_rows(pixels)
+        valid_pixels = select_rows(valid_pixels)
+        positions = select_rows(positions)
+        extra = select_rows(extra)
+        time_mask = select_rows(time_mask)
+        assert pixels is not None
+        assert valid_pixels is not None
+        assert positions is not None
+        selected_batch_size = int(pixels.shape[0])
+        sequence_length = int(pixels.shape[1])
+        if time_mask is None:
+            base_time_mask = torch.ones(
+                (selected_batch_size, sequence_length),
+                device=self.device,
+                dtype=torch.bool,
+            )
+        else:
+            base_time_mask = time_mask.to(device=self.device, dtype=torch.bool)
+        strong_time_mask = self._strong_native_target_time_mask(base_time_mask)
         with torch.no_grad():
             backbone = self.student.forward_backbone(
                 pixels,
                 valid_pixels,
                 positions,
                 extra,
-                time_mask=time_mask,
+                time_mask=strong_time_mask,
             )
             trend, structure = self.student._trend_and_structure(backbone)
             trend = trend.detach()
@@ -1078,9 +1221,8 @@ class Stage2Trainer:
                 mask=mask,
             )
             logits = self.student.classifier(raw.fused_repr)
-        rows = torch.tensor(selected_rows, device=self.device, dtype=torch.long)
         labels = torch.tensor(selected_labels, device=self.device, dtype=torch.long)
-        return logits.index_select(0, rows), labels
+        return logits, labels
 
     def _set_student_training_modes(self) -> None:
         """Train only the Stage-2 task path while frozen geometry stays deterministic."""
@@ -1159,6 +1301,8 @@ class Stage2Trainer:
         new_scale = float(self.scaler.get_scale())
         step_succeeded = not self.scaler.is_enabled() or new_scale >= previous_scale
         if step_succeeded:
+            if self.scheduler is not None:
+                self.scheduler.step()
             self.ema_teacher.update_after_optimizer_step(self.student)
             self.successful_optimizer_steps += 1
 
@@ -1198,9 +1342,11 @@ class Stage2Trainer:
         if steps == 0:
             raise RuntimeError("source training loader produced no Stage-2 batches")
         averages = {key: value / steps for key, value in meters.items()}
+        current_lr = float(self.optimizer.param_groups[0]["lr"])
         print(
             "STAGE2_TRAIN|"
             f"epoch={epoch}/{self.config.total_epochs}|steps={steps}"
+            f"|lr={current_lr:.8g}"
             f"|loss={averages['loss']:.4f}"
             f"|source_to_target={averages['source_to_target']:.4f}"
             f"|native_target={averages['native_target']:.4f}"
@@ -1212,6 +1358,8 @@ class Stage2Trainer:
         if self.writer is not None:
             for key, value in averages.items():
                 self.writer.add_scalar(f"stage2/train/{key}", value, epoch)
+            self.writer.add_scalar("stage2/train/lr", current_lr, epoch)
+        averages["lr"] = current_lr
         return averages
 
     def write_calibration_statistics(self) -> dict[str, str]:
