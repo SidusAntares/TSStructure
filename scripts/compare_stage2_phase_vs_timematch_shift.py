@@ -66,20 +66,12 @@ from torchvision.transforms import transforms
 
 import visualize_stage2_phase_alignment as phasevis
 from dataset import PixelSetData, worker_init_fn
+from methods.structure_da import phase_visualization_protocol as visproto
 from transforms import Normalize, RandomSamplePixels, ToTensor
 
 
 TIMEMATCH_REPOSITORY = "https://github.com/jnyborg/timematch"
 TIMEMATCH_PAPER = "https://doi.org/10.1016/j.isprsjprs.2022.04.018"
-
-
-def _shared_time_encoder(model):
-    try:
-        return model.temporal_module.raw_encoder.shared_ltae.shared_time_encoder
-    except AttributeError as error:
-        raise RuntimeError(
-            "model does not expose the expected shared temporal encoder"
-        ) from error
 
 
 def _resolve_unbounded_time2vec_inputs(
@@ -187,7 +179,7 @@ def _timematch_time_extrapolation(model):
     view temporarily evaluates the same learned Time2Vec formula without that
     boundary restriction. Model parameters are untouched.
     """
-    encoder = _shared_time_encoder(model)
+    encoder = visproto.phase_only_time_encoder(model)
     required = (
         "linear_weight",
         "linear_bias",

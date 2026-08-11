@@ -25,6 +25,28 @@ def checkpoint_model_state_dict(checkpoint: dict) -> dict:
     raise ValueError("checkpoint contains neither model_state_dict nor state_dict")
 
 
+def phase_only_time_encoder(model):
+    """Return the single-LTAE temporal encoder from the Phase-only model.
+
+    Phase-only TSStructure exposes exactly one classification temporal path:
+    ``temporal_module.raw_encoder.time_encoder``.  Keeping this lookup in the
+    protocol module prevents visualization scripts from silently falling back
+    to the removed dual-stream ``shared_ltae/shared_time_encoder`` hierarchy.
+    """
+    try:
+        encoder = model.temporal_module.raw_encoder.time_encoder
+    except AttributeError as error:
+        raise RuntimeError(
+            "Phase-only model must expose "
+            "temporal_module.raw_encoder.time_encoder"
+        ) from error
+    if encoder is None:
+        raise RuntimeError(
+            "Phase-only model temporal_module.raw_encoder.time_encoder is None"
+        )
+    return encoder
+
+
 def class_to_group(
     groups: Sequence[dict],
     *,

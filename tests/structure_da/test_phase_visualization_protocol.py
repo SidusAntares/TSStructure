@@ -32,6 +32,30 @@ def test_stage2_model_state_dict_is_accepted_by_visualization_loader() -> None:
     assert phasevis.checkpoint_model_state_dict(legacy)["weight"].item() == 2.0
 
 
+def test_phase_only_time_encoder_uses_single_ltae_contract() -> None:
+    marker = object()
+    model = SimpleNamespace(
+        temporal_module=SimpleNamespace(
+            raw_encoder=SimpleNamespace(time_encoder=marker)
+        )
+    )
+    assert phasevis.phase_only_time_encoder(model) is marker
+
+    stale_model = SimpleNamespace(
+        temporal_module=SimpleNamespace(
+            raw_encoder=SimpleNamespace(
+                shared_ltae=SimpleNamespace(shared_time_encoder=marker)
+            )
+        )
+    )
+    try:
+        phasevis.phase_only_time_encoder(stale_model)
+    except RuntimeError as error:
+        assert "raw_encoder.time_encoder" in str(error)
+    else:
+        raise AssertionError("removed dual-stream encoder path must not be accepted")
+
+
 def test_fold_reconstruction_exposes_held_out_test_partition() -> None:
     source = np.arange(10, dtype=np.int64)
     target = np.arange(100, 110, dtype=np.int64)
@@ -170,6 +194,11 @@ def test_visualization_scripts_follow_phase_only_forward_contract() -> None:
             node.attr
             for node in ast.walk(tree)
             if isinstance(node, ast.Attribute)
-            and node.attr in {"trend_repr", "structure_repr"}
+            and node.attr in {
+                "trend_repr",
+                "structure_repr",
+                "shared_ltae",
+                "shared_time_encoder",
+            }
         }
         assert not removed, f"{relative} still uses removed Phase-only fields: {removed}"
