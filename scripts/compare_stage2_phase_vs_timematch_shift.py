@@ -561,6 +561,52 @@ def _three_view_distances(
     return d0, ds, dp, stats
 
 
+def _three_view_pse_metrics(
+    source_records: Sequence[dict],
+    target_records: Sequence[dict],
+    *,
+    grid_size: int,
+) -> Tuple[dict, List[dict]]:
+    source_center, source_support, _ = phasevis._canonical_pse_center(
+        source_records, positions_key="positions", grid_size=grid_size
+    )
+    class_distances = {}
+    centers = {}
+    for name, position_key in (
+        ("no_shift", "positions"),
+        ("timematch_scalar", "positions_scalar"),
+        ("domain_phase", "positions_after"),
+    ):
+        center, support, _ = phasevis._canonical_pse_center(
+            target_records, positions_key=position_key, grid_size=grid_size
+        )
+        mse, l2, common = phasevis._pse_integrated_distance(
+            source_center, source_support, center, support
+        )
+        class_distances[name] = {"mse": mse, "l2": l2, "common_grid": common}
+        centers[name] = (center, support)
+
+    rows: List[dict] = []
+    for record in target_records:
+        row = {"parcel_index": int(record["parcel_index"])}
+        for name, position_key in (
+            ("no_shift", "positions"),
+            ("timematch_scalar", "positions_scalar"),
+            ("domain_phase", "positions_after"),
+        ):
+            trajectory, support, _ = phasevis._canonicalize_pse_tokens(
+                record, positions_key=position_key, grid_size=grid_size
+            )
+            mse, l2, common = phasevis._pse_integrated_distance(
+                source_center, source_support, trajectory, support
+            )
+            row[f"pse_mse_{name}"] = mse
+            row[f"pse_l2_{name}"] = l2
+            row[f"pse_common_grid_{name}"] = common
+        rows.append(row)
+    return class_distances, rows
+
+
 def _three_view_classification(records: Sequence[dict], class_id: int) -> dict:
     logits0 = torch.stack([record["logits_before"].float() for record in records])
     logits_s = torch.stack([record["logits_scalar"].float() for record in records])
@@ -681,6 +727,11 @@ def _global_summary(sample_rows: Sequence[dict], requested_classes: Sequence[int
     return {
         "num_samples": int(len(sample_rows)),
         "visualized_classes": [int(v) for v in requested_classes],
+        "pse_l2_mean": {
+            "no_shift": mean("pse_l2_no_shift"),
+            "timematch_scalar": mean("pse_l2_scalar"),
+            "domain_phase": mean("pse_l2_phase"),
+        },
         "fused_distance_mean": {
             "no_shift": mean("fused_distance_no_shift"),
             "timematch_scalar": mean("fused_distance_scalar"),
@@ -730,7 +781,7 @@ def _write_readme(
         "",
         "## 1. 这个目录在回答什么",
         "",
-        "本实验只做前向诊断，不训练模型、不更新参数、不重新估计 Domain Phase。目的只有一个：在同一个 Stage-1 TSStructure 模型上，比较最基础的 TimeMatch 式整段时间平移和当前 nonlinear Domain Phase，谁更能改善 target→source 的同类表示对齐。",
+        "本实验只做前向诊断，不训练模型、不更新参数、不重新估计 Domain Phase。TimeMatch scalar shift 只在 target-train 上无监督选择；正式 No/Scalar/Phase 对照使用 held-out source-test / target-test。目的只有一个：在同一个 Stage-1 TSStructure 模型上，比较最基础的 TimeMatch 式整段时间平移和当前 nonlinear Domain Phase，谁更能改善 target→source 的同类表示对齐。",
         "",
         "三种 target 视图：",
         "",
@@ -764,7 +815,7 @@ def _write_readme(
         "| `README_中文说明.md` | 当前说明文件 | 归档时与整个目录一起保留 |",
         "| `timematch_scalar_shift/shift_scan.csv` | -60~60 每个整数 shift 的 IS、entropy、oracle accuracy、oracle Macro-F1 | `selected_by_inception_score=true` 是正式无监督 scalar shift |",
         "| `timematch_scalar_shift/shift_scan.png` | scalar shift 扫描曲线 | 看 IS 选中的 shift 是否接近 oracle 最优；差很大说明 scalar shift **估计器**本身在当前模型上有问题 |",
-        "| `class_comparison_summary.csv` | 每类 No/Scalar/Phase 的 LTAE 距离、概率、准确率和 Phase 函数几何结果 | 第一层最主要汇总表 |",
+        "| `class_comparison_summary.csv` | 每类 No/Scalar/Phase 的 direct PSE distance、LTAE 距离、概率、准确率和 Phase 函数几何结果 | 第一层最主要汇总表 |",
         "| `sample_comparison.csv` | 每个 oracle target 样本的三视图详细结果 | 可计算分布、失败样本和类别差异 |",
         "| `ltae_representation_comparison/` | 每类 LTAE fused/trend/structure 距离散点 | 左列 Scalar、右列 Domain Phase；点在 y=x 下方表示比 No shift 更接近 source |",
         "| `classifier_probability_comparison/` | 每类真实类别概率 before/after 散点 | 点在 y=x 上方表示该时间校正提高 true-class probability |",
@@ -780,7 +831,7 @@ def _write_readme(
         "## 5. 最重要的判断顺序",
         "",
         "1. 先看 `shift_scan.png`：IS 选择的 scalar shift 是否接近 oracle 最优 shift。",
-        "2. 再看全局 `fused_distance_mean`：Scalar 与 Domain Phase 谁使 LTAE fused representation 更接近 source 同类 prototype。",
+        "2. 先看全局 `pse_l2_mean`：Scalar 与 Domain Phase 谁在完整 PSE latent temporal process 上更接近 source；再看 `fused_distance_mean` 判断这种改善是否传到 LTAE。",
         "3. 再看 `oracle_accuracy` / `true_class_probability_mean`：几何改善是否传到 classifier。",
         "4. 若 oracle scalar shift 很有效而 IS scalar 不行，问题主要是 shift estimator；若 IS scalar 也明显优于 Domain Phase，问题主要在 Domain Phase；若 Scalar 和 Domain Phase 都几乎不改变 LTAE，则应优先检查 Time2Vec/LTAE 对时间位置的敏感性。",
         "",
@@ -826,7 +877,11 @@ def run(args: argparse.Namespace) -> dict:
     time_scale_days = float(phasevis._runtime_value(runtime, "time_scale", 365.0))
 
     groups = phasevis._checkpoint_group_payloads(checkpoint)
-    class_to_group = phasevis._class_to_group(groups)
+    class_to_group = phasevis._class_to_group(
+        groups,
+        phase_routes=checkpoint.get("phase_routes"),
+        num_classes=len(classes),
+    )
     available_classes = tuple(sorted(class_to_group))
     requested_classes = available_classes if args.classes is None else tuple(args.classes)
     unknown = sorted(set(requested_classes) - set(available_classes))
@@ -838,7 +893,15 @@ def run(args: argparse.Namespace) -> dict:
         )
 
     device = torch.device(args.device)
-    model = phasevis._build_model(runtime, checkpoint, device)
+    model_checkpoint_path = None if args.model_checkpoint is None else args.model_checkpoint.resolve()
+    model_checkpoint = (
+        None
+        if model_checkpoint_path is None
+        else torch.load(model_checkpoint_path, map_location="cpu", weights_only=False)
+    )
+    model = phasevis._build_model(
+        runtime, checkpoint, device, model_checkpoint=model_checkpoint
+    )
 
     source_all = phasevis._eligible_parcels(
         data_root,
@@ -856,7 +919,7 @@ def run(args: argparse.Namespace) -> dict:
         combine_spring_and_winter=combine,
         time_coordinate_mode=time_mode,
     )
-    train_indices = phasevis._reconstruct_fold_train_indices(
+    splits = phasevis._reconstruct_fold_splits(
         source_all,
         target_all,
         source=source,
@@ -877,7 +940,7 @@ def run(args: argparse.Namespace) -> dict:
         data_root,
         target,
         classes,
-        train_indices[target],
+        splits[target]["train"],
         closed_set=closed_set,
         combine_spring_and_winter=combine,
         time_coordinate_mode=time_mode,
@@ -923,20 +986,20 @@ def run(args: argparse.Namespace) -> dict:
     # ------------------------------------------------------------------
     # B. Fixed oracle visualization subset shared by No/Scalar/Phase views.
     # ------------------------------------------------------------------
-    source_meta = phasevis._metadata_train_dataset(
+    source_meta = phasevis._metadata_dataset(
         data_root,
         source,
         classes,
-        train_indices[source],
+        splits[source]["test"],
         closed_set=closed_set,
         combine_spring_and_winter=combine,
         time_coordinate_mode=time_mode,
     )
-    target_meta = phasevis._metadata_train_dataset(
+    target_meta = phasevis._metadata_dataset(
         data_root,
         target,
         classes,
-        train_indices[target],
+        splits[target]["test"],
         closed_set=closed_set,
         combine_spring_and_winter=combine,
         time_coordinate_mode=time_mode,
@@ -1042,6 +1105,9 @@ def run(args: argparse.Namespace) -> dict:
             phase_key="structure_repr_after",
         )
         cls = _three_view_classification(target_class, class_id)
+        pse_views, pse_rows = _three_view_pse_metrics(
+            source_class, target_class, grid_size=args.pse_grid_size
+        )
 
         # Domain Phase's own function-geometry effect is retained for context.
         shape_stats = phasevis._distance_stats(
@@ -1070,6 +1136,12 @@ def run(args: argparse.Namespace) -> dict:
                 "phase_group_id": group_id,
                 "target_samples": len(target_class),
                 "timematch_scalar_shift_days": selected_shift,
+                "pse_l2_no_shift": pse_views["no_shift"]["l2"],
+                "pse_l2_scalar": pse_views["timematch_scalar"]["l2"],
+                "pse_l2_phase": pse_views["domain_phase"]["l2"],
+                "pse_mse_no_shift": pse_views["no_shift"]["mse"],
+                "pse_mse_scalar": pse_views["timematch_scalar"]["mse"],
+                "pse_mse_phase": pse_views["domain_phase"]["mse"],
                 "fused_no_shift_mean": fused_stats["no_shift_mean"],
                 "fused_scalar_mean": fused_stats["scalar_mean"],
                 "fused_phase_mean": fused_stats["phase_mean"],
@@ -1103,6 +1175,7 @@ def run(args: argparse.Namespace) -> dict:
         )
 
         for index, record in enumerate(target_class):
+            pse_sample = pse_rows[index]
             logits0 = record["logits_before"].float()
             logitss = record["logits_scalar"].float()
             logitsp = record["logits_after"].float()
@@ -1122,6 +1195,12 @@ def run(args: argparse.Namespace) -> dict:
                     "scalar_shift_days": selected_shift,
                     "phase_position_shift_signed_mean_days": float(phase_delta.mean().item()) if phase_delta.numel() else None,
                     "phase_position_shift_abs_mean_days": float(phase_delta.abs().mean().item()) if phase_delta.numel() else None,
+                    "pse_l2_no_shift": pse_sample["pse_l2_no_shift"],
+                    "pse_l2_scalar": pse_sample["pse_l2_timematch_scalar"],
+                    "pse_l2_phase": pse_sample["pse_l2_domain_phase"],
+                    "pse_mse_no_shift": pse_sample["pse_mse_no_shift"],
+                    "pse_mse_scalar": pse_sample["pse_mse_timematch_scalar"],
+                    "pse_mse_phase": pse_sample["pse_mse_domain_phase"],
                     "fused_distance_no_shift": float(fused0[index].item()),
                     "fused_distance_scalar": float(fuseds[index].item()),
                     "fused_distance_phase": float(fusedp[index].item()),
@@ -1184,7 +1263,8 @@ def run(args: argparse.Namespace) -> dict:
 
     manifest = {
         "purpose": "first-layer no-shift vs TimeMatch-style scalar shift vs confirmed Domain Phase comparison",
-        "checkpoint": str(checkpoint_path),
+        "phase_checkpoint": str(checkpoint_path),
+        "model_checkpoint": str(model_checkpoint_path or checkpoint_path),
         "checkpoint_stage": checkpoint.get("stage"),
         "checkpoint_epoch": checkpoint.get("epoch"),
         "successful_optimizer_steps": checkpoint.get("successful_optimizer_steps"),
@@ -1194,6 +1274,8 @@ def run(args: argparse.Namespace) -> dict:
         "fold": fold,
         "classes": list(classes),
         "visualized_class_ids": [int(v) for v in requested_classes],
+        "shift_estimation_partition": "target train only; labels ignored for Inception-Score selection",
+        "oracle_comparison_partition": "held-out source test + held-out target test",
         "target_label_usage": "oracle post-hoc diagnostics only; never used to select scalar shift or estimate Domain Phase",
         "timematch_reference": {
             "repository": TIMEMATCH_REPOSITORY,
@@ -1219,6 +1301,8 @@ def run(args: argparse.Namespace) -> dict:
         "class_summary": class_rows,
     }
     _json_dump(output_dir / "comparison_manifest.json", manifest)
+    _json_dump(output_dir / "manifest.json", manifest)
+    _json_dump(output_dir / "summary.json", global_summary)
     _write_readme(
         output_dir / "README_中文说明.md",
         checkpoint=checkpoint_path,
@@ -1248,7 +1332,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="First-layer diagnostic: No shift vs TimeMatch scalar vs Domain Phase."
     )
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True, help="Stage-2 checkpoint providing confirmed Phase state and source statistics")
+    parser.add_argument("--model-checkpoint", type=Path, default=None, help="Optional Stage-1 checkpoint providing zero-step model weights while reusing saved Phase state")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -1257,6 +1342,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--samples-per-class", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--pse-grid-size", type=int, default=128)
     parser.add_argument("--dpi", type=int, default=180)
     parser.add_argument("--timematch-max-shift", type=int, default=60)
     parser.add_argument("--timematch-estimation-batches", type=int, default=100)
@@ -1271,6 +1357,8 @@ def main() -> None:
         raise ValueError("sample/batch sizes must be positive")
     if args.num_workers < 0:
         raise ValueError("num-workers must be nonnegative")
+    if args.pse_grid_size < 2:
+        raise ValueError("pse-grid-size must be at least 2")
     if args.timematch_max_shift < 0:
         raise ValueError("timematch-max-shift must be nonnegative")
     if args.timematch_estimation_batches <= 0 or args.timematch_batch_size <= 0:

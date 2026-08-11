@@ -54,6 +54,8 @@ from torchvision.transforms import transforms
 
 from dataset import GroupByShapesBatchSampler, PixelSetData, worker_init_fn
 from methods.structure_da.feature_snapshots import fit_deterministic_pca, project_features
+from methods.structure_da.phase_geometry import phase_distance
+from methods.structure_da import phase_visualization_protocol as visproto
 from methods.structure_da.full_model import TSStructureModel
 from methods.structure_da.confirmed_phase_view import align_target_positions_to_source
 from methods.structure_da.phase_registration import (
@@ -95,14 +97,41 @@ def _checkpoint_group_payloads(checkpoint: dict) -> List[dict]:
     return confirmed
 
 
-def _class_to_group(groups: Sequence[dict]) -> Dict[int, dict]:
+def _class_to_group(
+    groups: Sequence[dict],
+    *,
+    phase_routes: Optional[Sequence[Optional[int]]] = None,
+    num_classes: Optional[int] = None,
+) -> Dict[int, dict]:
+    """Resolve Phase *usage* routing, not only estimation membership.
+
+    ``member_classes`` are the class centers that estimated a group.  Stage-2
+    usage can be broader: M=1 is available to every class and M=2 can expand
+    through Stable-Label routing.  Prefer the serialized ``phase_routes`` when
+    present so held-out diagnostics test the same C_use semantics as training.
+    """
+    group_by_id = {int(group["group_id"]): group for group in groups}
     mapping: Dict[int, dict] = {}
+    if phase_routes is not None:
+        for class_id, route in enumerate(phase_routes):
+            if route is None:
+                continue
+            group = group_by_id.get(int(route))
+            if group is not None:
+                mapping[int(class_id)] = group
+    if mapping:
+        return mapping
+
     for group in groups:
         for class_id in group.get("member_classes", ()):
             class_id = int(class_id)
             if class_id in mapping:
                 raise ValueError("a class belongs to more than one confirmed phase group")
             mapping[class_id] = group
+    if len(groups) == 1 and num_classes is not None:
+        group = groups[0]
+        for class_id in range(int(num_classes)):
+            mapping.setdefault(class_id, group)
     return mapping
 
 
@@ -113,7 +142,23 @@ def _runtime_value(runtime: dict, name: str, default=None):
     return value
 
 
-def _build_model(runtime: dict, checkpoint: dict, device: torch.device) -> TSStructureModel:
+def _checkpoint_model_state_dict(checkpoint: dict) -> dict:
+    state_dict = checkpoint.get("model_state_dict")
+    if isinstance(state_dict, dict):
+        return state_dict
+    state_dict = checkpoint.get("state_dict")
+    if isinstance(state_dict, dict):
+        return state_dict
+    raise ValueError("checkpoint contains neither model_state_dict nor state_dict")
+
+
+def _build_model(
+    runtime: dict,
+    checkpoint: dict,
+    device: torch.device,
+    *,
+    model_checkpoint: Optional[dict] = None,
+) -> TSStructureModel:
     model = TSStructureModel(
         num_classes=int(runtime["num_classes"]),
         input_dim=int(_runtime_value(runtime, "input_dim", 10)),
@@ -142,10 +187,8 @@ def _build_model(runtime: dict, checkpoint: dict, device: torch.device) -> TSStr
             _runtime_value(runtime, "time2vec_max_frequency", 16.0)
         ),
     )
-    state_dict = checkpoint.get("state_dict")
-    if not isinstance(state_dict, dict):
-        raise ValueError("checkpoint does not contain state_dict")
-    model.load_state_dict(state_dict, strict=True)
+    state_source = checkpoint if model_checkpoint is None else model_checkpoint
+    model.load_state_dict(_checkpoint_model_state_dict(state_source), strict=True)
     model.to(device)
     model.eval()
     return model
@@ -174,7 +217,7 @@ def _eligible_parcels(
     return dataset.get_parcel_indices()
 
 
-def _reconstruct_fold_train_indices(
+def _reconstruct_fold_splits(
     source_parcels: np.ndarray,
     target_parcels: np.ndarray,
     *,
@@ -184,12 +227,17 @@ def _reconstruct_fold_train_indices(
     val_ratio: float,
     test_ratio: float,
     fold: int,
-) -> Dict[str, set]:
-    """Reproduce create_train_val_test_folds exactly for the requested fold."""
+) -> Dict[str, Dict[str, set]]:
+    """Reproduce ``train.create_train_val_test_folds`` for one fold.
+
+    Keeping all three partitions here is important: Phase is estimated from
+    target-train, whereas the formal post-hoc visualization must use held-out
+    source-test/target-test parcels.
+    """
     rng = random.Random(seed)
     requested = None
-    for fold_index in range(fold + 1):
-        splits: Dict[str, set] = {}
+    for _fold_index in range(fold + 1):
+        splits: Dict[str, Dict[str, set]] = {}
         for name, raw in ((source, source_parcels), (target, target_parcels)):
             indices = [int(value) for value in raw.tolist()]
             n = len(indices)
@@ -197,18 +245,22 @@ def _reconstruct_fold_train_indices(
             n_val = int(val_ratio * n)
             n_train = n - n_test - n_val
             rng.shuffle(indices)
-            splits[name] = set(indices[:n_train])
+            splits[name] = {
+                "train": set(indices[:n_train]),
+                "val": set(indices[n_train:n_train + n_val]),
+                "test": set(indices[n_train + n_val:]),
+            }
         requested = splits
     if requested is None:
         raise RuntimeError("failed to reconstruct requested fold")
     return requested
 
 
-def _metadata_train_dataset(
+def _metadata_dataset(
     data_root: str,
     domain: str,
     classes: Sequence[str],
-    train_indices: set,
+    indices: set,
     *,
     closed_set: bool,
     combine_spring_and_winter: bool,
@@ -219,12 +271,23 @@ def _metadata_train_dataset(
         dataset_name=domain,
         classes=list(classes),
         transform=None,
-        indices=train_indices,
+        indices=indices,
         with_extra=False,
         closed_set=closed_set,
         combine_spring_and_winter=combine_spring_and_winter,
         time_coordinate_mode=time_coordinate_mode,
     )
+
+
+# Backward-compatible aliases for older diagnostic imports.  New code should
+# use the full split dictionary and ``_metadata_dataset`` explicitly.
+def _reconstruct_fold_train_indices(*args, **kwargs) -> Dict[str, set]:
+    splits = _reconstruct_fold_splits(*args, **kwargs)
+    return {domain: parts["train"] for domain, parts in splits.items()}
+
+
+def _metadata_train_dataset(*args, **kwargs) -> PixelSetData:
+    return _metadata_dataset(*args, **kwargs)
 
 
 def _uniform_selected_parcels(
@@ -408,6 +471,7 @@ def _collect_geometry(
                 "parcel_index": int(parcels[row].item()),
                 "positions": backbone.normalized_positions[row].detach().cpu(),
                 "mask": backbone.time_mask[row].detach().cpu(),
+                "pse_tokens": backbone.tokens[row].detach().cpu(),
                 "trend_tokens": trend_tokens[row].detach().cpu(),
                 "structure_tokens": structure_tokens[row].detach().cpu(),
                 "trend_q_before": output.geometry.trend_srvf[row].detach().cpu(),
@@ -493,6 +557,202 @@ def _source_pca(
 
 def _project(values: Tensor, mean: np.ndarray, components: np.ndarray) -> np.ndarray:
     return project_features(values.numpy().astype(np.float32), mean, components)
+
+
+def _canonicalize_pse_tokens(
+    record: dict,
+    *,
+    positions_key: str,
+    grid_size: int = 128,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Piecewise-linearly place PSE latent tokens on a fixed canonical grid.
+
+    Domain Phase does not alter PSE values; it changes the time coordinates
+    attached to those values.  This helper therefore uses the same latent
+    tokens with either native positions or the saved gamma-inverse corrected
+    positions.  No target information is used to fit parameters.
+    """
+    if grid_size < 2:
+        raise ValueError("grid_size must be at least 2")
+    mask = record["mask"].bool()
+    positions = record[positions_key][mask].detach().cpu().double()
+    values = record["pse_tokens"][mask].detach().cpu().double()
+    grid = torch.linspace(0.0, 1.0, int(grid_size), dtype=torch.float64)
+    output = torch.zeros((grid.numel(), values.shape[-1]), dtype=torch.float64)
+    support = torch.zeros(grid.numel(), dtype=torch.bool)
+    if positions.numel() < 2:
+        return output.float(), support, grid.float()
+    if not torch.all(positions[1:] > positions[:-1]).item():
+        raise ValueError(f"{positions_key} must be strictly increasing on valid tokens")
+    support = (grid >= positions[0]) & (grid <= positions[-1])
+    query = grid[support]
+    if not query.numel():
+        return output.float(), support, grid.float()
+    upper = torch.searchsorted(positions, query, right=True).clamp(
+        min=1, max=positions.numel() - 1
+    )
+    lower = upper - 1
+    x0 = positions[lower]
+    x1 = positions[upper]
+    fraction = ((query - x0) / (x1 - x0).clamp_min(1e-12)).unsqueeze(-1)
+    interpolated = values[lower] + fraction * (values[upper] - values[lower])
+    output[support] = interpolated
+    return output.float(), support, grid.float()
+
+
+def _canonical_pse_center(
+    records: Sequence[dict],
+    *,
+    positions_key: str,
+    grid_size: int = 128,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    trajectories: List[Tensor] = []
+    supports: List[Tensor] = []
+    grid: Optional[Tensor] = None
+    for record in records:
+        trajectory, support, current_grid = _canonicalize_pse_tokens(
+            record, positions_key=positions_key, grid_size=grid_size
+        )
+        trajectories.append(trajectory)
+        supports.append(support)
+        grid = current_grid
+    if not trajectories or grid is None:
+        raise ValueError("PSE center requires at least one record")
+    values = torch.stack(trajectories, dim=0)
+    support = torch.stack(supports, dim=0)
+    counts = support.sum(dim=0)
+    center = (values * support.unsqueeze(-1)).sum(dim=0) / counts.clamp_min(1).unsqueeze(-1)
+    return center, counts > 0, grid
+
+
+def _pse_integrated_distance(
+    left: Tensor,
+    left_support: Tensor,
+    right: Tensor,
+    right_support: Tensor,
+) -> Tuple[float, float, int]:
+    common = left_support.bool() & right_support.bool()
+    count = int(common.sum().item())
+    if count < 2:
+        return float("nan"), float("nan"), count
+    squared_feature_error = (left[common].float() - right[common].float()).square().mean(dim=-1)
+    weights = torch.ones_like(squared_feature_error)
+    if weights.numel() > 1:
+        weights[[0, -1]] *= 0.5
+    integrated_mse = float((squared_feature_error * weights).sum().item() / weights.sum().item())
+    return integrated_mse, float(np.sqrt(max(integrated_mse, 0.0))), count
+
+
+def _pse_class_metrics(
+    source_records: Sequence[dict],
+    target_records: Sequence[dict],
+    *,
+    grid_size: int = 128,
+) -> Tuple[dict, List[dict], dict]:
+    source_center, source_support, grid = _canonical_pse_center(
+        source_records, positions_key="positions", grid_size=grid_size
+    )
+    target_before_center, target_before_support, _ = _canonical_pse_center(
+        target_records, positions_key="positions", grid_size=grid_size
+    )
+    target_after_center, target_after_support, _ = _canonical_pse_center(
+        target_records, positions_key="positions_after", grid_size=grid_size
+    )
+    before_mse, before_l2, before_common = _pse_integrated_distance(
+        source_center, source_support, target_before_center, target_before_support
+    )
+    after_mse, after_l2, after_common = _pse_integrated_distance(
+        source_center, source_support, target_after_center, target_after_support
+    )
+
+    sample_rows: List[dict] = []
+    improved = 0
+    valid_samples = 0
+    for record in target_records:
+        before, before_support, _ = _canonicalize_pse_tokens(
+            record, positions_key="positions", grid_size=grid_size
+        )
+        after, after_support, _ = _canonicalize_pse_tokens(
+            record, positions_key="positions_after", grid_size=grid_size
+        )
+        sample_before_mse, sample_before_l2, sample_before_common = _pse_integrated_distance(
+            source_center, source_support, before, before_support
+        )
+        sample_after_mse, sample_after_l2, sample_after_common = _pse_integrated_distance(
+            source_center, source_support, after, after_support
+        )
+        is_valid = np.isfinite(sample_before_l2) and np.isfinite(sample_after_l2)
+        if is_valid:
+            valid_samples += 1
+            improved += int(sample_after_l2 < sample_before_l2)
+        sample_rows.append(
+            {
+                "parcel_index": int(record["parcel_index"]),
+                "pse_mse_before": sample_before_mse,
+                "pse_mse_after": sample_after_mse,
+                "pse_l2_before": sample_before_l2,
+                "pse_l2_after": sample_after_l2,
+                "pse_common_grid_before": sample_before_common,
+                "pse_common_grid_after": sample_after_common,
+                "pse_distance_improved": bool(is_valid and sample_after_l2 < sample_before_l2),
+            }
+        )
+    relative = (before_l2 - after_l2) / max(before_l2, 1e-12) if np.isfinite(before_l2) else float("nan")
+    summary = {
+        "pse_class_mean_mse_before": before_mse,
+        "pse_class_mean_mse_after": after_mse,
+        "pse_class_mean_l2_before": before_l2,
+        "pse_class_mean_l2_after": after_l2,
+        "pse_class_mean_relative_reduction": relative,
+        "pse_sample_improvement_rate": improved / valid_samples if valid_samples else float("nan"),
+        "pse_valid_samples": valid_samples,
+        "pse_common_grid_before": before_common,
+        "pse_common_grid_after": after_common,
+    }
+    curves = {
+        "grid": grid,
+        "source_center": source_center,
+        "source_support": source_support,
+        "target_before_center": target_before_center,
+        "target_before_support": target_before_support,
+        "target_after_center": target_after_center,
+        "target_after_support": target_after_support,
+    }
+    return summary, sample_rows, curves
+
+
+def _plot_pse_class_mean_alignment(
+    path: Path,
+    *,
+    title: str,
+    curves: dict,
+    pca_mean: np.ndarray,
+    pca_components: np.ndarray,
+    dpi: int,
+) -> None:
+    grid = curves["grid"].numpy() * 365.0
+    projected = {
+        name: _project(curves[name], pca_mean, pca_components)
+        for name in ("source_center", "target_before_center", "target_after_center")
+    }
+    figure, axes = plt.subplots(2, 1, figsize=(9.0, 7.0), sharex=True, constrained_layout=True)
+    labels = (
+        ("source_center", "source_support", "Source test class mean"),
+        ("target_before_center", "target_before_support", "Target test native"),
+        ("target_after_center", "target_after_support", "Target test after Domain Phase"),
+    )
+    for component, axis in enumerate(axes):
+        for value_key, support_key, label in labels:
+            support = curves[support_key].numpy().astype(bool)
+            axis.plot(grid[support], projected[value_key][support, component], label=label, linewidth=1.8)
+        axis.set_ylabel(f"source-fit PCA PC{component + 1}")
+        axis.grid(alpha=0.18)
+        axis.legend(loc="best")
+    axes[-1].set_xlabel("canonical day")
+    figure.suptitle(title)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
 
 
 def _support_weighted_center(records: Sequence[dict], q_key: str, support_key: str) -> Tuple[Tensor, Tensor]:
@@ -886,6 +1146,12 @@ def _plot_phase_groups(output_dir: Path, groups: Sequence[dict], dpi: int) -> Li
             "group_id": int(group["group_id"]),
             "member_classes": [int(v) for v in group.get("member_classes", ())],
             "gamma_points": int(len(gamma)),
+            "within_dispersion": group.get("within_dispersion"),
+            "diameter": group.get("diameter"),
+            "core_radius": group.get("core_radius"),
+            "center_drift": group.get("center_drift"),
+            "sample_evidence_count": group.get("sample_evidence_count"),
+            "class_count": group.get("class_count"),
             "source_to_target_shift_days_interior_median": median_shift,
             "source_to_target_shift_days_interior_p10": float(np.percentile(interior_shift, 10)),
             "source_to_target_shift_days_interior_p90": float(np.percentile(interior_shift, 90)),
@@ -919,6 +1185,157 @@ def _plot_phase_groups(output_dir: Path, groups: Sequence[dict], dpi: int) -> Li
     return summaries
 
 
+def _phase_consistency_outputs(
+    output_dir: Path,
+    *,
+    checkpoint: dict,
+    groups: Sequence[dict],
+    classes: Sequence[str],
+    dpi: int,
+) -> dict:
+    """Write experiment-03 class/group Phase consistency diagnostics.
+
+    Older Stage-2 checkpoints saved group centers but not class centers.  Those
+    checkpoints remain usable for experiments 01/02/04; experiment 03 records
+    the missing serialization explicitly instead of reconstructing it from new
+    DP calls or pretending the data exist.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    group_summary = _plot_phase_groups(output_dir, groups, dpi)
+    phase = checkpoint.get("phase_state")
+    class_centers = phase.get("class_centers") if isinstance(phase, dict) else None
+    available = isinstance(class_centers, (list, tuple)) and len(class_centers) > 0
+    availability = {
+        "class_center_gamma_available": bool(available),
+        "legacy_checkpoint_degraded_mode": not bool(available),
+        "reason": None if available else (
+            "checkpoint predates full Phase-state serialization; group center gamma is available "
+            "but class center gammas cannot be recovered without rerunning registration"
+        ),
+    }
+    _json_dump(output_dir / "availability.json", availability)
+    _json_dump(output_dir / "group_summary.json", {"groups": group_summary})
+
+    if not available:
+        _json_dump(output_dir / "manifest.json", {
+            "experiment": "03_domain_phase_consistency",
+            **availability,
+            "groups": group_summary,
+        })
+        (output_dir / "README_中文说明.md").write_text(
+            "# 03 Domain-level Phase consistency\n\n"
+            "本实验用于判断已确认的 Phase 是否由多个类别共同支持，而不是类别特异 Phase。\n\n"
+            "当前 checkpoint 属于旧序列化格式：保存了 confirmed group center gamma，"
+            "但没有保存 class-center gamma。因此本目录仍给出 `phase_groups/` 与 "
+            "`group_summary.json`，但无法可靠计算 class-center pairwise distance。"
+            "不会重新运行 exact-DP，也不会从日志或 group center 伪造 class center。\n\n"
+            "后续由本 patch 产生的新 checkpoint 会完整保存 class centers；届时同一脚本"
+            "会自动输出 `class_center_gamma.png`、`displacement_days_by_class.png`、"
+            "`class_phase_summary.csv` 和 `pairwise_center_distance.csv`。\n",
+            encoding="utf-8",
+        )
+        return {"availability": availability, "groups": group_summary, "class_centers": []}
+
+    group_by_id = {int(group["group_id"]): group for group in groups}
+    class_rows: List[dict] = []
+    pairwise_rows: List[dict] = []
+    prepared: List[Tuple[int, Tensor, dict]] = []
+    for payload in class_centers:
+        gamma = payload.get("center_gamma")
+        if not isinstance(gamma, Tensor):
+            continue
+        class_id = int(payload["class_id"])
+        gamma = gamma.detach().cpu().double()
+        nearest_group_id = None
+        nearest_distance = None
+        for group_id, group in group_by_id.items():
+            distance = float(phase_distance(gamma, group["center_gamma"].detach().cpu().double()).item())
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_distance = distance
+                nearest_group_id = group_id
+        grid = torch.linspace(0.0, 1.0, gamma.numel(), dtype=torch.float64)
+        displacement = (gamma - grid) * 365.0
+        interior = displacement[(grid >= 0.10) & (grid <= 0.90)]
+        class_rows.append({
+            "class_id": class_id,
+            "class_name": classes[class_id] if 0 <= class_id < len(classes) else str(class_id),
+            "valid": bool(payload.get("valid", False)),
+            "reject_reason": payload.get("reject_reason"),
+            "candidate_count": payload.get("candidate_count"),
+            "effective_evidence_count": payload.get("effective_evidence_count"),
+            "dispersion": payload.get("dispersion"),
+            "diameter": payload.get("diameter"),
+            "median_distance": payload.get("median_distance"),
+            "center_drift": payload.get("center_drift"),
+            "nearest_group_id": nearest_group_id,
+            "distance_to_nearest_group": nearest_distance,
+            "source_to_target_shift_days_interior_median": float(interior.median().item()) if interior.numel() else float("nan"),
+            "source_to_target_shift_days_interior_p10": float(torch.quantile(interior, 0.10).item()) if interior.numel() else float("nan"),
+            "source_to_target_shift_days_interior_p90": float(torch.quantile(interior, 0.90).item()) if interior.numel() else float("nan"),
+        })
+        prepared.append((class_id, gamma, payload))
+
+    for left_id, left_gamma, _ in prepared:
+        for right_id, right_gamma, _ in prepared:
+            pairwise_rows.append({
+                "class_id_i": left_id,
+                "class_id_j": right_id,
+                "phase_distance": float(phase_distance(left_gamma, right_gamma).item()),
+            })
+    if class_rows:
+        _write_csv(output_dir / "class_phase_summary.csv", class_rows)
+    if pairwise_rows:
+        _write_csv(output_dir / "pairwise_center_distance.csv", pairwise_rows)
+
+    fig, ax = plt.subplots(figsize=(9.5, 6.0), constrained_layout=True)
+    for class_id, gamma, payload in prepared:
+        grid = np.linspace(0.0, 365.0, gamma.numel())
+        ax.plot(grid, gamma.numpy() * 365.0, linewidth=1.2, alpha=0.75, label=f"{class_id}:{classes[class_id]}")
+    for group in groups:
+        gamma = group["center_gamma"].detach().cpu().double().numpy()
+        grid = np.linspace(0.0, 365.0, len(gamma))
+        ax.plot(grid, gamma * 365.0, linewidth=3.0, linestyle="--", label=f"group {int(group['group_id'])}")
+    ax.plot([0.0, 365.0], [0.0, 365.0], linestyle=":", linewidth=1.2, label="identity")
+    ax.set_xlabel("source canonical day")
+    ax.set_ylabel("target canonical day")
+    ax.set_title("Class Phase centers and confirmed Domain Phase group centers")
+    ax.grid(alpha=0.18)
+    ax.legend(loc="best", fontsize=8, ncol=2)
+    fig.savefig(output_dir / "class_center_gamma.png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(9.5, 6.0), constrained_layout=True)
+    for class_id, gamma, _ in prepared:
+        grid = torch.linspace(0.0, 1.0, gamma.numel(), dtype=torch.float64)
+        ax.plot(grid.numpy() * 365.0, ((gamma - grid) * 365.0).numpy(), linewidth=1.2, label=f"{class_id}:{classes[class_id]}")
+    ax.axhline(0.0, linestyle=":", linewidth=1.0)
+    ax.set_xlabel("canonical day")
+    ax.set_ylabel("gamma(t)-t (days)")
+    ax.set_title("Source-to-target Phase displacement by class")
+    ax.grid(alpha=0.18)
+    ax.legend(loc="best", fontsize=8, ncol=2)
+    fig.savefig(output_dir / "displacement_days_by_class.png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+    _json_dump(output_dir / "manifest.json", {
+        "experiment": "03_domain_phase_consistency",
+        **availability,
+        "groups": group_summary,
+        "num_class_centers": len(class_rows),
+    })
+    (output_dir / "README_中文说明.md").write_text(
+        "# 03 Domain-level Phase consistency\n\n"
+        "目标：区分共享的 domain-level Phase 与 class-intrinsic Phase。target true label 不参与本实验；"
+        "这里使用的是 calibration 时保存的 class-level Phase centers。\n\n"
+        "重点查看 `class_center_gamma.png`、`displacement_days_by_class.png`、"
+        "`pairwise_center_distance.csv` 和 `class_phase_summary.csv`。若可靠类别中心紧密围绕"
+        "同一个 group center，支持共享 Domain Phase；若类别中心明显分裂而 M=1 仍被确认，"
+        "应重新审计 group-level criteria。\n",
+        encoding="utf-8",
+    )
+    return {"availability": availability, "groups": group_summary, "class_centers": class_rows}
+
+
 def _write_csv(path: Path, rows: Sequence[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -933,6 +1350,18 @@ def _json_dump(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
+
+# Bind the script to the dependency-light, unit-tested protocol helpers.  The
+# local definitions above are kept for backward source compatibility with old
+# notebooks that may import them by line/function, but runtime calls use this
+# shared implementation.
+_checkpoint_model_state_dict = visproto.checkpoint_model_state_dict
+_class_to_group = visproto.class_to_group
+_reconstruct_fold_splits = visproto.reconstruct_fold_splits
+_canonicalize_pse_tokens = visproto.canonicalize_pse_tokens
+_canonical_pse_center = visproto.canonical_pse_center
+_pse_integrated_distance = visproto.pse_integrated_distance
+_pse_class_metrics = visproto.pse_class_metrics
 
 
 def _write_chinese_readme(
@@ -949,7 +1378,7 @@ def _write_chinese_readme(
     lines: List[str] = []
     lines.append("# Domain Phase 对齐可视化结果说明")
     lines.append("")
-    lines.append("本目录用于检查已确认的 Domain Phase 是否真正改善 source-target 同类对齐。目标域真实标签只用于离线 oracle 可视化配对，不参与训练、伪标签、Domain Phase 或 Domain Shape 的估计。")
+    lines.append("本目录使用 held-out source-test / target-test 检查已确认的 Domain Phase 是否真正改善 source-target 同类对齐。目标域真实标签只用于离线 oracle 可视化配对，不参与训练、伪标签、Domain Phase、阈值选择或模型选择。")
     lines.append("")
     lines.append("## 本次运行")
     lines.append("")
@@ -982,9 +1411,9 @@ def _write_chinese_readme(
     lines.append("")
     lines.append("| 文件 | 含义 |")
     lines.append("|---|---|")
-    lines.append("| `phase_alignment_summary.csv` | 每个类别的 Shape、Trend、LTAE 表示 before/after 汇总指标 |")
-    lines.append("| `ltae_representation_samples.csv` | 每个 target 样本的 LTAE 距离、位置移动、分类概率 before/after |")
-    lines.append("| `phase_alignment_manifest.json` | 本次运行参数、Phase 方向、PCA 信息和完整汇总 |")
+    lines.append("| `summary.csv` | 每个类别的 Shape、Trend、LTAE 表示 before/after 汇总指标 |")
+    lines.append("| `sample_metrics.csv` | 每个 target-test 样本的 LTAE 距离、位置移动、分类概率 before/after |")
+    lines.append("| `manifest.json` | 本次运行参数、held-out split、Phase 方向、PCA 信息和完整汇总 |")
     lines.append("| `source_only_projection_basis.npz` | 只用 source 拟合并冻结的 PCA basis，保证 target before/after 共用同一投影 |")
     lines.append("")
     if group_summaries:
@@ -1047,7 +1476,11 @@ def run(args: argparse.Namespace) -> dict:
     test_ratio = float(_runtime_value(runtime, "test_ratio", 0.2))
 
     groups = _checkpoint_group_payloads(checkpoint)
-    class_to_group = _class_to_group(groups)
+    class_to_group = _class_to_group(
+        groups,
+        phase_routes=checkpoint.get("phase_routes"),
+        num_classes=len(classes),
+    )
     available_classes = tuple(sorted(class_to_group))
     requested_classes = available_classes if args.classes is None else tuple(args.classes)
     unknown = sorted(set(requested_classes) - set(available_classes))
@@ -1060,7 +1493,15 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError("requested class id is outside checkpoint class range")
 
     device = torch.device(args.device)
-    model = _build_model(runtime, checkpoint, device)
+    model_checkpoint_path = None if args.model_checkpoint is None else args.model_checkpoint.resolve()
+    model_checkpoint = (
+        None
+        if model_checkpoint_path is None
+        else torch.load(model_checkpoint_path, map_location="cpu", weights_only=False)
+    )
+    model = _build_model(
+        runtime, checkpoint, device, model_checkpoint=model_checkpoint
+    )
 
     source_all = _eligible_parcels(
         data_root, source, classes,
@@ -1074,7 +1515,7 @@ def run(args: argparse.Namespace) -> dict:
         combine_spring_and_winter=combine,
         time_coordinate_mode=time_mode,
     )
-    train_indices = _reconstruct_fold_train_indices(
+    splits = _reconstruct_fold_splits(
         source_all, target_all,
         source=source,
         target=target,
@@ -1084,14 +1525,14 @@ def run(args: argparse.Namespace) -> dict:
         fold=fold,
     )
 
-    source_meta = _metadata_train_dataset(
-        data_root, source, classes, train_indices[source],
+    source_meta = _metadata_dataset(
+        data_root, source, classes, splits[source]["test"],
         closed_set=closed_set,
         combine_spring_and_winter=combine,
         time_coordinate_mode=time_mode,
     )
-    target_meta = _metadata_train_dataset(
-        data_root, target, classes, train_indices[target],
+    target_meta = _metadata_dataset(
+        data_root, target, classes, splits[target]["test"],
         closed_set=closed_set,
         combine_spring_and_winter=combine,
         time_coordinate_mode=time_mode,
@@ -1151,6 +1592,12 @@ def run(args: argparse.Namespace) -> dict:
         support_key=None,
         token_mask=True,
     )
+    pse_mean, pse_components, pse_ratio = _source_pca(
+        source_records,
+        feature_key="pse_tokens",
+        support_key=None,
+        token_mask=True,
+    )
 
     bank = checkpoint.get("source_prototype_bank")
     if not isinstance(bank, dict):
@@ -1163,8 +1610,13 @@ def run(args: argparse.Namespace) -> dict:
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    geometry_dir = output_dir / "01_domain_phase_geometry_alignment"
+    pse_dir = output_dir / "02_pse_latent_phase_alignment"
+    phase_consistency_dir = output_dir / "03_domain_phase_consistency"
+    for directory in (geometry_dir, pse_dir, phase_consistency_dir):
+        directory.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
-        output_dir / "source_only_projection_basis.npz",
+        geometry_dir / "source_only_projection_basis.npz",
         shape_mean=shape_mean,
         shape_components=shape_components,
         shape_explained_variance_ratio=shape_ratio,
@@ -1175,9 +1627,17 @@ def run(args: argparse.Namespace) -> dict:
         structure_components=structure_components,
         structure_explained_variance_ratio=structure_ratio,
     )
+    np.savez_compressed(
+        pse_dir / "pse_pca_source_fit.npz",
+        pse_mean=pse_mean,
+        pse_components=pse_components,
+        pse_explained_variance_ratio=pse_ratio,
+    )
 
     summary_rows: List[dict] = []
     sample_rows: List[dict] = []
+    pse_summary_rows: List[dict] = []
+    pse_sample_rows: List[dict] = []
     for class_id in requested_classes:
         source_class = source_records.get(class_id, [])
         target_class = target_records.get(class_id, [])
@@ -1209,6 +1669,32 @@ def run(args: argparse.Namespace) -> dict:
             support_after_key="trend_support_after",
             prototype_q=source_trend_proto[class_id],
             prototype_support=source_trend_support[class_id],
+        )
+        pse_stats, class_pse_samples, pse_curves = _pse_class_metrics(
+            source_class, target_class, grid_size=args.pse_grid_size
+        )
+        pse_summary_rows.append({
+            "class_id": int(class_id),
+            "class_name": name,
+            "phase_group_id": group_id,
+            "source_test_samples": len(source_class),
+            "target_test_samples": len(target_class),
+            **pse_stats,
+        })
+        for item in class_pse_samples:
+            pse_sample_rows.append({
+                "class_id": int(class_id),
+                "class_name": name,
+                "phase_group_id": group_id,
+                **item,
+            })
+        _plot_pse_class_mean_alignment(
+            pse_dir / f"class_{class_id:02d}_{name}" / "pse_pc_mean_before_after.png",
+            title=f"PSE latent Phase alignment — class {class_id}: {name}",
+            curves=pse_curves,
+            pca_mean=pse_mean,
+            pca_components=pse_components,
+            dpi=args.dpi,
         )
 
         source_fused_sampled = _representation_center(source_class, "fused_repr_before")
@@ -1341,7 +1827,7 @@ def run(args: argparse.Namespace) -> dict:
         )
 
         _plot_q_spaghetti(
-            output_dir / "shape_spaghetti" / f"{stem}.png",
+            geometry_dir / "shape_spaghetti" / f"{stem}.png",
             title=f"Shape-SRVF Phase alignment — class {class_id}: {name}",
             source=source_class,
             target=target_class,
@@ -1356,7 +1842,7 @@ def run(args: argparse.Namespace) -> dict:
             dpi=args.dpi,
         )
         _plot_q_mean_overlay(
-            output_dir / "shape_mean_overlay" / f"{stem}.png",
+            geometry_dir / "shape_mean_overlay" / f"{stem}.png",
             title=f"Shape-SRVF class center — class {class_id}: {name}",
             target=target_class,
             q_prefix="shape_q",
@@ -1367,7 +1853,7 @@ def run(args: argparse.Namespace) -> dict:
             dpi=args.dpi,
         )
         _plot_q_spaghetti(
-            output_dir / "trend_spaghetti" / f"{stem}.png",
+            geometry_dir / "trend_spaghetti" / f"{stem}.png",
             title=f"Trend-SRVF Phase alignment — class {class_id}: {name}",
             source=source_class,
             target=target_class,
@@ -1382,7 +1868,7 @@ def run(args: argparse.Namespace) -> dict:
             dpi=args.dpi,
         )
         _plot_structure_position_spaghetti(
-            output_dir / "ltae_position_spaghetti" / f"{stem}.png",
+            geometry_dir / "ltae_position_spaghetti" / f"{stem}.png",
             title=f"Raw Structure tokens and LTAE positions — class {class_id}: {name}",
             source=source_class,
             target=target_class,
@@ -1394,7 +1880,7 @@ def run(args: argparse.Namespace) -> dict:
             dpi=args.dpi,
         )
         _plot_representation_distance(
-            output_dir / "ltae_representation_distance" / f"{stem}.png",
+            geometry_dir / "ltae_representation_distance" / f"{stem}.png",
             title=f"LTAE representation Phase alignment — class {class_id}: {name}",
             metrics=(
                 ("Fused / formal source prototype", fused_before, fused_after),
@@ -1407,11 +1893,49 @@ def run(args: argparse.Namespace) -> dict:
 
     if not summary_rows:
         raise RuntimeError("no class produced a Phase-alignment diagnostic")
-    _write_csv(output_dir / "phase_alignment_summary.csv", summary_rows)
-    _write_csv(output_dir / "ltae_representation_samples.csv", sample_rows)
-    group_summaries = _plot_phase_groups(output_dir, groups, args.dpi)
-    manifest = {
-        "checkpoint": str(checkpoint_path),
+    _write_csv(geometry_dir / "summary.csv", summary_rows)
+    _write_csv(geometry_dir / "sample_metrics.csv", sample_rows)
+    if not pse_summary_rows:
+        raise RuntimeError("no class produced a PSE latent Phase diagnostic")
+    geometry_macro = {
+        "num_classes": len(summary_rows),
+        "shape_before_class_equal_mean": float(np.mean([row["shape_before_mean"] for row in summary_rows])),
+        "shape_after_class_equal_mean": float(np.mean([row["shape_after_mean"] for row in summary_rows])),
+        "trend_before_class_equal_mean": float(np.mean([row["trend_before_mean"] for row in summary_rows])),
+        "trend_after_class_equal_mean": float(np.mean([row["trend_after_mean"] for row in summary_rows])),
+        "ltae_fused_before_class_equal_mean": float(np.mean([row["ltae_fused_before_mean"] for row in summary_rows])),
+        "ltae_fused_after_class_equal_mean": float(np.mean([row["ltae_fused_after_mean"] for row in summary_rows])),
+    }
+    _json_dump(geometry_dir / "summary.json", geometry_macro)
+
+    _write_csv(pse_dir / "pse_distance_summary.csv", pse_summary_rows)
+    _write_csv(pse_dir / "sample_level.csv", pse_sample_rows)
+
+    def _macro_mean(key: str) -> float:
+        values = [float(row[key]) for row in pse_summary_rows if np.isfinite(float(row[key]))]
+        return float(np.mean(values)) if values else float("nan")
+
+    pse_macro = {
+        "num_classes": len(pse_summary_rows),
+        "class_equal_pse_l2_before": _macro_mean("pse_class_mean_l2_before"),
+        "class_equal_pse_l2_after": _macro_mean("pse_class_mean_l2_after"),
+        "class_equal_relative_reduction": _macro_mean("pse_class_mean_relative_reduction"),
+        "class_equal_sample_improvement_rate": _macro_mean("pse_sample_improvement_rate"),
+    }
+    _json_dump(pse_dir / "summary.json", pse_macro)
+
+    phase_consistency = _phase_consistency_outputs(
+        phase_consistency_dir,
+        checkpoint=checkpoint,
+        groups=groups,
+        classes=classes,
+        dpi=args.dpi,
+    )
+    group_summaries = phase_consistency["groups"]
+
+    common_manifest = {
+        "phase_checkpoint": str(checkpoint_path),
+        "model_checkpoint": str(model_checkpoint_path or checkpoint_path),
         "checkpoint_stage": checkpoint.get("stage"),
         "checkpoint_epoch": checkpoint.get("epoch"),
         "successful_optimizer_steps": checkpoint.get("successful_optimizer_steps"),
@@ -1419,34 +1943,33 @@ def run(args: argparse.Namespace) -> dict:
         "target": target,
         "seed": seed,
         "fold": fold,
+        "data_partition": "held-out source test + held-out target test",
         "classes": list(classes),
         "visualized_class_ids": list(requested_classes),
         "samples_per_class": args.samples_per_class,
-        "display_samples": args.display_samples,
-        "target_label_usage": "oracle post-hoc visualization only; never used by training or Domain Phase estimation",
+        "target_label_usage": "oracle-only diagnostic grouping; never used by training, Phase estimation, threshold selection or model selection",
         "phase_direction": {
             "group_gamma": "source_to_target",
             "target_ltae_alignment": "target positions use gamma inverse",
             "target_srvf_alignment": "target q uses warp_q_gamma(q, gamma)",
         },
+    }
+    geometry_manifest = {
+        **common_manifest,
+        "experiment": "01_domain_phase_geometry_alignment",
         "resample_self_check": {
             "reference": "independent piecewise-linear evaluation of saved gamma(u) on the Shape grid",
             "expected": "gamma_resample_max_abs_difference approximately zero",
         },
-        "ltae_representation_diagnostic": {
-            "primary": "Euclidean distance from target fused_repr to formal checkpoint source fused prototype before/after gamma^-1 position correction",
-            "branch_diagnostics": "trend_repr and structure_repr use selected source true-class sample means because the formal bank stores only fused prototypes",
-        },
-        "pca_fit_scope": "source-only selected true-class rows; basis frozen before projecting target before/after views",
+        "pca_fit_scope": "source-test selected rows only; basis frozen before target projection",
         "shape_pca_explained_variance_ratio": shape_ratio.tolist(),
         "trend_pca_explained_variance_ratio": trend_ratio.tolist(),
         "structure_pca_explained_variance_ratio": structure_ratio.tolist(),
-        "phase_groups": group_summaries,
         "class_summary": summary_rows,
     }
-    _json_dump(output_dir / "phase_alignment_manifest.json", manifest)
+    _json_dump(geometry_dir / "manifest.json", geometry_manifest)
     _write_chinese_readme(
-        output_dir / "README_中文说明.md",
+        geometry_dir / "README_中文说明.md",
         checkpoint_path=checkpoint_path,
         source=source,
         target=target,
@@ -1455,19 +1978,66 @@ def run(args: argparse.Namespace) -> dict:
         summary_rows=summary_rows,
         group_summaries=group_summaries,
     )
+
+    pse_manifest = {
+        **common_manifest,
+        "experiment": "02_pse_latent_phase_alignment",
+        "pse_grid_size": int(args.pse_grid_size),
+        "metric": "piecewise-linear canonical interpolation of unchanged PSE latent values; class-equal support-aware integrated feature-MSE/L2 before vs gamma^-1-corrected target positions",
+        "pca_fit_scope": "PCA fitted only from held-out source PSE tokens; target before/after only transformed",
+        "pse_pca_explained_variance_ratio": pse_ratio.tolist(),
+        "macro_summary": pse_macro,
+        "class_summary": pse_summary_rows,
+    }
+    _json_dump(pse_dir / "manifest.json", pse_manifest)
+    (pse_dir / "README_中文说明.md").write_text(
+        "# 02 PSE latent Phase alignment\n\n"
+        "目的：直接检验完整 PSE latent temporal process H 中是否存在可测的共享 Domain Phase。"
+        "本实验使用 held-out source-test / target-test；target true label 仅用于 oracle 分组。\n\n"
+        "Phase 不修改 PSE latent value，只把 target token 的时间位置从 native t 改为 "
+        "gamma^{-1}(t)。脚本在固定 128-D PSE 空间做 canonical 线性插值，在共同 support 上"
+        "计算 class-mean integrated MSE/L2，并报告每个 target 样本到 source class mean 的"
+        "before/after 距离。`pse_distance_summary.csv` 是正式数值结果；PCA 仅用于作图，且只"
+        "由 source tokens 拟合。\n\n"
+        "若大多数类别以及 class-equal macro 的 after distance 明显下降，支持 PSE latent 中存在"
+        "共享 domain phase；若 SRVF geometry 改善而本目录 direct PSE distance 不改善，则当前"
+        "Phase 主要是分解/SRVF 几何内部效应。\n",
+        encoding="utf-8",
+    )
+
+    suite_manifest = {
+        **common_manifest,
+        "experiments": {
+            "01_domain_phase_geometry_alignment": "01_domain_phase_geometry_alignment/manifest.json",
+            "02_pse_latent_phase_alignment": "02_pse_latent_phase_alignment/manifest.json",
+            "03_domain_phase_consistency": "03_domain_phase_consistency/manifest.json",
+        },
+        "phase_consistency": phase_consistency["availability"],
+    }
+    _json_dump(output_dir / "manifest.json", suite_manifest)
+    (output_dir / "README_中文说明.md").write_text(
+        "# Phase-only Domain Phase 独立验证套件\n\n"
+        "本目录包含三个互相独立的 held-out 诊断：\n\n"
+        "- `01_domain_phase_geometry_alignment/`：Trend / Structure-SRVF 与 LTAE 表示 before/after；\n"
+        "- `02_pse_latent_phase_alignment/`：直接 128-D PSE latent support-aware distance；\n"
+        "- `03_domain_phase_consistency/`：class-level Phase centers 与 group center 一致性。\n\n"
+        "所有 target true labels 都是 oracle-only diagnostic，不参与训练、Phase estimation 或无监督选择。\n",
+        encoding="utf-8",
+    )
     print(
         "PHASE_ALIGNMENT_VIS_COMPLETE|"
         f"output={output_dir}|classes={len(summary_rows)}|samples={len(sample_rows)}",
         flush=True,
     )
-    return manifest
+    return suite_manifest
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Visualize true-class source/target Shape before and after saved Domain Phase."
     )
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True, help="Stage-2 checkpoint providing confirmed Phase state and source statistics")
+    parser.add_argument("--model-checkpoint", type=Path, default=None, help="Optional Stage-1 checkpoint providing model weights for a zero-step audit while reusing saved Phase state")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -1477,6 +2047,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--display-samples", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--pse-grid-size", type=int, default=128)
     parser.add_argument("--robust-lower", type=float, default=1.0)
     parser.add_argument("--robust-upper", type=float, default=99.0)
     parser.add_argument("--dpi", type=int, default=180)
@@ -1491,6 +2062,8 @@ def main() -> None:
         raise ValueError("display-samples cannot exceed samples-per-class")
     if args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("batch-size must be positive and num-workers nonnegative")
+    if args.pse_grid_size < 2:
+        raise ValueError("pse-grid-size must be at least 2")
     if not 0.0 <= args.robust_lower < args.robust_upper <= 100.0:
         raise ValueError("robust percentile range is invalid")
     if args.dpi <= 0:

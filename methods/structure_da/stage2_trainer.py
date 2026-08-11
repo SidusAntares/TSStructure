@@ -237,24 +237,54 @@ def _phase_rejections_log_value(state: DomainPhaseState) -> str:
 
 
 def _phase_state_payload(state: DomainPhaseState) -> dict:
+    """Serialize the complete no-gradient Domain Phase state for diagnostics.
+
+    Stage-2 checkpoints are also the durable input to post-hoc Phase audits.
+    Group centers alone are sufficient to *apply* a confirmed Phase, but they
+    are not sufficient to test the domain-level hypothesis itself: that audit
+    additionally needs the reliable/rejected class centers and their geometry.
+    Keep every tensor detached on CPU so checkpointing cannot create a hidden
+    gradient path.
+    """
     return {
-        "scan_index": state.scan_index,
-        "m": state.m,
+        "scan_index": int(state.scan_index),
+        "m": int(state.m),
         "decision_status": state.decision_status.value,
-        "decision_stability_age": state.decision_stability_age,
-        "valid_phase_classes": tuple(state.valid_phase_classes),
-        "rejected_classes": tuple(state.rejected_classes),
+        "decision_stability_age": int(state.decision_stability_age),
+        "valid_phase_classes": tuple(int(v) for v in state.valid_phase_classes),
+        "rejected_classes": tuple(int(v) for v in state.rejected_classes),
+        "identity_evidence_classes": tuple(int(v) for v in state.identity_evidence_classes),
+        "identity_evidence_count": float(state.identity_evidence_count),
+        "residual_evidence_classes": tuple(int(v) for v in state.residual_evidence_classes),
+        "residual_evidence_count": int(state.residual_evidence_count),
+        "class_centers": tuple(
+            {
+                "class_id": int(center.class_id),
+                "center_gamma": center.center_gamma.detach().cpu(),
+                "candidate_count": int(center.candidate_count),
+                "effective_evidence_count": float(center.effective_evidence_count),
+                "dispersion": float(center.dispersion),
+                "diameter": float(center.diameter),
+                "median_distance": float(center.median_distance),
+                "center_drift": center.center_drift,
+                "valid": bool(center.valid),
+                "reject_reason": center.reject_reason,
+            }
+            for center in state.class_centers
+        ),
         "groups": tuple(
             {
-                "group_id": g.group_id,
-                "member_classes": tuple(g.member_classes),
+                "group_id": int(g.group_id),
+                "member_classes": tuple(int(v) for v in g.member_classes),
                 "status": g.status.value,
                 "center_gamma": g.center_gamma.detach().cpu(),
-                "confirmation_age": g.confirmation_age,
+                "confirmation_age": int(g.confirmation_age),
                 "center_drift": g.center_drift,
-                "within_dispersion": g.within_dispersion,
-                "diameter": g.diameter,
-                "core_radius": g.core_radius,
+                "within_dispersion": float(g.within_dispersion),
+                "diameter": float(g.diameter),
+                "core_radius": float(g.core_radius),
+                "sample_evidence_count": float(g.sample_evidence_count),
+                "class_count": int(g.class_count),
             }
             for g in state.groups
         ),
@@ -725,6 +755,9 @@ class Stage2Trainer:
 def run_stage2_statistics_diagnostic(trainer: Stage2Trainer) -> Stage2StatisticsSnapshot:
     snapshot = trainer.initialize_statistics()
     print("STAGE2_INIT_COMPLETE|statistics_ready=true|phase_only=true")
+    calibration_path = trainer.save_ema_checkpoint(
+        "stage2_calibration_state.pt", epoch=0, target_val=None
+    )
     print(
         "STAGE2_DIAGNOSTIC_COMPLETE|"
         f"phase_m={snapshot.phase_state.m}"
@@ -732,6 +765,7 @@ def run_stage2_statistics_diagnostic(trainer: Stage2Trainer) -> Stage2Statistics
         f"|stable_labels={snapshot.stable_labels.num_stable_labels}"
         "|phase_only=true"
         f"|optimizer_steps={trainer.successful_optimizer_steps}"
+        f"|calibration_state={calibration_path}"
     )
     return snapshot
 

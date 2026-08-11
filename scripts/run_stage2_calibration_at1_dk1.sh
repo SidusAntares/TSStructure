@@ -48,4 +48,4 @@ run_training \
     --progress_bar off
 
 echo "STAGE2_CALIBRATION_COMPLETE|output=${RUN_OUTPUT_DIRECTORY}/fold_0|log=${TASK_LOG}"
-echo "CALIBRATION_FILES|summary=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_summary.json|pairwise=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_pairwise.csv|candidates=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_candidates.csv|stable=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_stable_candidates.csv|geometry=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_geometry.pt"
+echo "CALIBRATION_FILES|state=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_state.pt|summary=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_summary.json|pairwise=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_pairwise.csv|candidates=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_candidates.csv|stable=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_stable_candidates.csv|geometry=${RUN_OUTPUT_DIRECTORY}/fold_0/stage2_calibration_geometry.pt"
