@@ -100,6 +100,40 @@ _WORKER_SOURCE_NP: np.ndarray | None = None
 _WORKER_TARGET_NP: np.ndarray | None = None
 
 
+def remap_local_sample_ids_to_parcels(
+    local_sample_ids: Tensor,
+    parcel_indices: Sequence[int],
+) -> Tensor:
+    """Map dataset-local sample indices back to stable parcel identities.
+
+    ``TargetGeometryCache.sample_ids`` comes from
+    ``target_hypothesis_scan._batch_sample_ids()``, which prefers the batch
+    ``index`` field when both ``index`` and ``parcel_index`` are present.
+    For ``PixelSetData`` selected subsets that ``index`` is the local dataset
+    position, while downstream 06 diagnostics are keyed by stable
+    ``parcel_index``. This helper makes that boundary explicit without
+    changing the shared Stage-2 scanner contract.
+    """
+    local = local_sample_ids.detach().to(device="cpu", dtype=torch.long)
+    if local.ndim != 1:
+        raise ValueError("local_sample_ids must be one-dimensional")
+    parcels = np.asarray(parcel_indices, dtype=np.int64)
+    if parcels.ndim != 1:
+        raise ValueError("parcel_indices must be one-dimensional")
+    if local.numel() == 0:
+        return local
+    minimum = int(local.min().item())
+    maximum = int(local.max().item())
+    if minimum < 0 or maximum >= len(parcels):
+        raise IndexError(
+            "target geometry cache contains sample indices outside the selected dataset"
+        )
+    mapped = torch.from_numpy(parcels[local.numpy()].copy()).to(dtype=torch.long)
+    if torch.unique(mapped).numel() != mapped.numel():
+        raise ValueError("parcel_index identities must be unique within the selected dataset")
+    return mapped
+
+
 def trend_only_cache(cache: TargetGeometryCache) -> TRegistrationGeometryCache:
     return TRegistrationGeometryCache(
         sample_ids=cache.sample_ids.detach().cpu(),

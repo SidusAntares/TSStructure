@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import math
 from pathlib import Path
@@ -60,6 +60,7 @@ from methods.structure_da.sample_phase_diagnostic import (
     classical_mds,
     evaluate_shape_validation,
     phase_distance_matrix,
+    remap_local_sample_ids_to_parcels,
     select_raw_shape_candidate,
     solve_t_only_registrations,
     trend_only_cache,
@@ -1317,6 +1318,17 @@ def run(args) -> dict:
         shape_grid=model.temporal_module.structure_geometry.functional_lift.canonical_grid.detach().cpu(),
         shape_extractor=model.temporal_module.structure_geometry,
         reg_extractor=reg_extractor,
+    )
+    dataset = target_test_loader.dataset
+    get_parcel_indices = getattr(dataset, "get_parcel_indices", None)
+    if not callable(get_parcel_indices):
+        raise TypeError("06 target dataset must expose get_parcel_indices()")
+    target_cache = replace(
+        target_cache,
+        sample_ids=remap_local_sample_ids_to_parcels(
+            target_cache.sample_ids,
+            get_parcel_indices(),
+        ),
     )
     print(
         "SAMPLE_PHASE_STAGE_A_GEOMETRY_CACHE|status=ready"

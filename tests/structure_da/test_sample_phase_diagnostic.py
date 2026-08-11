@@ -12,6 +12,7 @@ from methods.structure_da.sample_phase_diagnostic import (
     TRegistrationGeometryCache,
     classical_mds,
     phase_distance_matrix,
+    remap_local_sample_ids_to_parcels,
     select_raw_shape_candidate,
     solve_t_only_registrations,
 )
@@ -125,6 +126,13 @@ def test_phase_distance_matrix_and_mds_are_descriptive_geometry_only():
     coords = classical_mds(distance, dimensions=2)
     assert coords.shape == (3, 2)
     assert torch.isfinite(coords).all()
+
+
+def test_local_geometry_ids_are_mapped_back_to_stable_parcel_ids():
+    local_ids = torch.tensor([2, 0, 3, 1], dtype=torch.long)
+    parcel_ids = [101, 205, 309, 412]
+    mapped = remap_local_sample_ids_to_parcels(local_ids, parcel_ids)
+    assert mapped.tolist() == [309, 101, 412, 205]
 
 
 def test_06_launcher_keeps_full_stage_a_and_bounded_stage_b():
