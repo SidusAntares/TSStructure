@@ -141,3 +141,22 @@ def test_06_script_explicitly_forbids_clustering_decisions():
     assert '"group_count_selected": False' in text
     assert '"s_used_for_gamma_generation_or_legality": False' in text
     assert '"distance_calibration_used": False' in text
+
+
+def test_06_wraps_stage2_scanners_with_device_batch_loader():
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "diagnose_sample_level_phase_validity.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(script)
+    wrapped_names = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "DeviceBatchLoader":
+            if node.args and isinstance(node.args[0], ast.Name):
+                wrapped_names.append(node.args[0].id)
+    assert "source_train_loader" in wrapped_names
+    assert "target_test_loader" in wrapped_names

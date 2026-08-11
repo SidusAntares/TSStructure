@@ -64,7 +64,10 @@ from methods.structure_da.sample_phase_diagnostic import (
     solve_t_only_registrations,
     trend_only_cache,
 )
-from methods.structure_da.stage2_trainer import build_stage2_registration_extractor
+from methods.structure_da.stage2_trainer import (
+    DeviceBatchLoader,
+    build_stage2_registration_extractor,
+)
 from methods.structure_da.target_hypothesis_scan import PhaseHypothesisScanConfig
 from methods.structure_da import target_hypothesis_scan as targetscan
 
@@ -1300,8 +1303,8 @@ def run(args) -> dict:
     )
     source_reg_bank = _load_or_build_registration_bank(
         cache_dir / "source_registration_bank.pt", model=model,
-        source_train_loader=source_train_loader, num_classes=len(classes),
-        device=device, reg_extractor=reg_extractor,
+        source_train_loader=DeviceBatchLoader(source_train_loader, device),
+        num_classes=len(classes), device=device, reg_extractor=reg_extractor,
     )
 
     print(
@@ -1310,7 +1313,7 @@ def run(args) -> dict:
         flush=True,
     )
     target_cache = targetscan._build_target_geometry_cache(
-        model, target_test_loader, device=device,
+        model, DeviceBatchLoader(target_test_loader, device), device=device,
         shape_grid=model.temporal_module.structure_geometry.functional_lift.canonical_grid.detach().cpu(),
         shape_extractor=model.temporal_module.structure_geometry,
         reg_extractor=reg_extractor,
