@@ -291,6 +291,25 @@ def _phase_state_payload(state: DomainPhaseState) -> dict:
     }
 
 
+def _phase_progressive_payload(
+    history: list[tuple[int, DomainPhaseState]] | tuple[tuple[int, DomainPhaseState], ...],
+) -> tuple[dict, ...]:
+    """Serialize every progressive evidence-stage class/group state.
+
+    The final DomainPhaseState is enough for Stage-2 training, but post-hoc
+    diagnostics need to distinguish a genuinely different class center from a
+    class center that was still drifting as the evidence budget grew.  Store
+    the stage budget together with the complete no-gradient Phase payload.
+    """
+    return tuple(
+        {
+            "evidence_budget": int(budget),
+            "phase_state": _phase_state_payload(state),
+        }
+        for budget, state in history
+    )
+
+
 def _bank_to_cpu(bank: SourcePrototypeBank) -> dict:
     return {
         "trend_srvf": bank.trend_srvf.detach().cpu(),
@@ -366,6 +385,7 @@ class Stage2Trainer:
         self.statistics: Stage2StatisticsSnapshot | None = None
         self.hypothesis_scan_count = 0
         self.phase_evidence_stages = 0
+        self.phase_state_progressive: list[tuple[int, DomainPhaseState]] = []
         self.stable_label_refresh_count = 0
         self.successful_optimizer_steps = 0
         self._validate_optimizer_boundary()
@@ -445,12 +465,14 @@ class Stage2Trainer:
         scanner = self._get_phase_scanner()
         phase_state: DomainPhaseState | None = None
         final_result: TargetHypothesisScanResult | None = None
+        self.phase_state_progressive = []
         for budget in self._phase_evidence_budgets(scanner.total_cached_samples):
             final_result = scanner.scan_to_budget(budget)
             self.phase_evidence_stages += 1
             phase_state = update_domain_phase_state(
                 final_result, self.config.phase, previous_state=phase_state
             )
+            self.phase_state_progressive.append((int(budget), phase_state))
             print(
                 "STAGE2_PHASE_EVIDENCE_STAGE|"
                 f"budget={budget}|phase_scan_index={phase_state.scan_index}"
@@ -740,6 +762,9 @@ class Stage2Trainer:
                 "macro_f1": target_val.get("macro_f1"),
             },
             "phase_state": _phase_state_payload(self.statistics.phase_state),
+            "phase_state_progressive": _phase_progressive_payload(
+                self.phase_state_progressive
+            ),
             "phase_routes": tuple(self.statistics.phase_routes),
             "source_geometry_version": self.source_geometry_version,
             "source_prototype_bank": _bank_to_cpu(self.source_prototype_bank),

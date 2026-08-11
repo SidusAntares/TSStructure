@@ -16,6 +16,7 @@ from methods.structure_da import (
     PhaseGroupStatus,
 )
 from methods.structure_da.stage2_trainer import (
+    _phase_progressive_payload,
     _phase_state_payload,
     run_stage2_statistics_diagnostic,
 )
@@ -202,3 +203,60 @@ def test_visualization_scripts_follow_phase_only_forward_contract() -> None:
             }
         }
         assert not removed, f"{relative} still uses removed Phase-only fields: {removed}"
+
+
+def test_phase_diagnostic_role_separates_compression_from_extension() -> None:
+    members = (0, 3, 4)
+    assert phasevis.phase_diagnostic_role(3, members) == "m1_aggregation_compression"
+    assert phasevis.phase_diagnostic_role(1, members) == "confirmed_phase_extension_application"
+
+    member_gap = phasevis.phase_gain_gap_fields(
+        class_gain=0.12, group_gain=-0.03, estimation_member=True
+    )
+    assert member_gap["compression_loss"] == 0.15
+    assert member_gap["application_gap"] is None
+
+    extension_gap = phasevis.phase_gain_gap_fields(
+        class_gain=0.12, group_gain=-0.03, estimation_member=False
+    )
+    assert extension_gap["compression_loss"] is None
+    assert extension_gap["application_gap"] == 0.15
+
+
+def test_progressive_phase_payload_preserves_budget_and_class_centers() -> None:
+    center_a = PhaseClassCenter(
+        class_id=0, center_gamma=_gamma(1.05), candidate_count=4,
+        effective_evidence_count=4.0, dispersion=0.01, diameter=0.02,
+        median_distance=0.01, center_drift=None, valid=True, reject_reason=None,
+    )
+    center_b = PhaseClassCenter(
+        class_id=0, center_gamma=_gamma(1.10), candidate_count=8,
+        effective_evidence_count=8.0, dispersion=0.01, diameter=0.02,
+        median_distance=0.01, center_drift=0.02, valid=True, reject_reason=None,
+    )
+    state_a = DomainPhaseState(
+        scan_index=0, m=0, class_centers=(center_a,), valid_phase_classes=(0,),
+        groups=(), rejected_classes=(),
+    )
+    state_b = DomainPhaseState(
+        scan_index=1, m=0, class_centers=(center_b,), valid_phase_classes=(0,),
+        groups=(), rejected_classes=(),
+    )
+    payload = _phase_progressive_payload([(64, state_a), (128, state_b)])
+    assert [item["evidence_budget"] for item in payload] == [64, 128]
+    torch.testing.assert_close(
+        payload[1]["phase_state"]["class_centers"][0]["center_gamma"],
+        center_b.center_gamma,
+    )
+
+
+def test_class_center_diagnostic_script_documents_oracle_and_membership_semantics() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    script = (repository_root / "scripts/diagnose_class_center_vs_group_phase.py").read_text(
+        encoding="utf-8"
+    )
+    assert "oracle-only" in script
+    assert "compression_loss" in script
+    assert "application_gap" in script
+    assert "phase_state_progressive" in script
+    assert "class diameter threshold" in script

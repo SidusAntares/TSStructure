@@ -274,3 +274,31 @@ def pse_class_metrics(
         "target_after_support": target_after_support,
     }
     return summary, sample_rows, curves
+
+
+def phase_diagnostic_role(class_id: int, estimation_members: Sequence[int]) -> str:
+    """Return the only valid interpretation label for class-vs-group comparison.
+
+    Classes that estimated the M=1 center can exhibit aggregation/compression
+    loss.  Classes outside C_est were never compressed into that center; their
+    class-vs-group discrepancy is an expanded-application question instead.
+    """
+    return (
+        "m1_aggregation_compression"
+        if int(class_id) in {int(value) for value in estimation_members}
+        else "confirmed_phase_extension_application"
+    )
+
+
+def phase_gain_gap_fields(
+    *,
+    class_gain: float,
+    group_gain: float,
+    estimation_member: bool,
+) -> dict:
+    """Name class-center vs group-center gain gaps without mixing semantics."""
+    gap = float(class_gain) - float(group_gain)
+    return {
+        "compression_loss": gap if bool(estimation_member) else None,
+        "application_gap": None if bool(estimation_member) else gap,
+    }
