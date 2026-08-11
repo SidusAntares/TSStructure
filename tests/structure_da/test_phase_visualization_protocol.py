@@ -260,3 +260,33 @@ def test_class_center_diagnostic_script_documents_oracle_and_membership_semantic
     assert "application_gap" in script
     assert "phase_state_progressive" in script
     assert "class diameter threshold" in script
+
+
+def test_stage2_calibration_launcher_only_uses_train_cli_arguments() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    launcher = (repository_root / "scripts/run_stage2_calibration_at1_dk1.sh").read_text(
+        encoding="utf-8"
+    )
+    train_tree = ast.parse((repository_root / "train.py").read_text(encoding="utf-8"))
+
+    supported: set[str] = set()
+    for node in ast.walk(train_tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+        ):
+            continue
+        for argument in node.args:
+            if (
+                isinstance(argument, ast.Constant)
+                and isinstance(argument.value, str)
+                and argument.value.startswith("--")
+            ):
+                supported.add(argument.value)
+
+    import re
+
+    passed = set(re.findall(r"--[A-Za-z0-9_-]+", launcher))
+    unsupported = sorted(passed - supported)
+    assert unsupported == [], f"calibration launcher passes unsupported train.py args: {unsupported}"

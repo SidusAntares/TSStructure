@@ -40,7 +40,6 @@ run_training \
     --stage1_checkpoint "${STAGE1_CHECKPOINT}" \
     --stage2_diagnostic_only \
     --stage2_epochs 1 \
-    --stage2_block_epochs 1 \
     --stage2_phase_evidence_initial_samples 64 \
     --stage2_phase_evidence_max_samples 512 \
     --stage2_registration_workers "${REGISTRATION_WORKERS}" \
