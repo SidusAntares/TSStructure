@@ -620,7 +620,7 @@ def main(config):
             fallback = os.path.join(config.fold_dir, "model.pt")
             checkpoint_path = stage2_last if os.path.isfile(stage2_last) else fallback
             print(f"Restoring evaluation model from {checkpoint_path}...")
-            state_dict = torch.load(checkpoint_path, weights_only=False)["state_dict"]
+            state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)["state_dict"]
             load_structure_da_state_dict(model, state_dict)
             test_metrics = evaluation(
                 model,
@@ -683,7 +683,7 @@ def main(config):
             raise FileNotFoundError(
                 f"Stage-1 checkpoint not found for Stage-2 boundary: {stage1_best_path}"
             )
-        stage1_checkpoint = torch.load(stage1_best_path, weights_only=False)
+        stage1_checkpoint = torch.load(stage1_best_path, map_location="cpu", weights_only=False)
         if "model_state_dict" not in stage1_checkpoint:
             raise ValueError(
                 "Stage-1 checkpoint is missing model_state_dict: "
@@ -1050,7 +1050,7 @@ def _finalize_stage1_checkpoints(
     }
 
     if os.path.isfile(tmp_best_path):
-        best_state = torch.load(tmp_best_path, weights_only=False)
+        best_state = torch.load(tmp_best_path, map_location="cpu", weights_only=False)
         best_checkpoint = build_prototype_state(
             best_state["state_dict"],
             best_state["epoch"],
