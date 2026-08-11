@@ -17,8 +17,8 @@ non-identity Domain Phase group it visualizes:
    to Time2Vec/LTAE (values are unchanged);
 4. class-level before/after support-aware distances to the frozen source
    prototype;
-5. Time2Vec/LTAE fused, trend and structure representation distances before
-   and after applying gamma^{-1} to target observation positions; and
+5. the single-stream Time2Vec/LTAE fused representation distance before and
+   after applying gamma^{-1} to target observation positions; and
 6. the confirmed Domain Phase gamma itself and its displacement in days.
 
 The preferred input is ``stage2_calibration_state.pt`` written by a
@@ -482,8 +482,6 @@ def _collect_geometry(
                 "shape_valid": bool(output.geometry.structure_valid[row].item()),
                 "grid": grid.detach().cpu(),
                 "fused_repr_before": output.fused_repr[row].detach().cpu(),
-                "trend_repr_before": output.trend_repr[row].detach().cpu(),
-                "structure_repr_before": output.structure_repr[row].detach().cpu(),
                 "logits_before": output.logits[row].detach().cpu(),
             }
             if target:
@@ -508,8 +506,6 @@ def _collect_geometry(
                         output.geometry.structure_support[row], gamma_grid, grid
                     ).detach().cpu(),
                     "fused_repr_after": aligned_output.fused_repr[row].detach().cpu(),
-                    "trend_repr_after": aligned_output.trend_repr[row].detach().cpu(),
-                    "structure_repr_after": aligned_output.structure_repr[row].detach().cpu(),
                     "logits_after": aligned_output.logits[row].detach().cpu(),
                     "gamma_grid": gamma_grid.detach().cpu(),
                     "gamma_grid_reference": gamma_grid_reference.detach().cpu(),
@@ -1698,8 +1694,6 @@ def run(args: argparse.Namespace) -> dict:
         )
 
         source_fused_sampled = _representation_center(source_class, "fused_repr_before")
-        source_trend_sampled = _representation_center(source_class, "trend_repr_before")
-        source_structure_sampled = _representation_center(source_class, "structure_repr_before")
         fused_before, fused_after, fused_stats = _representation_distances(
             target_class,
             before_key="fused_repr_before",
@@ -1711,18 +1705,6 @@ def run(args: argparse.Namespace) -> dict:
             before_key="fused_repr_before",
             after_key="fused_repr_after",
             prototype=source_fused_sampled,
-        )
-        trend_repr_before, trend_repr_after, trend_repr_stats = _representation_distances(
-            target_class,
-            before_key="trend_repr_before",
-            after_key="trend_repr_after",
-            prototype=source_trend_sampled,
-        )
-        structure_repr_before, structure_repr_after, structure_repr_stats = _representation_distances(
-            target_class,
-            before_key="structure_repr_before",
-            after_key="structure_repr_after",
-            prototype=source_structure_sampled,
         )
         cls_stats = _classification_stats(target_class, class_id)
         position_stats = _position_shift_stats(target_class)
@@ -1762,12 +1744,6 @@ def run(args: argparse.Namespace) -> dict:
             "ltae_fused_sampled_before_mean": fused_sampled_stats["before_mean"],
             "ltae_fused_sampled_after_mean": fused_sampled_stats["after_mean"],
             "ltae_fused_sampled_improvement_rate": fused_sampled_stats["improvement_rate"],
-            "ltae_trend_before_mean": trend_repr_stats["before_mean"],
-            "ltae_trend_after_mean": trend_repr_stats["after_mean"],
-            "ltae_trend_improvement_rate": trend_repr_stats["improvement_rate"],
-            "ltae_structure_before_mean": structure_repr_stats["before_mean"],
-            "ltae_structure_after_mean": structure_repr_stats["after_mean"],
-            "ltae_structure_improvement_rate": structure_repr_stats["improvement_rate"],
             "true_probability_before_mean": cls_stats["true_probability_before_mean"],
             "true_probability_after_mean": cls_stats["true_probability_after_mean"],
             "oracle_accuracy_before": cls_stats["accuracy_before"],
@@ -1802,10 +1778,6 @@ def run(args: argparse.Namespace) -> dict:
                     "fused_distance_improved": bool(fused_after[index] < fused_before[index]),
                     "fused_sampled_distance_before": float(fused_sampled_before[index].item()),
                     "fused_sampled_distance_after": float(fused_sampled_after[index].item()),
-                    "trend_repr_distance_before": float(trend_repr_before[index].item()),
-                    "trend_repr_distance_after": float(trend_repr_after[index].item()),
-                    "structure_repr_distance_before": float(structure_repr_before[index].item()),
-                    "structure_repr_distance_after": float(structure_repr_after[index].item()),
                     "true_probability_before": float(probs_before[class_id].item()),
                     "true_probability_after": float(probs_after[class_id].item()),
                     "prediction_before": int(logits_before.argmax().item()),
@@ -1885,8 +1857,6 @@ def run(args: argparse.Namespace) -> dict:
             metrics=(
                 ("Fused / formal source prototype", fused_before, fused_after),
                 ("Fused / sampled source center", fused_sampled_before, fused_sampled_after),
-                ("Trend repr / sampled source center", trend_repr_before, trend_repr_after),
-                ("Structure repr / sampled source center", structure_repr_before, structure_repr_after),
             ),
             dpi=args.dpi,
         )

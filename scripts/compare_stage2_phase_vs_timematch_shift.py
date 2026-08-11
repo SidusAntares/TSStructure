@@ -508,8 +508,6 @@ def _attach_scalar_view(
                 {
                     "positions_scalar": scalar_positions[row].detach().cpu(),
                     "fused_repr_scalar": output.fused_repr[row].detach().cpu(),
-                    "trend_repr_scalar": output.trend_repr[row].detach().cpu(),
-                    "structure_repr_scalar": output.structure_repr[row].detach().cpu(),
                     "logits_scalar": output.logits[row].detach().cpu(),
                 }
             )
@@ -737,16 +735,6 @@ def _global_summary(sample_rows: Sequence[dict], requested_classes: Sequence[int
             "timematch_scalar": mean("fused_distance_scalar"),
             "domain_phase": mean("fused_distance_phase"),
         },
-        "trend_repr_distance_mean": {
-            "no_shift": mean("trend_repr_distance_no_shift"),
-            "timematch_scalar": mean("trend_repr_distance_scalar"),
-            "domain_phase": mean("trend_repr_distance_phase"),
-        },
-        "structure_repr_distance_mean": {
-            "no_shift": mean("structure_repr_distance_no_shift"),
-            "timematch_scalar": mean("structure_repr_distance_scalar"),
-            "domain_phase": mean("structure_repr_distance_phase"),
-        },
         "true_class_probability_mean": {
             "no_shift": mean("true_probability_no_shift"),
             "timematch_scalar": mean("true_probability_scalar"),
@@ -817,7 +805,7 @@ def _write_readme(
         "| `timematch_scalar_shift/shift_scan.png` | scalar shift 扫描曲线 | 看 IS 选中的 shift 是否接近 oracle 最优；差很大说明 scalar shift **估计器**本身在当前模型上有问题 |",
         "| `class_comparison_summary.csv` | 每类 No/Scalar/Phase 的 direct PSE distance、LTAE 距离、概率、准确率和 Phase 函数几何结果 | 第一层最主要汇总表 |",
         "| `sample_comparison.csv` | 每个 oracle target 样本的三视图详细结果 | 可计算分布、失败样本和类别差异 |",
-        "| `ltae_representation_comparison/` | 每类 LTAE fused/trend/structure 距离散点 | 左列 Scalar、右列 Domain Phase；点在 y=x 下方表示比 No shift 更接近 source |",
+        "| `ltae_representation_comparison/` | 每类 Phase-only 单路 LTAE fused 距离散点 | 左列 Scalar、右列 Domain Phase；点在 y=x 下方表示比 No shift 更接近 source |",
         "| `classifier_probability_comparison/` | 每类真实类别概率 before/after 散点 | 点在 y=x 上方表示该时间校正提高 true-class probability |",
         "| `phase_groups/` | 保存的 confirmed nonlinear gamma 及其日期偏移 | 用于对照 nonlinear Phase 和 scalar shift 的尺度 |",
         "| `comparison_manifest.json` | 完整运行配置与全局汇总 | 机器可读归档 |",
@@ -1081,28 +1069,12 @@ def run(args: argparse.Namespace) -> dict:
         group_id = int(class_to_group[class_id]["group_id"])
         stem = phasevis._class_stem(class_id, name)
 
-        source_trend_center = _center(source_class, "trend_repr_before")
-        source_structure_center = _center(source_class, "structure_repr_before")
         fused0, fuseds, fusedp, fused_stats = _three_view_distances(
             target_class,
             prototype=source_fused_proto[class_id],
             base_key="fused_repr_before",
             scalar_key="fused_repr_scalar",
             phase_key="fused_repr_after",
-        )
-        trend0, trends, trendp, trend_stats = _three_view_distances(
-            target_class,
-            prototype=source_trend_center,
-            base_key="trend_repr_before",
-            scalar_key="trend_repr_scalar",
-            phase_key="trend_repr_after",
-        )
-        struct0, structs, structp, struct_stats = _three_view_distances(
-            target_class,
-            prototype=source_structure_center,
-            base_key="structure_repr_before",
-            scalar_key="structure_repr_scalar",
-            phase_key="structure_repr_after",
         )
         cls = _three_view_classification(target_class, class_id)
         pse_views, pse_rows = _three_view_pse_metrics(
@@ -1149,16 +1121,6 @@ def run(args: argparse.Namespace) -> dict:
                 "fused_phase_relative_reduction": fused_stats["phase_relative_reduction"],
                 "fused_scalar_improvement_rate": fused_stats["scalar_improvement_rate"],
                 "fused_phase_improvement_rate": fused_stats["phase_improvement_rate"],
-                "trend_repr_no_shift_mean": trend_stats["no_shift_mean"],
-                "trend_repr_scalar_mean": trend_stats["scalar_mean"],
-                "trend_repr_phase_mean": trend_stats["phase_mean"],
-                "trend_repr_scalar_improvement_rate": trend_stats["scalar_improvement_rate"],
-                "trend_repr_phase_improvement_rate": trend_stats["phase_improvement_rate"],
-                "structure_repr_no_shift_mean": struct_stats["no_shift_mean"],
-                "structure_repr_scalar_mean": struct_stats["scalar_mean"],
-                "structure_repr_phase_mean": struct_stats["phase_mean"],
-                "structure_repr_scalar_improvement_rate": struct_stats["scalar_improvement_rate"],
-                "structure_repr_phase_improvement_rate": struct_stats["phase_improvement_rate"],
                 "true_probability_no_shift_mean": cls["true_probability_no_shift_mean"],
                 "true_probability_scalar_mean": cls["true_probability_scalar_mean"],
                 "true_probability_phase_mean": cls["true_probability_phase_mean"],
@@ -1204,12 +1166,6 @@ def run(args: argparse.Namespace) -> dict:
                     "fused_distance_no_shift": float(fused0[index].item()),
                     "fused_distance_scalar": float(fuseds[index].item()),
                     "fused_distance_phase": float(fusedp[index].item()),
-                    "trend_repr_distance_no_shift": float(trend0[index].item()),
-                    "trend_repr_distance_scalar": float(trends[index].item()),
-                    "trend_repr_distance_phase": float(trendp[index].item()),
-                    "structure_repr_distance_no_shift": float(struct0[index].item()),
-                    "structure_repr_distance_scalar": float(structs[index].item()),
-                    "structure_repr_distance_phase": float(structp[index].item()),
                     "true_probability_no_shift": float(probs0[class_id].item()),
                     "true_probability_scalar": float(probss[class_id].item()),
                     "true_probability_phase": float(probsp[class_id].item()),
@@ -1227,8 +1183,6 @@ def run(args: argparse.Namespace) -> dict:
             title=f"No shift vs TimeMatch scalar vs Domain Phase — class {class_id}: {name}",
             metrics=(
                 ("Fused / formal source prototype", fused0, fuseds, fusedp),
-                ("Trend repr / sampled source center", trend0, trends, trendp),
-                ("Structure repr / sampled source center", struct0, structs, structp),
             ),
             dpi=args.dpi,
         )

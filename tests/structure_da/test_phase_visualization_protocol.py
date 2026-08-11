@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -155,3 +157,19 @@ def test_diagnostic_only_run_persists_zero_step_calibration_state() -> None:
     result = run_stage2_statistics_diagnostic(trainer)
     assert result is snapshot
     assert trainer.saved == [("stage2_calibration_state.pt", 0, None)]
+
+
+def test_visualization_scripts_follow_phase_only_forward_contract() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    for relative in (
+        "scripts/visualize_stage2_phase_alignment.py",
+        "scripts/compare_stage2_phase_vs_timematch_shift.py",
+    ):
+        tree = ast.parse((repository_root / relative).read_text(encoding="utf-8"))
+        removed = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr in {"trend_repr", "structure_repr"}
+        }
+        assert not removed, f"{relative} still uses removed Phase-only fields: {removed}"
