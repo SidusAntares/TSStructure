@@ -135,6 +135,8 @@ def test_13a2_script_contract_has_hard_oracle_boundary_and_no_training_gate():
     assert "protocol-fixed to 5-fold cross-fit" in text
     assert "13_metric_interpretation.md" in text
     assert "不按 AUROC 排名后自动挑 best evidence" in text
+    assert '("austria/33UVP/2017", "denmark/32VNH/2017", 1, 0)' in text
+    assert '(source, target, seed, fold) != ("AT1", "DK1", 1, 0)' not in text
     called = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):

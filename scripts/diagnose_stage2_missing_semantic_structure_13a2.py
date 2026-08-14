@@ -1145,8 +1145,13 @@ def run(args) -> dict:
         raise ValueError("calibration checkpoint is missing runtime_config")
     classes = [str(v) for v in runtime["classes"]]
     source = str(runtime["source"]); target = str(runtime["target"]); seed = int(runtime["seed"]); fold = int(args.fold)
-    if (source, target, seed, fold) != ("AT1", "DK1", 1, 0):
-        raise ValueError("first 13A-2 run is frozen to AT1->DK1 seed=1 fold=0")
+    expected_task = ("austria/33UVP/2017", "denmark/32VNH/2017", 1, 0)
+    actual_task = (source, target, seed, fold)
+    if actual_task != expected_task:
+        raise ValueError(
+            "first 13A-2 run is frozen to AT1->DK1 seed=1 fold=0 "
+            f"(expected runtime={expected_task}, got runtime={actual_task})"
+        )
     data_root = str(args.data_root or runtime["data_root"])
     closed_set = bool(runtime.get("closed_set", True)); combine = bool(runtime.get("combine_spring_and_winter", False))
     time_mode = str(runtime.get("time_coordinate_mode", "canonical_day_of_year"))
