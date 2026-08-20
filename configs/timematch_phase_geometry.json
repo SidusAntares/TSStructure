@@ -1,0 +1,10 @@
+{
+  "stage2_registration_lambda": 0.0,
+  "stage2_registration_gain_ratio_max": 0.95,
+  "stage2_registration_min_common_support": 0.6,
+  "stage2_registration_max_roughness": 1000000000.0,
+  "stage2_registration_min_increment": 0.001,
+  "stage2_registration_max_local_speed": 4.0,
+  "stage2_registration_max_deviation": 0.25,
+  "stage2_class_hypothesis_margin": 0.05
+}

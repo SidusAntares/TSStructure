@@ -1,270 +1,57 @@
-"""Two-stage structure model: Stage-1 source prototype training backbone."""
+"""TimeMatch semantic path with an optional frozen temporal-geometry branch."""
 
-from models.ltae import ContinuousTime2Vec
-
-from .backbone import StructureBackbone, StructureBackboneOutput
 from .decomposition import DecompositionOutput, SymmetricTimeKernelDecomposition
-from .diagnostics import (
-    ContributionDiagnostics,
-    DecompositionDiagnostics,
-    DiagnosticMoments,
-    DiagnosticStat,
-    compute_decomposition_diagnostics,
-    compute_structure_contribution_diagnostics,
-    merge_contribution_diagnostics,
-    merge_decomposition_diagnostics,
-    summarize_contribution_diagnostics,
-    summarize_decomposition_diagnostics,
-)
-from .feature_snapshots import (
-    FeatureSnapshotConfig,
-    FeatureSnapshotManager,
-    SnapshotCaptureResult,
-    create_feature_snapshot_manager,
-    deterministic_class_selection,
-    load_selected_samples,
-)
-from .full_model import TSStructureModel
-from .phase_evidence import (
-    GammaDiagnostics,
-    PairwisePhaseCandidate,
-    compute_gamma_diagnostics,
-    empirical_cdf,
-    shape_distance_to_prototype,
-)
-from .phase_geometry import (
-    gamma_to_psi,
-    pairwise_phase_distances,
-    phase_distance,
-    sqrt_mean_gamma,
-    sqrt_median_gamma,
-)
-from .domain_phase_state import (
-    CandidatePhaseCompatibility,
-    CandidatePhaseCompatibilityStatus,
-    DomainPhaseConfig,
-    DomainPhaseState,
-    PhaseClassCenter,
-    PhaseDecisionStatus,
-    PhaseGroup,
-    PhaseGroupStatus,
-    ResidualPhaseEvidence,
-    ResidualPhaseGroupCandidate,
-    collect_residual_phase_evidence,
-    detect_residual_phase_group,
-    evaluate_candidate_phase_compatibility,
-    evaluate_sample_class_phase_compatibility,
-    update_domain_phase_state,
-)
-from .confirmed_phase_view import (
-    IDENTITY_PHASE_GROUP_ID,
-    ConfirmedPhaseView,
-    align_target_positions_to_source,
-    map_source_positions_to_target,
-    build_confirmed_class_to_group_map,
-    build_confirmed_phase_view,
-    build_phase_calibrated_view,
-)
-from .ema_teacher import Stage2EMATeacher
+from .original_timematch import FrozenGeometryCopy, OriginalTimeMatchModel
+from .phase_evidence import PairwisePhaseCandidate, empirical_cdf, shape_distance_to_prototype
 from .phase_registration import (
     FdasrsfCurveRegistrationAdapter,
-    GammaLegalityOutput,
-    build_source_registration_prototypes,
     check_gamma_legality,
     resample_gamma,
     warp_q_gamma,
     warp_support_gamma,
 )
-from .prototype_bank import (
-    QUANTILE_LEVELS,
-    SourcePrototypeBank,
-    SupportAwareDistanceOutput,
-    support_aware_q_distance,
-)
+from .prototype_bank import SourcePrototypeBank, SupportAwareDistanceOutput, support_aware_q_distance
 from .registration_geometry import (
     RegistrationGeometryOutput,
     SourceRegistrationPrototypeBank,
     TargetGeometryCache,
     evaluate_registration_geometry,
 )
-from .representation import (
-    FunctionalGeometryOutput,
-    RawTemporalRepresentation,
-    TSStructureForwardOutput,
-)
-from .source_prototype_scanner import (
-    build_source_prototype_bank,
-    finalize_distance_statistics,
-)
-from .source_trainer import SourceClassificationTrainer, SourceTrainStepOutput
-from .stage2_trainer import (
-    DeviceBatchLoader,
-    Stage2RunResult,
-    Stage2StatisticsSnapshot,
-    Stage2Trainer,
-    Stage2TrainerConfig,
-    TargetHypothesisCache,
-    build_stage2_registration_extractor,
-    run_stage2_statistics_diagnostic,
-    run_stage2_training,
-)
-from .stage2_parameter_policy import (
-    Stage2ParameterPolicy,
-    configure_stage2_parameter_policy,
-)
-from .stage2_objective import (
-    Stage2Objective,
-    Stage2ObjectiveConfig,
-    Stage2ObjectiveOutput,
-)
-from .stable_target_labels import (
-    StableLabelConfig,
-    StableTargetCandidate,
-    StableTargetLabel,
-    StableTargetLabelScanResult,
-    evaluate_stable_target_candidate,
-    scan_stable_target_labels,
-    scan_stable_target_labels_from_candidates,
-    scan_stable_target_labels_from_confirmed_phase,
-)
-from .target_hypothesis_scan import (
-    CandidatePseudoLabel,
-    PairwiseClassAlignment,
-    PhaseHypothesisScanConfig,
-    TargetClassPhaseHypothesis,
-    TargetHypothesisScanResult,
-    TargetPhaseHypothesisScanner,
-    scan_target_class_phase_hypotheses,
-)
-from .temporal_functional import (
-    SourceRunningStandardizer,
-    TemporalFunctionalLift,
-    TemporalFunctionalOutput,
-)
-from .temporal_geometry import PhaseTangentOutput, warp_to_identity_tangent
-from .temporal_head import LatentTemporalLTAE
-from .temporal_module import PhaseOnlyTemporalModule
-from .temporal_srvf import (
-    SourceRunningSupportScale,
-    TemporalSRVFExtractor,
-    TemporalSRVFOutput,
+from .temporal_functional import SourceRunningStandardizer, TemporalFunctionalLift, TemporalFunctionalOutput
+from .temporal_srvf import SourceRunningSupportScale, TemporalSRVFExtractor, TemporalSRVFOutput
+from .timematch_nonlinear_phase import (
+    ALPHA_BANK,
+    candidate_phase_grid,
+    requires_nonlinear_phase,
 )
 
 __all__ = [
-    "QUANTILE_LEVELS",
-    "ContinuousTime2Vec",
-    "ContributionDiagnostics",
-    "ConfirmedPhaseView",
-    "IDENTITY_PHASE_GROUP_ID",
-    "DecompositionDiagnostics",
+    "ALPHA_BANK",
     "DecompositionOutput",
-    "DomainPhaseConfig",
-    "DomainPhaseState",
-    "DiagnosticMoments",
-    "DiagnosticStat",
+    "FrozenGeometryCopy",
+    "OriginalTimeMatchModel",
     "FdasrsfCurveRegistrationAdapter",
-    "FeatureSnapshotConfig",
-    "FeatureSnapshotManager",
-    "FunctionalGeometryOutput",
-    "GammaDiagnostics",
-    "GammaLegalityOutput",
     "PairwisePhaseCandidate",
-    "PairwiseClassAlignment",
-    "CandidatePseudoLabel",
-    "CandidatePhaseCompatibility",
-    "CandidatePhaseCompatibilityStatus",
-    "PhaseHypothesisScanConfig",
-    "PhaseClassCenter",
-    "PhaseDecisionStatus",
-    "PhaseGroup",
-    "PhaseGroupStatus",
-    "ResidualPhaseEvidence",
-    "ResidualPhaseGroupCandidate",
-    "PhaseTangentOutput",
-    "RawTemporalRepresentation",
     "RegistrationGeometryOutput",
-    "LatentTemporalLTAE",
-    "SnapshotCaptureResult",
-    "SourceClassificationTrainer",
     "SourcePrototypeBank",
     "SourceRegistrationPrototypeBank",
     "SourceRunningStandardizer",
     "SourceRunningSupportScale",
-    "SourceTrainStepOutput",
-    "StableLabelConfig",
-    "StableTargetCandidate",
-    "StableTargetLabel",
-    "StableTargetLabelScanResult",
-    "scan_stable_target_labels_from_confirmed_phase",
-    "scan_stable_target_labels_from_candidates",
-    "Stage2EMATeacher",
-    "Stage2Objective",
-    "Stage2ObjectiveConfig",
-    "Stage2ObjectiveOutput",
-    "Stage2ParameterPolicy",
-    "StructureBackbone",
-    "StructureBackboneOutput",
     "SupportAwareDistanceOutput",
     "SymmetricTimeKernelDecomposition",
-    "TSStructureForwardOutput",
-    "TSStructureModel",
-    "TargetClassPhaseHypothesis",
     "TargetGeometryCache",
-    "TargetHypothesisScanResult",
-    "TargetPhaseHypothesisScanner",
     "TemporalFunctionalLift",
     "TemporalFunctionalOutput",
     "TemporalSRVFExtractor",
     "TemporalSRVFOutput",
-    "PhaseOnlyTemporalModule",
-    "build_source_prototype_bank",
-    "build_source_registration_prototypes",
-    "build_confirmed_class_to_group_map",
-    "build_confirmed_phase_view",
-    "build_phase_calibrated_view",
+    "candidate_phase_grid",
     "check_gamma_legality",
-    "compute_decomposition_diagnostics",
-    "compute_gamma_diagnostics",
-    "compute_structure_contribution_diagnostics",
-    "collect_residual_phase_evidence",
-    "configure_stage2_parameter_policy",
-    "create_feature_snapshot_manager",
-    "detect_residual_phase_group",
-    "deterministic_class_selection",
     "empirical_cdf",
-    "evaluate_candidate_phase_compatibility",
-    "evaluate_sample_class_phase_compatibility",
     "evaluate_registration_geometry",
-    "evaluate_stable_target_candidate",
-    "finalize_distance_statistics",
-    "gamma_to_psi",
-    "load_selected_samples",
-    "map_source_positions_to_target",
-    "merge_contribution_diagnostics",
-    "merge_decomposition_diagnostics",
-    "pairwise_phase_distances",
-    "phase_distance",
     "resample_gamma",
-    "scan_target_class_phase_hypotheses",
-    "scan_stable_target_labels",
+    "requires_nonlinear_phase",
     "shape_distance_to_prototype",
-    "sqrt_mean_gamma",
-    "sqrt_median_gamma",
-    "summarize_contribution_diagnostics",
-    "summarize_decomposition_diagnostics",
     "support_aware_q_distance",
     "warp_q_gamma",
     "warp_support_gamma",
-    "warp_to_identity_tangent",
-    "update_domain_phase_state",
-    "align_target_positions_to_source",
-    "build_stage2_registration_extractor",
-    "DeviceBatchLoader",
-    "run_stage2_statistics_diagnostic",
-    "run_stage2_training",
-    "Stage2RunResult",
-    "Stage2StatisticsSnapshot",
-    "Stage2Trainer",
-    "Stage2TrainerConfig",
-    "TargetHypothesisCache",
 ]

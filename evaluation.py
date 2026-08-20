@@ -8,6 +8,12 @@ import sklearn.metrics
 from utils.train_utils import AverageMeter, progress_bar_disabled, to_cuda
 
 
+def forward_evaluation_logits(model, pixels, valid_pixels, positions, extra):
+    """Run the common classifier contract and normalize its logits output."""
+    output = model.forward(pixels, valid_pixels, positions, extra)
+    return output.logits if hasattr(output, 'logits') else output
+
+
 def validation(best_f1, best_model_path, config, criterion, device, epoch, model, val_loader, writer, temporal_shift=None):
     val_metrics = evaluation(
         model,
@@ -63,10 +69,13 @@ def evaluation(
 
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
         if temporal_shift is not None:
-            output = model.forward(pixels, valid_pixels, positions + temporal_shift, extra, return_geometry=False)
+            logits = forward_evaluation_logits(
+                model, pixels, valid_pixels, positions + temporal_shift, extra
+            )
         else:
-            output = model.forward(pixels, valid_pixels, positions, extra, return_geometry=False)
-        logits = output.logits
+            logits = forward_evaluation_logits(
+                model, pixels, valid_pixels, positions, extra
+            )
 
         predictions = logits.argmax(dim=1)
 

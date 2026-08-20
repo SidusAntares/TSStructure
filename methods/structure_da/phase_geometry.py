@@ -187,10 +187,9 @@ def sqrt_mean_gamma(gammas: Tensor) -> Tensor:
     gammas_cpu = _as_gammas(gammas)
     if _all_phase_identical(gammas_cpu):
         return gammas_cpu[0].clone().detach()
-    from fdasrsf import utility_functions
-
-    gamma_matrix_np = gammas_cpu.numpy().T
     try:
+        from fdasrsf import utility_functions
+        gamma_matrix_np = gammas_cpu.numpy().T
         _mu, gam_mean, _psi, _vec = utility_functions.SqrtMean(
             gamma_matrix_np,
             parallel=False,
