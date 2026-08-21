@@ -21,6 +21,11 @@ from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
 from models.stclassifier import PseLTae, PseTae, PseTempCNN, PseGru
+from models.decomposition_benchmark import (
+    build_benchmark_model,
+    component_normalization_dataset_name,
+    is_benchmark_model,
+)
 from timematch import train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
 from utils import label_utils
@@ -66,7 +71,32 @@ def main(config):
         sample_pixels_val = config.sample_pixels_val or (config.eval and config.temporal_shift)
         val_loader, test_loader = create_evaluation_loaders(config.target, splits, config, sample_pixels_val)
 
-        if config.model == 'pseltae':
+        if is_benchmark_model(config.model):
+            model = build_benchmark_model(
+                config.model,
+                input_dim=config.input_dim,
+                num_classes=config.num_classes,
+                with_extra=config.with_extra,
+                dlinear_kernel=config.dlinear_kernel,
+                micn_conv_kernels=config.micn_conv_kernels,
+                xpatch_ema_alpha=config.xpatch_ema_alpha,
+                stl_period=config.stl_period,
+                dwt_wavelet=config.dwt_wavelet,
+                dwt_level=config.dwt_level,
+                vmd_num_modes=config.vmd_num_modes,
+                vmd_alpha=config.vmd_alpha,
+                vmd_tau=config.vmd_tau,
+                vmd_dc=config.vmd_dc,
+                vmd_init=config.vmd_init,
+                vmd_tol=config.vmd_tol,
+                ceemdan_trials=config.ceemdan_trials,
+                ceemdan_epsilon=config.ceemdan_epsilon,
+                ceemdan_seed=config.ceemdan_seed,
+                ceemdan_sampen_m=config.ceemdan_sampen_m,
+                ceemdan_sampen_r_ratio=config.ceemdan_sampen_r_ratio,
+                ceemdan_se_threshold_factor=config.ceemdan_se_threshold_factor,
+            )
+        elif config.model == 'pseltae':
             model = PseLTae(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
         elif config.model == 'psetae':
             model = PseTae(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
@@ -290,6 +320,26 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
     )
     data_loader = create_train_loader(dataset, config.batch_size, config.num_workers)
     print(f'training dataset: {dataset_name}, n={len(dataset)}, batches={len(data_loader)}')
+    normalization_dataset_name = component_normalization_dataset_name(
+        model, config.source, dataset_name
+    )
+    if hasattr(model, 'fit_component_normalizers'):
+        normalization_loader = data_loader
+        if normalization_dataset_name != dataset_name:
+            normalization_dataset = PixelSetData(
+                config.data_root,
+                normalization_dataset_name,
+                config.classes,
+                train_transform,
+                indices=splits[normalization_dataset_name]['train'],
+                closed_set=config.closed_set,
+                combine_spring_and_winter=config.combine_spring_and_winter,
+            )
+            normalization_loader = create_train_loader(
+                normalization_dataset, config.batch_size, config.num_workers
+            )
+        print('Fitting decomposition component normalizers on the supervised training split...')
+        model.fit_component_normalizers(normalization_loader, device)
 
     criterion = FocalLoss(gamma=config.focal_loss_gamma)
     steps_per_epoch = len(data_loader)
@@ -463,7 +513,71 @@ if __name__ == '__main__':
     parser.add_argument('--focal_loss_gamma', default=1.0, type=float, help='gamma value for focal loss')
     parser.add_argument('--num_pixels', default=64, type=int, help='Number of pixels to sample from the input sample')
     parser.add_argument('--seq_length', default=30, type=int, help='Number of time steps to sample from the input sample')
-    parser.add_argument('--model', default='pseltae', choices=['psetae', 'pseltae', 'psetcnn', 'psegru'])
+    parser.add_argument(
+        '--model',
+        default='pseltae',
+        choices=[
+            'psetae',
+            'pseltae',
+            'psetcnn',
+            'psegru',
+            'raw_timematch',
+            'dlinear_decomp',
+            'micn_decomp',
+            'xpatch_ema',
+            'stl',
+            'vmd',
+            'dwt',
+            'ceemdan_se',
+        ],
+    )
+    parser.add_argument('--dlinear_kernel', default=25, type=int, help='moving-average kernel for dlinear_decomp')
+    parser.add_argument(
+        '--micn_conv_kernels',
+        default=[17, 49],
+        type=int,
+        nargs='+',
+        help=(
+            'MICN convolution scales; official construction maps each to an odd '
+            'decomposition kernel (even values are incremented by one)'
+        ),
+    )
+    parser.add_argument(
+        '--xpatch_ema_alpha',
+        default=0.3,
+        type=float,
+        help='xPatch EMA current-observation weight alpha (official unified default: 0.3)',
+    )
+    parser.add_argument(
+        '--stl_period',
+        default=7,
+        type=int,
+        help='STL seasonal period measured in observation-order indices (default: 7)',
+    )
+    parser.add_argument(
+        '--dwt_wavelet',
+        default='haar',
+        type=str,
+        help='PyWavelets discrete wavelet name (default: haar)',
+    )
+    parser.add_argument(
+        '--dwt_level',
+        default=2,
+        type=int,
+        help='fixed PyWavelets decomposition level (default: 2)',
+    )
+    parser.add_argument('--vmd_num_modes', default=5, type=int, help='fixed number of VMD modes (default: 5)')
+    parser.add_argument('--vmd_alpha', default=2000.0, type=float, help='VMD bandwidth constraint alpha (default: 2000)')
+    parser.add_argument('--vmd_tau', default=0.0, type=float, help='VMD dual-ascent time-step/noise tolerance tau (default: 0)')
+    parser.add_argument('--vmd_dc', default=0, type=int, choices=[0, 1], help='VMD DC-mode flag (default: 0)')
+    parser.add_argument('--vmd_init', default=1, type=int, choices=[0, 1, 2], help='vmdpy center-frequency initialization mode (default: 1)')
+    parser.add_argument('--vmd_tol', default=1e-7, type=float, help='VMD convergence tolerance (default: 1e-7)')
+    parser.add_argument('--ceemdan_trials', default=100, type=int, help='PyEMD CEEMDAN noise ensemble size (official default: 100)')
+    parser.add_argument('--ceemdan_epsilon', default=0.005, type=float, help='PyEMD CEEMDAN noise scale epsilon (official default: 0.005)')
+    parser.add_argument('--ceemdan_seed', default=1, type=int, help='deterministic PyEMD CEEMDAN noise seed')
+    parser.add_argument('--ceemdan_sampen_m', default=2, type=int, help='sample-entropy embedding dimension for CEEMDAN-SE (default: 2)')
+    parser.add_argument('--ceemdan_sampen_r_ratio', default=0.2, type=float, help='sample-entropy tolerance ratio r/std for CEEMDAN-SE (default: 0.2)')
+    parser.add_argument('--ceemdan_se_threshold_factor', default=0.5, type=float, help='adaptive CEEMDAN-SE threshold = factor * mean SampEn (literature rule default: 0.5)')
     parser.add_argument('--input_dim', default=10, type=int, help='Number of channels of input sample')
     parser.add_argument('--with_extra', default=False, type=bool_flag, help='whether to input extra geometric features to the PSE')
     parser.add_argument('--tensorboard_log_dir', default='runs')

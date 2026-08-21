@@ -391,8 +391,13 @@ def estimate_temporal_shift(
         sample = next(target_iter)
         labels.extend(sample['label'].tolist())
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
-        spatial_feats = model.spatial_encoder.forward(pixels, valid_pixels, extra)
-        shift_logits = torch.stack([model.decoder(model.temporal_encoder(spatial_feats, positions + shift)) for shift in shifts], dim=1)
+        if hasattr(model, 'forward_shift_candidates'):
+            shift_logits = model.forward_shift_candidates(
+                pixels, valid_pixels, positions, extra, shifts
+            )
+        else:
+            spatial_feats = model.spatial_encoder.forward(pixels, valid_pixels, extra)
+            shift_logits = torch.stack([model.decoder(model.temporal_encoder(spatial_feats, positions + shift)) for shift in shifts], dim=1)
         shift_probs = F.softmax(shift_logits, dim=2)
         shift_softmaxes.append(shift_probs)
     shift_softmaxes = torch.cat(shift_softmaxes).cpu().numpy()  # (N, n_shifts, n_classes)
