@@ -8,3 +8,4 @@ data/
 .ipynb_checkpoints
 .vscode/
 /sync_to_server.sh
+logs/
