@@ -7,6 +7,27 @@ FALSY_STRINGS = {"off", "false", "0"}
 TRUTHY_STRINGS = {"on", "true", "1"}
 
 
+def format_duration(seconds):
+    """Render elapsed seconds as an unbounded HH:MM:SS duration."""
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def format_log_block(title, lines, border="="):
+    """Build a stable, grep-friendly multi-line log block."""
+    rule = border * 72
+    return "\n".join([rule, title, "-" * 72, *lines, rule])
+
+
+def log_block(title, lines, border="="):
+    """Print a formatted log block surrounded by blank lines."""
+    print()
+    print(format_log_block(title, lines, border=border))
+    print()
+
+
 def progress_bar_disabled(mode="auto"):
     if mode == "off":
         return True

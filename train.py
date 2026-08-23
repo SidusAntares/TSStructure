@@ -22,6 +22,7 @@ from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
 from models.reimts_classifier import (
+    PatchOccupancyMeter,
     PseReIMTSMTANLTAE,
     format_patch_diagnostics,
     reimts_classification_loss,
@@ -35,9 +36,63 @@ from utils.metrics import overall_classification_report
 from utils.train_utils import (
     AverageMeter,
     bool_flag,
+    format_duration,
+    format_log_block,
     progress_bar_disabled,
     to_cuda,
 )
+
+
+def format_source_epoch_summary(
+    epoch,
+    epochs,
+    loss,
+    lr,
+    patch_meter,
+    epoch_seconds,
+    elapsed_seconds,
+):
+    patch_lines = patch_meter.format_lines("ReIMTS patches:")
+    return format_log_block(
+        f"[SOURCE] Epoch {epoch}/{epochs}",
+        [
+            "train:",
+            f"  loss: {loss:.6f}",
+            f"  lr: {lr:.2e}",
+            "",
+            *patch_lines,
+            "",
+            "timing:",
+            f"  epoch: {epoch_seconds:.2f} s",
+            f"  elapsed: {format_duration(elapsed_seconds)}",
+        ],
+    )
+
+
+def format_run_complete(
+    experiment,
+    total_seconds,
+    best_val_macro_f1,
+    test_macro_f1,
+):
+    best_value = (
+        "unavailable"
+        if best_val_macro_f1 is None
+        else f"{best_val_macro_f1:.6f}"
+    )
+    return format_log_block(
+        "[RUN COMPLETE]",
+        [
+            f"experiment: {experiment}",
+            f"total_runtime: {format_duration(total_seconds)}",
+            f"best_val_macro_f1: {best_value}",
+            f"test_macro_f1: {test_macro_f1:.6f}",
+        ],
+    )
+
+
+def tensorboard_fold_dir(experiment_log_dir, fold_num):
+    return os.path.join(experiment_log_dir, f"fold_{fold_num}")
 
 
 def create_model(config):
@@ -90,6 +145,7 @@ def forward_supervised_for_loss(
     criterion,
     loss_mode="patch",
     diagnostics_label=None,
+    patch_meter=None,
 ):
     """Use patch-direct supervision only for models exposing the capability."""
     capability = getattr(model, "forward_for_loss", None)
@@ -100,6 +156,8 @@ def forward_supervised_for_loss(
         )
         if diagnostics_label is not None:
             print(format_patch_diagnostics(output.patch_valid, diagnostics_label))
+        if patch_meter is not None:
+            patch_meter.update(output.patch_valid)
         return output.sample_logits, loss
     outputs = model.forward(pixels, mask, positions, extra)
     return outputs, criterion(outputs, targets)
@@ -107,6 +165,9 @@ def forward_supervised_for_loss(
 
 
 def main(config):
+    run_started = time.perf_counter()
+    run_best_f1s = []
+    run_test_f1s = []
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -126,6 +187,7 @@ def main(config):
         return
 
     for fold_num, splits in enumerate(folds):
+        fold_best_f1 = None
         print(f'Starting fold {fold_num}...')
 
         if config.closed_set:
@@ -154,9 +216,14 @@ def main(config):
             #         print('Skipping fold', fold_num)
             #         continue
 
-            writer = SummaryWriter(log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0)
+            writer = SummaryWriter(
+                log_dir=tensorboard_fold_dir(
+                    config.tensorboard_log_dir, fold_num
+                ),
+                purge_step=0,
+            )
             if config.method == 'timematch':
-                train_timematch(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
+                fold_best_f1 = train_timematch(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
             elif config.method == 'dann':
                 train_dann(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
             elif config.method == 'mmd':
@@ -166,7 +233,7 @@ def main(config):
             elif config.method == 'alda':
                 train_alda(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
             else:
-                train_supervised(model, config, writer, splits, val_loader, device, best_model_path)
+                fold_best_f1 = train_supervised(model, config, writer, splits, val_loader, device, best_model_path)
 
         print('Restoring best model weights for testing...')
 
@@ -186,8 +253,17 @@ def main(config):
         print(test_metrics['classification_report'])
 
         save_results(test_metrics, config)
+        run_test_f1s.append(test_metrics['macro_f1'])
+        if fold_best_f1 is not None:
+            run_best_f1s.append(fold_best_f1)
 
     overall_performance(config)
+    print(format_run_complete(
+        experiment=config.experiment_name or "unnamed",
+        total_seconds=time.perf_counter() - run_started,
+        best_val_macro_f1=(max(run_best_f1s) if run_best_f1s else None),
+        test_macro_f1=float(np.mean(run_test_f1s)),
+    ))
 
 
 def prepare_data_protocol(config):
@@ -358,9 +434,12 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs * steps_per_epoch, eta_min=0)
 
     best_f1 = 0
+    training_started = time.perf_counter()
     for epoch in range(config.epochs):
+        epoch_started = time.perf_counter()
         model.train()
         loss_meter = AverageMeter()
+        patch_meter = PatchOccupancyMeter()
 
         progress_bar = tqdm(
             enumerate(data_loader),
@@ -392,6 +471,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     and step == 0
                     else None
                 ),
+                patch_meter=patch_meter,
             )
             if (
                 getattr(config, "reimts_patch_diagnostics", False)
@@ -418,8 +498,20 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
 
         progress_bar.close()
 
+        print(format_source_epoch_summary(
+            epoch=epoch + 1,
+            epochs=config.epochs,
+            loss=loss_meter.avg,
+            lr=optimizer.param_groups[0]["lr"],
+            patch_meter=patch_meter,
+            epoch_seconds=time.perf_counter() - epoch_started,
+            elapsed_seconds=time.perf_counter() - training_started,
+        ))
+
         model.eval()
         best_f1 = validation(best_f1, best_model_path, config, criterion, device, epoch, model, val_loader, writer)
+
+    return best_f1
 
 
 def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1, test_ratio=0.2):

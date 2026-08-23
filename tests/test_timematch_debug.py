@@ -226,6 +226,8 @@ def _run_one_training_step(
         log_step=1,
         run_validation=False,
         output_student=True,
+        classes=["crop", "unknown"],
+        progress_bar="off",
     )
     timematch.train_timematch(
         model,
@@ -245,6 +247,21 @@ def test_empty_pseudo_label_batch_trains_source_only(monkeypatch):
 
     assert model.forward_batch_sizes == [2]
     assert torch.isfinite(model.scale)
+
+
+def test_empty_pseudo_epoch_logs_zero_safe_structured_diagnostics(monkeypatch, capsys):
+    _run_one_training_step(monkeypatch, target_weak_value=0.0)
+
+    logged = capsys.readouterr().out
+    assert "[TIMEMATCH] Epoch 1/1" in logged
+    assert "pseudo labels:" in logged
+    assert "accepted: 0" in logged
+    assert "confidence_mean_accepted: 0.0000" in logged
+    assert "target_updates: 0" in logged
+    assert "target: 0.000000" in logged
+    assert "pseudo class histogram:\n  crop: 0\n  unknown: 0" in logged
+    assert "Teacher pseudo label F1" not in logged
+    assert "\r" not in logged
 
 
 def test_nonempty_pseudo_label_batch_concatenates_and_splits_by_actual_size(

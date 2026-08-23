@@ -1,14 +1,44 @@
 import os
+import time
 import numpy as np
 import torch
 import torch.backends.cudnn
 import torch.nn.functional as F
 from tqdm import tqdm
 import sklearn.metrics
-from utils.train_utils import AverageMeter, progress_bar_disabled, to_cuda
+from utils.train_utils import (
+    AverageMeter,
+    format_log_block,
+    progress_bar_disabled,
+    to_cuda,
+)
+
+
+def format_validation_summary(
+    metrics,
+    best_before,
+    best_after,
+    checkpoint_saved,
+    validation_seconds,
+):
+    return format_log_block(
+        "[VALIDATION]",
+        [
+            f"loss: {metrics['loss']:.6f}",
+            f"accuracy: {metrics['accuracy']:.6f}",
+            f"macro_f1: {metrics['macro_f1']:.6f}",
+            f"kappa: {metrics['kappa']:.6f}",
+            f"best_macro_f1_before: {best_before:.6f}",
+            f"best_macro_f1_after: {best_after:.6f}",
+            f"checkpoint_saved: {str(checkpoint_saved).lower()}",
+            f"validation_time: {validation_seconds:.2f} s",
+        ],
+        border="-",
+    )
 
 
 def validation(best_f1, best_model_path, config, criterion, device, epoch, model, val_loader, writer, temporal_shift=None):
+    validation_started = time.perf_counter()
     val_metrics = evaluation(
         model,
         val_loader,
@@ -24,15 +54,20 @@ def validation(best_f1, best_model_path, config, criterion, device, epoch, model
     writer.add_scalar('val/accuracy', val_acc, global_step=epoch)
     writer.add_scalar('val/f1', val_f1, global_step=epoch)
     writer.add_scalar('val/kappa', val_kappa, global_step=epoch)
-    print(f"Validation result: loss={val_loss:.4f}, acc={val_acc:.2f}, f1={val_f1:.4f}")
+    best_before = best_f1
+    checkpoint_saved = False
     if val_f1 > best_f1:
-        print(f'Validation F1 improved from {best_f1:.4f} to {val_f1:.4f}!')
         best_f1 = val_f1
         if best_model_path is not None:
-            print(f'Saving best model to {best_model_path}')
             torch.save({'epoch': epoch, 'state_dict': model.state_dict(), 'best_f1': best_f1}, best_model_path)
-    else:
-        print(f'Validation F1 did not improve from {best_f1:.4f}.')
+            checkpoint_saved = True
+    print(format_validation_summary(
+        val_metrics,
+        best_before,
+        best_f1,
+        checkpoint_saved,
+        time.perf_counter() - validation_started,
+    ))
     return best_f1
 
 

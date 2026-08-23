@@ -21,6 +21,63 @@ class ReIMTSClassificationOutput:
     patch_valid: torch.Tensor
 
 
+class PatchOccupancyMeter:
+    """Aggregate lowest-scale patch occupancy across representative batches."""
+
+    def __init__(self):
+        self.samples = 0
+        self.valid_patches = 0
+        self.patch_slots = 0
+        self.empty_by_patch = None
+
+    def update(self, patch_valid):
+        valid = patch_valid.detach().bool().cpu()
+        if valid.ndim != 2:
+            raise ValueError("patch_valid must have shape [B, P]")
+        if self.empty_by_patch is None:
+            self.empty_by_patch = torch.zeros(valid.shape[1], dtype=torch.long)
+        elif self.empty_by_patch.numel() != valid.shape[1]:
+            raise ValueError("patch count changed while aggregating occupancy")
+        self.samples += valid.shape[0]
+        self.valid_patches += int(valid.sum().item())
+        self.patch_slots += valid.numel()
+        self.empty_by_patch += (~valid).sum(dim=0)
+
+    def summary(self):
+        patch_count = 0 if self.empty_by_patch is None else self.empty_by_patch.numel()
+        return {
+            "samples": self.samples,
+            "patches": patch_count,
+            "valid_per_sample_mean": (
+                self.valid_patches / self.samples if self.samples else 0.0
+            ),
+            "empty_patch_rate": (
+                1.0 - self.valid_patches / self.patch_slots
+                if self.patch_slots
+                else 0.0
+            ),
+            "quarter_empty_rates": (
+                (self.empty_by_patch.float() / self.samples).tolist()
+                if self.samples
+                else [0.0] * patch_count
+            ),
+        }
+
+    def format_lines(self, title="ReIMTS patches:"):
+        summary = self.summary()
+        lines = [
+            title,
+            "  valid patches/sample mean: "
+            f"{summary['valid_per_sample_mean']:.3f}",
+            f"  empty patch rate: {summary['empty_patch_rate']:.2%}",
+        ]
+        lines.extend(
+            f"  Q{index} empty rate: {rate:.2%}"
+            for index, rate in enumerate(summary["quarter_empty_rates"], 1)
+        )
+        return lines
+
+
 def format_patch_diagnostics(patch_valid, label):
     """Format lowest-scale patch occupancy without changing aggregation."""
     valid = patch_valid.detach().bool().cpu()

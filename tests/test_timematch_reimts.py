@@ -84,7 +84,14 @@ class _ShiftEstimatorModel(nn.Module):
         return torch.stack([score, -score], dim=1)
 
 
-def test_estimate_shift_runs_pse_once_and_changes_only_encoder_shift(monkeypatch):
+class _TiedShiftEstimatorModel(_ShiftEstimatorModel):
+    def forward_from_spatial_with_shift(self, spatial, positions, shift):
+        self.seen.append((positions.clone(), shift))
+        score = torch.ones(spatial.shape[0])
+        return torch.stack([score, -score], dim=1)
+
+
+def test_estimate_shift_runs_pse_once_changes_only_encoder_shift_and_logs_block(monkeypatch, capsys):
     model = _ShiftEstimatorModel()
     positions = torch.tensor([[80, 180, 280]])
     sample = {
@@ -120,6 +127,38 @@ def test_estimate_shift_runs_pse_once_and_changes_only_encoder_shift(monkeypatch
     assert model.spatial_encoder.calls == 1
     assert [entry[1] for entry in model.seen] == [-1, 0, 1]
     assert all(torch.equal(entry[0], positions) for entry in model.seen)
+    logged = capsys.readouterr().out
+    assert "[SHIFT ESTIMATION]" in logged
+    assert "estimator: ACC" in logged
+    assert "candidate_count: 3" in logged
+    assert "top5:" in logged
+    assert "debug oracle:" in logged
+
+
+def test_acc_shift_tie_preserves_original_first_candidate_selection(monkeypatch):
+    model = _TiedShiftEstimatorModel()
+    sample = {
+        "pixels": torch.ones(1, 3, 1, 1),
+        "valid_pixels": torch.ones(1, 3, 1),
+        "positions": torch.tensor([[80, 180, 280]]),
+        "extra": torch.zeros(1, 4),
+        "label": torch.tensor([0]),
+    }
+    monkeypatch.setattr(
+        timematch,
+        "to_cuda",
+        lambda value, device: (
+            value["pixels"], value["valid_pixels"],
+            value["positions"], value["extra"],
+        ),
+    )
+
+    best = timematch.estimate_temporal_shift(
+        model, [sample], "cpu", min_shift=-1, max_shift=1,
+        sample_size=1, shift_estimator="ACC", progress_bar="off",
+    )
+
+    assert best == -1
 
 
 def test_pseudo_labels_use_shift_capability_and_remain_sample_level(monkeypatch):

@@ -1,6 +1,7 @@
 import sys
 import subprocess
 import types
+import os
 from types import SimpleNamespace
 
 import torch
@@ -100,6 +101,12 @@ def test_source_supervised_helper_uses_valid_patch_loss():
 
     assert sample_logits.shape == (1, 2)
     assert torch.allclose(loss, expected)
+
+
+def test_tensorboard_fold_directory_stays_under_experiment_task():
+    assert train.tensorboard_fold_dir("runs/round3/source_DK1", 0) == os.path.join(
+        "runs/round3/source_DK1", "fold_0"
+    )
 
 
 def test_patch_diagnostics_report_counts_empty_rates_and_quarters():
