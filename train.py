@@ -6,6 +6,7 @@ import json
 import os
 import pickle as pkl
 import random
+import time
 
 import numpy as np
 import torch
@@ -20,6 +21,11 @@ from competitors.mmd.train_mmd import train_mmd
 from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
+from models.reimts_classifier import (
+    PseReIMTSMTANLTAE,
+    format_patch_diagnostics,
+    reimts_classification_loss,
+)
 from models.stclassifier import PseLTae, PseTae, PseTempCNN, PseGru
 from timematch import train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
@@ -32,6 +38,71 @@ from utils.train_utils import (
     progress_bar_disabled,
     to_cuda,
 )
+
+
+def create_model(config):
+    if config.model == 'pseltae':
+        return PseLTae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+        )
+    if config.model == 'psetae':
+        return PseTae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+        )
+    if config.model == 'psetcnn':
+        return PseTempCNN(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+        )
+    if config.model == 'psegru':
+        return PseGru(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+        )
+    if config.model == 'psereimtsmtanltae':
+        return PseReIMTSMTANLTAE(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+            latent_dim=config.mtan_latent_dim,
+            num_ref_points=config.mtan_num_ref_points,
+            mtan_heads=config.mtan_heads,
+            reimts_levels=config.reimts_levels,
+            reimts_scale_factor=config.reimts_scale_factor,
+            reimts_period=config.reimts_period,
+        )
+    raise NotImplementedError()
+
+
+def forward_supervised_for_loss(
+    model,
+    pixels,
+    mask,
+    positions,
+    extra,
+    targets,
+    criterion,
+    loss_mode="patch",
+    diagnostics_label=None,
+):
+    """Use patch-direct supervision only for models exposing the capability."""
+    capability = getattr(model, "forward_for_loss", None)
+    if callable(capability):
+        output = capability(pixels, mask, positions, extra)
+        loss = reimts_classification_loss(
+            output, targets, criterion, mode=loss_mode
+        )
+        if diagnostics_label is not None:
+            print(format_patch_diagnostics(output.patch_valid, diagnostics_label))
+        return output.sample_logits, loss
+    outputs = model.forward(pixels, mask, positions, extra)
+    return outputs, criterion(outputs, targets)
 
 
 
@@ -66,16 +137,7 @@ def main(config):
         sample_pixels_val = config.sample_pixels_val or (config.eval and config.temporal_shift)
         val_loader, test_loader = create_evaluation_loaders(config.target, splits, config, sample_pixels_val)
 
-        if config.model == 'pseltae':
-            model = PseLTae(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psetae':
-            model = PseTae(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psetcnn':
-            model = PseTempCNN(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psegru':
-            model = PseGru(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        else:
-            raise NotImplementedError()
+        model = create_model(config)
         
         model.to(config.device)
 
@@ -313,8 +375,33 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             targets = sample['label'].cuda(device=device, non_blocking=True)
 
             pixels, mask, positions, extra = to_cuda(sample, device)
-            outputs = model.forward(pixels, mask, positions, extra)
-            loss = criterion(outputs, targets)
+            forward_started = time.perf_counter()
+            outputs, loss = forward_supervised_for_loss(
+                model,
+                pixels,
+                mask,
+                positions,
+                extra,
+                targets,
+                criterion,
+                loss_mode=getattr(config, "reimts_loss_mode", "patch"),
+                diagnostics_label=(
+                    "source after RandomSampleTimeSteps"
+                    if getattr(config, "reimts_patch_diagnostics", False)
+                    and epoch == 0
+                    and step == 0
+                    else None
+                ),
+            )
+            if (
+                getattr(config, "reimts_patch_diagnostics", False)
+                and epoch == 0
+                and step == 0
+            ):
+                print(
+                    "[ReIMTS timing] one normal forward time: "
+                    f"{time.perf_counter() - forward_started:.6f}s"
+                )
 
             optimizer.zero_grad()
             loss.backward()
@@ -426,9 +513,9 @@ if __name__ == '__main__':
     parser.add_argument('--target', default='france/30TXT/2017', help='target dataset', choices=available_tiles)
     parser.add_argument('--num_folds', default=1, type=int, help='Number of train/test folds for cross validation')
     parser.add_argument("--val_ratio", default=0.1, type=float,
-                        help='Ratio of training data to use for validation. Default 10%.')
+                        help='Ratio of training data to use for validation. Default 10%%.')
     parser.add_argument("--test_ratio", default=0.2, type=float,
-                        help='Ratio of training data to use for testing. Default 20%.')
+                        help='Ratio of training data to use for testing. Default 20%%.')
     parser.add_argument('--sample_pixels_val', type=bool_flag, default=True, help='speed up validation at the cost of randomness')
     parser.add_argument('--output_dir', default='outputs', help='Path to the folder where the results should be stored')
     parser.add_argument('-e', '--experiment_name', default=None, help='Name of the experiment')
@@ -463,9 +550,41 @@ if __name__ == '__main__':
     parser.add_argument('--focal_loss_gamma', default=1.0, type=float, help='gamma value for focal loss')
     parser.add_argument('--num_pixels', default=64, type=int, help='Number of pixels to sample from the input sample')
     parser.add_argument('--seq_length', default=30, type=int, help='Number of time steps to sample from the input sample')
-    parser.add_argument('--model', default='pseltae', choices=['psetae', 'pseltae', 'psetcnn', 'psegru'])
+    parser.add_argument(
+        '--model',
+        default='pseltae',
+        choices=[
+            'psetae',
+            'pseltae',
+            'psetcnn',
+            'psegru',
+            'psereimtsmtanltae',
+        ],
+    )
     parser.add_argument('--input_dim', default=10, type=int, help='Number of channels of input sample')
     parser.add_argument('--with_extra', default=False, type=bool_flag, help='whether to input extra geometric features to the PSE')
+    parser.add_argument(
+        '--reimts_levels', default=3, type=int,
+        help='ReIMTS scale levels (TimeMatch adaptation default: 3)',
+    )
+    parser.add_argument('--reimts_scale_factor', default=2, type=int)
+    parser.add_argument('--reimts_period', default=365, type=int)
+    parser.add_argument(
+        '--mtan_num_ref_points',
+        default=8,
+        type=int,
+        help='mTAN reference points per scale (TimeMatch adaptation default: 8)',
+    )
+    parser.add_argument(
+        '--reimts_loss_mode', default='patch', choices=['patch', 'sample'],
+        help='ReIMTS classification supervision: valid patches or mean sample logits',
+    )
+    parser.add_argument(
+        '--reimts_patch_diagnostics', default=False, type=bool_flag,
+        help='print lowest-scale empty-patch rates and smoke timings',
+    )
+    parser.add_argument('--mtan_latent_dim', default=128, type=int)
+    parser.add_argument('--mtan_heads', default=1, type=int)
     parser.add_argument('--tensorboard_log_dir', default='runs')
     parser.add_argument('--train_on_target', default=False, action='store_true', help='supervised training on target for upper bound comparison')
 

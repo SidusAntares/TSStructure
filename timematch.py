@@ -2,6 +2,7 @@ from torch.utils.data.sampler import WeightedRandomSampler
 import sklearn.metrics
 from collections import Counter
 from copy import deepcopy
+import time
 
 import numpy as np
 import torch
@@ -12,6 +13,11 @@ from tqdm import tqdm
 
 from dataset import PixelSetData
 from evaluation import validation
+from models.reimts_classifier import (
+    ReIMTSClassificationOutput,
+    format_patch_diagnostics,
+    reimts_classification_loss,
+)
 from transforms import (
     Normalize,
     RandomSamplePixels,
@@ -32,6 +38,8 @@ from utils.train_utils import (
 def _check_temporal_index_range(model, positions, applied_shift, tag):
     if positions.numel() == 0:
         return
+    if not hasattr(model, "temporal_encoder"):
+        return
 
     temporal_encoder = model.temporal_encoder
     min_pos = int(positions.min().item())
@@ -48,6 +56,54 @@ def _check_temporal_index_range(model, positions, applied_shift, tag):
             "This usually means an extra temporal shift was applied on top of TimeMatch "
             "alignment or the positional encoding range is inconsistent with the dataset dates."
         )
+
+
+def forward_model_with_shift(
+    model, pixels, mask, positions, extra, shift
+):
+    """Apply TimeMatch encoder shift without changing ReIMTS split time."""
+    capability = getattr(model, "forward_with_shift", None)
+    if callable(capability):
+        return capability(pixels, mask, positions, extra, shift)
+    return model.forward(pixels, mask, positions + shift, extra)
+
+
+def forward_model_for_loss_with_shift(
+    model, pixels, mask, positions, extra, shift
+):
+    """Return patch-aware student output when the model supports it."""
+    capability = getattr(model, "forward_for_loss", None)
+    if callable(capability):
+        return capability(pixels, mask, positions, extra, shift=shift)
+    return forward_model_with_shift(
+        model, pixels, mask, positions, extra, shift
+    )
+
+
+def sample_logits_from_output(output):
+    if isinstance(output, ReIMTSClassificationOutput):
+        return output.sample_logits
+    return output
+
+
+def slice_student_output(output, start, stop):
+    if isinstance(output, ReIMTSClassificationOutput):
+        return ReIMTSClassificationOutput(
+            sample_logits=output.sample_logits[start:stop],
+            patch_logits=output.patch_logits[start:stop],
+            patch_valid=output.patch_valid[start:stop],
+        )
+    return output[start:stop]
+
+
+def student_classification_loss(
+    output, targets, criterion, loss_mode="patch"
+):
+    if isinstance(output, ReIMTSClassificationOutput):
+        return reimts_classification_loss(
+            output, targets, criterion, mode=loss_mode
+        )
+    return criterion(output, targets)
 
 
 def train_timematch(student, config, writer, val_loader, device, best_model_path, fold_num, splits):
@@ -67,6 +123,8 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         criterion = FocalLoss(gamma=config.focal_loss_gamma)
     else:
         criterion = torch.nn.CrossEntropyLoss()
+    reimts_loss_mode = getattr(config, "reimts_loss_mode", "patch")
+    patch_diagnostics = getattr(config, "reimts_patch_diagnostics", False)
 
     steps_per_epoch = config.steps_per_epoch
 
@@ -94,6 +152,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             sample_size=config.sample_size,
             shift_estimator=shift_estimator,
             progress_bar=getattr(config, "progress_bar", "auto"),
+            diagnostics=patch_diagnostics,
         )
         if target_to_source_shift >= 0:
             min_shift = 0
@@ -129,7 +188,8 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     target_loader_no_aug, device, estimated_class_distr,
                     min_shift=min_shift, max_shift=max_shift, sample_size=config.sample_size,
                     shift_estimator=config.shift_estimator,
-                    progress_bar=getattr(config, "progress_bar", "auto"))
+                    progress_bar=getattr(config, "progress_bar", "auto"),
+                    diagnostics=patch_diagnostics)
             if epoch == 0:
                 if config.shift_source:
                     source_to_target_shift = -target_to_source_shift
@@ -148,7 +208,27 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             # Get pseudo labels from teacher
             pixels_t_weak, mask_t_weak, position_t_weak, extra_t_weak = to_cuda(sample_target_weak, device)
             with torch.no_grad():
-                teacher_preds = F.softmax(teacher.forward(pixels_t_weak, mask_t_weak, position_t_weak + target_to_source_shift, extra_t_weak), dim=1)
+                if patch_diagnostics and epoch == 0 and step == 0:
+                    teacher_output = forward_model_for_loss_with_shift(
+                        teacher,
+                        pixels_t_weak,
+                        mask_t_weak,
+                        position_t_weak,
+                        extra_t_weak,
+                        target_to_source_shift,
+                    )
+                    if isinstance(teacher_output, ReIMTSClassificationOutput):
+                        print(format_patch_diagnostics(
+                            teacher_output.patch_valid, "target weak"
+                        ))
+                    teacher_logits = sample_logits_from_output(teacher_output)
+                else:
+                    teacher_logits = forward_model_with_shift(
+                        teacher, pixels_t_weak, mask_t_weak,
+                        position_t_weak, extra_t_weak,
+                        target_to_source_shift,
+                    )
+                teacher_preds = F.softmax(teacher_logits, dim=1)
             pseudo_conf, pseudo_targets = torch.max(teacher_preds, dim=1)
             pseudo_mask = pseudo_conf > config.pseudo_threshold
             num_pseudo = int(pseudo_mask.sum().item())
@@ -157,14 +237,28 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             pixels_s, mask_s, position_s, extra_s = to_cuda(sample_source, device)
             source_labels = sample_source['label'].cuda(device, non_blocking=True)
             pixels_t, mask_t, position_t, extra_t = to_cuda(sample_target_strong, device)
-            logits_target = None
+            output_target = None
             loss_target = 0.0
             if config.domain_specific_bn:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
-                logits_source = student.forward(pixels_s, mask_s, position_s + source_to_target_shift, extra_s)
+                output_source = forward_model_for_loss_with_shift(
+                    student,
+                    pixels_s,
+                    mask_s,
+                    position_s,
+                    extra_s,
+                    source_to_target_shift,
+                )
                 if num_pseudo >= 2:  # at least 2 examples required for BN
                     _check_temporal_index_range(student, position_t[pseudo_mask], 0, "target")
-                    logits_target = student.forward(pixels_t[pseudo_mask], mask_t[pseudo_mask], position_t[pseudo_mask], extra_t[pseudo_mask])
+                    output_target = forward_model_for_loss_with_shift(
+                        student,
+                        pixels_t[pseudo_mask],
+                        mask_t[pseudo_mask],
+                        position_t[pseudo_mask],
+                        extra_t[pseudo_mask],
+                        0,
+                    )
             else:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
                 if num_pseudo > 0:
@@ -177,28 +271,60 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
 
                     pixels = torch.cat([pixels_s, selected_pixels_t], dim=0)
                     mask = torch.cat([mask_s, selected_mask_t], dim=0)
-                    position = torch.cat(
-                        [position_s + source_to_target_shift, selected_position_t],
+                    position = torch.cat([position_s, selected_position_t], dim=0)
+                    shift = torch.cat(
+                        [
+                            torch.full_like(position_s, source_to_target_shift),
+                            torch.zeros_like(selected_position_t),
+                        ],
                         dim=0,
                     )
                     extra = torch.cat([extra_s, selected_extra_t], dim=0)
 
-                    logits = student.forward(pixels, mask, position, extra)
+                    output = forward_model_for_loss_with_shift(
+                        student, pixels, mask, position, extra, shift
+                    )
                     source_batch_size = pixels_s.shape[0]
-                    logits_source = logits[:source_batch_size]
-                    logits_target = logits[source_batch_size:]
+                    output_source = slice_student_output(
+                        output, 0, source_batch_size
+                    )
+                    output_target = slice_student_output(
+                        output, source_batch_size, None
+                    )
                 else:
-                    logits_source = student.forward(
+                    output_source = forward_model_for_loss_with_shift(
+                        student,
                         pixels_s,
                         mask_s,
-                        position_s + source_to_target_shift,
+                        position_s,
                         extra_s,
+                        source_to_target_shift,
                     )
-                    logits_target = None
+                    output_target = None
 
-            loss_source = criterion(logits_source, source_labels)
-            if logits_target is not None:
-                loss_target = criterion(logits_target, pseudo_targets[pseudo_mask])
+            loss_source = student_classification_loss(
+                output_source,
+                source_labels,
+                criterion,
+                loss_mode=reimts_loss_mode,
+            )
+            if patch_diagnostics and epoch == 0 and step == 0:
+                if isinstance(output_source, ReIMTSClassificationOutput):
+                    print(format_patch_diagnostics(
+                        output_source.patch_valid,
+                        "source after RandomSampleTimeSteps",
+                    ))
+                if isinstance(output_target, ReIMTSClassificationOutput):
+                    print(format_patch_diagnostics(
+                        output_target.patch_valid, "target strong"
+                    ))
+            if output_target is not None:
+                loss_target = student_classification_loss(
+                    output_target,
+                    pseudo_targets[pseudo_mask],
+                    criterion,
+                    loss_mode=reimts_loss_mode,
+                )
             loss = loss_source + config.trade_off * loss_target
 
             # compute loss and backprop
@@ -228,7 +354,12 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         # Evaluate pseudo labels
         all_labels, all_pseudo_labels, all_pseudo_mask = np.array(all_labels), np.array(all_pseudo_labels), np.array(all_pseudo_mask)
         pseudo_count = all_pseudo_mask.sum()
-        conf_pseudo_f1 = sklearn.metrics.f1_score(all_labels[all_pseudo_mask], all_pseudo_labels[all_pseudo_mask], average='macro', zero_division=0)
+        conf_pseudo_f1 = 0.0 if pseudo_count == 0 else sklearn.metrics.f1_score(
+            all_labels[all_pseudo_mask],
+            all_pseudo_labels[all_pseudo_mask],
+            average='macro',
+            zero_division=0,
+        )
         print(f"Teacher pseudo label F1 {conf_pseudo_f1:.3f} (n={pseudo_count})")
         writer.add_scalar("train/pseudo_f1", conf_pseudo_f1, epoch)
         writer.add_scalar("train/pseudo_count", pseudo_count, epoch)
@@ -375,6 +506,7 @@ def estimate_temporal_shift(
     sample_size=100,
     shift_estimator='IS',
     progress_bar='auto',
+    diagnostics=False,
 ):
     shifts = list(range(min_shift, max_shift + 1))
     model.eval()
@@ -383,18 +515,45 @@ def estimate_temporal_shift(
 
     target_iter = iter(target_loader)
     shift_softmaxes, labels = [], []
-    for _ in tqdm(
+    for batch_index in tqdm(
         range(sample_size),
         desc=f'Estimating shift between [{min_shift}, {max_shift}]',
         disable=progress_bar_disabled(progress_bar),
     ):
+        batch_started = time.perf_counter()
         sample = next(target_iter)
         labels.extend(sample['label'].tolist())
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
         spatial_feats = model.spatial_encoder.forward(pixels, valid_pixels, extra)
-        shift_logits = torch.stack([model.decoder(model.temporal_encoder(spatial_feats, positions + shift)) for shift in shifts], dim=1)
+        spatial_capability = getattr(
+            model, "forward_from_spatial_with_shift", None
+        )
+        if callable(spatial_capability):
+            shift_logits = torch.stack(
+                [
+                    spatial_capability(spatial_feats, positions, shift)
+                    for shift in shifts
+                ],
+                dim=1,
+            )
+        else:
+            shift_logits = torch.stack(
+                [
+                    model.decoder(
+                        model.temporal_encoder(spatial_feats, positions + shift)
+                    )
+                    for shift in shifts
+                ],
+                dim=1,
+            )
         shift_probs = F.softmax(shift_logits, dim=2)
         shift_softmaxes.append(shift_probs)
+        if diagnostics and batch_index == 0:
+            print(f"[ReIMTS timing] candidate shifts: {len(shifts)}")
+            print(
+                "[ReIMTS timing] one estimate_temporal_shift batch time: "
+                f"{time.perf_counter() - batch_started:.6f}s"
+            )
     shift_softmaxes = torch.cat(shift_softmaxes).cpu().numpy()  # (N, n_shifts, n_classes)
     labels = np.array(labels)
     shift_predictions = np.argmax(shift_softmaxes, axis=2)  # (N, n_shifts)
@@ -478,7 +637,14 @@ def get_pseudo_labels(
         indices.extend(sample["index"].tolist())
 
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
-        logits = model.forward(pixels, valid_pixels, positions + best_shift, extra)
+        logits = forward_model_with_shift(
+            model,
+            pixels,
+            valid_pixels,
+            positions,
+            extra,
+            best_shift,
+        )
         probs = F.softmax(logits, dim=1).cpu()
         pseudo_softmaxes.extend(probs.tolist())
 

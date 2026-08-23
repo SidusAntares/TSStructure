@@ -9,3 +9,4 @@ data/
 .vscode/
 /sync_to_server.sh
 logs/
+/docs/
