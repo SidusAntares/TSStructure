@@ -1,5 +1,9 @@
+import io
+
+import pytest
 import torch
 import torch.nn as nn
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from models.reimts_classifier import (
@@ -38,34 +42,42 @@ def test_three_levels_assign_every_observation_to_one_of_1_2_4_patches():
     assert memberships == [1, 2, 4]
 
 
-def test_gather_uses_unshifted_membership_and_keeps_shifted_encoder_time():
-    features = torch.arange(4, dtype=torch.float32).view(1, 4, 1)
-    split_positions = torch.tensor([[10, 100, 190, 280]])
-    encoder_positions = split_positions + 30
+def test_gather_preserves_irregular_observation_timestamps_exactly():
+    observation_positions = torch.tensor([[3, 17, 41, 96, 103, 188, 249, 360]])
+    features = torch.arange(8, dtype=torch.float32).view(1, 8, 1)
 
     gathered = gather_period_patches(
         features,
-        split_positions,
-        encoder_positions,
+        observation_positions,
         patches=4,
         period=365,
     )
 
-    assert gathered.patch_ids.tolist() == [[0, 1, 2, 3]]
-    assert gathered.valid.sum(dim=-1).tolist() == [[1, 1, 1, 1]]
-    assert gathered.features[gathered.valid].flatten().tolist() == [0, 1, 2, 3]
-    assert gathered.encoder_positions[gathered.valid].tolist() == [40, 130, 220, 310]
+    assert gathered.observation_valid.sum(dim=-1).tolist() == [[3, 2, 2, 1]]
+    assert gathered.observation_positions[gathered.observation_valid].tolist() == [
+        3, 17, 41, 96, 103, 188, 249, 360
+    ]
+    assert set(gathered.observation_positions[gathered.observation_valid].tolist()) <= set(
+        observation_positions.flatten().tolist()
+    )
 
 
 def test_shift_does_not_change_patch_membership():
     positions = torch.tensor([[80, 100, 170, 190, 260, 280, 350]])
     features = torch.randn(1, positions.shape[1], 3)
 
-    base = gather_period_patches(features, positions, positions, 4, 365)
-    shifted = gather_period_patches(features, positions, positions + 60, 4, 365)
+    negative_candidate = gather_period_patches(features, positions, 4, 365)
+    positive_candidate = gather_period_patches(features, positions, 4, 365)
 
-    assert torch.equal(base.patch_ids, shifted.patch_ids)
-    assert torch.equal(base.valid, shifted.valid)
+    assert torch.equal(negative_candidate.patch_ids, positive_candidate.patch_ids)
+    assert torch.equal(
+        negative_candidate.observation_valid,
+        positive_candidate.observation_valid,
+    )
+    assert torch.equal(
+        negative_candidate.observation_positions,
+        positive_candidate.observation_positions,
+    )
 
 
 def test_reimts_uses_independent_mtan_instances_with_official_reference_count():
@@ -82,7 +94,7 @@ def test_reimts_uses_independent_mtan_instances_with_official_reference_count():
     assert encoders.reference_points == (8, 8, 8)
 
 
-def test_mtan_returns_official_sampled_z0_shape_and_uses_encoder_positions():
+def test_mtan_returns_official_sampled_z0_shape_and_uses_observation_positions():
     encoder = MTANEncoder(
         input_dim=3,
         latent_dim=6,
@@ -229,7 +241,7 @@ def test_recursive_encoder_produces_matching_e_h_g_shapes_at_1_2_4_scales():
         [[1, 40, 100, 190, 230, 300, 360], [5, 80, 170, 200, 260, 320, 364]]
     )
 
-    output = encoder(features, split_positions, split_positions + 15)
+    output = encoder(features, split_positions)
 
     assert [scale.e.shape[:3] for scale in output.scales] == [
         (2, 1, 8),
@@ -242,6 +254,13 @@ def test_recursive_encoder_produces_matching_e_h_g_shapes_at_1_2_4_scales():
         assert scale.e.shape == scale.h.shape == scale.g.shape
         assert scale.alpha.shape == scale.e.shape
     assert output.lowest.shape == (2, 4, 8, 8)
+    assert output.lowest_reference_positions.shape == (2, 4, 8)
+    assert torch.equal(
+        output.scales[-1].observation_positions[
+            output.scales[-1].observation_valid
+        ],
+        torch.tensor([1, 40, 100, 190, 230, 300, 360, 5, 80, 170, 200, 260, 320, 364]),
+    )
 
 
 def test_reference_valid_means_only_patch_nonempty():
@@ -257,7 +276,7 @@ def test_reference_valid_means_only_patch_nonempty():
     features = torch.randn(1, 2, 4)
     positions = torch.tensor([[10, 200]])
 
-    output = encoder(features, positions, positions)
+    output = encoder(features, positions)
 
     assert output.lowest_valid.shape == (1, 4, 8)
     assert output.lowest_valid[0, 0].all()
@@ -267,7 +286,16 @@ def test_reference_valid_means_only_patch_nonempty():
 
 
 class _MeanTemporalDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+        self.seen_values = None
+        self.seen_positions = None
+
     def forward(self, values, positions):
+        self.calls += 1
+        self.seen_values = values.clone()
+        self.seen_positions = positions.clone()
         return values.mean(dim=1)
 
 
@@ -276,7 +304,7 @@ class _NonlinearClassifier(nn.Module):
         return torch.stack([features[:, 0].square(), features[:, 1]], dim=1)
 
 
-def test_decoder_shares_modules_and_averages_patch_logits_not_features():
+def test_four_patch_blocks_flatten_chronologically_and_decode_once():
     model = PseReIMTSMTANLTAE(
         input_dim=2,
         num_classes=2,
@@ -290,62 +318,51 @@ def test_decoder_shares_modules_and_averages_patch_logits_not_features():
         ltae_mlp=[4, 4],
         classifier_mlp=[4],
     )
-    model.temporal_decoder = _MeanTemporalDecoder()
+    decoder = _MeanTemporalDecoder()
+    model.temporal_decoder = decoder
     model.classifier = _NonlinearClassifier()
     lowest = torch.zeros(1, 4, 8, 4)
-    lowest[0, 0, :, :2] = torch.tensor([0.0, 1.0])
-    lowest[0, 1, :, :2] = torch.tensor([2.0, 3.0])
-    lowest[0, 2, :, :2] = torch.tensor([4.0, 5.0])
-    lowest[0, 3, :, :2] = torch.tensor([6.0, 7.0])
+    for patch_index in range(4):
+        lowest[0, patch_index, :, 0] = patch_index + 1
     valid = torch.ones(1, 4, 8, dtype=torch.bool)
+    reference_positions = torch.arange(32).reshape(1, 4, 8)
+    features = model._flatten_lowest(lowest, reference_positions, valid)
 
-    logits, patch_features, patch_logits = model._decode_lowest(lowest, valid)
+    logits, sample_features = model._decode_whole(features, shift=0)
 
-    assert patch_features.shape == (1, 4, 4)
-    assert patch_logits.shape == (1, 4, 2)
-    assert torch.allclose(logits, torch.tensor([[14.0, 4.0]]))
-    assert not torch.allclose(logits[:, 0], patch_features[:, :, 0].mean(1).square())
-    assert sum(1 for module in model.modules() if module is model.temporal_decoder) == 1
-    assert sum(1 for module in model.modules() if module is model.classifier) == 1
+    assert features.tokens.shape == (1, 32, 4)
+    assert features.positions.shape == (1, 32)
+    assert features.tokens[0, :, 0].tolist() == [1] * 8 + [2] * 8 + [3] * 8 + [4] * 8
+    assert features.positions.tolist() == [list(range(32))]
+    assert decoder.calls == 1
+    assert decoder.seen_values.shape == (1, 32, 4)
+    assert sample_features.shape == (1, 4)
+    assert logits.shape == (1, 2)
 
 
-def test_patch_loss_is_mean_of_valid_patch_individual_losses():
-    patch_logits = torch.tensor(
-        [
-            [[3.0, 0.0], [0.0, 3.0], [2.0, 1.0], [9.0, -9.0]],
-            [[0.0, 2.0], [1.0, 2.0], [-5.0, 5.0], [4.0, 0.0]],
-        ]
-    )
-    patch_valid = torch.tensor(
-        [[True, True, True, False], [True, True, False, True]]
-    )
-    targets = torch.tensor([0, 1])
+def test_patch_loss_mode_fails_fast_for_whole_sample_architecture():
     output = ReIMTSClassificationOutput(
-        sample_logits=patch_logits.mean(dim=1),
-        patch_logits=patch_logits,
-        patch_valid=patch_valid,
+        sample_logits=torch.randn(2, 3),
+        patch_valid=torch.ones(2, 4, dtype=torch.bool),
     )
-    criterion = nn.CrossEntropyLoss()
 
-    actual = reimts_classification_loss(output, targets, criterion, mode="patch")
-    repeated_targets = targets.unsqueeze(1).expand(-1, 4)
-    expected = criterion(patch_logits[patch_valid], repeated_targets[patch_valid])
-
-    assert torch.allclose(actual, expected)
+    with pytest.raises(ValueError, match="sample-level"):
+        reimts_classification_loss(
+            output, torch.tensor([0, 1]), nn.CrossEntropyLoss(), mode="patch"
+        )
 
 
-def test_sample_loss_matches_round_one_mean_logits_loss():
-    patch_logits = torch.randn(2, 4, 3)
+def test_sample_loss_consumes_one_logit_row_per_target_without_repeat():
+    sample_logits = torch.randn(2, 3)
     targets = torch.tensor([1, 2])
     output = ReIMTSClassificationOutput(
-        sample_logits=patch_logits.mean(dim=1),
-        patch_logits=patch_logits,
+        sample_logits=sample_logits,
         patch_valid=torch.ones(2, 4, dtype=torch.bool),
     )
     criterion = nn.CrossEntropyLoss()
 
     actual = reimts_classification_loss(output, targets, criterion, mode="sample")
-    expected = criterion(patch_logits.mean(dim=1), targets)
+    expected = criterion(sample_logits, targets)
 
     assert torch.allclose(actual, expected)
 
@@ -373,12 +390,52 @@ def test_full_model_returns_sample_logits_and_strict_checkpoint_round_trips():
 
     with torch.no_grad():
         logits = model(pixels, valid_pixels, positions, extra=None)
-    clone.load_state_dict(model.state_dict(), strict=True)
+    checkpoint = io.BytesIO()
+    torch.save({"state_dict": model.state_dict()}, checkpoint)
+    checkpoint.seek(0)
+    restored = torch.load(checkpoint, weights_only=False)
+    clone.load_state_dict(restored["state_dict"], strict=True)
+    clone.eval()
+    with torch.no_grad():
+        cloned_logits = clone(pixels, valid_pixels, positions, extra=None)
 
+    assert logits.shape == (2, 3)
+    assert torch.allclose(logits, cloned_logits)
+
+
+def test_ordinary_forward_calls_whole_sample_ltae_and_classifier_once_and_returns_final_embedding():
+    model = PseReIMTSMTANLTAE(
+        input_dim=2, num_classes=3, with_extra=False, latent_dim=8,
+        num_ref_points=8, mtan_heads=1, ltae_heads=1, ltae_key_dim=2,
+        ltae_model_dim=8, ltae_mlp=[8, 8], classifier_mlp=[8], dropout=0.0,
+    ).eval()
+    decoder = _MeanTemporalDecoder()
+    model.temporal_decoder = decoder
+    classifier = nn.Linear(8, 3)
+    model.classifier = classifier
+    classifier_calls = []
+    hook = classifier.register_forward_hook(
+        lambda module, args, output: classifier_calls.append(output.shape)
+    )
+    pixels = torch.randn(2, 8, 2, 5)
+    valid_pixels = torch.ones(2, 8, 5)
+    positions = torch.tensor([[3, 17, 41, 96, 103, 188, 249, 360]]).repeat(2, 1)
+
+    try:
+        logits, sample_feature = model(
+            pixels, valid_pixels, positions, None, return_feats=True
+        )
+    finally:
+        hook.remove()
+
+    assert decoder.calls == 1
+    assert classifier_calls == [torch.Size([2, 3])]
+    assert decoder.seen_values.shape == (2, 32, 8)
+    assert sample_feature.shape == (2, 8)
     assert logits.shape == (2, 3)
 
 
-def test_forward_for_loss_exposes_patch_logits_and_patch_nonempty_mask():
+def test_forward_for_loss_exposes_sample_logits_and_patch_occupancy_only():
     model = PseReIMTSMTANLTAE(
         input_dim=2,
         num_classes=3,
@@ -401,7 +458,6 @@ def test_forward_for_loss_exposes_patch_logits_and_patch_nonempty_mask():
     ordinary = model(pixels, valid_pixels, positions, None)
 
     assert output.sample_logits.shape == (2, 3)
-    assert output.patch_logits.shape == (2, 4, 3)
     assert output.patch_valid.shape == (2, 4)
     assert output.patch_valid.tolist() == [
         [True, False, True, False],
@@ -410,7 +466,7 @@ def test_forward_for_loss_exposes_patch_logits_and_patch_nonempty_mask():
     assert torch.allclose(ordinary, output.sample_logits)
 
 
-def test_shift_capability_eval_is_deterministic_and_changes_encoder_coordinates():
+def test_shift_changes_only_whole_ltae_positions_and_cached_tokens_are_identical():
     model = PseReIMTSMTANLTAE(
         input_dim=2,
         num_classes=3,
@@ -425,20 +481,114 @@ def test_shift_capability_eval_is_deterministic_and_changes_encoder_coordinates(
         classifier_mlp=[8],
         dropout=0.0,
     ).eval()
-    spatial = torch.randn(2, 6, 128)
-    positions = torch.tensor([[1, 60, 120, 190, 260, 340]]).repeat(2, 1)
-    seen_encoder_positions = []
+    decoder = _MeanTemporalDecoder()
+    model.temporal_decoder = decoder
+    model.classifier = nn.Linear(8, 3)
+    spatial = torch.randn(2, 8, 128)
+    positions = torch.tensor([[3, 17, 41, 96, 103, 188, 249, 360]]).repeat(2, 1)
 
-    hook = model.reimts_encoder.scale_encoders[0].register_forward_pre_hook(
-        lambda module, args: seen_encoder_positions.append(args[1].clone())
+    features = model.prepare_shift_features_from_spatial(spatial, positions)
+    original_tokens = features.tokens.clone()
+    base_positions = features.positions.clone()
+    model.forward_from_shift_features(features, shift=0)
+    seen_zero = decoder.seen_positions.clone()
+    model.forward_from_shift_features(features, shift=20)
+    seen_twenty = decoder.seen_positions.clone()
+
+    assert torch.equal(features.tokens, original_tokens)
+    assert torch.equal(features.positions, base_positions)
+    assert torch.equal(seen_zero, base_positions)
+    assert torch.equal(seen_twenty, base_positions + 20)
+
+
+def test_absolute_reference_positions_are_four_calendar_blocks_not_repeated_local_indices():
+    encoder = RecursiveTemporalEncoder(
+        input_dim=4, latent_dim=8, levels=3, scale_factor=2,
+        period=365, num_ref_points=8, num_heads=1,
+    ).eval()
+    features = torch.randn(1, 8, 4)
+    positions = torch.tensor([[3, 17, 41, 96, 103, 188, 249, 360]])
+
+    output = encoder(features, positions)
+    flattened = output.lowest_reference_positions.flatten().tolist()
+
+    assert output.lowest_reference_positions.shape == (1, 4, 8)
+    assert flattened == [
+        0, 13, 26, 39, 52, 65, 78, 91,
+        91, 104, 117, 130, 143, 156, 169, 182,
+        182, 196, 209, 222, 235, 248, 261, 274,
+        274, 287, 300, 313, 326, 339, 352, 364,
+    ]
+
+
+def test_global_shift_tensor_must_be_constant_within_each_sample():
+    model = PseReIMTSMTANLTAE(
+        input_dim=2, num_classes=3, with_extra=False, latent_dim=8,
+        num_ref_points=8, mtan_heads=1, ltae_heads=1, ltae_key_dim=2,
+        ltae_model_dim=8, ltae_mlp=[8, 8], classifier_mlp=[8], dropout=0.0,
+    ).eval()
+    features = SimpleNamespace(
+        tokens=torch.randn(1, 32, 8),
+        positions=torch.arange(32).unsqueeze(0),
+        patch_valid=torch.ones(1, 4, dtype=torch.bool),
     )
+
+    with pytest.raises(ValueError, match="whole-sample"):
+        model.forward_from_shift_features(
+            features, torch.tensor([[0, 0, 1, 1]])
+        )
+
+
+@pytest.mark.parametrize(
+    ("shift", "expected_index_range"),
+    [(-60, (40, 404)), (0, (100, 464)), (60, (160, 524))],
+)
+def test_real_ltae_embedding_accepts_full_year_reference_boundaries(
+    shift, expected_index_range
+):
+    model = PseReIMTSMTANLTAE(
+        input_dim=2,
+        num_classes=3,
+        with_extra=False,
+        latent_dim=8,
+        num_ref_points=8,
+        mtan_heads=1,
+        ltae_heads=1,
+        ltae_key_dim=2,
+        ltae_model_dim=8,
+        ltae_mlp=[8, 8],
+        classifier_mlp=[8],
+        dropout=0.0,
+        max_temporal_shift=100,
+    ).eval()
+    pixels = torch.randn(2, 8, 2, 5)
+    valid_pixels = torch.ones(2, 8, 5)
+    observation_positions = torch.tensor(
+        [[3, 17, 41, 96, 103, 188, 249, 360]]
+    ).repeat(2, 1)
+    embedding_indices = []
+    hook = model.temporal_decoder.positional_enc.register_forward_pre_hook(
+        lambda module, args: embedding_indices.append(args[0].detach().clone())
+    )
+
     try:
-        first = model.forward_from_spatial_with_shift(spatial, positions, shift=15)
-        second = model.forward_from_spatial_with_shift(spatial, positions, shift=15)
-        model.forward_from_spatial_with_shift(spatial, positions, shift=30)
+        with torch.no_grad():
+            logits = model.forward_with_shift(
+                pixels,
+                valid_pixels,
+                observation_positions,
+                extra=None,
+                shift=shift,
+            )
     finally:
         hook.remove()
 
-    assert torch.allclose(first, second)
-    assert torch.equal(seen_encoder_positions[0], seen_encoder_positions[1])
-    assert not torch.equal(seen_encoder_positions[0], seen_encoder_positions[2])
+    assert logits.shape == (2, 3)
+    assert len(embedding_indices) == 1
+    actual_indices = embedding_indices[0]
+    assert actual_indices.shape == (2, 32)
+    assert (int(actual_indices.min()), int(actual_indices.max())) == (
+        expected_index_range
+    )
+    assert 0 <= int(actual_indices.min())
+    assert int(actual_indices.max()) < model.temporal_decoder.positional_enc.num_embeddings

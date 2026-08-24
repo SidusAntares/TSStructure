@@ -29,7 +29,7 @@ TIMEMATCH_EXPERIMENT="closedset_timematch_32VNH_to_30TXT_reimts_mtan_smoke"
     --reimts_scale_factor 2 \
     --reimts_period 365 \
     --mtan_num_ref_points 8 \
-    --reimts_loss_mode patch \
+    --reimts_loss_mode sample \
     --reimts_patch_diagnostics true \
     --num_folds 1 \
     --epochs 1 \
@@ -52,7 +52,7 @@ TIMEMATCH_EXPERIMENT="closedset_timematch_32VNH_to_30TXT_reimts_mtan_smoke"
     --reimts_scale_factor 2 \
     --reimts_period 365 \
     --mtan_num_ref_points 8 \
-    --reimts_loss_mode patch \
+    --reimts_loss_mode sample \
     --reimts_patch_diagnostics true \
     --num_folds 1 \
     --batch_size 4 \

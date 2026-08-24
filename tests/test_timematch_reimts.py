@@ -6,6 +6,7 @@ import torch.nn as nn
 
 import timematch
 from models.reimts_classifier import ReIMTSClassificationOutput
+from models.stclassifier import PseLTae
 
 
 class _Baseline(nn.Module):
@@ -17,13 +18,13 @@ class _Baseline(nn.Module):
 class _Capable(nn.Module):
     def __init__(self):
         super().__init__()
-        self.split_positions = None
-        self.encoder_positions = None
+        self.observation_positions = None
+        self.ltae_positions = None
 
     def forward_with_shift(self, pixels, mask, positions, extra, shift):
-        self.split_positions = positions.clone()
-        self.encoder_positions = positions + shift
-        scores = self.encoder_positions.float().mean(dim=1)
+        self.observation_positions = positions.clone()
+        self.ltae_positions = positions + shift
+        scores = self.ltae_positions.float().mean(dim=1)
         return torch.stack([scores, -scores], dim=1)
 
     def forward_for_loss(self, *args, **kwargs):
@@ -44,7 +45,26 @@ def test_forward_model_with_shift_preserves_exact_baseline_path():
     assert torch.equal(actual, expected)
 
 
-def test_forward_model_with_shift_separates_reimts_split_and_encoder_time():
+def test_actual_pseltae_shift_regression_matches_original_direct_forward():
+    model = PseLTae(
+        input_dim=2, mlp1=[2, 4], pooling="mean_std", mlp2=[8, 8],
+        with_extra=False, n_head=1, d_k=2, d_model=8, mlp3=[8, 8],
+        dropout=0.0, mlp4=[8], num_classes=2,
+    ).eval()
+    pixels = torch.randn(2, 4, 2, 3)
+    mask = torch.ones(2, 4, 3)
+    positions = torch.tensor([[10, 40, 90, 180], [20, 60, 120, 240]])
+
+    with torch.no_grad():
+        expected = model(pixels, mask, positions + 7, None)
+        actual = timematch.forward_model_with_shift(
+            model, pixels, mask, positions, None, shift=7
+        )
+
+    assert torch.equal(actual, expected)
+
+
+def test_forward_model_with_shift_keeps_observation_time_real_and_shifts_ltae_time():
     model = _Capable()
     positions = torch.tensor([[80, 100, 180, 280]])
 
@@ -58,40 +78,51 @@ def test_forward_model_with_shift_separates_reimts_split_and_encoder_time():
     )
 
     assert logits.shape == (1, 2)
-    assert torch.equal(model.split_positions, positions)
-    assert torch.equal(model.encoder_positions, positions + 30)
-
-
-class _CountingSpatial(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.calls = 0
-
-    def forward(self, pixels, valid_pixels, extra):
-        self.calls += 1
-        return pixels.flatten(2).mean(dim=2, keepdim=True)
+    assert torch.equal(model.observation_positions, positions)
+    assert torch.equal(model.ltae_positions, positions + 30)
 
 
 class _ShiftEstimatorModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.spatial_encoder = _CountingSpatial()
+        self.pse_calls = 0
+        self.reimts_calls = 0
+        self.ltae_calls = 0
+        self.classifier_calls = 0
         self.seen = []
+        self.candidate_shifts = []
 
-    def forward_from_spatial_with_shift(self, spatial, positions, shift):
-        self.seen.append((positions.clone(), shift))
-        score = spatial.mean(dim=(1, 2)) + float(shift)
+    def prepare_shift_features(self, pixels, valid_pixels, positions, extra):
+        self.pse_calls += 1
+        self.reimts_calls += 1
+        return SimpleNamespace(
+            tokens=pixels.flatten(2).mean(dim=2, keepdim=True),
+            positions=positions.clone(),
+            spatial_encoder_time=0.01,
+            reimts_mtan_time=0.02,
+            total_feature_preparation_time=0.03,
+        )
+
+    def forward_from_shift_features(self, features, shift):
+        self.ltae_calls += 1
+        self.classifier_calls += 1
+        self.candidate_shifts.append(shift)
+        shifted_positions = features.positions + shift
+        self.seen.append((features.tokens.clone(), shifted_positions.clone()))
+        score = features.tokens.mean(dim=(1, 2)) + float(shift)
         return torch.stack([score, -score], dim=1)
 
 
 class _TiedShiftEstimatorModel(_ShiftEstimatorModel):
-    def forward_from_spatial_with_shift(self, spatial, positions, shift):
-        self.seen.append((positions.clone(), shift))
-        score = torch.ones(spatial.shape[0])
+    def forward_from_shift_features(self, features, shift):
+        self.ltae_calls += 1
+        self.classifier_calls += 1
+        self.seen.append((features.tokens.clone(), features.positions + shift))
+        score = torch.ones(features.tokens.shape[0])
         return torch.stack([score, -score], dim=1)
 
 
-def test_estimate_shift_runs_pse_once_changes_only_encoder_shift_and_logs_block(monkeypatch, capsys):
+def test_estimate_shift_caches_pse_and_reimts_for_all_121_candidates(monkeypatch, capsys):
     model = _ShiftEstimatorModel()
     positions = torch.tensor([[80, 180, 280]])
     sample = {
@@ -116,23 +147,35 @@ def test_estimate_shift_runs_pse_once_changes_only_encoder_shift_and_logs_block(
         model,
         [sample],
         "cpu",
-        min_shift=-1,
-        max_shift=1,
+        min_shift=-60,
+        max_shift=60,
         sample_size=1,
         shift_estimator="ACC",
         progress_bar="off",
     )
 
-    assert best in (-1, 0, 1)
-    assert model.spatial_encoder.calls == 1
-    assert [entry[1] for entry in model.seen] == [-1, 0, 1]
-    assert all(torch.equal(entry[0], positions) for entry in model.seen)
+    assert -60 <= best <= 60
+    assert model.pse_calls == 1
+    assert model.reimts_calls == 1
+    assert model.ltae_calls == 121
+    assert model.classifier_calls == 121
+    assert all(torch.equal(entry[0], model.seen[0][0]) for entry in model.seen)
+    assert torch.equal(model.seen[0][1], positions - 60)
+    assert torch.equal(model.seen[-1][1], positions + 60)
     logged = capsys.readouterr().out
     assert "[SHIFT ESTIMATION]" in logged
     assert "estimator: ACC" in logged
-    assert "candidate_count: 3" in logged
+    assert "candidate_count: 121" in logged
     assert "top5:" in logged
     assert "debug oracle:" in logged
+    assert "feature preparation:" in logged
+    assert "spatial_encoder_time:" in logged
+    assert "reimts_mtan_time:" in logged
+    assert "total_feature_preparation_time:" in logged
+    assert "candidate evaluation:" in logged
+    assert "ltae_classifier_total_time:" in logged
+    assert "mean_time_per_candidate:" in logged
+    assert "total_shift_estimation_time:" in logged
 
 
 def test_acc_shift_tie_preserves_original_first_candidate_selection(monkeypatch):
@@ -161,6 +204,50 @@ def test_acc_shift_tie_preserves_original_first_candidate_selection(monkeypatch)
     assert best == -1
 
 
+def test_estimator_applies_each_scalar_candidate_to_the_entire_batch(monkeypatch):
+    model = _ShiftEstimatorModel()
+    positions = torch.tensor(
+        [[0, 100, 364], [7, 120, 300], [20, 200, 340]]
+    )
+    sample = {
+        "pixels": torch.ones(3, 3, 1, 1),
+        "valid_pixels": torch.ones(3, 3, 1),
+        "positions": positions,
+        "extra": torch.zeros(3, 4),
+        "label": torch.tensor([0, 1, 0]),
+    }
+    monkeypatch.setattr(
+        timematch,
+        "to_cuda",
+        lambda value, device: (
+            value["pixels"],
+            value["valid_pixels"],
+            value["positions"],
+            value["extra"],
+        ),
+    )
+
+    timematch.estimate_temporal_shift(
+        model,
+        [sample],
+        "cpu",
+        min_shift=-2,
+        max_shift=2,
+        sample_size=1,
+        shift_estimator="ACC",
+        progress_bar="off",
+    )
+
+    assert model.candidate_shifts == [-2, -1, 0, 1, 2]
+    for candidate, (_, shifted_positions) in zip(
+        model.candidate_shifts, model.seen
+    ):
+        assert torch.equal(
+            shifted_positions - positions,
+            torch.full_like(positions, candidate),
+        )
+
+
 def test_pseudo_labels_use_shift_capability_and_remain_sample_level(monkeypatch):
     model = _Capable()
     sample = {
@@ -186,28 +273,21 @@ def test_pseudo_labels_use_shift_capability_and_remain_sample_level(monkeypatch)
     )
 
     assert pseudo.shape == (2, 2)
-    assert torch.equal(model.split_positions, sample["positions"])
-    assert torch.equal(model.encoder_positions, sample["positions"] + 5)
+    assert torch.equal(model.observation_positions, sample["positions"])
+    assert torch.equal(model.ltae_positions, sample["positions"] + 5)
 
 
-class _StudentPatchModel(nn.Module):
+class _StudentSampleModel(nn.Module):
     def forward_for_loss(self, pixels, mask, positions, extra, shift=0):
-        patch_logits = pixels
         return ReIMTSClassificationOutput(
-            sample_logits=patch_logits.mean(dim=1),
-            patch_logits=patch_logits,
+            sample_logits=pixels,
             patch_valid=mask.bool(),
         )
 
 
-def test_timematch_student_helper_preserves_patch_output_and_valid_loss():
-    model = _StudentPatchModel()
-    patch_logits = torch.tensor(
-        [
-            [[3.0, 0.0], [0.0, 3.0], [2.0, 1.0], [9.0, -9.0]],
-            [[0.0, 2.0], [1.0, 2.0], [-5.0, 5.0], [4.0, 0.0]],
-        ]
-    )
+def test_timematch_student_loss_is_sample_level_without_label_repeat():
+    model = _StudentSampleModel()
+    sample_logits = torch.tensor([[3.0, 0.0], [0.0, 2.0]])
     patch_valid = torch.tensor(
         [[True, True, True, False], [True, True, False, True]]
     )
@@ -216,20 +296,16 @@ def test_timematch_student_helper_preserves_patch_output_and_valid_loss():
 
     output = timematch.forward_model_for_loss_with_shift(
         model,
-        patch_logits,
+        sample_logits,
         patch_valid,
         torch.zeros(2, 1, dtype=torch.long),
         None,
         shift=0,
     )
     loss = timematch.student_classification_loss(
-        output, targets, criterion, loss_mode="patch"
+        output, targets, criterion, loss_mode="sample"
     )
-    expected_targets = targets.unsqueeze(1).expand(-1, 4)
-    expected = criterion(
-        patch_logits[patch_valid], expected_targets[patch_valid]
-    )
+    expected = criterion(sample_logits, targets)
 
     assert output.sample_logits.shape == (2, 2)
-    assert output.patch_logits.shape == (2, 4, 2)
     assert torch.allclose(loss, expected)

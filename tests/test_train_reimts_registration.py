@@ -62,42 +62,35 @@ def test_train_help_exposes_reimts_model_and_arguments():
     assert "--reimts_patch_diagnostics" in result.stdout
 
 
-class _SupervisedPatchModel:
+class _SupervisedSampleModel:
     def forward_for_loss(self, pixels, mask, positions, extra):
-        patch_logits = pixels
         return ReIMTSClassificationOutput(
-            sample_logits=patch_logits.mean(dim=1),
-            patch_logits=patch_logits,
+            sample_logits=pixels,
             patch_valid=mask.bool(),
         )
 
     def forward(self, *args, **kwargs):
-        raise AssertionError("patch-capable source training must use forward_for_loss")
+        raise AssertionError("diagnostic-capable source training must use forward_for_loss")
 
 
-def test_source_supervised_helper_uses_valid_patch_loss():
-    model = _SupervisedPatchModel()
-    patch_logits = torch.tensor(
-        [[[3.0, 0.0], [0.0, 3.0], [2.0, 1.0], [9.0, -9.0]]]
-    )
+def test_source_supervised_helper_uses_one_sample_logit_without_label_repeat():
+    model = _SupervisedSampleModel()
+    sample_logits_input = torch.tensor([[3.0, 0.0]])
     patch_valid = torch.tensor([[True, True, True, False]])
     targets = torch.tensor([0])
     criterion = nn.CrossEntropyLoss()
 
     sample_logits, loss = train.forward_supervised_for_loss(
         model,
-        patch_logits,
+        sample_logits_input,
         patch_valid,
         torch.zeros(1, 1, dtype=torch.long),
         None,
         targets,
         criterion,
-        loss_mode="patch",
+        loss_mode="sample",
     )
-    expected = criterion(
-        patch_logits[patch_valid],
-        targets.unsqueeze(1).expand(-1, 4)[patch_valid],
-    )
+    expected = criterion(sample_logits_input, targets)
 
     assert sample_logits.shape == (1, 2)
     assert torch.allclose(loss, expected)

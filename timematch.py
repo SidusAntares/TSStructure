@@ -99,6 +99,10 @@ def format_shift_diagnostics(
     sample_batches,
     runtime_seconds,
     selected_index=None,
+    spatial_encoder_time=0.0,
+    reimts_mtan_time=0.0,
+    total_feature_preparation_time=0.0,
+    ltae_classifier_total_time=0.0,
 ):
     """Format score ranking without participating in shift selection."""
     scores = np.asarray(scores)
@@ -147,7 +151,21 @@ def format_shift_diagnostics(
         f"  best_accuracy_shift: {shifts[oracle]}",
         f"  best_accuracy: {float(accuracy_scores[oracle]):.6f}",
         "",
-        f"runtime: {runtime_seconds:.2f} s",
+        "feature preparation:",
+        f"  spatial_encoder_time: {spatial_encoder_time:.6f} s",
+        f"  reimts_mtan_time: {reimts_mtan_time:.6f} s",
+        "  total_feature_preparation_time: "
+        f"{total_feature_preparation_time:.6f} s",
+        "",
+        "candidate evaluation:",
+        f"  candidate_count: {len(shifts)}",
+        "  ltae_classifier_total_time: "
+        f"{ltae_classifier_total_time:.6f} s",
+        "  mean_time_per_candidate: "
+        f"{ltae_classifier_total_time / max(1, len(shifts) * sample_batches):.6f} s",
+        "",
+        "runtime:",
+        f"  total_shift_estimation_time: {runtime_seconds:.6f} s",
     ])
     return format_log_block("[SHIFT ESTIMATION]", lines)
 
@@ -231,7 +249,7 @@ def _check_temporal_index_range(model, positions, applied_shift, tag):
 def forward_model_with_shift(
     model, pixels, mask, positions, extra, shift
 ):
-    """Apply TimeMatch encoder shift without changing ReIMTS split time."""
+    """Apply the model's global shift capability or baseline date shift."""
     capability = getattr(model, "forward_with_shift", None)
     if callable(capability):
         return capability(pixels, mask, positions, extra, shift)
@@ -241,7 +259,7 @@ def forward_model_with_shift(
 def forward_model_for_loss_with_shift(
     model, pixels, mask, positions, extra, shift
 ):
-    """Return patch-aware student output when the model supports it."""
+    """Return sample logits plus occupancy diagnostics when supported."""
     capability = getattr(model, "forward_for_loss", None)
     if callable(capability):
         return capability(pixels, mask, positions, extra, shift=shift)
@@ -260,14 +278,13 @@ def slice_student_output(output, start, stop):
     if isinstance(output, ReIMTSClassificationOutput):
         return ReIMTSClassificationOutput(
             sample_logits=output.sample_logits[start:stop],
-            patch_logits=output.patch_logits[start:stop],
             patch_valid=output.patch_valid[start:stop],
         )
     return output[start:stop]
 
 
 def student_classification_loss(
-    output, targets, criterion, loss_mode="patch"
+    output, targets, criterion, loss_mode="sample"
 ):
     if isinstance(output, ReIMTSClassificationOutput):
         return reimts_classification_loss(
@@ -294,7 +311,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         criterion = FocalLoss(gamma=config.focal_loss_gamma)
     else:
         criterion = torch.nn.CrossEntropyLoss()
-    reimts_loss_mode = getattr(config, "reimts_loss_mode", "patch")
+    reimts_loss_mode = getattr(config, "reimts_loss_mode", "sample")
     patch_diagnostics = getattr(config, "reimts_patch_diagnostics", False)
 
     steps_per_epoch = config.steps_per_epoch
@@ -728,6 +745,10 @@ def estimate_temporal_shift(
 
     target_iter = iter(target_loader)
     shift_softmaxes, labels = [], []
+    spatial_encoder_time = 0.0
+    reimts_mtan_time = 0.0
+    total_feature_preparation_time = 0.0
+    ltae_classifier_total_time = 0.0
     for _ in tqdm(
         range(sample_size),
         desc=f'Estimating shift between [{min_shift}, {max_shift}]',
@@ -736,19 +757,56 @@ def estimate_temporal_shift(
         sample = next(target_iter)
         labels.extend(sample['label'].tolist())
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
-        spatial_feats = model.spatial_encoder.forward(pixels, valid_pixels, extra)
-        spatial_capability = getattr(
-            model, "forward_from_spatial_with_shift", None
+        prepare_capability = getattr(model, "prepare_shift_features", None)
+        evaluate_capability = getattr(
+            model, "forward_from_shift_features", None
         )
-        if callable(spatial_capability):
+        if callable(prepare_capability) and callable(evaluate_capability):
+            features = prepare_capability(
+                pixels, valid_pixels, positions, extra
+            )
+            spatial_encoder_time += float(
+                getattr(features, "spatial_encoder_time", 0.0)
+            )
+            reimts_mtan_time += float(
+                getattr(features, "reimts_mtan_time", 0.0)
+            )
+            total_feature_preparation_time += float(
+                getattr(
+                    features,
+                    "total_feature_preparation_time",
+                    getattr(features, "spatial_encoder_time", 0.0)
+                    + getattr(features, "reimts_mtan_time", 0.0),
+                )
+            )
+            if features.tokens.is_cuda:
+                torch.cuda.synchronize(features.tokens.device)
+            candidate_started = time.perf_counter()
             shift_logits = torch.stack(
                 [
-                    spatial_capability(spatial_feats, positions, shift)
+                    evaluate_capability(features, shift)
                     for shift in shifts
                 ],
                 dim=1,
             )
+            if shift_logits.is_cuda:
+                torch.cuda.synchronize(shift_logits.device)
+            ltae_classifier_total_time += (
+                time.perf_counter() - candidate_started
+            )
         else:
+            if pixels.is_cuda:
+                torch.cuda.synchronize(pixels.device)
+            spatial_started = time.perf_counter()
+            spatial_feats = model.spatial_encoder.forward(
+                pixels, valid_pixels, extra
+            )
+            if spatial_feats.is_cuda:
+                torch.cuda.synchronize(spatial_feats.device)
+            spatial_seconds = time.perf_counter() - spatial_started
+            spatial_encoder_time += spatial_seconds
+            total_feature_preparation_time += spatial_seconds
+            candidate_started = time.perf_counter()
             shift_logits = torch.stack(
                 [
                     model.decoder(
@@ -757,6 +815,11 @@ def estimate_temporal_shift(
                     for shift in shifts
                 ],
                 dim=1,
+            )
+            if shift_logits.is_cuda:
+                torch.cuda.synchronize(shift_logits.device)
+            ltae_classifier_total_time += (
+                time.perf_counter() - candidate_started
             )
         shift_probs = F.softmax(shift_logits, dim=2)
         shift_softmaxes.append(shift_probs)
@@ -814,6 +877,10 @@ def estimate_temporal_shift(
         sample_batches=sample_size,
         runtime_seconds=time.perf_counter() - estimation_started,
         selected_index=best_shift_idx,
+        spatial_encoder_time=spatial_encoder_time,
+        reimts_mtan_time=reimts_mtan_time,
+        total_feature_preparation_time=total_feature_preparation_time,
+        ltae_classifier_total_time=ltae_classifier_total_time,
     ))
     return best_shift
 

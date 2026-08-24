@@ -15,9 +15,8 @@ class PeriodPatchBatch:
     """A padded batch of timestamp-defined period patches."""
 
     features: Tensor
-    split_positions: Tensor
-    encoder_positions: Tensor
-    valid: Tensor
+    observation_positions: Tensor
+    observation_valid: Tensor
     patch_ids: Tensor
 
 
@@ -28,12 +27,16 @@ class RecursiveScaleOutput:
     alpha: Optional[Tensor]
     g: Tensor
     valid: Tensor
+    observation_positions: Tensor
+    observation_valid: Tensor
+    reference_positions: Tensor
 
 
 @dataclass(frozen=True)
 class RecursiveTemporalOutput:
     lowest: Tensor
     lowest_valid: Tensor
+    lowest_reference_positions: Tensor
     scales: Tuple[RecursiveScaleOutput, ...]
 
 
@@ -52,21 +55,18 @@ def period_patch_ids(positions: Tensor, patches: int, period: int) -> Tensor:
 
 def gather_period_patches(
     features: Tensor,
-    split_positions: Tensor,
-    encoder_positions: Tensor,
+    observation_positions: Tensor,
     patches: int,
     period: int,
 ) -> PeriodPatchBatch:
-    """Gather observations by raw-time membership and retain encoder time."""
+    """Gather patches while preserving the original absolute timestamps."""
     if features.ndim != 3:
         raise ValueError("features must have shape [B,T,D]")
-    if split_positions.shape != features.shape[:2]:
-        raise ValueError("split_positions must have shape [B,T]")
-    if encoder_positions.shape != split_positions.shape:
-        raise ValueError("encoder_positions must match split_positions")
+    if observation_positions.shape != features.shape[:2]:
+        raise ValueError("observation_positions must have shape [B,T]")
 
     batch_size, _, feature_dim = features.shape
-    patch_ids = period_patch_ids(split_positions, patches, period)
+    patch_ids = period_patch_ids(observation_positions, patches, period)
     counts = torch.stack(
         [(patch_ids == patch).sum(dim=1) for patch in range(patches)], dim=1
     )
@@ -74,8 +74,7 @@ def gather_period_patches(
     gathered_features = features.new_zeros(
         batch_size, patches, padded_length, feature_dim
     )
-    gathered_split = split_positions.new_zeros(batch_size, patches, padded_length)
-    gathered_encoder = encoder_positions.new_zeros(
+    gathered_positions = observation_positions.new_zeros(
         batch_size, patches, padded_length
     )
     valid = torch.zeros(
@@ -95,21 +94,47 @@ def gather_period_patches(
             gathered_features[batch_index, patch_index, :length] = features[
                 batch_index, selected
             ]
-            gathered_split[batch_index, patch_index, :length] = split_positions[
-                batch_index, selected
-            ]
-            gathered_encoder[batch_index, patch_index, :length] = encoder_positions[
-                batch_index, selected
-            ]
+            gathered_positions[
+                batch_index, patch_index, :length
+            ] = observation_positions[batch_index, selected]
             valid[batch_index, patch_index, :length] = True
 
     return PeriodPatchBatch(
         features=gathered_features,
-        split_positions=gathered_split,
-        encoder_positions=gathered_encoder,
-        valid=valid,
+        observation_positions=gathered_positions,
+        observation_valid=valid,
         patch_ids=patch_ids,
     )
+
+
+def absolute_reference_positions(
+    batch_size: int,
+    patches: int,
+    reference_points: int,
+    period: int,
+    device,
+) -> Tensor:
+    """Map each patch-local mTAN query to its absolute calendar day.
+
+    mTAN uses local reference coordinates in ``[0, 1]`` internally.  LTAE
+    receives the corresponding absolute coordinates, discretized to the
+    nearest calendar day.  The final endpoint is clamped to ``period - 1`` so
+    the configured LTAE positional table remains valid at the largest shift.
+    """
+    local = torch.linspace(0.0, 1.0, reference_points, device=device)
+    starts = (
+        torch.arange(patches, device=device, dtype=torch.float32)
+        * float(period)
+        / patches
+    )
+    ends = (
+        (torch.arange(patches, device=device, dtype=torch.float32) + 1)
+        * float(period)
+        / patches
+    )
+    absolute = starts[:, None] + local[None, :] * (ends - starts)[:, None]
+    absolute = absolute.clamp(max=period - 1).round().long()
+    return absolute.unsqueeze(0).expand(batch_size, -1, -1)
 
 
 def split_temporal_representation(
@@ -216,8 +241,7 @@ class RecursiveTemporalEncoder(nn.Module):
     def forward(
         self,
         spatial_features: Tensor,
-        split_positions: Tensor,
-        encoder_positions: Tensor,
+        observation_positions: Tensor,
     ) -> RecursiveTemporalOutput:
         batch_size = spatial_features.shape[0]
         scale_outputs = []
@@ -228,8 +252,7 @@ class RecursiveTemporalEncoder(nn.Module):
             patches = self.scale_factor**level
             gathered = gather_period_patches(
                 spatial_features,
-                split_positions,
-                encoder_positions,
+                observation_positions,
                 patches=patches,
                 period=self.period,
             )
@@ -237,10 +260,10 @@ class RecursiveTemporalEncoder(nn.Module):
             flat_features = gathered.features.reshape(
                 batch_size * patches, padded_length, feature_dim
             )
-            flat_positions = gathered.encoder_positions.reshape(
+            flat_positions = gathered.observation_positions.reshape(
                 batch_size * patches, padded_length
             )
-            flat_valid = gathered.valid.reshape(
+            flat_valid = gathered.observation_valid.reshape(
                 batch_size * patches, padded_length
             )
             e = mtan_encoder(flat_features, flat_positions, flat_valid).reshape(
@@ -248,7 +271,7 @@ class RecursiveTemporalEncoder(nn.Module):
             )
             # mTAN already consumes observation timestamps and validity. This
             # is only a patch-nonempty flag, not reference-level missingness.
-            patch_nonempty = gathered.valid.any(dim=-1)
+            patch_nonempty = gathered.observation_valid.any(dim=-1)
             reference_valid = patch_nonempty.unsqueeze(-1).expand(
                 -1, -1, self.num_ref_points
             )
@@ -277,9 +300,23 @@ class RecursiveTemporalEncoder(nn.Module):
                 h = flat_aligned_h.reshape_as(e)
                 g = g * reference_valid.unsqueeze(-1).to(g.dtype)
 
+            reference_positions = absolute_reference_positions(
+                batch_size=batch_size,
+                patches=patches,
+                reference_points=self.num_ref_points,
+                period=self.period,
+                device=spatial_features.device,
+            )
             scale_outputs.append(
                 RecursiveScaleOutput(
-                    e=e, h=h, alpha=alpha, g=g, valid=reference_valid
+                    e=e,
+                    h=h,
+                    alpha=alpha,
+                    g=g,
+                    valid=reference_valid,
+                    observation_positions=gathered.observation_positions,
+                    observation_valid=gathered.observation_valid,
+                    reference_positions=reference_positions,
                 )
             )
             previous_g = g
@@ -288,5 +325,6 @@ class RecursiveTemporalEncoder(nn.Module):
         return RecursiveTemporalOutput(
             lowest=scale_outputs[-1].g,
             lowest_valid=scale_outputs[-1].valid,
+            lowest_reference_positions=scale_outputs[-1].reference_positions,
             scales=tuple(scale_outputs),
         )

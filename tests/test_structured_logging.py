@@ -115,6 +115,10 @@ def test_shift_diagnostics_ranks_minimum_scores_and_prints_top_entries_multiline
         accuracy_scores=np.array([0.2, 0.4, 0.3, 0.9, 0.1, 0.0]),
         sample_batches=100,
         runtime_seconds=87.4,
+        spatial_encoder_time=1.2,
+        reimts_mtan_time=3.4,
+        total_feature_preparation_time=4.6,
+        ltae_classifier_total_time=8.0,
     )
 
     assert "[SHIFT ESTIMATION]" in rendered
@@ -122,6 +126,13 @@ def test_shift_diagnostics_ranks_minimum_scores_and_prints_top_entries_multiline
     assert "second_best_shift: 0" in rendered
     assert "score_gap: 0.100000" in rendered
     assert "debug oracle:\n  best_accuracy_shift: 1" in rendered
+    assert "feature preparation:" in rendered
+    assert "spatial_encoder_time: 1.200000 s" in rendered
+    assert "reimts_mtan_time: 3.400000 s" in rendered
+    assert "total_feature_preparation_time: 4.600000 s" in rendered
+    assert "candidate evaluation:" in rendered
+    assert "ltae_classifier_total_time: 8.000000 s" in rendered
+    assert "runtime:\n  total_shift_estimation_time: 87.400000 s" in rendered
     top_lines = [line for line in rendered.splitlines() if "shift=" in line]
     assert len(top_lines) == 5
     assert top_lines[0].strip().startswith("1. shift=-1")

@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import dataclass
+import time
 
 import torch
 import torch.nn as nn
@@ -14,11 +15,25 @@ from models.reimts.recursive_temporal import RecursiveTemporalEncoder
 
 @dataclass(frozen=True)
 class ReIMTSClassificationOutput:
-    """Training output; inference continues to expose only sample logits."""
+    """Sample-level training output plus occupancy-only diagnostics."""
 
     sample_logits: torch.Tensor
-    patch_logits: torch.Tensor
     patch_valid: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ReIMTSShiftFeatures:
+    """Pre-LTAE whole-sample features cached across TimeMatch candidates."""
+
+    tokens: torch.Tensor
+    positions: torch.Tensor
+    patch_valid: torch.Tensor
+    spatial_encoder_time: float = 0.0
+    reimts_mtan_time: float = 0.0
+
+    @property
+    def total_feature_preparation_time(self):
+        return self.spatial_encoder_time + self.reimts_mtan_time
 
 
 class PatchOccupancyMeter:
@@ -107,21 +122,13 @@ def format_patch_diagnostics(patch_valid, label):
     return "\n".join(lines)
 
 
-def reimts_classification_loss(output, targets, criterion, mode="patch"):
-    """Compute patch-direct or Round 1 sample-level classification loss."""
-    if mode == "sample":
-        return criterion(output.sample_logits, targets)
-    if mode != "patch":
-        raise ValueError("reimts loss mode must be 'patch' or 'sample'")
-    repeated_targets = targets.unsqueeze(1).expand(
-        -1, output.patch_logits.shape[1]
-    )
-    if not output.patch_valid.any():
-        raise ValueError("patch loss requires at least one non-empty patch")
-    return criterion(
-        output.patch_logits[output.patch_valid],
-        repeated_targets[output.patch_valid],
-    )
+def reimts_classification_loss(output, targets, criterion, mode="sample"):
+    """Compute the formal Round 4 sample-level classification loss."""
+    if mode != "sample":
+        raise ValueError(
+            "Round 4 ReIMTS uses sample-level loss; patch mode is incompatible"
+        )
+    return criterion(output.sample_logits, targets)
 
 
 class PseReIMTSMTANLTAE(nn.Module):
@@ -185,85 +192,142 @@ class PseReIMTSMTANLTAE(nn.Module):
             max_position=reimts_period,
         )
         self.classifier = get_decoder(classifier_mlp, num_classes)
-        decoder_positions = torch.linspace(
-            0, reimts_period - 1, num_ref_points
-        ).round().long()
-        self.register_buffer(
-            "decoder_positions", decoder_positions, persistent=True
-        )
 
-    def _decode_lowest(self, lowest, lowest_valid):
+    def _flatten_lowest(
+        self, lowest, lowest_reference_positions, lowest_valid
+    ):
+        """Concatenate patch blocks into one chronological token sequence."""
+        if lowest.ndim != 4:
+            raise ValueError("lowest tokens must have shape [B,P,R,D]")
+        if lowest_reference_positions.shape != lowest.shape[:3]:
+            raise ValueError("reference positions must match lowest tokens")
+        if lowest_valid.shape != lowest.shape[:3]:
+            raise ValueError("lowest validity must match lowest tokens")
         batch_size, patches, ref_points, latent_dim = lowest.shape
-        flat_lowest = lowest.reshape(
-            batch_size * patches, ref_points, latent_dim
+        return ReIMTSShiftFeatures(
+            tokens=lowest.reshape(batch_size, patches * ref_points, latent_dim),
+            positions=lowest_reference_positions.reshape(
+                batch_size, patches * ref_points
+            ),
+            patch_valid=lowest_valid.any(dim=-1),
         )
-        positions = self.decoder_positions.unsqueeze(0).expand(
-            batch_size * patches, -1
-        )
-        flat_features = self.temporal_decoder(flat_lowest, positions)
-        patch_features = flat_features.reshape(batch_size, patches, -1)
-        patch_logits = self.classifier(
-            patch_features.reshape(batch_size * patches, -1)
-        ).reshape(batch_size, patches, -1)
-        sample_logits = patch_logits.mean(dim=1)
-        return sample_logits, patch_features, patch_logits
 
-    def _forward_from_spatial_output(self, spatial_feats, positions, shift=0):
-        split_positions = positions
-        encoder_positions = positions + shift
-        recursive = self.reimts_encoder(
-            spatial_feats,
-            split_positions=split_positions,
-            encoder_positions=encoder_positions,
+    def prepare_shift_features_from_spatial(self, spatial_feats, positions):
+        """Run shift-invariant ReIMTS/mTAN/IARF once on real timestamps."""
+        if spatial_feats.is_cuda:
+            torch.cuda.synchronize(spatial_feats.device)
+        reimts_started = time.perf_counter()
+        recursive = self.reimts_encoder(spatial_feats, positions)
+        flattened = self._flatten_lowest(
+            recursive.lowest,
+            recursive.lowest_reference_positions,
+            recursive.lowest_valid,
         )
-        sample_logits, patch_features, patch_logits = self._decode_lowest(
-            recursive.lowest, recursive.lowest_valid
+        if flattened.tokens.is_cuda:
+            torch.cuda.synchronize(flattened.tokens.device)
+        reimts_seconds = time.perf_counter() - reimts_started
+        return ReIMTSShiftFeatures(
+            tokens=flattened.tokens,
+            positions=flattened.positions,
+            patch_valid=flattened.patch_valid,
+            reimts_mtan_time=reimts_seconds,
         )
-        patch_valid = recursive.lowest_valid.any(dim=-1)
-        output = ReIMTSClassificationOutput(
+
+    def prepare_shift_features(self, pixels, mask, positions, extra):
+        """Cache PSE and all ReIMTS work before candidate-specific LTAE."""
+        if pixels.is_cuda:
+            torch.cuda.synchronize(pixels.device)
+        spatial_started = time.perf_counter()
+        spatial_feats = self.spatial_encoder(pixels, mask, extra)
+        if spatial_feats.is_cuda:
+            torch.cuda.synchronize(spatial_feats.device)
+        spatial_seconds = time.perf_counter() - spatial_started
+        features = self.prepare_shift_features_from_spatial(
+            spatial_feats, positions
+        )
+        return ReIMTSShiftFeatures(
+            tokens=features.tokens,
+            positions=features.positions,
+            patch_valid=features.patch_valid,
+            spatial_encoder_time=spatial_seconds,
+            reimts_mtan_time=features.reimts_mtan_time,
+        )
+
+    def _whole_sample_shift(self, shift, features):
+        shift = torch.as_tensor(
+            shift, device=features.positions.device, dtype=features.positions.dtype
+        )
+        batch_size = features.positions.shape[0]
+        if shift.ndim == 0:
+            return shift.expand(batch_size)
+        if shift.ndim == 1:
+            if shift.numel() == 1:
+                return shift.expand(batch_size)
+            if shift.numel() != batch_size:
+                raise ValueError("shift must provide one value per sample")
+            return shift
+        if shift.shape[0] != batch_size:
+            raise ValueError("shift batch dimension must match features")
+        flat = shift.reshape(batch_size, -1)
+        if not torch.equal(flat, flat[:, :1].expand_as(flat)):
+            raise ValueError("shift must be one whole-sample translation")
+        return flat[:, 0]
+
+    def _decode_whole(self, features, shift):
+        sample_shift = self._whole_sample_shift(shift, features)
+        shifted_positions = features.positions + sample_shift.unsqueeze(1)
+        sample_features = self.temporal_decoder(
+            features.tokens, shifted_positions
+        )
+        sample_logits = self.classifier(sample_features)
+        return sample_logits, sample_features
+
+    def forward_from_shift_features(
+        self, features, shift, return_feats=False
+    ):
+        """Evaluate one global translation with one LTAE and classifier."""
+        sample_logits, sample_features = self._decode_whole(features, shift)
+        if return_feats:
+            return sample_logits, sample_features
+        return sample_logits
+
+    def _output_from_shift_features(self, features, shift):
+        sample_logits = self.forward_from_shift_features(features, shift)
+        return ReIMTSClassificationOutput(
             sample_logits=sample_logits,
-            patch_logits=patch_logits,
-            patch_valid=patch_valid,
+            patch_valid=features.patch_valid,
         )
-        return output, patch_features
 
     def forward_from_spatial_for_loss_with_shift(
         self, spatial_feats, positions, shift=0
     ):
-        output, _ = self._forward_from_spatial_output(
-            spatial_feats, positions, shift
+        features = self.prepare_shift_features_from_spatial(
+            spatial_feats, positions
         )
-        return output
+        return self._output_from_shift_features(features, shift)
 
     def forward_from_spatial_with_shift(
         self, spatial_feats, positions, shift=0, return_feats=False
     ):
-        output, patch_features = self._forward_from_spatial_output(
-            spatial_feats, positions, shift
+        features = self.prepare_shift_features_from_spatial(
+            spatial_feats, positions
         )
-        if return_feats:
-            # Unweighted mean of lowest-scale patch features. Empty-patch
-            # policy will follow sample aggregation after real-data smoke.
-            return output.sample_logits, patch_features.mean(dim=1)
-        return output.sample_logits
+        return self.forward_from_shift_features(
+            features, shift, return_feats=return_feats
+        )
 
     def forward_for_loss(
         self, pixels, mask, positions, extra, shift=0
     ):
-        spatial_feats = self.spatial_encoder(pixels, mask, extra)
-        return self.forward_from_spatial_for_loss_with_shift(
-            spatial_feats, positions, shift
-        )
+        features = self.prepare_shift_features(pixels, mask, positions, extra)
+        return self._output_from_shift_features(features, shift)
 
     def forward_with_shift(
         self, pixels, mask, positions, extra, shift, return_feats=False
     ):
-        spatial_feats = self.spatial_encoder(pixels, mask, extra)
-        return self.forward_from_spatial_with_shift(
-            spatial_feats,
-            positions,
-            shift=shift,
-            return_feats=return_feats,
+        features = self.prepare_shift_features(pixels, mask, positions, extra)
+        return self.forward_from_shift_features(
+            features, shift=shift, return_feats=return_feats
         )
 
     def forward(self, pixels, mask, positions, extra, return_feats=False):

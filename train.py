@@ -143,11 +143,11 @@ def forward_supervised_for_loss(
     extra,
     targets,
     criterion,
-    loss_mode="patch",
+    loss_mode="sample",
     diagnostics_label=None,
     patch_meter=None,
 ):
-    """Use patch-direct supervision only for models exposing the capability."""
+    """Use sample-level supervision and retain patch occupancy diagnostics."""
     capability = getattr(model, "forward_for_loss", None)
     if callable(capability):
         output = capability(pixels, mask, positions, extra)
@@ -463,7 +463,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 extra,
                 targets,
                 criterion,
-                loss_mode=getattr(config, "reimts_loss_mode", "patch"),
+                loss_mode=getattr(config, "reimts_loss_mode", "sample"),
                 diagnostics_label=(
                     "source after RandomSampleTimeSteps"
                     if getattr(config, "reimts_patch_diagnostics", False)
@@ -668,8 +668,8 @@ if __name__ == '__main__':
         help='mTAN reference points per scale (TimeMatch adaptation default: 8)',
     )
     parser.add_argument(
-        '--reimts_loss_mode', default='patch', choices=['patch', 'sample'],
-        help='ReIMTS classification supervision: valid patches or mean sample logits',
+        '--reimts_loss_mode', default='sample', choices=['patch', 'sample'],
+        help='ReIMTS Round 4 supervision (sample required; patch fails fast)',
     )
     parser.add_argument(
         '--reimts_patch_diagnostics', default=False, type=bool_flag,

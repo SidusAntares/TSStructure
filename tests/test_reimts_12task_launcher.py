@@ -40,7 +40,7 @@ def test_launcher_commands_freeze_formal_reimts_and_timematch_arguments():
         "--reimts_levels 3", "--reimts_scale_factor 2",
         "--reimts_period 365", "--mtan_num_ref_points 8",
         "--mtan_latent_dim 128", "--mtan_heads 1",
-        "--reimts_loss_mode patch", "--num_folds 1",
+        "--reimts_loss_mode sample", "--num_folds 1",
         "--progress_bar off",
     ):
         assert script.count(option) >= 2

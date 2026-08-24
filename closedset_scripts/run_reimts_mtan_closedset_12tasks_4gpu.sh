@@ -96,7 +96,7 @@ run_source_worker() {
         --mtan_num_ref_points 8 \
         --mtan_latent_dim 128 \
         --mtan_heads 1 \
-        --reimts_loss_mode patch \
+        --reimts_loss_mode sample \
         --num_folds 1 \
         --progress_bar off \
         --epochs 100 \
@@ -140,7 +140,7 @@ run_source_worker() {
             --mtan_num_ref_points 8 \
             --mtan_latent_dim 128 \
             --mtan_heads 1 \
-            --reimts_loss_mode patch \
+            --reimts_loss_mode sample \
             --num_folds 1 \
             --progress_bar off \
             --output_dir "$OUTPUT_ROOT" \

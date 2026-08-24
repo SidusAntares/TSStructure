@@ -93,20 +93,26 @@ class MTANEncoder(nn.Module):
             [self.linear(positions), torch.sin(self.periodic(positions))], dim=-1
         )
 
-    def forward(self, values: Tensor, encoder_positions: Tensor, valid: Tensor):
+    def forward(
+        self, values: Tensor, observation_positions: Tensor, valid: Tensor
+    ):
         if values.ndim != 3:
             raise ValueError("values must have shape [B,L,D]")
-        if encoder_positions.shape != values.shape[:2]:
-            raise ValueError("encoder_positions must have shape [B,L]")
-        if valid.shape != encoder_positions.shape:
-            raise ValueError("valid must match encoder_positions")
+        if observation_positions.shape != values.shape[:2]:
+            raise ValueError("observation_positions must have shape [B,L]")
+        if valid.shape != observation_positions.shape:
+            raise ValueError("valid must match observation_positions")
 
         valid_features = valid.unsqueeze(-1).expand_as(values)
         masked_values = values * valid_features.to(values.dtype)
         encoder_input = torch.cat(
             [masked_values, valid_features.to(values.dtype)], dim=-1
         )
-        normalized_time = encoder_positions.to(values.dtype) / float(self.period)
+        # Candidate shifts never enter mTAN.  Normalization is derived only
+        # from the original absolute observation dates retained by ReIMTS.
+        normalized_time = observation_positions.to(values.dtype) / float(
+            self.period
+        )
         key = self._time_embedding(normalized_time)
         query = self._time_embedding(self.query.to(values.dtype).unsqueeze(0))
         attention_mask = torch.cat([valid_features, valid_features], dim=-1)
