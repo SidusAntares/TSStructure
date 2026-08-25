@@ -109,7 +109,7 @@ def test_official_backend_preserves_centered_mode_order_and_explicit_signs(monke
         return torch.zeros(
             values.shape[0],
             values.shape[1],
-            output_shape,
+            *output_shape,
             dtype=values.dtype,
         )
 
@@ -133,6 +133,33 @@ def test_official_backend_preserves_centered_mode_order_and_explicit_signs(monke
         ("type2", {"eps": 1e-6, "modeord": 0, "isign": 1}),
         ("type1", {"eps": 1e-6, "modeord": 0, "isign": -1}),
     ]
+
+
+def test_official_type1_adapter_passes_1d_output_shape_as_tuple():
+    from models.fredn.nufft import PytorchFinufftBackend
+
+    output_shapes = []
+
+    def fake_type1(points, values, output_shape, **kwargs):
+        output_shapes.append(output_shape)
+        size = output_shape[0] if isinstance(output_shape, tuple) else output_shape
+        return torch.zeros(
+            values.shape[0],
+            values.shape[1],
+            size,
+            dtype=values.dtype,
+        )
+
+    backend = object.__new__(PytorchFinufftBackend)
+    backend._type1 = fake_type1
+    backend.eps = 1e-6
+    points = torch.tensor([-0.5, 0.5])
+    values = torch.zeros(1, 2, 1, dtype=torch.complex64)
+
+    result = backend.type1(points, values, num_modes=3, isign=-1)
+
+    assert output_shapes == [(3,)]
+    assert result.shape == (1, 3, 1)
 
 
 def test_regularized_analysis_recovers_known_irregular_finite_series():

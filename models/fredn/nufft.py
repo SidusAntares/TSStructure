@@ -122,10 +122,11 @@ class PytorchFinufftBackend:
         if isign not in (-1, 1):
             raise ValueError("isign must be explicitly set to -1 or 1")
         strengths = values.permute(0, 2, 1).contiguous()
+        output_shape = (int(num_modes),)
         coeffs = self._type1(
             points.unsqueeze(0),
             strengths,
-            num_modes,
+            output_shape,
             eps=self.eps,
             modeord=0,
             isign=isign,
