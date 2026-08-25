@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from dataset import PixelSetData
 from evaluation import validation
+from models.fredn.diagnostics import log_fredn_diagnostics
 from transforms import (
     Normalize,
     RandomSamplePixels,
@@ -33,21 +34,62 @@ def _check_temporal_index_range(model, positions, applied_shift, tag):
     if positions.numel() == 0:
         return
 
-    temporal_encoder = model.temporal_encoder
     min_pos = int(positions.min().item())
     max_pos = int(positions.max().item())
-    min_idx = min_pos + applied_shift + temporal_encoder.max_temporal_shift
-    max_idx = max_pos + applied_shift + temporal_encoder.max_temporal_shift
-    table_size = temporal_encoder.positional_enc.num_embeddings
+    if hasattr(model, "get_temporal_encoders"):
+        temporal_encoders = model.get_temporal_encoders()
+    else:
+        temporal_encoders = (model.temporal_encoder,)
+    for encoder_index, temporal_encoder in enumerate(temporal_encoders):
+        min_idx = min_pos + applied_shift + temporal_encoder.max_temporal_shift
+        max_idx = max_pos + applied_shift + temporal_encoder.max_temporal_shift
+        table_size = temporal_encoder.positional_enc.num_embeddings
 
-    if min_idx < 0 or max_idx >= table_size:
-        raise ValueError(
-            f"{tag} temporal indices out of range: "
-            f"positions=[{min_pos}, {max_pos}], shift={applied_shift}, "
-            f"embedding_indices=[{min_idx}, {max_idx}], table_size={table_size}. "
-            "This usually means an extra temporal shift was applied on top of TimeMatch "
-            "alignment or the positional encoding range is inconsistent with the dataset dates."
+        if min_idx < 0 or max_idx >= table_size:
+            raise ValueError(
+                f"{tag} temporal indices out of range: encoder={encoder_index}, "
+                f"positions=[{min_pos}, {max_pos}], shift={applied_shift}, "
+                f"embedding_indices=[{min_idx}, {max_idx}], table_size={table_size}. "
+                "This usually means an extra temporal shift was applied on top of TimeMatch "
+                "alignment or the positional encoding range is inconsistent with the dataset dates."
+            )
+
+
+def _forward_with_temporal_shift(
+    model,
+    pixels,
+    mask,
+    positions,
+    extra,
+    temporal_shift=0,
+):
+    if hasattr(model, "forward_with_temporal_shift"):
+        return model.forward_with_temporal_shift(
+            pixels,
+            mask,
+            positions,
+            extra,
+            temporal_shift=temporal_shift,
         )
+    return model.forward(pixels, mask, positions + temporal_shift, extra)
+
+
+def _prepare_temporal_features(model, spatial_feats, positions):
+    if hasattr(model, "prepare_temporal_features"):
+        return model.prepare_temporal_features(spatial_feats, positions)
+    return spatial_feats
+
+
+def _classify_prepared(model, prepared, positions, temporal_shift=0):
+    if hasattr(model, "classify_prepared"):
+        return model.classify_prepared(
+            prepared,
+            positions,
+            temporal_shift=temporal_shift,
+        )
+    return model.decoder(
+        model.temporal_encoder(prepared, positions + temporal_shift)
+    )
 
 
 def train_timematch(student, config, writer, val_loader, device, best_model_path, fold_num, splits):
@@ -148,7 +190,17 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             # Get pseudo labels from teacher
             pixels_t_weak, mask_t_weak, position_t_weak, extra_t_weak = to_cuda(sample_target_weak, device)
             with torch.no_grad():
-                teacher_preds = F.softmax(teacher.forward(pixels_t_weak, mask_t_weak, position_t_weak + target_to_source_shift, extra_t_weak), dim=1)
+                teacher_preds = F.softmax(
+                    _forward_with_temporal_shift(
+                        teacher,
+                        pixels_t_weak,
+                        mask_t_weak,
+                        position_t_weak,
+                        extra_t_weak,
+                        temporal_shift=target_to_source_shift,
+                    ),
+                    dim=1,
+                )
             pseudo_conf, pseudo_targets = torch.max(teacher_preds, dim=1)
             pseudo_mask = pseudo_conf > config.pseudo_threshold
             num_pseudo = int(pseudo_mask.sum().item())
@@ -161,10 +213,23 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             loss_target = 0.0
             if config.domain_specific_bn:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
-                logits_source = student.forward(pixels_s, mask_s, position_s + source_to_target_shift, extra_s)
+                logits_source = _forward_with_temporal_shift(
+                    student,
+                    pixels_s,
+                    mask_s,
+                    position_s,
+                    extra_s,
+                    temporal_shift=source_to_target_shift,
+                )
                 if num_pseudo >= 2:  # at least 2 examples required for BN
                     _check_temporal_index_range(student, position_t[pseudo_mask], 0, "target")
-                    logits_target = student.forward(pixels_t[pseudo_mask], mask_t[pseudo_mask], position_t[pseudo_mask], extra_t[pseudo_mask])
+                    logits_target = _forward_with_temporal_shift(
+                        student,
+                        pixels_t[pseudo_mask],
+                        mask_t[pseudo_mask],
+                        position_t[pseudo_mask],
+                        extra_t[pseudo_mask],
+                    )
             else:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
                 if num_pseudo > 0:
@@ -178,21 +243,46 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     pixels = torch.cat([pixels_s, selected_pixels_t], dim=0)
                     mask = torch.cat([mask_s, selected_mask_t], dim=0)
                     position = torch.cat(
-                        [position_s + source_to_target_shift, selected_position_t],
+                        [position_s, selected_position_t],
+                        dim=0,
+                    )
+                    temporal_shift = torch.cat(
+                        [
+                            torch.full(
+                                (position_s.shape[0], 1),
+                                source_to_target_shift,
+                                device=position_s.device,
+                                dtype=position_s.dtype,
+                            ),
+                            torch.zeros(
+                                (selected_position_t.shape[0], 1),
+                                device=selected_position_t.device,
+                                dtype=selected_position_t.dtype,
+                            ),
+                        ],
                         dim=0,
                     )
                     extra = torch.cat([extra_s, selected_extra_t], dim=0)
 
-                    logits = student.forward(pixels, mask, position, extra)
+                    logits = _forward_with_temporal_shift(
+                        student,
+                        pixels,
+                        mask,
+                        position,
+                        extra,
+                        temporal_shift=temporal_shift,
+                    )
                     source_batch_size = pixels_s.shape[0]
                     logits_source = logits[:source_batch_size]
                     logits_target = logits[source_batch_size:]
                 else:
-                    logits_source = student.forward(
+                    logits_source = _forward_with_temporal_shift(
+                        student,
                         pixels_s,
                         mask_s,
-                        position_s + source_to_target_shift,
+                        position_s,
                         extra_s,
+                        temporal_shift=source_to_target_shift,
                     )
                     logits_target = None
 
@@ -220,6 +310,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                 writer.add_scalar("train/loss", loss_meter.val, global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                 writer.add_scalar("train/target_updates", len(torch.nonzero(pseudo_mask)), global_step)
+                log_fredn_diagnostics(student, writer, global_step)
 
             global_step += 1
 
@@ -392,7 +483,19 @@ def estimate_temporal_shift(
         labels.extend(sample['label'].tolist())
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
         spatial_feats = model.spatial_encoder.forward(pixels, valid_pixels, extra)
-        shift_logits = torch.stack([model.decoder(model.temporal_encoder(spatial_feats, positions + shift)) for shift in shifts], dim=1)
+        prepared = _prepare_temporal_features(model, spatial_feats, positions)
+        shift_logits = torch.stack(
+            [
+                _classify_prepared(
+                    model,
+                    prepared,
+                    positions,
+                    temporal_shift=shift,
+                )
+                for shift in shifts
+            ],
+            dim=1,
+        )
         shift_probs = F.softmax(shift_logits, dim=2)
         shift_softmaxes.append(shift_probs)
     shift_softmaxes = torch.cat(shift_softmaxes).cpu().numpy()  # (N, n_shifts, n_classes)
@@ -478,7 +581,14 @@ def get_pseudo_labels(
         indices.extend(sample["index"].tolist())
 
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
-        logits = model.forward(pixels, valid_pixels, positions + best_shift, extra)
+        logits = _forward_with_temporal_shift(
+            model,
+            pixels,
+            valid_pixels,
+            positions,
+            extra,
+            temporal_shift=best_shift,
+        )
         probs = F.softmax(logits, dim=1).cpu()
         pseudo_softmaxes.extend(probs.tolist())
 

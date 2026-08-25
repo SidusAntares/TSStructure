@@ -63,7 +63,21 @@ def evaluation(
 
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
         if temporal_shift is not None:
-            logits = model.forward(pixels, valid_pixels, positions + temporal_shift, extra)
+            if hasattr(model, "forward_with_temporal_shift"):
+                logits = model.forward_with_temporal_shift(
+                    pixels,
+                    valid_pixels,
+                    positions,
+                    extra,
+                    temporal_shift=temporal_shift,
+                )
+            else:
+                logits = model.forward(
+                    pixels,
+                    valid_pixels,
+                    positions + temporal_shift,
+                    extra,
+                )
         else:
             logits = model.forward(pixels, valid_pixels, positions, extra)
 

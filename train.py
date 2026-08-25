@@ -20,7 +20,8 @@ from competitors.mmd.train_mmd import train_mmd
 from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
-from models.stclassifier import PseLTae, PseTae, PseTempCNN, PseGru
+from models.fredn.diagnostics import log_fredn_diagnostics
+from models.stclassifier import PseFreDNLTae, PseLTae, PseTae, PseTempCNN, PseGru
 from timematch import train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
 from utils import label_utils
@@ -33,6 +34,47 @@ from utils.train_utils import (
     to_cuda,
 )
 
+
+
+def add_model_arguments(parser):
+    parser.add_argument(
+        '--model',
+        default='pseltae',
+        choices=['psetae', 'pseltae', 'psetcnn', 'psegru', 'psefrednltae'],
+    )
+    parser.add_argument('--fredn_num_modes', default=9, type=int)
+    parser.add_argument('--fredn_nufft_reg', default=1e-3, type=float)
+    parser.add_argument('--fredn_nufft_tol', default=1e-5, type=float)
+    parser.add_argument('--fredn_nufft_max_iter', default=20, type=int)
+    parser.add_argument('--fredn_period_days', default=365.0, type=float)
+    return parser
+
+
+def create_model(config, nufft_backend=None):
+    common = dict(
+        input_dim=config.input_dim,
+        num_classes=config.num_classes,
+        with_extra=config.with_extra,
+    )
+    if config.model == 'pseltae':
+        return PseLTae(**common)
+    if config.model == 'psetae':
+        return PseTae(**common)
+    if config.model == 'psetcnn':
+        return PseTempCNN(**common)
+    if config.model == 'psegru':
+        return PseGru(**common)
+    if config.model == 'psefrednltae':
+        return PseFreDNLTae(
+            **common,
+            fredn_num_modes=config.fredn_num_modes,
+            fredn_nufft_reg=config.fredn_nufft_reg,
+            fredn_nufft_tol=config.fredn_nufft_tol,
+            fredn_nufft_max_iter=config.fredn_nufft_max_iter,
+            fredn_period_days=config.fredn_period_days,
+            nufft_backend=nufft_backend,
+        )
+    raise NotImplementedError(config.model)
 
 
 def main(config):
@@ -66,16 +108,7 @@ def main(config):
         sample_pixels_val = config.sample_pixels_val or (config.eval and config.temporal_shift)
         val_loader, test_loader = create_evaluation_loaders(config.target, splits, config, sample_pixels_val)
 
-        if config.model == 'pseltae':
-            model = PseLTae(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psetae':
-            model = PseTae(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psetcnn':
-            model = PseTempCNN(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psegru':
-            model = PseGru(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        else:
-            raise NotImplementedError()
+        model = create_model(config)
         
         model.to(config.device)
 
@@ -314,6 +347,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
 
             pixels, mask, positions, extra = to_cuda(sample, device)
             outputs = model.forward(pixels, mask, positions, extra)
+            log_fredn_diagnostics(model, writer, global_step + step)
             loss = criterion(outputs, targets)
 
             optimizer.zero_grad()
@@ -463,7 +497,7 @@ if __name__ == '__main__':
     parser.add_argument('--focal_loss_gamma', default=1.0, type=float, help='gamma value for focal loss')
     parser.add_argument('--num_pixels', default=64, type=int, help='Number of pixels to sample from the input sample')
     parser.add_argument('--seq_length', default=30, type=int, help='Number of time steps to sample from the input sample')
-    parser.add_argument('--model', default='pseltae', choices=['psetae', 'pseltae', 'psetcnn', 'psegru'])
+    add_model_arguments(parser)
     parser.add_argument('--input_dim', default=10, type=int, help='Number of channels of input sample')
     parser.add_argument('--with_extra', default=False, type=bool_flag, help='whether to input extra geometric features to the PSE')
     parser.add_argument('--tensorboard_log_dir', default='runs')
