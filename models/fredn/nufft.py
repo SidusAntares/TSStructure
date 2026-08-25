@@ -198,7 +198,15 @@ class IrregularFourierAnalyzer(nn.Module):
         self,
         points: torch.Tensor,
         features: torch.Tensor,
-    ) -> Tuple[torch.Tensor, int, float, bool]:
+    ) -> Tuple[
+        torch.Tensor,
+        int,
+        float,
+        bool,
+        List[int],
+        List[float],
+        List[bool],
+    ]:
         values = features.to(self._complex_dtype(features.dtype))
         rhs = self.backend.type1(
             points,
@@ -227,7 +235,15 @@ class IrregularFourierAnalyzer(nn.Module):
         residual_squared = (residual.conj() * residual).sum(dim=1).real
         rhs_norm = residual_squared.sqrt().clamp_min(torch.finfo(features.dtype).eps)
         relative_residual = residual_squared.sqrt() / rhs_norm
-        converged = bool(torch.all(relative_residual <= self.tol).item())
+        sample_converged = torch.all(relative_residual <= self.tol, dim=1)
+        sample_iterations = torch.full(
+            (features.shape[0],),
+            -1,
+            device=features.device,
+            dtype=torch.long,
+        )
+        sample_iterations[sample_converged] = 0
+        converged = bool(torch.all(sample_converged).item())
         iterations = 0
         tiny = torch.finfo(features.dtype).eps
 
@@ -244,7 +260,10 @@ class IrregularFourierAnalyzer(nn.Module):
             )
             iterations += 1
             relative_residual = new_residual_squared.sqrt() / rhs_norm
-            converged = bool(torch.all(relative_residual <= self.tol).item())
+            sample_converged = torch.all(relative_residual <= self.tol, dim=1)
+            newly_converged = (sample_iterations < 0) & sample_converged
+            sample_iterations[newly_converged] = iterations
+            converged = bool(torch.all(sample_converged).item())
             if converged:
                 residual = new_residual
                 residual_squared = new_residual_squared
@@ -255,7 +274,17 @@ class IrregularFourierAnalyzer(nn.Module):
             residual_squared = new_residual_squared
 
         max_relative_residual = float(relative_residual.max().detach().cpu())
-        return solution, iterations, max_relative_residual, converged
+        sample_residuals = relative_residual.max(dim=1).values
+        sample_iterations[sample_iterations < 0] = iterations
+        return (
+            solution,
+            iterations,
+            max_relative_residual,
+            converged,
+            sample_iterations.detach().cpu().tolist(),
+            sample_residuals.detach().cpu().tolist(),
+            sample_converged.detach().cpu().tolist(),
+        )
 
     def forward(
         self,
@@ -274,15 +303,26 @@ class IrregularFourierAnalyzer(nn.Module):
         _synchronize_if_cuda(features)
         started = time.perf_counter()
         per_sample = [None] * features.shape[0]
+        per_sample_iterations = [None] * features.shape[0]
+        per_sample_residuals = [None] * features.shape[0]
+        per_sample_converged = [None] * features.shape[0]
         group_diagnostics = []
         for indices, shared_points in groups:
             group_features = features.index_select(0, indices)
-            solution, iterations, residual, converged = self._solve_group(
-                shared_points,
-                group_features,
-            )
+            (
+                solution,
+                iterations,
+                residual,
+                converged,
+                group_sample_iterations,
+                group_sample_residuals,
+                group_sample_converged,
+            ) = self._solve_group(shared_points, group_features)
             for offset, batch_index in enumerate(indices.detach().cpu().tolist()):
                 per_sample[batch_index] = solution[offset]
+                per_sample_iterations[batch_index] = group_sample_iterations[offset]
+                per_sample_residuals[batch_index] = group_sample_residuals[offset]
+                per_sample_converged[batch_index] = group_sample_converged[offset]
             group_diagnostics.append((iterations, residual, converged))
         coeffs = torch.stack(per_sample, dim=0)
         _synchronize_if_cuda(coeffs)
@@ -294,6 +334,9 @@ class IrregularFourierAnalyzer(nn.Module):
             "num_point_groups": len(groups),
             "shared_points_rate": _shared_points_rate(groups, features.shape[0]),
             "analysis_time": elapsed,
+            "per_sample_solver_iterations": per_sample_iterations,
+            "per_sample_solver_residual": per_sample_residuals,
+            "per_sample_solver_converged": per_sample_converged,
         }
         self.last_diagnostics = diagnostics
         return coeffs, diagnostics
