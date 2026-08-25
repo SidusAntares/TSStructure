@@ -47,6 +47,11 @@ def add_model_arguments(parser):
     parser.add_argument('--fredn_nufft_tol', default=1e-5, type=float)
     parser.add_argument('--fredn_nufft_max_iter', default=20, type=int)
     parser.add_argument('--fredn_period_days', default=365.0, type=float)
+    parser.add_argument(
+        '--fredn_fourier_solver',
+        default='dense_direct',
+        choices=['dense_direct', 'nufft_cg'],
+    )
     return parser
 
 
@@ -72,6 +77,11 @@ def create_model(config, nufft_backend=None):
             fredn_nufft_tol=config.fredn_nufft_tol,
             fredn_nufft_max_iter=config.fredn_nufft_max_iter,
             fredn_period_days=config.fredn_period_days,
+            fredn_fourier_solver=getattr(
+                config,
+                'fredn_fourier_solver',
+                'dense_direct',
+            ),
             nufft_backend=nufft_backend,
         )
     raise NotImplementedError(config.model)
@@ -346,8 +356,18 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             targets = sample['label'].cuda(device=device, non_blocking=True)
 
             pixels, mask, positions, extra = to_cuda(sample, device)
-            outputs = model.forward(pixels, mask, positions, extra)
-            log_fredn_diagnostics(model, writer, global_step + step)
+            current_step = global_step + step
+            collect_diagnostics = step % config.log_step == 0
+            if getattr(model, 'supports_fredn_diagnostics', False):
+                outputs = model.forward(
+                    pixels,
+                    mask,
+                    positions,
+                    extra,
+                    collect_diagnostics=collect_diagnostics,
+                )
+            else:
+                outputs = model.forward(pixels, mask, positions, extra)
             loss = criterion(outputs, targets)
 
             optimizer.zero_grad()
@@ -358,6 +378,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             loss_meter.update(loss.item(), n=config.batch_size)
 
             if step % config.log_step == 0:
+                log_fredn_diagnostics(model, writer, current_step)
                 lr = optimizer.param_groups[0]["lr"]
                 progress_bar.set_postfix(lr=f'{lr:.1E}', loss=f"{loss_meter.avg:.3f}")
                 writer.add_scalar("train/loss", loss_meter.val, global_step + step)

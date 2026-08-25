@@ -55,11 +55,11 @@ class FrequencyDisentangler(nn.Module):
         seasonal_ratio = seasonal_coeffs.abs().square().sum() / total_energy
         detached_mask = mask.detach()
         return {
-            "mask_mean": float(detached_mask.mean().cpu()),
-            "mask_std": float(detached_mask.std(unbiased=False).cpu()),
-            "mask_lt_0.1": float((detached_mask < 0.1).float().mean().cpu()),
-            "mask_gt_0.9": float((detached_mask > 0.9).float().mean().cpu()),
-            "trend_energy_ratio": float(trend_ratio.detach().cpu()),
-            "seasonal_energy_ratio": float(seasonal_ratio.detach().cpu()),
-            "frequency_mask_mean": detached_mask.mean(dim=1).cpu(),
+            "mask_mean": detached_mask.mean(),
+            "mask_std": detached_mask.std(unbiased=False),
+            "mask_lt_0.1": (detached_mask < 0.1).float().mean(),
+            "mask_gt_0.9": (detached_mask > 0.9).float().mean(),
+            "trend_energy_ratio": trend_ratio.detach(),
+            "seasonal_energy_ratio": seasonal_ratio.detach(),
+            "frequency_mask_mean": detached_mask.mean(dim=1),
         }

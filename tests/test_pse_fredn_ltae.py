@@ -1,6 +1,5 @@
 import torch
 
-from models.fredn.nufft import DenseFourierBackend
 from models.stclassifier import PseFreDNLTae
 
 
@@ -23,7 +22,7 @@ def _tiny_model(num_classes=3):
         fredn_nufft_reg=1e-3,
         fredn_nufft_tol=1e-6,
         fredn_nufft_max_iter=12,
-        nufft_backend=DenseFourierBackend(),
+        fredn_fourier_solver="dense_direct",
     )
 
 
@@ -59,13 +58,49 @@ def test_prepare_reports_distinct_additivity_and_reconstruction_errors():
     pixels, mask, positions, extra = _tiny_batch()
     spatial_features = model.spatial_encoder(pixels, mask, extra)
 
-    prepared = model.prepare_temporal_features(spatial_features, positions)
+    prepared = model.prepare_temporal_features(
+        spatial_features,
+        positions,
+        collect_diagnostics=True,
+    )
 
     assert prepared.trend.shape == spatial_features.shape
     assert prepared.seasonal.shape == spatial_features.shape
     assert prepared.diagnostics["additivity_error"] < 1e-6
     assert prepared.diagnostics["reconstruction_error"] >= prepared.diagnostics["additivity_error"]
     assert prepared.diagnostics["imaginary_residual"] < 1e-4
+
+
+def test_prepare_uses_two_syntheses_normally_and_three_for_diagnostics(monkeypatch):
+    model = _tiny_model().eval()
+    pixels, mask, positions, extra = _tiny_batch()
+    spatial_features = model.spatial_encoder(pixels, mask, extra)
+    original = model.fourier_synthesizer.synthesize_complex
+    calls = []
+
+    def recording_synthesis(coeffs, timestamps):
+        calls.append(coeffs)
+        return original(coeffs, timestamps)
+
+    monkeypatch.setattr(
+        model.fourier_synthesizer,
+        "synthesize_complex",
+        recording_synthesis,
+    )
+
+    prepared = model.prepare_temporal_features(spatial_features, positions)
+    assert len(calls) == 2
+    assert prepared.diagnostics == {}
+    assert model.last_diagnostics == {}
+
+    calls.clear()
+    prepared = model.prepare_temporal_features(
+        spatial_features,
+        positions,
+        collect_diagnostics=True,
+    )
+    assert len(calls) == 3
+    assert "reconstruction_error" in prepared.diagnostics
 
 
 def test_both_ltaes_receive_exactly_the_same_shifted_positions():

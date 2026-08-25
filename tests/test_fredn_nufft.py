@@ -6,12 +6,15 @@ import pytest
 import torch
 
 from models.fredn.nufft import (
+    BatchedDirectFourierAnalyzer,
+    BatchedDirectFourierSynthesizer,
     DenseFourierBackend,
     IrregularFourierAnalyzer,
     IrregularFourierSynthesizer,
     centered_modes,
     positions_to_periodic_points,
 )
+from models.fredn.disentangler import FrequencyDisentangler
 
 
 def _known_real_series(dtype=torch.complex128):
@@ -239,3 +242,127 @@ def test_analysis_and_synthesis_propagate_gradients_to_real_features():
 
     assert features.grad is not None
     assert torch.count_nonzero(features.grad).item() > 0
+
+
+def test_dense_direct_matches_cg_reference_for_different_timestamp_rows():
+    torch.manual_seed(23)
+    positions = torch.tensor(
+        [
+            [3.0, 31.0, 76.0, 129.0, 190.0, 254.0, 333.0],
+            [8.0, 42.0, 81.0, 145.0, 202.0, 271.0, 350.0],
+            [1.0, 19.0, 68.0, 121.0, 184.0, 247.0, 319.0],
+        ],
+        dtype=torch.float64,
+    )
+    features = torch.randn(3, 7, 2, dtype=torch.float64)
+    reference = IrregularFourierAnalyzer(
+        num_modes=5,
+        period_days=365.0,
+        reg=1e-2,
+        tol=1e-12,
+        max_iter=100,
+        backend=DenseFourierBackend(),
+    )
+    direct = BatchedDirectFourierAnalyzer(
+        num_modes=5,
+        period_days=365.0,
+        reg=1e-2,
+    )
+
+    reference_coeffs, reference_diagnostics = reference(features, positions)
+    direct_coeffs, direct_diagnostics = direct(features, positions)
+
+    relative_error = torch.linalg.vector_norm(
+        direct_coeffs - reference_coeffs
+    ) / torch.linalg.vector_norm(reference_coeffs)
+    assert relative_error < 1e-7
+    assert reference_diagnostics["solver_converged"] is True
+    assert direct_diagnostics["solver_info"].shape == (3,)
+    assert torch.count_nonzero(direct_diagnostics["solver_info"]) == 0
+
+
+def test_dense_direct_uses_one_batched_solve_ex_for_distinct_timestamps(monkeypatch):
+    torch.manual_seed(29)
+    positions = torch.tensor(
+        [
+            [0.0, 20.0, 60.0, 130.0, 220.0, 330.0],
+            [5.0, 35.0, 80.0, 150.0, 245.0, 350.0],
+            [9.0, 47.0, 95.0, 175.0, 260.0, 359.0],
+        ],
+        dtype=torch.float64,
+    )
+    features = torch.randn(3, 6, 2, dtype=torch.float64)
+    calls = []
+    original_solve_ex = torch.linalg.solve_ex
+
+    def recording_solve_ex(gram, rhs, **kwargs):
+        calls.append((gram.shape, rhs.shape, kwargs))
+        return original_solve_ex(gram, rhs, **kwargs)
+
+    monkeypatch.setattr(torch.linalg, "solve_ex", recording_solve_ex)
+    analyzer = BatchedDirectFourierAnalyzer(5, 365.0, 1e-3)
+
+    coeffs, _ = analyzer(features, positions)
+
+    assert coeffs.shape == (3, 5, 2)
+    assert calls == [
+        (torch.Size([3, 5, 5]), torch.Size([3, 5, 2]), {"check_errors": False})
+    ]
+
+
+def test_dense_direct_trend_and_seasonal_match_cg_reference_path():
+    torch.manual_seed(31)
+    positions = torch.tensor(
+        [
+            [4.0, 37.0, 88.0, 146.0, 213.0, 282.0, 344.0],
+            [7.0, 45.0, 101.0, 158.0, 226.0, 294.0, 356.0],
+        ],
+        dtype=torch.float64,
+    )
+    features = torch.randn(2, 7, 3, dtype=torch.float64)
+    backend = DenseFourierBackend()
+    reference_analyzer = IrregularFourierAnalyzer(
+        5, 365.0, 1e-2, 1e-12, 100, backend=backend
+    )
+    reference_synthesizer = IrregularFourierSynthesizer(
+        5, 365.0, backend=backend
+    )
+    direct_analyzer = BatchedDirectFourierAnalyzer(5, 365.0, 1e-2)
+    direct_synthesizer = BatchedDirectFourierSynthesizer(5, 365.0)
+    disentangler = FrequencyDisentangler(5, 3).double()
+
+    reference_coeffs, _ = reference_analyzer(features, positions)
+    direct_coeffs, _ = direct_analyzer(features, positions)
+    reference_trend, reference_seasonal, _ = disentangler(reference_coeffs)
+    direct_trend, direct_seasonal, _ = disentangler(direct_coeffs)
+
+    reference_trend_output = reference_synthesizer(reference_trend, positions)
+    reference_seasonal_output = reference_synthesizer(reference_seasonal, positions)
+    direct_trend_output = direct_synthesizer(direct_trend, positions)
+    direct_seasonal_output = direct_synthesizer(direct_seasonal, positions)
+
+    assert torch.allclose(direct_trend_output, reference_trend_output, rtol=1e-7, atol=1e-9)
+    assert torch.allclose(
+        direct_seasonal_output,
+        reference_seasonal_output,
+        rtol=1e-7,
+        atol=1e-9,
+    )
+
+
+def test_dense_direct_preserves_conjugate_symmetry_and_real_synthesis():
+    torch.manual_seed(37)
+    positions = torch.tensor(
+        [[2.0, 29.0, 73.0, 118.0, 177.0, 238.0, 301.0, 358.0]],
+        dtype=torch.float64,
+    )
+    features = torch.randn(1, 8, 2, dtype=torch.float64)
+    analyzer = BatchedDirectFourierAnalyzer(5, 365.0, 1e-3)
+    synthesizer = BatchedDirectFourierSynthesizer(5, 365.0)
+
+    coeffs, _ = analyzer(features, positions)
+    reconstructed_complex = synthesizer.synthesize_complex(coeffs, positions)
+
+    assert torch.allclose(coeffs[:, :2], coeffs[:, 3:].flip(1).conj(), rtol=1e-10, atol=1e-10)
+    assert torch.linalg.vector_norm(reconstructed_complex.imag) < 1e-10
+    assert not synthesizer(coeffs, positions).is_complex()

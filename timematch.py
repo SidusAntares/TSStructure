@@ -62,8 +62,18 @@ def _forward_with_temporal_shift(
     positions,
     extra,
     temporal_shift=0,
+    collect_diagnostics=False,
 ):
     if hasattr(model, "forward_with_temporal_shift"):
+        if getattr(model, "supports_fredn_diagnostics", False):
+            return model.forward_with_temporal_shift(
+                pixels,
+                mask,
+                positions,
+                extra,
+                temporal_shift=temporal_shift,
+                collect_diagnostics=collect_diagnostics,
+            )
         return model.forward_with_temporal_shift(
             pixels,
             mask,
@@ -74,8 +84,19 @@ def _forward_with_temporal_shift(
     return model.forward(pixels, mask, positions + temporal_shift, extra)
 
 
-def _prepare_temporal_features(model, spatial_feats, positions):
+def _prepare_temporal_features(
+    model,
+    spatial_feats,
+    positions,
+    collect_diagnostics=False,
+):
     if hasattr(model, "prepare_temporal_features"):
+        if getattr(model, "supports_fredn_diagnostics", False):
+            return model.prepare_temporal_features(
+                spatial_feats,
+                positions,
+                collect_diagnostics=collect_diagnostics,
+            )
         return model.prepare_temporal_features(spatial_feats, positions)
     return spatial_feats
 
@@ -185,6 +206,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
 
         all_labels, all_pseudo_labels, all_pseudo_mask = [], [], []
         for step in progress_bar:
+            collect_diagnostics = global_step % config.log_step == 0
             sample_source, (sample_target_weak, sample_target_strong) = next(source_iter), next(target_iter)
 
             # Get pseudo labels from teacher
@@ -220,6 +242,9 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     position_s,
                     extra_s,
                     temporal_shift=source_to_target_shift,
+                    collect_diagnostics=(
+                        collect_diagnostics and num_pseudo < 2
+                    ),
                 )
                 if num_pseudo >= 2:  # at least 2 examples required for BN
                     _check_temporal_index_range(student, position_t[pseudo_mask], 0, "target")
@@ -229,6 +254,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                         mask_t[pseudo_mask],
                         position_t[pseudo_mask],
                         extra_t[pseudo_mask],
+                        collect_diagnostics=collect_diagnostics,
                     )
             else:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
@@ -271,6 +297,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                         position,
                         extra,
                         temporal_shift=temporal_shift,
+                        collect_diagnostics=collect_diagnostics,
                     )
                     source_batch_size = pixels_s.shape[0]
                     logits_source = logits[:source_batch_size]
@@ -283,6 +310,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                         position_s,
                         extra_s,
                         temporal_shift=source_to_target_shift,
+                        collect_diagnostics=collect_diagnostics,
                     )
                     logits_target = None
 
@@ -306,7 +334,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             all_pseudo_labels.extend(pseudo_targets.tolist())
             all_pseudo_mask.extend(pseudo_mask.tolist())
 
-            if step % config.log_step == 0:
+            if global_step % config.log_step == 0:
                 writer.add_scalar("train/loss", loss_meter.val, global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                 writer.add_scalar("train/target_updates", len(torch.nonzero(pseudo_mask)), global_step)

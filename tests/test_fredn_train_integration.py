@@ -44,7 +44,11 @@ for module_name, function_name in (
 
 import train
 from models.fredn.diagnostics import log_fredn_diagnostics
-from models.fredn.nufft import DenseFourierBackend
+from models.fredn.nufft import (
+    BatchedDirectFourierAnalyzer,
+    DenseFourierBackend,
+    IrregularFourierAnalyzer,
+)
 from models.stclassifier import PseFreDNLTae, PseLTae
 from scripts.report_temporal_positions import summarize_temporal_positions
 import timematch
@@ -67,6 +71,7 @@ def test_model_arguments_keep_pseltae_default_and_expose_fredn_flags():
     )
 
     assert defaults.model == "pseltae"
+    assert defaults.fredn_fourier_solver == "dense_direct"
     assert configured.model == "psefrednltae"
     assert configured.fredn_num_modes == 11
     assert configured.fredn_period_days == 730.0
@@ -98,6 +103,27 @@ def test_model_factory_builds_baseline_and_fredn_without_changing_baseline():
 
     assert isinstance(baseline, PseLTae)
     assert isinstance(fredn, PseFreDNLTae)
+    assert isinstance(fredn.fourier_analyzer, BatchedDirectFourierAnalyzer)
+
+
+def test_model_factory_keeps_nufft_cg_as_explicit_reference_backend():
+    fredn = train.create_model(
+        SimpleNamespace(
+            model="psefrednltae",
+            input_dim=10,
+            num_classes=3,
+            with_extra=False,
+            fredn_num_modes=5,
+            fredn_nufft_reg=1e-3,
+            fredn_nufft_tol=1e-5,
+            fredn_nufft_max_iter=10,
+            fredn_period_days=365.0,
+            fredn_fourier_solver="nufft_cg",
+        ),
+        nufft_backend=DenseFourierBackend(),
+    )
+
+    assert isinstance(fredn.fourier_analyzer, IrregularFourierAnalyzer)
 
 
 def test_model_factory_rejects_even_mode_count():

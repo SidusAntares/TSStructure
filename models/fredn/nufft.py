@@ -32,6 +32,164 @@ def positions_to_periodic_points(
     return torch.remainder(points + math.pi, 2.0 * math.pi) - math.pi
 
 
+def _batched_fourier_matrix(
+    points: torch.Tensor,
+    num_modes: int,
+    isign: int,
+    complex_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build ``A[b,l,k] = exp(isign * i * x[b,l] * k)`` in one batch."""
+    if isign not in (-1, 1):
+        raise ValueError("isign must be explicitly set to -1 or 1")
+    real_dtype = torch.float64 if complex_dtype == torch.complex128 else torch.float32
+    modes = centered_modes(num_modes, device=points.device, dtype=real_dtype)
+    phase = points.to(real_dtype).unsqueeze(-1) * modes
+    return torch.exp((isign * 1j) * phase).to(complex_dtype)
+
+
+class BatchedDirectFourierAnalyzer(nn.Module):
+    """Solve the batched irregular Fourier ridge system with a dense direct solve."""
+
+    def __init__(
+        self,
+        num_modes: int,
+        period_days: float,
+        reg: float,
+        synthesis_isign: int = 1,
+    ):
+        super().__init__()
+        centered_modes(num_modes)
+        if reg < 0:
+            raise ValueError("fredn_nufft_reg must be non-negative")
+        if period_days <= 0:
+            raise ValueError("fredn_period_days must be positive")
+        if synthesis_isign not in (-1, 1):
+            raise ValueError("synthesis_isign must be explicitly set to -1 or 1")
+        self.num_modes = num_modes
+        self.period_days = period_days
+        self.reg = reg
+        self.synthesis_isign = synthesis_isign
+        self.last_diagnostics: Dict[str, object] = {}
+
+    @staticmethod
+    def _complex_dtype(real_dtype: torch.dtype) -> torch.dtype:
+        return torch.complex128 if real_dtype == torch.float64 else torch.complex64
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        positions: torch.Tensor,
+        collect_diagnostics: bool = False,
+    ):
+        if features.ndim != 3 or positions.ndim != 2:
+            raise ValueError("features must be [B,L,D] and positions must be [B,L]")
+        if features.is_complex():
+            raise ValueError("features must be real-valued")
+        if features.shape[:2] != positions.shape:
+            raise ValueError("features and positions batch/time dimensions must match")
+
+        complex_dtype = self._complex_dtype(features.dtype)
+        points = positions_to_periodic_points(positions, self.period_days)
+        matrix = _batched_fourier_matrix(
+            points,
+            self.num_modes,
+            self.synthesis_isign,
+            complex_dtype,
+        )
+        adjoint = matrix.conj().transpose(-2, -1)
+        gram = torch.matmul(adjoint, matrix)
+        identity = torch.eye(
+            self.num_modes,
+            device=features.device,
+            dtype=complex_dtype,
+        )
+        gram = gram + self.reg * identity
+        rhs = torch.matmul(adjoint, features.to(complex_dtype))
+        solution, info = torch.linalg.solve_ex(
+            gram,
+            rhs,
+            check_errors=False,
+        )
+        diagnostics = {"solver_info": info.detach()}
+        if collect_diagnostics:
+            normal_residual = torch.matmul(gram, solution) - rhs
+            solver_residual = torch.linalg.vector_norm(
+                normal_residual,
+                dim=(-2, -1),
+            ) / torch.linalg.vector_norm(rhs, dim=(-2, -1)).clamp_min(
+                torch.finfo(features.dtype).eps
+            )
+            identical_rows = (
+                positions.unsqueeze(1) == positions.unsqueeze(0)
+            ).all(dim=-1)
+            shared_points_rate = (
+                identical_rows.sum(dim=1) > 1
+            ).to(features.dtype).mean()
+            diagnostics.update(
+                {
+                    "solver_residual": solver_residual.max().detach(),
+                    "per_sample_solver_residual": solver_residual.detach(),
+                    "per_sample_solver_converged": (
+                        (info == 0) & torch.isfinite(solver_residual)
+                    ).detach(),
+                    "shared_points_rate": shared_points_rate.detach(),
+                }
+            )
+        self.last_diagnostics = diagnostics
+        return solution, diagnostics
+
+
+class BatchedDirectFourierSynthesizer(nn.Module):
+    """Evaluate centered Fourier modes for all timestamp rows without grouping."""
+
+    def __init__(
+        self,
+        num_modes: int,
+        period_days: float,
+        synthesis_isign: int = 1,
+    ):
+        super().__init__()
+        centered_modes(num_modes)
+        if period_days <= 0:
+            raise ValueError("fredn_period_days must be positive")
+        if synthesis_isign not in (-1, 1):
+            raise ValueError("synthesis_isign must be explicitly set to -1 or 1")
+        self.num_modes = num_modes
+        self.period_days = period_days
+        self.synthesis_isign = synthesis_isign
+        self.last_diagnostics: Dict[str, object] = {}
+
+    def synthesize_complex(
+        self,
+        coeffs: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        if coeffs.ndim != 3 or positions.ndim != 2:
+            raise ValueError("coeffs must be [B,F,D] and positions must be [B,L]")
+        if coeffs.shape[0] != positions.shape[0]:
+            raise ValueError("coeffs and positions must have the same batch size")
+        if coeffs.shape[1] != self.num_modes:
+            raise ValueError("coeffs frequency dimension does not match num_modes")
+        if not coeffs.is_complex():
+            raise ValueError("coeffs must be complex-valued")
+
+        points = positions_to_periodic_points(positions, self.period_days)
+        matrix = _batched_fourier_matrix(
+            points,
+            self.num_modes,
+            self.synthesis_isign,
+            coeffs.dtype,
+        )
+        return torch.matmul(matrix, coeffs)
+
+    def forward(
+        self,
+        coeffs: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.synthesize_complex(coeffs, positions).real
+
+
 class DenseFourierBackend:
     """Differentiable exact Fourier sums used as a test reference backend."""
 

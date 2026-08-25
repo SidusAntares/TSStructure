@@ -1,4 +1,5 @@
 import csv
+import math
 
 import pytest
 import torch
@@ -6,6 +7,8 @@ from torch import nn
 
 from models.fredn.disentangler import FrequencyDisentangler
 from models.fredn.nufft import (
+    BatchedDirectFourierAnalyzer,
+    BatchedDirectFourierSynthesizer,
     DenseFourierBackend,
     IrregularFourierAnalyzer,
     IrregularFourierSynthesizer,
@@ -168,6 +171,72 @@ def test_analyzer_exposes_per_sample_solver_diagnostics():
     assert len(diagnostics["per_sample_solver_iterations"]) == 2
     assert len(diagnostics["per_sample_solver_converged"]) == 2
     assert len(diagnostics["per_sample_solver_residual"]) == 2
+
+
+def test_dense_direct_per_sample_solver_diagnostics_are_opt_in_and_detached():
+    analyzer = BatchedDirectFourierAnalyzer(
+        num_modes=3,
+        period_days=365.0,
+        reg=1e-3,
+    )
+    features = torch.randn(2, 5, 2, requires_grad=True)
+    positions = torch.tensor(
+        [[0.0, 20.0, 70.0, 160.0, 280.0], [2.0, 22.0, 72.0, 162.0, 282.0]]
+    )
+
+    _, normal_diagnostics = analyzer(features, positions)
+    _, audit_diagnostics = analyzer(
+        features,
+        positions,
+        collect_diagnostics=True,
+    )
+
+    assert "per_sample_solver_residual" not in normal_diagnostics
+    assert "per_sample_solver_converged" not in normal_diagnostics
+    residuals = audit_diagnostics["per_sample_solver_residual"]
+    converged = audit_diagnostics["per_sample_solver_converged"]
+    assert residuals.shape == (2,)
+    assert converged.shape == (2,)
+    assert residuals.requires_grad is False
+    assert converged.requires_grad is False
+    assert torch.isfinite(residuals).all()
+    assert converged.dtype == torch.bool
+    assert converged.all()
+
+
+def test_dense_direct_audit_reports_finite_residual_and_per_sample_convergence():
+    torch.manual_seed(43)
+    analyzer = BatchedDirectFourierAnalyzer(
+        num_modes=3,
+        period_days=365.0,
+        reg=1e-3,
+    )
+    synthesizer = BatchedDirectFourierSynthesizer(
+        num_modes=3,
+        period_days=365.0,
+    )
+    disentangler = FrequencyDisentangler(num_modes=3, channels=2)
+    features = torch.randn(2, 5, 2)
+    positions = torch.tensor(
+        [[0.0, 20.0, 70.0, 160.0, 280.0], [2.0, 22.0, 72.0, 162.0, 282.0]]
+    )
+
+    rows, diagnostics = audit_fourier_batch(
+        features,
+        positions,
+        analyzer,
+        synthesizer,
+        disentangler,
+    )
+
+    assert len(rows) == 2
+    for row in rows:
+        assert math.isfinite(row["cg_residual"])
+        assert math.isfinite(row["reconstruction_error"])
+        assert math.isfinite(row["additivity_error"])
+        assert row["cg_converged"] is True
+        assert row["cg_iterations"] == 0
+    assert math.isfinite(diagnostics["imaginary_residual"])
 
 
 def test_shared_points_solver_keeps_per_sample_iteration_counts():

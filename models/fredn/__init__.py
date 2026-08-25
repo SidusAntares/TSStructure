@@ -2,6 +2,8 @@
 
 from models.fredn.disentangler import FrequencyDisentangler
 from models.fredn.nufft import (
+    BatchedDirectFourierAnalyzer,
+    BatchedDirectFourierSynthesizer,
     DenseFourierBackend,
     IrregularFourierAnalyzer,
     IrregularFourierSynthesizer,
@@ -9,6 +11,8 @@ from models.fredn.nufft import (
 )
 
 __all__ = [
+    "BatchedDirectFourierAnalyzer",
+    "BatchedDirectFourierSynthesizer",
     "DenseFourierBackend",
     "FrequencyDisentangler",
     "IrregularFourierAnalyzer",

@@ -6,6 +6,7 @@ import json
 import math
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.fredn.disentangler import FrequencyDisentangler
 from models.fredn.nufft import (
+    BatchedDirectFourierAnalyzer,
+    BatchedDirectFourierSynthesizer,
     IrregularFourierAnalyzer,
     IrregularFourierSynthesizer,
     PytorchFinufftBackend,
@@ -137,25 +140,47 @@ def _relative_errors(reference, candidate):
     return numerator / denominator
 
 
+def _synchronize_for_audit(tensor):
+    if tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+
+
 @torch.no_grad()
 def audit_fourier_batch(features, positions, analyzer, synthesizer, disentangler):
-    coeffs, analysis = analyzer(features, positions)
+    _synchronize_for_audit(features)
+    analysis_started = time.perf_counter()
+    if isinstance(analyzer, BatchedDirectFourierAnalyzer):
+        coeffs, analysis = analyzer(
+            features,
+            positions,
+            collect_diagnostics=True,
+        )
+    else:
+        coeffs, analysis = analyzer(features, positions)
+    _synchronize_for_audit(coeffs)
+    analysis_time = time.perf_counter() - analysis_started
     trend_coeffs, seasonal_coeffs, mask = disentangler(coeffs)
 
+    _synchronize_for_audit(coeffs)
+    synthesis_started = time.perf_counter()
     reconstructed_complex = synthesizer.synthesize_complex(coeffs, positions)
-    full_synthesis = dict(synthesizer.last_diagnostics)
     trend_complex = synthesizer.synthesize_complex(trend_coeffs, positions)
-    trend_synthesis = dict(synthesizer.last_diagnostics)
     seasonal_complex = synthesizer.synthesize_complex(seasonal_coeffs, positions)
-    seasonal_synthesis = dict(synthesizer.last_diagnostics)
+    _synchronize_for_audit(seasonal_complex)
+    synthesis_time = time.perf_counter() - synthesis_started
 
     reconstructed = reconstructed_complex.real
     recombined = trend_complex.real + seasonal_complex.real
     reconstruction_errors = _relative_errors(features, reconstructed)
     additivity_errors = _relative_errors(reconstructed, recombined)
-    iterations = analysis["per_sample_solver_iterations"]
-    converged = analysis["per_sample_solver_converged"]
-    residuals = analysis["per_sample_solver_residual"]
+    if "solver_info" in analysis:
+        iterations = [0] * features.shape[0]
+        converged = analysis["per_sample_solver_converged"].detach().cpu().tolist()
+        residuals = analysis["per_sample_solver_residual"].detach().cpu().tolist()
+    else:
+        iterations = analysis["per_sample_solver_iterations"]
+        converged = analysis["per_sample_solver_converged"]
+        residuals = analysis["per_sample_solver_residual"]
 
     rows = []
     for index in range(features.shape[0]):
@@ -173,13 +198,14 @@ def audit_fourier_batch(features, positions, analyzer, synthesizer, disentangler
         )
 
     diagnostics = {
-        "analysis_time": float(analysis["analysis_time"]),
-        "synthesis_time": float(
-            full_synthesis["synthesis_time"]
-            + trend_synthesis["synthesis_time"]
-            + seasonal_synthesis["synthesis_time"]
+        "analysis_time": analysis_time,
+        "synthesis_time": synthesis_time,
+        "imaginary_residual": float(
+            (
+                torch.linalg.vector_norm(reconstructed_complex.imag)
+                / torch.linalg.vector_norm(reconstructed_complex.real).clamp_min(1e-12)
+            ).cpu()
         ),
-        "imaginary_residual": float(full_synthesis["imaginary_residual"]),
         "frequency_mask_mean": mask.detach().mean(dim=1).cpu().tolist(),
     }
     return rows, diagnostics
@@ -300,6 +326,11 @@ def main():
     parser.add_argument("--period-days", type=float, default=365.0)
     parser.add_argument("--solver-tol", type=float, default=1e-5)
     parser.add_argument("--solver-max-iter", type=int, default=20)
+    parser.add_argument(
+        "--fourier-solver",
+        choices=("nufft_cg", "dense_direct"),
+        default="nufft_cg",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-pixels", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -317,7 +348,9 @@ def main():
     if args.num_workers != 0:
         raise SystemExit("audit sweep requires --num-workers 0 for deterministic sampling")
 
-    backend = PytorchFinufftBackend()
+    backend = None
+    if args.fourier_solver == "nufft_cg" or args.official_smoke or args.official_smoke_only:
+        backend = PytorchFinufftBackend()
     if args.official_smoke or args.official_smoke_only:
         result = run_correctness_smoke(
             backend,
@@ -386,19 +419,30 @@ def main():
                 by_pixel_dim=False,
             )
             loader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
-            analyzer = IrregularFourierAnalyzer(
-                num_modes,
-                args.period_days,
-                regularization,
-                args.solver_tol,
-                args.solver_max_iter,
-                backend=backend,
-            ).to(device)
-            synthesizer = IrregularFourierSynthesizer(
-                num_modes,
-                args.period_days,
-                backend=backend,
-            ).to(device)
+            if args.fourier_solver == "nufft_cg":
+                analyzer = IrregularFourierAnalyzer(
+                    num_modes,
+                    args.period_days,
+                    regularization,
+                    args.solver_tol,
+                    args.solver_max_iter,
+                    backend=backend,
+                ).to(device)
+                synthesizer = IrregularFourierSynthesizer(
+                    num_modes,
+                    args.period_days,
+                    backend=backend,
+                ).to(device)
+            else:
+                analyzer = BatchedDirectFourierAnalyzer(
+                    num_modes,
+                    args.period_days,
+                    regularization,
+                ).to(device)
+                synthesizer = BatchedDirectFourierSynthesizer(
+                    num_modes,
+                    args.period_days,
+                ).to(device)
             config_rows = []
             analysis_time = synthesis_time = 0.0
             sample_offset = 0
@@ -426,6 +470,7 @@ def main():
                             "pse_state": pse_state,
                             "num_modes": num_modes,
                             "regularization": regularization,
+                            "fourier_solver": args.fourier_solver,
                             "sample_index": sample_offset + row["sample_index"],
                         }
                     )
@@ -447,6 +492,7 @@ def main():
                 "pse_state": pse_state,
                 "num_modes_cli": num_modes,
                 "regularization": regularization,
+                "fourier_solver": args.fourier_solver,
                 "median_sequence_length": float(np.median(lengths)),
                 "num_modes_over_median_length": float(num_modes / np.median(lengths)),
                 "reconstruction": summarize_rows(config_rows, "reconstruction_error"),

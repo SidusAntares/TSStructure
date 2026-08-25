@@ -32,7 +32,10 @@ def log_fredn_diagnostics(
         return
     for source_name, tensorboard_name in _SCALAR_KEYS.items():
         if source_name in diagnostics:
-            writer.add_scalar(tensorboard_name, diagnostics[source_name], step)
+            value = diagnostics[source_name]
+            if torch.is_tensor(value):
+                value = value.detach().cpu()
+            writer.add_scalar(tensorboard_name, value, step)
 
     frequency_means = diagnostics.get("frequency_mask_mean")
     if frequency_means is None or step % frequency_log_interval != 0:
