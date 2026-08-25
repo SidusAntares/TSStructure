@@ -20,7 +20,8 @@ from competitors.mmd.train_mmd import train_mmd
 from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
-from models.stclassifier import PseLTae, PseTae, PseTempCNN, PseGru
+from models.mtkd import log_mtkd_diagnostics, reset_mtkd_diagnostics
+from models.stclassifier import PseLTae, PseMTKDLtae, PseTae, PseTempCNN, PseGru
 from timematch import train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
 from utils import label_utils
@@ -33,6 +34,61 @@ from utils.train_utils import (
     to_cuda,
 )
 
+
+
+def _build_model(config):
+    if config.model == 'pseltae':
+        return PseLTae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+        )
+    if config.model == 'psemtkdltae':
+        return PseMTKDLtae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+            mtkd_time_scale_days=config.mtkd_time_scale_days,
+            mtkd_tau_fast_init_days=config.mtkd_tau_fast_init_days,
+            mtkd_tau_slow_init_days=config.mtkd_tau_slow_init_days,
+            mtkd_tau_min_days=config.mtkd_tau_min_days,
+            mtkd_delta_tau_min_days=config.mtkd_delta_tau_min_days,
+            mtkd_learnable_tau=config.mtkd_learnable_tau,
+        )
+    if config.model == 'psetae':
+        return PseTae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+        )
+    if config.model == 'psetcnn':
+        return PseTempCNN(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+        )
+    if config.model == 'psegru':
+        return PseGru(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+        )
+    raise NotImplementedError()
+
+
+def _add_model_arguments(parser):
+    parser.add_argument(
+        '--model',
+        default='pseltae',
+        choices=['psetae', 'pseltae', 'psemtkdltae', 'psetcnn', 'psegru'],
+    )
+    parser.add_argument('--mtkd_time_scale_days', default=365.0, type=float)
+    parser.add_argument('--mtkd_tau_fast_init_days', default=30.0, type=float)
+    parser.add_argument('--mtkd_tau_slow_init_days', default=90.0, type=float)
+    parser.add_argument('--mtkd_tau_min_days', default=1.0, type=float)
+    parser.add_argument('--mtkd_delta_tau_min_days', default=1.0, type=float)
+    parser.add_argument('--mtkd_learnable_tau', default=True, type=bool_flag)
+    return parser
 
 
 def main(config):
@@ -66,16 +122,7 @@ def main(config):
         sample_pixels_val = config.sample_pixels_val or (config.eval and config.temporal_shift)
         val_loader, test_loader = create_evaluation_loaders(config.target, splits, config, sample_pixels_val)
 
-        if config.model == 'pseltae':
-            model = PseLTae(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psetae':
-            model = PseTae(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psetcnn':
-            model = PseTempCNN(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        elif config.model == 'psegru':
-            model = PseGru(input_dim=config.input_dim, num_classes=config.num_classes, with_extra=config.with_extra)
-        else:
-            raise NotImplementedError()
+        model = _build_model(config)
         
         model.to(config.device)
 
@@ -298,6 +345,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
     best_f1 = 0
     for epoch in range(config.epochs):
         model.train()
+        reset_mtkd_diagnostics(model)
         loss_meter = AverageMeter()
 
         progress_bar = tqdm(
@@ -333,6 +381,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
 
         model.eval()
         best_f1 = validation(best_f1, best_model_path, config, criterion, device, epoch, model, val_loader, writer)
+        log_mtkd_diagnostics(model, 'source', epoch + 1, writer)
 
 
 def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1, test_ratio=0.2):
@@ -463,7 +512,7 @@ if __name__ == '__main__':
     parser.add_argument('--focal_loss_gamma', default=1.0, type=float, help='gamma value for focal loss')
     parser.add_argument('--num_pixels', default=64, type=int, help='Number of pixels to sample from the input sample')
     parser.add_argument('--seq_length', default=30, type=int, help='Number of time steps to sample from the input sample')
-    parser.add_argument('--model', default='pseltae', choices=['psetae', 'pseltae', 'psetcnn', 'psegru'])
+    _add_model_arguments(parser)
     parser.add_argument('--input_dim', default=10, type=int, help='Number of channels of input sample')
     parser.add_argument('--with_extra', default=False, type=bool_flag, help='whether to input extra geometric features to the PSE')
     parser.add_argument('--tensorboard_log_dir', default='runs')

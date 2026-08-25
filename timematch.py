@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from dataset import PixelSetData
 from evaluation import validation
+from models.mtkd import log_mtkd_diagnostics, reset_mtkd_diagnostics
 from transforms import (
     Normalize,
     RandomSamplePixels,
@@ -139,6 +140,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             writer.add_scalar("train/temporal_shift", target_to_source_shift, epoch)
 
         student.train()
+        reset_mtkd_diagnostics(student)
         teacher.eval()  # don't update BN or use dropout for teacher
 
         all_labels, all_pseudo_labels, all_pseudo_mask = [], [], []
@@ -243,6 +245,8 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             else:
                 teacher.eval()
                 best_f1 = validation(best_f1, None, config, criterion, device, epoch, teacher, val_loader, writer)
+
+        log_mtkd_diagnostics(student, 'timematch', epoch + 1, writer)
 
     # Save model final model 
     if config.output_student:
