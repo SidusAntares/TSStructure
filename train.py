@@ -24,6 +24,7 @@ from models.mtkd import log_mtkd_diagnostics, reset_mtkd_diagnostics
 from models.stclassifier import (
     PseGru,
     PseLTae,
+    PseMTKDLateLtae,
     PseMTKDLtae,
     PseMTKDMidLtae,
     PseTae,
@@ -74,6 +75,18 @@ def _build_model(config):
             mtkd_delta_tau_min_days=config.mtkd_delta_tau_min_days,
             mtkd_learnable_tau=config.mtkd_learnable_tau,
         )
+    if config.model == 'psemtkdlateltae':
+        return PseMTKDLateLtae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+            mtkd_time_scale_days=config.mtkd_time_scale_days,
+            mtkd_tau_fast_init_days=config.mtkd_tau_fast_init_days,
+            mtkd_tau_slow_init_days=config.mtkd_tau_slow_init_days,
+            mtkd_tau_min_days=config.mtkd_tau_min_days,
+            mtkd_delta_tau_min_days=config.mtkd_delta_tau_min_days,
+            mtkd_learnable_tau=config.mtkd_learnable_tau,
+        )
     if config.model == 'psetae':
         return PseTae(
             input_dim=config.input_dim,
@@ -99,7 +112,15 @@ def _add_model_arguments(parser):
     parser.add_argument(
         '--model',
         default='pseltae',
-        choices=['psetae', 'pseltae', 'psemtkdltae', 'psemtkdmidltae', 'psetcnn', 'psegru'],
+        choices=[
+            'psetae',
+            'pseltae',
+            'psemtkdltae',
+            'psemtkdmidltae',
+            'psemtkdlateltae',
+            'psetcnn',
+            'psegru',
+        ],
     )
     parser.add_argument('--mtkd_time_scale_days', default=365.0, type=float)
     parser.add_argument('--mtkd_tau_fast_init_days', default=30.0, type=float)

@@ -3,7 +3,7 @@ from copy import deepcopy
 import torch.nn as nn
 
 from models.competings import GRU, TempConv
-from models.decoder import get_decoder
+from models.decoder import MTKDLateLogitDecoder, get_decoder
 from models.ltae import LTAE
 from models.mtkd import MTKDEarlyConcatLTAE, MTKDMidConcatLTAE
 from models.pse import PixelSetEncoder
@@ -232,6 +232,88 @@ class PseMTKDMidLtae(nn.Module):
         mid_mlp4 = deepcopy(mlp4)
         mid_mlp4[0] = 2 * mlp3[-1]
         self.decoder = get_decoder(mid_mlp4, num_classes)
+
+    def forward(self, pixels, mask, positions, extra, return_feats=False):
+        spatial_feats = self.spatial_encoder(pixels, mask, extra)
+        temporal_feats = self.temporal_encoder(spatial_feats, positions)
+        logits = self.decoder(temporal_feats)
+        if return_feats:
+            return logits, temporal_feats
+        return logits
+
+    def param_ratio(self):
+        total = get_ntrainparams(self)
+        spatial = get_ntrainparams(self.spatial_encoder)
+        temporal = get_ntrainparams(self.temporal_encoder)
+        classifier = get_ntrainparams(self.decoder)
+        print("TOTAL TRAINABLE PARAMETERS : {}".format(total))
+        print(
+            "RATIOS: Spatial {:5.1f}% , Temporal {:5.1f}% , Classifier {:5.1f}%".format(
+                spatial / total * 100,
+                temporal / total * 100,
+                classifier / total * 100,
+            )
+        )
+        return total
+
+
+class PseMTKDLateLtae(nn.Module):
+    """Pixel-Set encoder + MTKD dual LTAE + independent logit classifiers."""
+
+    def __init__(
+        self,
+        input_dim=10,
+        mlp1=[10, 32, 64],
+        pooling="mean_std",
+        mlp2=[128, 128],
+        with_extra=True,
+        extra_size=4,
+        n_head=16,
+        d_k=8,
+        d_model=256,
+        mlp3=[256, 128],
+        dropout=0.2,
+        T=1000,
+        mlp4=[128, 64, 32],
+        num_classes=20,
+        max_temporal_shift=100,
+        mtkd_time_scale_days=365.0,
+        mtkd_tau_fast_init_days=30.0,
+        mtkd_tau_slow_init_days=90.0,
+        mtkd_tau_min_days=1.0,
+        mtkd_delta_tau_min_days=1.0,
+        mtkd_learnable_tau=True,
+    ):
+        super().__init__()
+        if with_extra:
+            mlp2 = deepcopy(mlp2)
+            mlp2[0] += extra_size
+
+        self.spatial_encoder = PixelSetEncoder(
+            input_dim,
+            mlp1=mlp1,
+            pooling=pooling,
+            mlp2=mlp2,
+            with_extra=with_extra,
+            extra_size=extra_size,
+        )
+        self.temporal_encoder = MTKDMidConcatLTAE(
+            in_channels=mlp2[-1],
+            n_head=n_head,
+            d_k=d_k,
+            d_model=d_model,
+            n_neurons=mlp3,
+            dropout=dropout,
+            T=T,
+            max_temporal_shift=max_temporal_shift,
+            time_scale_days=mtkd_time_scale_days,
+            tau_fast_init_days=mtkd_tau_fast_init_days,
+            tau_slow_init_days=mtkd_tau_slow_init_days,
+            tau_min_days=mtkd_tau_min_days,
+            delta_tau_min_days=mtkd_delta_tau_min_days,
+            learnable_tau=mtkd_learnable_tau,
+        )
+        self.decoder = MTKDLateLogitDecoder(mlp4, num_classes)
 
     def forward(self, pixels, mask, positions, extra, return_feats=False):
         spatial_feats = self.spatial_encoder(pixels, mask, extra)

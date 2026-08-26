@@ -13,7 +13,13 @@ from models.mtkd import (
     MultiScaleTemporalKernelDecomposition,
     log_mtkd_diagnostics,
 )
-from models.stclassifier import PseLTae, PseMTKDLtae, PseMTKDMidLtae
+from models.decoder import MTKDLateLogitDecoder
+from models.stclassifier import (
+    PseLTae,
+    PseMTKDLateLtae,
+    PseMTKDLtae,
+    PseMTKDMidLtae,
+)
 from train import _add_model_arguments, _build_model
 
 
@@ -465,3 +471,128 @@ def test_mid_model_uses_existing_mtkd_diagnostics_helpers(capsys):
     assert diagnostics is not None
     assert diagnostics["ts_relative_difference"] == pytest.approx(0.0, abs=1e-7)
     assert "MTKD DIAGNOSTICS" in output
+
+
+def test_late_decoder_uses_independent_classifiers_and_sums_raw_logits():
+    decoder = MTKDLateLogitDecoder([128, 64, 32], num_classes=6).eval()
+    temporal_feats = torch.randn(3, 256)
+    z_t = temporal_feats[:, :128]
+    z_s = temporal_feats[:, 128:]
+
+    with torch.no_grad():
+        logits_t = decoder.classifier_t(z_t)
+        logits_s = decoder.classifier_s(z_s)
+        actual = decoder(temporal_feats)
+
+    assert decoder.classifier_t is not decoder.classifier_s
+    assert next(decoder.classifier_t.parameters()).data_ptr() != next(
+        decoder.classifier_s.parameters()
+    ).data_ptr()
+    assert logits_t.shape == (3, 6)
+    assert logits_s.shape == (3, 6)
+    torch.testing.assert_close(actual, logits_t + logits_s)
+
+
+def test_late_model_reuses_mid_encoder_and_passes_identical_positions_to_both_ltaes():
+    model = PseMTKDLateLtae(input_dim=10, with_extra=False, num_classes=6).eval()
+    spatial_feats = torch.randn(2, 5, 128)
+    positions = torch.arange(5).unsqueeze(0).repeat(2, 1) * 17
+    captured = {}
+
+    def capture_positions(name):
+        def hook(_module, args):
+            captured[name] = args[1]
+
+        return hook
+
+    handle_t = model.temporal_encoder.ltae_t.register_forward_pre_hook(
+        capture_positions("t")
+    )
+    handle_s = model.temporal_encoder.ltae_s.register_forward_pre_hook(
+        capture_positions("s")
+    )
+    try:
+        with torch.no_grad():
+            temporal_feats = model.temporal_encoder(spatial_feats, positions)
+    finally:
+        handle_t.remove()
+        handle_s.remove()
+
+    assert isinstance(model.temporal_encoder, MTKDMidConcatLTAE)
+    assert captured["t"] is positions
+    assert captured["s"] is positions
+    assert captured["t"] is captured["s"]
+    assert temporal_feats.shape == (2, 256)
+    assert isinstance(model.temporal_encoder.mtkd, MultiScaleTemporalKernelDecomposition)
+    assert sum(
+        isinstance(module, MultiScaleTemporalKernelDecomposition)
+        for module in model.modules()
+    ) == 1
+
+
+def test_pse_mtkd_late_ltae_return_feats_and_manual_timematch_path_match():
+    model = PseMTKDLateLtae(input_dim=10, with_extra=False, num_classes=6).eval()
+    pixels, valid_pixels, positions, extra = _model_inputs()
+
+    with torch.no_grad():
+        full_logits = model(pixels, valid_pixels, positions, extra)
+        returned_logits, temporal_feats = model(
+            pixels, valid_pixels, positions, extra, return_feats=True
+        )
+        spatial = model.spatial_encoder(pixels, valid_pixels, extra)
+        temporal = model.temporal_encoder(spatial, positions)
+        manual_logits = model.decoder(temporal)
+        logits_t = model.decoder.classifier_t(temporal[:, :128])
+        logits_s = model.decoder.classifier_s(temporal[:, 128:])
+
+    assert temporal_feats.shape == (2, 256)
+    assert full_logits.shape == (2, 6)
+    torch.testing.assert_close(full_logits, returned_logits)
+    torch.testing.assert_close(full_logits, manual_logits)
+    torch.testing.assert_close(full_logits, logits_t + logits_s)
+    torch.testing.assert_close(temporal_feats, temporal)
+
+
+def test_train_build_model_passes_mtkd_configuration_to_late_model():
+    config = SimpleNamespace(
+        model="psemtkdlateltae",
+        input_dim=10,
+        num_classes=6,
+        with_extra=False,
+        mtkd_time_scale_days=400.0,
+        mtkd_tau_fast_init_days=20.0,
+        mtkd_tau_slow_init_days=75.0,
+        mtkd_tau_min_days=2.0,
+        mtkd_delta_tau_min_days=3.0,
+        mtkd_learnable_tau=False,
+    )
+
+    model = _build_model(config)
+    tau_fast, tau_slow = model.temporal_encoder.mtkd.get_tau_days()
+
+    assert isinstance(model, PseMTKDLateLtae)
+    torch.testing.assert_close(tau_fast, torch.tensor(20.0))
+    torch.testing.assert_close(tau_slow, torch.tensor(75.0))
+    assert not isinstance(model.temporal_encoder.mtkd.a, torch.nn.Parameter)
+    assert not isinstance(model.temporal_encoder.mtkd.b, torch.nn.Parameter)
+
+
+def test_late_model_is_registered_and_launcher_uses_expected_configuration():
+    parser = argparse.ArgumentParser()
+    _add_model_arguments(parser)
+    choices = parser._option_string_actions["--model"].choices
+    launcher = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "run_mtkd_ts_late_9tasks_3gpu.sh"
+    )
+    text = launcher.read_text(encoding="utf-8")
+
+    assert "psemtkdlateltae" in choices
+    assert "GPU_IDS=(1 2 3)" in text
+    assert "SOURCE_DOMAINS=(AT1 FR1 FR2)" in text
+    assert "--model psemtkdlateltae" in text
+    assert "--progress_bar off" in text
+    assert "mtkd_ts_late_9tasks" in text
+    assert "run_mtkd_ts_late_9tasks_3gpu.sh" in text
+    assert "psemtkdmidltae" not in text
