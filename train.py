@@ -21,7 +21,14 @@ from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
 from models.mtkd import log_mtkd_diagnostics, reset_mtkd_diagnostics
-from models.stclassifier import PseLTae, PseMTKDLtae, PseTae, PseTempCNN, PseGru
+from models.stclassifier import (
+    PseGru,
+    PseLTae,
+    PseMTKDLtae,
+    PseMTKDMidLtae,
+    PseTae,
+    PseTempCNN,
+)
 from timematch import train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
 from utils import label_utils
@@ -45,6 +52,18 @@ def _build_model(config):
         )
     if config.model == 'psemtkdltae':
         return PseMTKDLtae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+            mtkd_time_scale_days=config.mtkd_time_scale_days,
+            mtkd_tau_fast_init_days=config.mtkd_tau_fast_init_days,
+            mtkd_tau_slow_init_days=config.mtkd_tau_slow_init_days,
+            mtkd_tau_min_days=config.mtkd_tau_min_days,
+            mtkd_delta_tau_min_days=config.mtkd_delta_tau_min_days,
+            mtkd_learnable_tau=config.mtkd_learnable_tau,
+        )
+    if config.model == 'psemtkdmidltae':
+        return PseMTKDMidLtae(
             input_dim=config.input_dim,
             num_classes=config.num_classes,
             with_extra=config.with_extra,
@@ -80,7 +99,7 @@ def _add_model_arguments(parser):
     parser.add_argument(
         '--model',
         default='pseltae',
-        choices=['psetae', 'pseltae', 'psemtkdltae', 'psetcnn', 'psegru'],
+        choices=['psetae', 'pseltae', 'psemtkdltae', 'psemtkdmidltae', 'psetcnn', 'psegru'],
     )
     parser.add_argument('--mtkd_time_scale_days', default=365.0, type=float)
     parser.add_argument('--mtkd_tau_fast_init_days', default=30.0, type=float)

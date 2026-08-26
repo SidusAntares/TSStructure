@@ -9,10 +9,11 @@ import torch
 
 from models.mtkd import (
     MTKDEarlyConcatLTAE,
+    MTKDMidConcatLTAE,
     MultiScaleTemporalKernelDecomposition,
     log_mtkd_diagnostics,
 )
-from models.stclassifier import PseLTae, PseMTKDLtae
+from models.stclassifier import PseLTae, PseMTKDLtae, PseMTKDMidLtae
 from train import _add_model_arguments, _build_model
 
 
@@ -339,3 +340,128 @@ def test_mtkd_launcher_uses_only_gpu_1_2_3_and_disables_progress_bars():
 def test_mtkd_rejects_invalid_time_scales(kwargs):
     with pytest.raises(ValueError):
         _make_mtkd(**kwargs)
+
+
+
+def test_mid_temporal_encoder_uses_independent_ltaes_then_concatenates_features():
+    encoder = MTKDMidConcatLTAE(in_channels=128).eval()
+    spatial_feats = torch.randn(2, 5, 128)
+    positions = torch.arange(5).unsqueeze(0).repeat(2, 1) * 17
+
+    with torch.no_grad():
+        t, s = encoder.mtkd(spatial_feats, positions)
+        expected_t = encoder.ltae_t(t, positions)
+        expected_s = encoder.ltae_s(s, positions)
+        actual = encoder(spatial_feats, positions)
+
+    assert encoder.ltae_t is not encoder.ltae_s
+    assert encoder.ltae_t.in_channels == 128
+    assert encoder.ltae_s.in_channels == 128
+    assert expected_t.shape == (2, 128)
+    assert expected_s.shape == (2, 128)
+    assert actual.shape == (2, 256)
+    torch.testing.assert_close(actual, torch.cat([expected_t, expected_s], dim=-1))
+
+    t_param = next(encoder.ltae_t.parameters())
+    s_param = next(encoder.ltae_s.parameters())
+    assert t_param is not s_param
+    assert t_param.data_ptr() != s_param.data_ptr()
+
+
+def test_mid_temporal_encoder_forwards_timematch_properties_and_keeps_embeddings_independent():
+    encoder = MTKDMidConcatLTAE(in_channels=128)
+
+    assert encoder.max_temporal_shift == encoder.ltae_t.max_temporal_shift
+    assert encoder.positional_enc is encoder.ltae_t.positional_enc
+    assert encoder.ltae_t.positional_enc is not encoder.ltae_s.positional_enc
+    assert (
+        encoder.ltae_t.positional_enc.num_embeddings
+        == encoder.ltae_s.positional_enc.num_embeddings
+    )
+    embedding_keys = [
+        key for key in encoder.state_dict() if key.endswith("positional_enc.weight")
+    ]
+    assert embedding_keys == [
+        "ltae_t.positional_enc.weight",
+        "ltae_s.positional_enc.weight",
+    ]
+
+
+def test_pse_mtkd_mid_ltae_logits_return_feats_and_manual_timematch_path_match():
+    model = PseMTKDMidLtae(input_dim=10, with_extra=False, num_classes=6).eval()
+    pixels, valid_pixels, positions, extra = _model_inputs()
+
+    with torch.no_grad():
+        logits = model(pixels, valid_pixels, positions, extra)
+        returned_logits, temporal_feats = model(
+            pixels, valid_pixels, positions, extra, return_feats=True
+        )
+        spatial = model.spatial_encoder(pixels, valid_pixels, extra)
+        manual_temporal = model.temporal_encoder(spatial, positions)
+        manual_logits = model.decoder(manual_temporal)
+
+    assert spatial.shape == (2, 5, 128)
+    assert temporal_feats.shape == (2, 256)
+    assert logits.shape == (2, 6)
+    assert model.decoder[0].linear.in_features == 256
+    torch.testing.assert_close(logits, returned_logits)
+    torch.testing.assert_close(logits, manual_logits)
+    torch.testing.assert_close(temporal_feats, manual_temporal)
+
+
+def test_train_build_model_passes_mtkd_configuration_to_mid_model():
+    config = SimpleNamespace(
+        model="psemtkdmidltae",
+        input_dim=10,
+        num_classes=6,
+        with_extra=False,
+        mtkd_time_scale_days=400.0,
+        mtkd_tau_fast_init_days=20.0,
+        mtkd_tau_slow_init_days=75.0,
+        mtkd_tau_min_days=2.0,
+        mtkd_delta_tau_min_days=3.0,
+        mtkd_learnable_tau=False,
+    )
+
+    model = _build_model(config)
+    tau_fast, tau_slow = model.temporal_encoder.mtkd.get_tau_days()
+
+    assert isinstance(model, PseMTKDMidLtae)
+    torch.testing.assert_close(tau_fast, torch.tensor(20.0))
+    torch.testing.assert_close(tau_slow, torch.tensor(75.0))
+    assert model.temporal_encoder.mtkd.time_scale_days == 400.0
+    assert not isinstance(model.temporal_encoder.mtkd.a, torch.nn.Parameter)
+    assert not isinstance(model.temporal_encoder.mtkd.b, torch.nn.Parameter)
+
+
+def test_mid_model_is_registered_and_launcher_uses_expected_configuration():
+    parser = argparse.ArgumentParser()
+    _add_model_arguments(parser)
+    choices = parser._option_string_actions["--model"].choices
+    launcher = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "run_mtkd_ts_mid_9tasks_3gpu.sh"
+    )
+    text = launcher.read_text(encoding="utf-8")
+
+    assert "psemtkdmidltae" in choices
+    assert "GPU_IDS=(1 2 3)" in text
+    assert "SOURCE_DOMAINS=(AT1 FR1 FR2)" in text
+    assert "--model psemtkdmidltae" in text
+    assert "--progress_bar off" in text
+    assert "mtkd_ts_mid_9tasks" in text
+    assert "run_mtkd_ts_mid_9tasks_3gpu.sh" in text
+
+
+def test_mid_model_uses_existing_mtkd_diagnostics_helpers(capsys):
+    model = PseMTKDMidLtae(input_dim=10, with_extra=False, num_classes=6)
+    component = torch.ones(2, 3, 128)
+    model.temporal_encoder.record_diagnostics(component, component)
+
+    diagnostics = log_mtkd_diagnostics(model, "source", 1)
+    output = capsys.readouterr().out
+
+    assert diagnostics is not None
+    assert diagnostics["ts_relative_difference"] == pytest.approx(0.0, abs=1e-7)
+    assert "MTKD DIAGNOSTICS" in output
