@@ -163,7 +163,7 @@ class _DualRangeModel:
         return self.encoders
 
 
-def test_temporal_range_check_validates_both_fredn_ltaes():
+def test_temporal_range_check_validates_all_reported_encoders():
     positions = torch.tensor([[30, 40]], dtype=torch.long)
 
     with pytest.raises(ValueError, match="encoder=1"):

@@ -18,6 +18,10 @@ _SCALAR_KEYS = {
     "analysis_time": "fredn/nufft_analysis_time",
     "synthesis_time": "fredn/nufft_synthesis_time",
     "imaginary_residual": "fredn/imaginary_residual",
+    "trend_logit_rms": "fredn/trend_logit_rms",
+    "seasonal_logit_rms": "fredn/seasonal_logit_rms",
+    "trend_feature_rms": "fredn/trend_feature_rms",
+    "seasonal_feature_rms": "fredn/seasonal_feature_rms",
 }
 
 

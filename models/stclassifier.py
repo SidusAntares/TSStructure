@@ -7,12 +7,13 @@ import torch.nn as nn
 
 from models.competings import GRU, TempConv
 from models.decoder import get_decoder
-from models.fredn.disentangler import FrequencyDisentangler
+from models.fredn.disentangler import FrequencyDisentangler, ReImSpectralEncoder
 from models.fredn.nufft import (
     BatchedDirectFourierAnalyzer,
     BatchedDirectFourierSynthesizer,
     IrregularFourierAnalyzer,
     IrregularFourierSynthesizer,
+    centered_modes,
 )
 from models.ltae import LTAE
 from models.pse import PixelSetEncoder
@@ -22,12 +23,12 @@ from models.tae import TemporalAttentionEncoder
 @dataclass
 class FreDNPreparedFeatures:
     trend: torch.Tensor
-    seasonal: torch.Tensor
+    seasonal_coeffs: torch.Tensor
     diagnostics: Dict[str, object]
 
 
 class PseFreDNLTae(nn.Module):
-    """PSE + complementary FreDN decomposition + two independent LTAEs."""
+    """PSE + FreDN decomposition + trend LTAE and seasonal ReIm encoder."""
 
     supports_fredn_diagnostics = True
 
@@ -99,6 +100,14 @@ class PseFreDNLTae(nn.Module):
                 "fredn_fourier_solver must be 'dense_direct' or 'nufft_cg'"
             )
         self.fredn_fourier_solver = fredn_fourier_solver
+        self.fredn_num_modes = fredn_num_modes
+        self.fredn_period_days = fredn_period_days
+        self.synthesis_isign = self.fourier_synthesizer.synthesis_isign
+        self.register_buffer(
+            "fredn_modes",
+            centered_modes(fredn_num_modes),
+            persistent=False,
+        )
         self.frequency_disentangler = FrequencyDisentangler(
             num_modes=fredn_num_modes,
             channels=channels,
@@ -116,25 +125,22 @@ class PseFreDNLTae(nn.Module):
             max_position=max_position,
         )
         self.trend_temporal_encoder = LTAE(**ltae_kwargs)
-        self.seasonal_temporal_encoder = LTAE(**ltae_kwargs)
         temporal_dim = mlp3[-1]
         if mlp4[0] != temporal_dim:
-            raise ValueError("mlp4 input must match each LTAE output dimension")
+            raise ValueError("mlp4 input must match the branch feature dimension")
         self.trend_norm = nn.LayerNorm(temporal_dim)
-        self.seasonal_norm = nn.LayerNorm(temporal_dim)
-        self.fusion = nn.Sequential(
-            nn.Linear(2 * temporal_dim, temporal_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
+        self.seasonal_spectral_encoder = ReImSpectralEncoder(
+            num_modes=fredn_num_modes,
+            channels=channels,
+            output_dim=temporal_dim,
+            dropout=dropout,
         )
-        self.decoder = get_decoder(mlp4, num_classes)
+        self.trend_classifier = get_decoder(mlp4, num_classes)
+        self.seasonal_classifier = get_decoder(mlp4, num_classes)
         self.last_diagnostics: Dict[str, object] = {}
 
     def get_temporal_encoders(self):
-        return (
-            self.trend_temporal_encoder,
-            self.seasonal_temporal_encoder,
-        )
+        return (self.trend_temporal_encoder,)
 
     def prepare_temporal_features(
         self,
@@ -159,14 +165,13 @@ class PseFreDNLTae(nn.Module):
             trend_coeffs,
             positions,
         )
-        seasonal_complex = self.fourier_synthesizer.synthesize_complex(
-            seasonal_coeffs,
-            positions,
-        )
         trend = trend_complex.real
-        seasonal = seasonal_complex.real
         diagnostics = {}
         if collect_diagnostics:
+            seasonal_complex = self.fourier_synthesizer.synthesize_complex(
+                seasonal_coeffs,
+                positions,
+            )
             reconstructed_complex = self.fourier_synthesizer.synthesize_complex(
                 coeffs,
                 positions,
@@ -174,7 +179,7 @@ class PseFreDNLTae(nn.Module):
             reconstructed = reconstructed_complex.real
             epsilon = torch.finfo(spatial_feats.dtype).eps
             additivity_error = torch.linalg.vector_norm(
-                trend + seasonal - reconstructed
+                trend + seasonal_complex.real - reconstructed
             ) / (torch.linalg.vector_norm(reconstructed) + epsilon)
             reconstruction_error = torch.linalg.vector_norm(
                 reconstructed - spatial_feats
@@ -212,9 +217,52 @@ class PseFreDNLTae(nn.Module):
         self.last_diagnostics = diagnostics
         return FreDNPreparedFeatures(
             trend=trend,
-            seasonal=seasonal,
+            seasonal_coeffs=seasonal_coeffs,
             diagnostics=diagnostics,
         )
+
+    def _shift_seasonal_coefficients(
+        self,
+        seasonal_coeffs,
+        temporal_shift,
+    ):
+        if seasonal_coeffs.ndim != 3:
+            raise ValueError("seasonal_coeffs must be [B,F,D]")
+        batch_size = seasonal_coeffs.shape[0]
+        shift = torch.as_tensor(
+            temporal_shift,
+            device=seasonal_coeffs.device,
+            dtype=seasonal_coeffs.real.dtype,
+        )
+        if shift.ndim == 0:
+            shift = shift.reshape(1, 1, 1)
+        elif shift.ndim == 1 and shift.shape[0] in (1, batch_size):
+            shift = shift.reshape(shift.shape[0], 1, 1)
+        elif (
+            shift.ndim == 2
+            and shift.shape[1] == 1
+            and shift.shape[0] in (1, batch_size)
+        ):
+            shift = shift.reshape(shift.shape[0], 1, 1)
+        else:
+            raise ValueError(
+                "temporal_shift must be scalar, [1], [B], [1,1], or [B,1]"
+            )
+
+        modes = self.fredn_modes.to(
+            device=seasonal_coeffs.device,
+            dtype=seasonal_coeffs.real.dtype,
+        ).reshape(1, -1, 1)
+        phase_angle = (
+            -self.synthesis_isign
+            * 2.0
+            * torch.pi
+            * shift
+            * modes
+            / self.fredn_period_days
+        )
+        phase = torch.polar(torch.ones_like(phase_angle), phase_angle)
+        return seasonal_coeffs * phase
 
     def classify_prepared(
         self,
@@ -228,19 +276,28 @@ class PseFreDNLTae(nn.Module):
             prepared.trend,
             shifted_positions,
         )
-        seasonal_embedding = self.seasonal_temporal_encoder(
-            prepared.seasonal,
-            shifted_positions,
+        trend_features = self.trend_norm(trend_embedding)
+        shifted_seasonal_coeffs = self._shift_seasonal_coefficients(
+            prepared.seasonal_coeffs,
+            temporal_shift,
         )
-        combined = torch.cat(
-            [
-                self.trend_norm(trend_embedding),
-                self.seasonal_norm(seasonal_embedding),
-            ],
-            dim=-1,
+        seasonal_features = self.seasonal_spectral_encoder(
+            shifted_seasonal_coeffs
         )
-        temporal_feats = self.fusion(combined)
-        logits = self.decoder(temporal_feats)
+        trend_logits = self.trend_classifier(trend_features)
+        seasonal_logits = self.seasonal_classifier(seasonal_features)
+        logits = trend_logits + seasonal_logits
+        temporal_feats = trend_features + seasonal_features
+        if prepared.diagnostics:
+            prepared.diagnostics.update(
+                {
+                    "trend_logit_rms": trend_logits.square().mean().sqrt().detach(),
+                    "seasonal_logit_rms": seasonal_logits.square().mean().sqrt().detach(),
+                    "trend_feature_rms": trend_features.square().mean().sqrt().detach(),
+                    "seasonal_feature_rms": seasonal_features.square().mean().sqrt().detach(),
+                }
+            )
+            self.last_diagnostics = prepared.diagnostics
         if return_feats:
             return logits, temporal_feats
         return logits

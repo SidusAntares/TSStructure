@@ -167,6 +167,10 @@ def test_required_fredn_diagnostics_are_logged(capsys):
             "analysis_time": 0.01,
             "synthesis_time": 0.02,
             "imaginary_residual": 1e-8,
+            "trend_logit_rms": 0.8,
+            "seasonal_logit_rms": 0.6,
+            "trend_feature_rms": 1.0,
+            "seasonal_feature_rms": 0.9,
             "frequency_mask_mean": [0.2, 0.4, 0.2],
         }
     )
@@ -184,6 +188,10 @@ def test_required_fredn_diagnostics_are_logged(capsys):
         "fredn/reconstruction_error",
         "fredn/additivity_error",
         "fredn/nufft_solver_iterations",
+        "fredn/trend_logit_rms",
+        "fredn/seasonal_logit_rms",
+        "fredn/trend_feature_rms",
+        "fredn/seasonal_feature_rms",
     }
     assert required.issubset(writer.scalars)
     assert "FREDN_MASK_BY_FREQUENCY" in capsys.readouterr().out
@@ -334,6 +342,8 @@ def test_psefrednltae_timematch_one_step_smoke(monkeypatch):
     assert saved
     assert all(torch.isfinite(value).all() for value in saved[0]["state_dict"].values())
     assert "fredn/additivity_error" in writer.scalars
+    assert "fredn/trend_logit_rms" in writer.scalars
+    assert "fredn/seasonal_logit_rms" in writer.scalars
 
 
 def test_fredn_shift_sweep_runs_fourier_analysis_once(monkeypatch):
@@ -350,16 +360,24 @@ def test_fredn_shift_sweep_runs_fourier_analysis_once(monkeypatch):
         ),
     )
     calls = []
+    classify_calls = []
     hook = model.fourier_analyzer.register_forward_hook(
         lambda module, inputs, output: calls.append(1)
     )
+    original_classify = model.classify_prepared
+
+    def recording_classify(*args, **kwargs):
+        classify_calls.append(1)
+        return original_classify(*args, **kwargs)
+
+    monkeypatch.setattr(model, "classify_prepared", recording_classify)
     try:
         timematch.estimate_temporal_shift(
             model,
             [sample],
             "cpu",
-            min_shift=-2,
-            max_shift=2,
+            min_shift=-60,
+            max_shift=60,
             sample_size=1,
             shift_estimator="IS",
             progress_bar="off",
@@ -368,3 +386,4 @@ def test_fredn_shift_sweep_runs_fourier_analysis_once(monkeypatch):
         hook.remove()
 
     assert calls == [1]
+    assert len(classify_calls) == 121

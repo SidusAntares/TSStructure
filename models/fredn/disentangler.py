@@ -8,6 +8,68 @@ from torch import nn
 from models.fredn.nufft import centered_modes
 
 
+class _ResidualFrequencyLearner(nn.Module):
+    """Small frequency MLP with a learned residual projection."""
+
+    def __init__(self, num_modes: int, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.mlp_projection = nn.Sequential(
+            nn.Linear(num_modes, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_modes),
+        )
+        self.residual_projection = nn.Linear(num_modes, num_modes)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return self.mlp_projection(values) + self.residual_projection(values)
+
+
+class ReImSpectralEncoder(nn.Module):
+    """Encode a complex spectrum with one learner shared by real and imaginary parts."""
+
+    def __init__(
+        self,
+        num_modes: int,
+        channels: int,
+        output_dim: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        centered_modes(num_modes)
+        if channels <= 0 or output_dim <= 0:
+            raise ValueError("channels and output_dim must be positive")
+        self.num_modes = num_modes
+        self.channels = channels
+        self.shared_reim_mlp = _ResidualFrequencyLearner(
+            num_modes=num_modes,
+            hidden_dim=2 * num_modes,
+            dropout=dropout,
+        )
+        self.spectral_readout = nn.Linear(2 * num_modes, 1)
+        self.channel_norm = nn.LayerNorm(channels)
+        self.output_projection = nn.Sequential(
+            nn.Linear(channels, output_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, coeffs: torch.Tensor) -> torch.Tensor:
+        if coeffs.ndim != 3:
+            raise ValueError("coeffs must be [B,F,D]")
+        if coeffs.shape[1:] != (self.num_modes, self.channels):
+            raise ValueError("coeffs shape does not match configured modes/channels")
+        if not coeffs.is_complex():
+            raise ValueError("coeffs must be complex-valued")
+
+        channel_spectra = coeffs.transpose(1, 2)
+        real_features = self.shared_reim_mlp(channel_spectra.real)
+        imaginary_features = self.shared_reim_mlp(channel_spectra.imag)
+        reim_features = torch.cat((real_features, imaginary_features), dim=-1)
+        channel_features = self.spectral_readout(reim_features).squeeze(-1)
+        return self.output_projection(self.channel_norm(channel_features))
+
+
 class FrequencyDisentangler(nn.Module):
     """Split coefficients with a soft mask shared by paired frequencies."""
 

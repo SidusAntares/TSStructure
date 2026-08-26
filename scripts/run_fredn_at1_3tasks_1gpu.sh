@@ -11,8 +11,8 @@ SKIP_SOURCE="${SKIP_SOURCE:-0}"
 export PYTHONUNBUFFERED=1
 
 SOURCE="austria/33UVP/2017"
-RUN_NAME="fredn_at1_3tasks_seed1"
-SOURCE_EXPERIMENT="fredn_AT1_source_seed1"
+RUN_NAME="fredn_reim_at1_3tasks_seed1"
+SOURCE_EXPERIMENT="fredn_reim_AT1_source_seed1"
 OUTPUT_ROOT="outputs/${RUN_NAME}"
 TENSORBOARD_ROOT="runs/${RUN_NAME}"
 TASK_LOG_ROOT="logs/${RUN_NAME}"
@@ -70,7 +70,7 @@ run_timematch_task() {
     local stage="$1"
     local target_alias="$2"
     local target="$3"
-    local experiment="fredn_AT1_${target_alias}_timematch_seed1"
+    local experiment="fredn_reim_AT1_${target_alias}_timematch_seed1"
     local task_log="${TASK_LOG_ROOT}/AT1_${target_alias}_timematch.log"
 
     printf '%s\n' \
