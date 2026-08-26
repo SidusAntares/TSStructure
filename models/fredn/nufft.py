@@ -125,6 +125,7 @@ class BatchedDirectFourierAnalyzer(nn.Module):
             shared_points_rate = (
                 identical_rows.sum(dim=1) > 1
             ).to(features.dtype).mean()
+            condition_numbers = torch.linalg.cond(gram.detach())
             diagnostics.update(
                 {
                     "solver_residual": solver_residual.max().detach(),
@@ -133,6 +134,7 @@ class BatchedDirectFourierAnalyzer(nn.Module):
                         (info == 0) & torch.isfinite(solver_residual)
                     ).detach(),
                     "shared_points_rate": shared_points_rate.detach(),
+                    "condition_numbers": condition_numbers.detach(),
                 }
             )
         self.last_diagnostics = diagnostics

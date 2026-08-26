@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import pytest
 import torch
 
@@ -101,6 +103,13 @@ def test_prepare_reports_distinct_additivity_and_reconstruction_errors():
     assert prepared.diagnostics["additivity_error"] < 1e-6
     assert prepared.diagnostics["reconstruction_error"] >= prepared.diagnostics["additivity_error"]
     assert prepared.diagnostics["imaginary_residual"] < 1e-4
+    for key in (
+        "fourier_condition_mean",
+        "fourier_condition_median",
+        "fourier_condition_p95",
+        "fourier_condition_max",
+    ):
+        assert torch.isfinite(prepared.diagnostics[key])
 
 
 def test_prepare_uses_one_synthesis_normally_and_three_for_diagnostics(monkeypatch):
@@ -288,3 +297,40 @@ def test_classification_gradient_reaches_every_required_component():
         ]
         assert gradients, name
         assert any(torch.count_nonzero(gradient).item() > 0 for gradient in gradients), name
+
+
+def test_collecting_diagnostics_does_not_change_logits_or_parameter_gradients():
+    normal_model = _tiny_model().eval()
+    diagnostic_model = deepcopy(normal_model).eval()
+    pixels, mask, positions, extra = _tiny_batch()
+
+    normal_logits = normal_model(
+        pixels,
+        mask,
+        positions,
+        extra,
+        collect_diagnostics=False,
+    )
+    diagnostic_logits = diagnostic_model(
+        pixels,
+        mask,
+        positions,
+        extra,
+        collect_diagnostics=True,
+    )
+    normal_logits.square().mean().backward()
+    diagnostic_logits.square().mean().backward()
+
+    assert torch.equal(normal_logits, diagnostic_logits)
+    for (normal_name, normal_parameter), (diagnostic_name, diagnostic_parameter) in zip(
+        normal_model.named_parameters(),
+        diagnostic_model.named_parameters(),
+    ):
+        assert normal_name == diagnostic_name
+        if normal_parameter.grad is None or diagnostic_parameter.grad is None:
+            assert normal_parameter.grad is diagnostic_parameter.grad, normal_name
+        else:
+            assert torch.equal(
+                normal_parameter.grad,
+                diagnostic_parameter.grad,
+            ), normal_name

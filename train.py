@@ -20,7 +20,10 @@ from competitors.mmd.train_mmd import train_mmd
 from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
-from models.fredn.diagnostics import log_fredn_diagnostics
+from models.fredn.diagnostics import (
+    log_fredn_checkpoint_mask,
+    log_fredn_diagnostics,
+)
 from models.stclassifier import PseFreDNLTae, PseLTae, PseTae, PseTempCNN, PseGru
 from timematch import train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
@@ -153,6 +156,19 @@ def main(config):
 
         state_dict = torch.load(best_model_path, weights_only=False)['state_dict']
         model.load_state_dict(state_dict)
+        checkpoint_stage = (
+            'timematch_test'
+            if getattr(config, 'method', None) == 'timematch'
+            else 'source_best'
+        )
+        log_fredn_checkpoint_mask(
+            model,
+            stage=checkpoint_stage,
+            output_path=os.path.join(
+                config.fold_dir,
+                f'fredn_mask_{checkpoint_stage}.pt',
+            ),
+        )
 
         test_metrics = evaluation(
             model,

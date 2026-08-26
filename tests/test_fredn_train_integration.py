@@ -43,7 +43,10 @@ for module_name, function_name in (
     sys.modules.setdefault(module_name, module_stub)
 
 import train
-from models.fredn.diagnostics import log_fredn_diagnostics
+from models.fredn.diagnostics import (
+    log_fredn_checkpoint_mask,
+    log_fredn_diagnostics,
+)
 from models.fredn.nufft import (
     BatchedDirectFourierAnalyzer,
     DenseFourierBackend,
@@ -172,6 +175,43 @@ def test_required_fredn_diagnostics_are_logged(capsys):
             "trend_feature_rms": 1.0,
             "seasonal_feature_rms": 0.9,
             "frequency_mask_mean": [0.2, 0.4, 0.2],
+            "frequency_mask_std": [0.1, 0.2, 0.1],
+            "frequency_mask_p05": [0.1, 0.2, 0.1],
+            "frequency_mask_p25": [0.15, 0.3, 0.15],
+            "frequency_mask_p50": [0.2, 0.4, 0.2],
+            "frequency_mask_p75": [0.25, 0.5, 0.25],
+            "frequency_mask_p95": [0.3, 0.6, 0.3],
+            "frequency_mask_near_half": [0.0, 0.25, 0.0],
+            "frequency_mask_low025": [0.5, 0.0, 0.5],
+            "frequency_mask_high075": [0.0, 0.0, 0.0],
+            "mask_min": 0.1,
+            "mask_max": 0.6,
+            "mask_p05": 0.1,
+            "mask_p25": 0.15,
+            "mask_p50": 0.2,
+            "mask_p75": 0.4,
+            "mask_p95": 0.6,
+            "mask_near_half": 0.1,
+            "mask_low025": 0.4,
+            "mask_high075": 0.0,
+            "feature_freq_std_mean": 0.12,
+            "feature_freq_std_median": 0.11,
+            "feature_freq_std_p90": 0.2,
+            "feature_freq_std_max": 0.25,
+            "feature_freq_range_mean": 0.3,
+            "feature_freq_range_median": 0.28,
+            "feature_freq_range_p90": 0.4,
+            "feature_freq_range_max": 0.5,
+            "abs_freq_corr": -0.7,
+            "input_energy_by_frequency": [0.2, 0.6, 0.2],
+            "trend_energy_by_frequency": [0.1, 0.8, 0.1],
+            "seasonal_energy_by_frequency": [0.3, 0.4, 0.3],
+            "branch_trend_energy_ratio": 0.45,
+            "branch_seasonal_energy_ratio": 0.55,
+            "fourier_condition_mean": 10.0,
+            "fourier_condition_median": 9.0,
+            "fourier_condition_p95": 14.0,
+            "fourier_condition_max": 15.0,
         }
     )
     writer = _Writer()
@@ -192,9 +232,143 @@ def test_required_fredn_diagnostics_are_logged(capsys):
         "fredn/seasonal_logit_rms",
         "fredn/trend_feature_rms",
         "fredn/seasonal_feature_rms",
+        "fredn/mask_near_half",
+        "fredn/mask_low025",
+        "fredn/mask_high075",
+        "fredn/feature_freq_std_mean",
+        "fredn/abs_freq_corr",
+        "fredn/branch_trend_energy_ratio",
+        "fredn/fourier_condition_mean",
     }
     assert required.issubset(writer.scalars)
-    assert "FREDN_MASK_BY_FREQUENCY" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    for prefix in (
+        "FREDN_MASK_BY_FREQUENCY",
+        "FREDN_MASK_DISTRIBUTION",
+        "FREDN_MASK_GLOBAL",
+        "FREDN_MASK_FEATURE_SPECIALIZATION",
+        "FREDN_MASK_PRIOR_ALIGNMENT",
+        "FREDN_ENERGY_BY_FREQUENCY",
+        "FREDN_BRANCH_ENERGY",
+        "FREDN_BRANCH_OUTPUT",
+        "FREDN_FOURIER_DIAGNOSTICS",
+        "FREDN_FOURIER_CONDITION",
+    ):
+        assert prefix in output
+
+
+def test_checkpoint_mask_logging_uses_restored_mask_and_saves_snapshot(
+    tmp_path,
+    capsys,
+):
+    model = _tiny_fredn_for_timematch()
+    with torch.no_grad():
+        model.frequency_disentangler.nonnegative_logits.fill_(-4.0)
+    restored_state = deepcopy(model.state_dict())
+    restored_mask = model.frequency_disentangler.expanded_mask().detach().clone()
+    with torch.no_grad():
+        model.frequency_disentangler.nonnegative_logits.fill_(4.0)
+    model.load_state_dict(restored_state)
+    snapshot_path = tmp_path / "fredn_mask_source_best.pt"
+
+    logged = log_fredn_checkpoint_mask(
+        model,
+        stage="source_best",
+        output_path=snapshot_path,
+    )
+
+    output = capsys.readouterr().out
+    snapshot = torch.load(snapshot_path, weights_only=False)
+    assert logged is True
+    assert "FREDN_CHECKPOINT_MASK|stage=source_best" in output
+    assert "high075=0.000000" in output
+    assert torch.equal(snapshot["mask"], restored_mask.cpu())
+    assert snapshot["frequencies"].shape == (3,)
+
+
+@pytest.mark.parametrize(
+    ("method", "expected_stage"),
+    (("source", "source_best"), ("timematch", "timematch_test")),
+)
+def test_main_logs_checkpoint_mask_after_restoring_evaluated_state(
+    monkeypatch,
+    method,
+    expected_stage,
+):
+    model = _tiny_fredn_for_timematch()
+    with torch.no_grad():
+        model.frequency_disentangler.nonnegative_logits.fill_(-4.0)
+    restored_state = deepcopy(model.state_dict())
+    restored_mask = model.frequency_disentangler.expanded_mask().detach().clone()
+    with torch.no_grad():
+        model.frequency_disentangler.nonnegative_logits.fill_(4.0)
+
+    monkeypatch.setattr(train, "prepare_data_protocol", lambda config: ({}, None))
+    monkeypatch.setattr(
+        train,
+        "create_train_val_test_folds",
+        lambda *args, **kwargs: [{}],
+    )
+    monkeypatch.setattr(
+        train,
+        "create_evaluation_loaders",
+        lambda *args, **kwargs: (None, []),
+    )
+    monkeypatch.setattr(train, "create_model", lambda config: model)
+    monkeypatch.setattr(
+        train.torch,
+        "load",
+        lambda *args, **kwargs: {"state_dict": restored_state},
+    )
+    captured = {}
+
+    def capture_checkpoint_mask(restored_model, stage, output_path):
+        captured["mask"] = (
+            restored_model.frequency_disentangler.expanded_mask().detach().clone()
+        )
+        captured["stage"] = stage
+        captured["output_path"] = str(output_path)
+        return True
+
+    monkeypatch.setattr(train, "log_fredn_checkpoint_mask", capture_checkpoint_mask)
+    monkeypatch.setattr(
+        train,
+        "evaluation",
+        lambda *args, **kwargs: {
+            "accuracy": 1.0,
+            "macro_f1": 1.0,
+            "classification_report": "ok",
+        },
+    )
+    monkeypatch.setattr(train, "save_results", lambda *args, **kwargs: None)
+    monkeypatch.setattr(train, "overall_performance", lambda config: None)
+    config = SimpleNamespace(
+        seed=1,
+        device="cpu",
+        source="source",
+        target="target",
+        num_folds=1,
+        val_ratio=0.2,
+        test_ratio=0.2,
+        overall=False,
+        closed_set=False,
+        output_dir="outputs/diagnostic-test",
+        sample_pixels_val=False,
+        eval=True,
+        temporal_shift=0,
+        method=method,
+        classes=["a", "b"],
+        experiment_name="diagnostic-test",
+        progress_bar="off",
+    )
+
+    train.main(config)
+
+    assert torch.equal(captured["mask"], restored_mask)
+    assert captured["stage"] == expected_stage
+    assert captured["output_path"].endswith(
+        f"fredn_mask_{expected_stage}.pt"
+    )
 
 
 def _write_metadata(root: Path, domain: str, start_date: int, dates):

@@ -189,6 +189,19 @@ class PseFreDNLTae(nn.Module):
             ) / (torch.linalg.vector_norm(reconstructed_complex.real) + epsilon)
 
             diagnostics = dict(analysis_diagnostics)
+            if "condition_numbers" in diagnostics:
+                condition_numbers = diagnostics["condition_numbers"]
+                diagnostics.update(
+                    {
+                        "fourier_condition_mean": condition_numbers.mean().detach(),
+                        "fourier_condition_median": condition_numbers.median().detach(),
+                        "fourier_condition_p95": torch.quantile(
+                            condition_numbers,
+                            0.95,
+                        ).detach(),
+                        "fourier_condition_max": condition_numbers.max().detach(),
+                    }
+                )
             if "solver_info" in diagnostics:
                 solver_info = diagnostics["solver_info"]
                 diagnostics.update(

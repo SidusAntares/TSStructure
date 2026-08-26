@@ -106,22 +106,141 @@ class FrequencyDisentangler(nn.Module):
         return trend, seasonal, mask
 
     @staticmethod
+    def mask_diagnostics(mask: torch.Tensor) -> Dict[str, object]:
+        """Summarize the expanded mask that is applied to Fourier coefficients."""
+        if mask.ndim != 2:
+            raise ValueError("mask must be [F,D]")
+        if mask.is_complex():
+            raise ValueError("mask must be real-valued")
+
+        with torch.no_grad():
+            detached_mask = mask.detach()
+            quantile_levels = torch.tensor(
+                [0.05, 0.25, 0.50, 0.75, 0.95],
+                device=detached_mask.device,
+                dtype=detached_mask.dtype,
+            )
+            frequency_quantiles = torch.quantile(
+                detached_mask,
+                quantile_levels,
+                dim=1,
+            )
+            global_quantiles = torch.quantile(
+                detached_mask.reshape(-1),
+                quantile_levels,
+            )
+            feature_frequency_std = detached_mask.std(dim=0, unbiased=False)
+            feature_frequency_range = (
+                detached_mask.max(dim=0).values
+                - detached_mask.min(dim=0).values
+            )
+            frequency_mean = detached_mask.mean(dim=1)
+            magnitudes = centered_modes(
+                detached_mask.shape[0],
+                device=detached_mask.device,
+                dtype=detached_mask.dtype,
+            ).abs()
+            centered_magnitudes = magnitudes - magnitudes.mean()
+            centered_frequency_mean = frequency_mean - frequency_mean.mean()
+            correlation_denominator = torch.sqrt(
+                centered_magnitudes.square().sum()
+                * centered_frequency_mean.square().sum()
+            ).clamp_min(torch.finfo(detached_mask.dtype).eps)
+            abs_freq_corr = (
+                centered_magnitudes * centered_frequency_mean
+            ).sum() / correlation_denominator
+
+            feature_std_quantiles = torch.quantile(
+                feature_frequency_std,
+                torch.tensor(
+                    [0.50, 0.90],
+                    device=detached_mask.device,
+                    dtype=detached_mask.dtype,
+                ),
+            )
+            feature_range_quantiles = torch.quantile(
+                feature_frequency_range,
+                torch.tensor(
+                    [0.50, 0.90],
+                    device=detached_mask.device,
+                    dtype=detached_mask.dtype,
+                ),
+            )
+            near_half = (detached_mask - 0.5).abs() < 0.05
+            low025 = detached_mask < 0.25
+            high075 = detached_mask > 0.75
+
+            return {
+                "mask_mean": detached_mask.mean(),
+                "mask_std": detached_mask.std(unbiased=False),
+                "mask_min": detached_mask.min(),
+                "mask_max": detached_mask.max(),
+                "mask_p05": global_quantiles[0],
+                "mask_p25": global_quantiles[1],
+                "mask_p50": global_quantiles[2],
+                "mask_p75": global_quantiles[3],
+                "mask_p95": global_quantiles[4],
+                "mask_near_half": near_half.float().mean(),
+                "mask_low025": low025.float().mean(),
+                "mask_high075": high075.float().mean(),
+                "mask_lt_0.1": (detached_mask < 0.1).float().mean(),
+                "mask_gt_0.9": (detached_mask > 0.9).float().mean(),
+                "frequency_mask_mean": frequency_mean,
+                "frequency_mask_std": detached_mask.std(dim=1, unbiased=False),
+                "frequency_mask_p05": frequency_quantiles[0],
+                "frequency_mask_p25": frequency_quantiles[1],
+                "frequency_mask_p50": frequency_quantiles[2],
+                "frequency_mask_p75": frequency_quantiles[3],
+                "frequency_mask_p95": frequency_quantiles[4],
+                "frequency_mask_near_half": near_half.float().mean(dim=1),
+                "frequency_mask_low025": low025.float().mean(dim=1),
+                "frequency_mask_high075": high075.float().mean(dim=1),
+                "feature_freq_std_mean": feature_frequency_std.mean(),
+                "feature_freq_std_median": feature_std_quantiles[0],
+                "feature_freq_std_p90": feature_std_quantiles[1],
+                "feature_freq_std_max": feature_frequency_std.max(),
+                "feature_freq_range_mean": feature_frequency_range.mean(),
+                "feature_freq_range_median": feature_range_quantiles[0],
+                "feature_freq_range_p90": feature_range_quantiles[1],
+                "feature_freq_range_max": feature_frequency_range.max(),
+                "abs_freq_corr": abs_freq_corr,
+            }
+
+    @staticmethod
     def diagnostics(
         coeffs: torch.Tensor,
         trend_coeffs: torch.Tensor,
         seasonal_coeffs: torch.Tensor,
         mask: torch.Tensor,
     ) -> Dict[str, object]:
-        total_energy = coeffs.abs().square().sum().clamp_min(1e-12)
-        trend_ratio = trend_coeffs.abs().square().sum() / total_energy
-        seasonal_ratio = seasonal_coeffs.abs().square().sum() / total_energy
-        detached_mask = mask.detach()
-        return {
-            "mask_mean": detached_mask.mean(),
-            "mask_std": detached_mask.std(unbiased=False),
-            "mask_lt_0.1": (detached_mask < 0.1).float().mean(),
-            "mask_gt_0.9": (detached_mask > 0.9).float().mean(),
-            "trend_energy_ratio": trend_ratio.detach(),
-            "seasonal_energy_ratio": seasonal_ratio.detach(),
-            "frequency_mask_mean": detached_mask.mean(dim=1),
-        }
+        with torch.no_grad():
+            detached_coeffs = coeffs.detach()
+            detached_trend = trend_coeffs.detach()
+            detached_seasonal = seasonal_coeffs.detach()
+            total_energy = detached_coeffs.abs().square().sum().clamp_min(1e-12)
+            trend_total = detached_trend.abs().square().sum()
+            seasonal_total = detached_seasonal.abs().square().sum()
+            branch_total = (trend_total + seasonal_total).clamp_min(1e-12)
+
+            input_by_frequency = detached_coeffs.abs().square().mean(dim=(0, 2))
+            trend_by_frequency = detached_trend.abs().square().mean(dim=(0, 2))
+            seasonal_by_frequency = detached_seasonal.abs().square().mean(
+                dim=(0, 2)
+            )
+
+            diagnostics = FrequencyDisentangler.mask_diagnostics(mask)
+            diagnostics.update(
+                {
+                    "trend_energy_ratio": trend_total / total_energy,
+                    "seasonal_energy_ratio": seasonal_total / total_energy,
+                    "branch_trend_energy_ratio": trend_total / branch_total,
+                    "branch_seasonal_energy_ratio": seasonal_total / branch_total,
+                    "input_energy_by_frequency": input_by_frequency
+                    / input_by_frequency.sum().clamp_min(1e-12),
+                    "trend_energy_by_frequency": trend_by_frequency
+                    / trend_by_frequency.sum().clamp_min(1e-12),
+                    "seasonal_energy_by_frequency": seasonal_by_frequency
+                    / seasonal_by_frequency.sum().clamp_min(1e-12),
+                }
+            )
+            return diagnostics
