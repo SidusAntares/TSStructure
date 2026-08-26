@@ -221,6 +221,54 @@ class MTKDEarlyConcatLTAE(nn.Module):
         return self.ltae(early_concat, positions)
 
 
+class MTKDSOnlyLTAE(MTKDEarlyConcatLTAE):
+    """MTKD followed by one LTAE over the smoothed structure S only."""
+
+    def __init__(
+        self,
+        in_channels=128,
+        n_head=16,
+        d_k=8,
+        d_model=256,
+        n_neurons=(256, 128),
+        dropout=0.2,
+        T=1000,
+        max_temporal_shift=100,
+        time_scale_days=365.0,
+        tau_fast_init_days=30.0,
+        tau_slow_init_days=90.0,
+        tau_min_days=1.0,
+        delta_tau_min_days=1.0,
+        learnable_tau=True,
+    ):
+        nn.Module.__init__(self)
+        self.mtkd = MultiScaleTemporalKernelDecomposition(
+            time_scale_days=time_scale_days,
+            tau_fast_init_days=tau_fast_init_days,
+            tau_slow_init_days=tau_slow_init_days,
+            tau_min_days=tau_min_days,
+            delta_tau_min_days=delta_tau_min_days,
+            learnable_tau=learnable_tau,
+        )
+        self.ltae = LTAE(
+            in_channels=in_channels,
+            n_head=n_head,
+            d_k=d_k,
+            d_model=d_model,
+            n_neurons=list(n_neurons),
+            dropout=dropout,
+            T=T,
+            max_temporal_shift=max_temporal_shift,
+        )
+        self.reset_diagnostics()
+
+    def forward(self, spatial_feats, positions):
+        t, s = self.mtkd(spatial_feats, positions)
+        if self.training:
+            self.record_diagnostics(t, s)
+        return self.ltae(s, positions)
+
+
 class MTKDMidConcatLTAE(nn.Module):
     """MTKD T/S branches encoded independently, then concatenated."""
 
