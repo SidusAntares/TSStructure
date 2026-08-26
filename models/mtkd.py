@@ -381,6 +381,88 @@ class MTKDMidConcatLTAE(nn.Module):
         return torch.cat([z_t, z_s], dim=-1)
 
 
+class MTKDTDMidConcatLTAE(MTKDMidConcatLTAE):
+    """MTKD T/D branches encoded independently, then concatenated."""
+
+    def __init__(
+        self,
+        in_channels=128,
+        n_head=16,
+        d_k=8,
+        d_model=256,
+        n_neurons=(256, 128),
+        dropout=0.2,
+        T=1000,
+        max_temporal_shift=100,
+        time_scale_days=365.0,
+        tau_fast_init_days=30.0,
+        tau_slow_init_days=90.0,
+        tau_min_days=1.0,
+        delta_tau_min_days=1.0,
+        learnable_tau=True,
+    ):
+        super().__init__(
+            in_channels=in_channels,
+            n_head=n_head,
+            d_k=d_k,
+            d_model=d_model,
+            n_neurons=n_neurons,
+            dropout=dropout,
+            T=T,
+            max_temporal_shift=max_temporal_shift,
+            time_scale_days=time_scale_days,
+            tau_fast_init_days=tau_fast_init_days,
+            tau_slow_init_days=tau_slow_init_days,
+            tau_min_days=tau_min_days,
+            delta_tau_min_days=delta_tau_min_days,
+            learnable_tau=learnable_tau,
+        )
+        self.ltae_d = self.ltae_s
+        del self.ltae_s
+
+    def record_diagnostics(self, t, s):
+        """Accumulate existing T/S metrics and detached T/D metrics."""
+        super().record_diagnostics(t, s)
+        with torch.no_grad():
+            flat_t = t.detach().reshape(t.shape[0], -1)
+            flat_s = s.detach().reshape(s.shape[0], -1)
+            flat_d = flat_s - flat_t
+            d_norm = torch.linalg.vector_norm(flat_d, dim=1)
+            s_norm = torch.linalg.vector_norm(flat_s, dim=1)
+            values = {
+                "d_to_s_norm_ratio": d_norm / (s_norm + self.mtkd.eps),
+                "td_cosine_similarity": F.cosine_similarity(
+                    flat_t, flat_d, dim=1, eps=self.mtkd.eps
+                ),
+            }
+            for name, value in values.items():
+                batch_total = value.sum().detach()
+                if name in self._diagnostic_totals:
+                    self._diagnostic_totals[name].add_(batch_total)
+                else:
+                    self._diagnostic_totals[name] = batch_total
+
+    def get_diagnostics(self):
+        diagnostics = super().get_diagnostics()
+        for name in ("d_to_s_norm_ratio", "td_cosine_similarity"):
+            if self._diagnostic_sample_count:
+                diagnostics[name] = (
+                    self._diagnostic_totals[name] / self._diagnostic_sample_count
+                ).detach().cpu().item()
+            else:
+                diagnostics[name] = float("nan")
+        return diagnostics
+
+    def forward(self, spatial_feats, positions):
+        t, s = self.mtkd(spatial_feats, positions)
+        if self.training:
+            self.record_diagnostics(t, s)
+        d = s - t
+        z_t = self.ltae_t(t, positions)
+        z_d = self.ltae_d(d, positions)
+        return torch.cat([z_t, z_d], dim=-1)
+
+
 def reset_mtkd_diagnostics(model):
     """Reset diagnostics when the model uses an MTKD temporal encoder."""
     temporal_encoder = getattr(model, "temporal_encoder", None)
@@ -416,6 +498,15 @@ def log_mtkd_diagnostics(model, stage, epoch, writer=None):
         ),
         "=" * 60,
     ]
+    if "d_to_s_norm_ratio" in diagnostics:
+        lines[-1:-1] = [
+            "d_to_s_norm_ratio      : {:.6f}".format(
+                diagnostics["d_to_s_norm_ratio"]
+            ),
+            "td_cosine_similarity   : {:.6f}".format(
+                diagnostics["td_cosine_similarity"]
+            ),
+        ]
     print("\n\n" + "\n".join(lines) + "\n\n", flush=True)
     if writer is not None:
         for name, value in diagnostics.items():

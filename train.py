@@ -28,6 +28,7 @@ from models.stclassifier import (
     PseMTKDLtae,
     PseMTKDMidLtae,
     PseMTKDSOnlyLtae,
+    PseMTKDTDMidLtae,
     PseTae,
     PseTempCNN,
 )
@@ -100,6 +101,18 @@ def _build_model(config):
             mtkd_delta_tau_min_days=config.mtkd_delta_tau_min_days,
             mtkd_learnable_tau=config.mtkd_learnable_tau,
         )
+    if config.model == 'psemtkdtdmidltae':
+        return PseMTKDTDMidLtae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+            mtkd_time_scale_days=config.mtkd_time_scale_days,
+            mtkd_tau_fast_init_days=config.mtkd_tau_fast_init_days,
+            mtkd_tau_slow_init_days=config.mtkd_tau_slow_init_days,
+            mtkd_tau_min_days=config.mtkd_tau_min_days,
+            mtkd_delta_tau_min_days=config.mtkd_delta_tau_min_days,
+            mtkd_learnable_tau=config.mtkd_learnable_tau,
+        )
     if config.model == 'psetae':
         return PseTae(
             input_dim=config.input_dim,
@@ -132,6 +145,7 @@ def _add_model_arguments(parser):
             'psemtkdmidltae',
             'psemtkdlateltae',
             'psemtkdsltae',
+            'psemtkdtdmidltae',
             'psetcnn',
             'psegru',
         ],
