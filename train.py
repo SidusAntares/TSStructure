@@ -20,7 +20,11 @@ from competitors.mmd.train_mmd import train_mmd
 from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
-from models.mtkd import log_mtkd_diagnostics, reset_mtkd_diagnostics
+from models.mtkd import (
+    log_mtkd_diagnostics,
+    optimizer_parameter_groups,
+    reset_mtkd_diagnostics,
+)
 from models.stclassifier import (
     PseGru,
     PseLTae,
@@ -29,6 +33,9 @@ from models.stclassifier import (
     PseMTKDMidLtae,
     PseMTKDSOnlyLtae,
     PseMTKDTDMidLtae,
+    PseMTKDTQMidLtae,
+    PseMTKDTQLOOLtae,
+    PseMTKDTQSingleLtae,
     PseTae,
     PseTempCNN,
 )
@@ -113,6 +120,35 @@ def _build_model(config):
             mtkd_delta_tau_min_days=config.mtkd_delta_tau_min_days,
             mtkd_learnable_tau=config.mtkd_learnable_tau,
         )
+    if config.model == 'psemtkdtqmidltae':
+        return PseMTKDTQMidLtae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+            mtkd_time_scale_days=config.mtkd_time_scale_days,
+            mtkd_tau_fast_init_days=config.mtkd_tau_fast_init_days,
+            mtkd_tau_slow_init_days=config.mtkd_tau_slow_init_days,
+            mtkd_tau_min_days=config.mtkd_tau_min_days,
+            mtkd_delta_tau_min_days=config.mtkd_delta_tau_min_days,
+            mtkd_learnable_tau=config.mtkd_learnable_tau,
+        )
+    if config.model == 'psemtkdtqsingleltae':
+        return PseMTKDTQSingleLtae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+            tq_tau_days=config.tq_tau_days,
+        )
+    if config.model == 'psemtkdtqlooltae':
+        return PseMTKDTQLOOLtae(
+            input_dim=config.input_dim,
+            num_classes=config.num_classes,
+            with_extra=config.with_extra,
+            tq_loo_variant=config.tq_loo_variant,
+            tq_tau_init_days=config.tq_tau_init_days,
+            tq_tau_min_days=config.tq_tau_min_days,
+            tq_loo_pse_weight=config.tq_loo_pse_weight,
+        )
     if config.model == 'psetae':
         return PseTae(
             input_dim=config.input_dim,
@@ -146,6 +182,9 @@ def _add_model_arguments(parser):
             'psemtkdlateltae',
             'psemtkdsltae',
             'psemtkdtdmidltae',
+            'psemtkdtqmidltae',
+            'psemtkdtqsingleltae',
+            'psemtkdtqlooltae',
             'psetcnn',
             'psegru',
         ],
@@ -156,6 +195,15 @@ def _add_model_arguments(parser):
     parser.add_argument('--mtkd_tau_min_days', default=1.0, type=float)
     parser.add_argument('--mtkd_delta_tau_min_days', default=1.0, type=float)
     parser.add_argument('--mtkd_learnable_tau', default=True, type=bool_flag)
+    parser.add_argument('--tq_tau_days', default=60.0, type=float)
+    parser.add_argument(
+        '--tq_loo_variant',
+        default='split_loo_tau_pse',
+        choices=['loo_tau_only', 'pse_loo_fixed75', 'split_loo_tau_pse'],
+    )
+    parser.add_argument('--tq_tau_init_days', default=75.0, type=float)
+    parser.add_argument('--tq_tau_min_days', default=1.0, type=float)
+    parser.add_argument('--tq_loo_pse_weight', default=0.1, type=float)
     return parser
 
 
@@ -373,13 +421,25 @@ def print_closed_set_counts(config, eligible_indices, splits):
 def get_num_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+
+def _optimizer_parameter_groups(model, weight_decay):
+    return optimizer_parameter_groups(model, weight_decay)
+
+
+def _loo_raw_error(model, loo_losses):
+    if model.loo_variant == 'pse_loo_fixed75':
+        return loo_losses['loo_pse']
+    return loo_losses['loo_tau']
+
 def get_dataset_size(data_root, dataset):
     dir = os.path.join(data_root, dataset)
     return len([name for name in os.listdir(os.path.join(dir, 'data')) if name.endswith('.zarr')])
 
 def train_supervised(model, config, writer, splits, val_loader, device, best_model_path):
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    optimizer = torch.optim.Adam(
+        _optimizer_parameter_groups(model, config.weight_decay), lr=config.lr
+    )
 
     best_f1 = 0
 
@@ -429,8 +489,26 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             targets = sample['label'].cuda(device=device, non_blocking=True)
 
             pixels, mask, positions, extra = to_cuda(sample, device)
-            outputs = model.forward(pixels, mask, positions, extra)
-            loss = criterion(outputs, targets)
+            if isinstance(model, PseMTKDTQLOOLtae):
+                spatial_feats = model.spatial_encoder(pixels, mask, extra)
+                outputs = model.forward_from_spatial(spatial_feats, positions)
+                loo_losses = model.compute_loo_losses(spatial_feats, positions)
+                loss = (
+                    criterion(outputs, targets)
+                    + loo_losses['loo_tau']
+                    + model.loo_pse_weight * loo_losses['loo_pse']
+                )
+                model.temporal_encoder.record_domain_diagnostics(
+                    'source',
+                    spatial_feats,
+                    positions,
+                    _loo_raw_error(model, loo_losses),
+                    loo_losses['loo_valid_query_count'],
+                    labels=targets,
+                )
+            else:
+                outputs = model.forward(pixels, mask, positions, extra)
+                loss = criterion(outputs, targets)
 
             optimizer.zero_grad()
             loss.backward()

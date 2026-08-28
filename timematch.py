@@ -12,7 +12,11 @@ from tqdm import tqdm
 
 from dataset import PixelSetData
 from evaluation import validation
-from models.mtkd import log_mtkd_diagnostics, reset_mtkd_diagnostics
+from models.mtkd import (
+    log_mtkd_diagnostics,
+    optimizer_parameter_groups,
+    reset_mtkd_diagnostics,
+)
 from transforms import (
     Normalize,
     RandomSamplePixels,
@@ -51,6 +55,22 @@ def _check_temporal_index_range(model, positions, applied_shift, tag):
         )
 
 
+def _loo_raw_error(model, loo_losses):
+    if model.loo_variant == "pse_loo_fixed75":
+        return loo_losses["loo_pse"]
+    return loo_losses["loo_tau"]
+
+
+def _domain_balanced_loo(model, h_s, positions_s, h_t, positions_t):
+    source_losses = model.compute_loo_losses(h_s, positions_s)
+    target_losses = model.compute_loo_losses(h_t, positions_t)
+    balanced = {
+        name: 0.5 * (source_losses[name] + target_losses[name])
+        for name in ("loo_tau", "loo_pse")
+    }
+    return source_losses, target_losses, balanced
+
+
 def train_timematch(student, config, writer, val_loader, device, best_model_path, fold_num, splits):
     source_loader, target_loader_no_aug, target_loader = get_data_loaders(splits, config, config.balance_source)
 
@@ -71,7 +91,9 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
 
     steps_per_epoch = config.steps_per_epoch
 
-    optimizer = torch.optim.Adam(student.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    optimizer = torch.optim.Adam(
+        optimizer_parameter_groups(student, config.weight_decay), lr=config.lr
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs * steps_per_epoch, eta_min=0)
 
     source_iter = iter(cycle(source_loader))
@@ -161,7 +183,65 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             pixels_t, mask_t, position_t, extra_t = to_cuda(sample_target_strong, device)
             logits_target = None
             loss_target = 0.0
-            if config.domain_specific_bn:
+            uses_loo = hasattr(student, "compute_loo_losses")
+            if uses_loo:
+                shifted_position_s = position_s + source_to_target_shift
+                _check_temporal_index_range(
+                    student, position_s, source_to_target_shift, "source"
+                )
+                _check_temporal_index_range(student, position_t, 0, "target")
+
+                if config.domain_specific_bn:
+                    h_s = student.spatial_encoder(pixels_s, mask_s, extra_s)
+                    h_t = student.spatial_encoder(pixels_t, mask_t, extra_t)
+                    logits_source = student.forward_from_spatial(
+                        h_s, shifted_position_s
+                    )
+                    if num_pseudo >= 2:
+                        logits_target = student.forward_from_spatial(
+                            h_t[pseudo_mask], position_t[pseudo_mask]
+                        )
+                else:
+                    source_batch_size = pixels_s.shape[0]
+                    all_h = student.spatial_encoder(
+                        torch.cat([pixels_s, pixels_t], dim=0),
+                        torch.cat([mask_s, mask_t], dim=0),
+                        torch.cat([extra_s, extra_t], dim=0),
+                    )
+                    h_s = all_h[:source_batch_size]
+                    h_t = all_h[source_batch_size:]
+                    if num_pseudo > 0:
+                        task_h = torch.cat([h_s, h_t[pseudo_mask]], dim=0)
+                        task_positions = torch.cat(
+                            [shifted_position_s, position_t[pseudo_mask]], dim=0
+                        )
+                        logits = student.forward_from_spatial(task_h, task_positions)
+                        logits_source = logits[:source_batch_size]
+                        logits_target = logits[source_batch_size:]
+                    else:
+                        logits_source = student.forward_from_spatial(
+                            h_s, shifted_position_s
+                        )
+
+                source_loo, target_loo, balanced_loo = _domain_balanced_loo(
+                    student, h_s, shifted_position_s, h_t, position_t
+                )
+                student.temporal_encoder.record_domain_diagnostics(
+                    "source",
+                    h_s,
+                    shifted_position_s,
+                    _loo_raw_error(student, source_loo),
+                    source_loo["loo_valid_query_count"],
+                    labels=source_labels,
+                )
+                student.temporal_encoder.record_domain_diagnostics(
+                    "target",
+                    h_t,
+                    position_t,
+                    _loo_raw_error(student, target_loo),
+                    target_loo["loo_valid_query_count"],
+                )
+            elif config.domain_specific_bn:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
                 logits_source = student.forward(pixels_s, mask_s, position_s + source_to_target_shift, extra_s)
                 if num_pseudo >= 2:  # at least 2 examples required for BN
@@ -202,6 +282,12 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             if logits_target is not None:
                 loss_target = criterion(logits_target, pseudo_targets[pseudo_mask])
             loss = loss_source + config.trade_off * loss_target
+            if uses_loo:
+                loss = (
+                    loss
+                    + balanced_loo["loo_tau"]
+                    + student.loo_pse_weight * balanced_loo["loo_pse"]
+                )
 
             # compute loss and backprop
             optimizer.zero_grad()
