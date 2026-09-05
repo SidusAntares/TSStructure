@@ -8,7 +8,7 @@ calling audit script for oracle grouping and evaluation.
 from collections import Counter
 from dataclasses import dataclass
 import math
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -31,6 +31,69 @@ class Landmark:
 
 class TopologyMismatchError(ValueError):
     """Raised when landmark correspondence is not topology-compatible."""
+
+
+@dataclass(frozen=True)
+class SourceAlignmentTemplate:
+    """Source-only topology and aligned prototype for one candidate class."""
+
+    signature: Signature
+    canonical_landmarks: Tuple[Landmark, ...]
+    aligned_prototype: np.ndarray
+    accepted_indices: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class PrototypePrediction:
+    prediction: int
+    chosen_distance: float
+    distances: Tuple[Tuple[int, float], ...]
+
+
+@dataclass(frozen=True)
+class CandidateAlignmentPrediction:
+    prediction: int
+    chosen_distance: float
+    eligible_classes: Tuple[int, ...]
+    distances: Tuple[Tuple[int, float], ...]
+    signatures: Tuple[Tuple[int, Signature], ...]
+    used_alignment: bool
+    used_fallback: bool
+
+
+def build_direct_fourier_views(
+    spatial_features: torch.Tensor,
+    positions: torch.Tensor,
+    dense_positions: torch.Tensor,
+    mode_counts: Sequence[int] = (9, 13),
+    period_days: float = 365.0,
+    reg: float = 1e-3,
+    synthesis_isign: int = 1,
+) -> Dict[int, torch.Tensor]:
+    """Reconstruct several resolutions from the exact same frozen PSE tensor."""
+    from models.fredn.nufft import (
+        BatchedDirectFourierAnalyzer,
+        BatchedDirectFourierSynthesizer,
+    )
+
+    if spatial_features.ndim != 3:
+        raise ValueError("spatial_features must be [B,L,D]")
+    views = {}
+    for mode in mode_counts:
+        analyzer = BatchedDirectFourierAnalyzer(
+            num_modes=int(mode),
+            period_days=period_days,
+            reg=reg,
+            synthesis_isign=synthesis_isign,
+        ).to(spatial_features.device)
+        synthesizer = BatchedDirectFourierSynthesizer(
+            num_modes=int(mode),
+            period_days=period_days,
+            synthesis_isign=synthesis_isign,
+        ).to(spatial_features.device)
+        coefficients, _ = analyzer(spatial_features, positions)
+        views[int(mode)] = synthesizer(coefficients, dense_positions)
+    return views
 
 
 def parse_fredn_checkpoint_specs(
@@ -590,3 +653,271 @@ def pareto_modes(
         if not dominated:
             result.append(dict(candidate))
     return sorted(result, key=lambda row: row["mode"])
+
+
+def _robust_normalize_curve(curve: np.ndarray) -> np.ndarray:
+    values = np.asarray(curve, dtype=np.float64)
+    median = np.median(values)
+    first, third = np.percentile(values, [25, 75])
+    scale = max(float(third - first), np.finfo(np.float64).eps)
+    return (values - median) / scale
+
+
+def shape_distance(first: np.ndarray, second: np.ndarray, family: str) -> float:
+    """Compute one of the three frozen shape-distance definitions."""
+    first = np.asarray(first, dtype=np.float64)
+    second = np.asarray(second, dtype=np.float64)
+    if first.ndim != 1 or first.shape != second.shape:
+        raise ValueError("curves must be matching one-dimensional arrays")
+    if family == "absolute":
+        return float(np.linalg.norm(first - second) / first.size)
+    if family == "correlation":
+        first_centered = first - first.mean()
+        second_centered = second - second.mean()
+        denominator = np.linalg.norm(first_centered) * np.linalg.norm(second_centered)
+        if denominator <= np.finfo(np.float64).eps:
+            return 0.0 if np.allclose(first, second) else 1.0
+        correlation = float(np.dot(first_centered, second_centered) / denominator)
+        return float(1.0 - np.clip(correlation, -1.0, 1.0))
+    if family == "derivative":
+        if first.size < 2:
+            raise ValueError("derivative distance requires at least two points")
+        first_diff = np.diff(_robust_normalize_curve(first))
+        second_diff = np.diff(_robust_normalize_curve(second))
+        return float(np.linalg.norm(first_diff - second_diff) / (first.size - 1))
+    raise ValueError("distance family must be absolute, correlation, or derivative")
+
+
+def nearest_prototype_prediction(
+    curves_by_class: Mapping[int, np.ndarray],
+    prototypes: Mapping[int, np.ndarray],
+    distance_family: str,
+    eligible_classes: Optional[Sequence[int]] = None,
+) -> PrototypePrediction:
+    """Classify without labels using each class's source-only PCA view."""
+    classes = sorted(prototypes if eligible_classes is None else eligible_classes)
+    if not classes:
+        raise ValueError("at least one candidate class is required")
+    distances = []
+    for class_id in classes:
+        if class_id not in curves_by_class or class_id not in prototypes:
+            raise KeyError(f"missing curve or prototype for class {class_id}")
+        distances.append(
+            (
+                int(class_id),
+                shape_distance(
+                    curves_by_class[class_id], prototypes[class_id], distance_family
+                ),
+            )
+        )
+    chosen = min(distances, key=lambda item: (item[1], item[0]))
+    return PrototypePrediction(chosen[0], chosen[1], tuple(distances))
+
+
+def build_source_alignment_template(
+    grid: np.ndarray,
+    correspondence_curves: Sequence[np.ndarray],
+    comparison_curves: Sequence[np.ndarray],
+    prominence_threshold: float,
+    min_distance_days: float,
+) -> SourceAlignmentTemplate:
+    """Fit a source-only correspondence template and aligned comparison median."""
+    if len(correspondence_curves) != len(comparison_curves):
+        raise ValueError("correspondence and comparison sets must have equal length")
+    landmark_sets = [
+        detect_structural_landmarks(
+            grid,
+            curve,
+            min_distance_days=min_distance_days,
+            prominence_threshold=prominence_threshold,
+        )
+        for curve in correspondence_curves
+    ]
+    signature, canonical, accepted = build_landmark_prototype(landmark_sets)
+    if not canonical:
+        aligned = np.empty((0, len(grid)), dtype=np.float64)
+    else:
+        aligned = np.stack(
+            [
+                align_curve_to_landmark_template(
+                    grid,
+                    np.asarray(comparison_curves[index]),
+                    landmark_sets[index],
+                    canonical,
+                )
+                for index in accepted
+            ]
+        )
+    prototype = (
+        np.median(aligned, axis=0)
+        if len(aligned)
+        else np.median(np.asarray(comparison_curves, dtype=np.float64), axis=0)
+    )
+    return SourceAlignmentTemplate(
+        signature=signature,
+        canonical_landmarks=tuple(canonical),
+        aligned_prototype=np.asarray(prototype, dtype=np.float64),
+        accepted_indices=tuple(int(index) for index in accepted),
+    )
+
+
+def candidate_alignment_prediction(
+    grid: np.ndarray,
+    correspondence_curves: Mapping[int, np.ndarray],
+    comparison_curves: Mapping[int, np.ndarray],
+    templates: Mapping[int, SourceAlignmentTemplate],
+    thresholds: Mapping[int, float],
+    unaligned_prototypes: Mapping[int, np.ndarray],
+    distance_family: str,
+    min_distance_days: float,
+) -> CandidateAlignmentPrediction:
+    """Predict from source-derived candidate gates; target labels are not accepted."""
+    candidate_distances = []
+    signatures = []
+    for class_id in sorted(templates):
+        landmarks = detect_structural_landmarks(
+            grid,
+            correspondence_curves[class_id],
+            min_distance_days=min_distance_days,
+            prominence_threshold=thresholds[class_id],
+        )
+        signature = topology_signature(landmarks)
+        signatures.append((int(class_id), signature))
+        template = templates[class_id]
+        if signature != template.signature or not template.canonical_landmarks:
+            continue
+        aligned = align_curve_to_landmark_template(
+            grid,
+            comparison_curves[class_id],
+            landmarks,
+            template.canonical_landmarks,
+        )
+        candidate_distances.append(
+            (
+                int(class_id),
+                shape_distance(aligned, template.aligned_prototype, distance_family),
+            )
+        )
+    if candidate_distances:
+        chosen = min(candidate_distances, key=lambda item: (item[1], item[0]))
+        return CandidateAlignmentPrediction(
+            chosen[0],
+            chosen[1],
+            tuple(item[0] for item in candidate_distances),
+            tuple(candidate_distances),
+            tuple(signatures),
+            True,
+            False,
+        )
+    fallback = nearest_prototype_prediction(
+        comparison_curves, unaligned_prototypes, distance_family
+    )
+    return CandidateAlignmentPrediction(
+        fallback.prediction,
+        fallback.chosen_distance,
+        (),
+        fallback.distances,
+        tuple(signatures),
+        False,
+        True,
+    )
+
+
+def classification_metrics(
+    true_labels: Sequence[int],
+    predictions: Sequence[int],
+    class_ids: Optional[Sequence[int]] = None,
+) -> Dict[str, float]:
+    true_values = np.asarray(true_labels, dtype=np.int64)
+    predicted_values = np.asarray(predictions, dtype=np.int64)
+    if true_values.shape != predicted_values.shape or true_values.ndim != 1:
+        raise ValueError("labels and predictions must be matching one-dimensional arrays")
+    classes = (
+        np.asarray(sorted(set(true_values.tolist()) | set(predicted_values.tolist())))
+        if class_ids is None
+        else np.asarray(class_ids, dtype=np.int64)
+    )
+    f1_values = []
+    for class_id in classes:
+        true_positive = np.sum((true_values == class_id) & (predicted_values == class_id))
+        false_positive = np.sum((true_values != class_id) & (predicted_values == class_id))
+        false_negative = np.sum((true_values == class_id) & (predicted_values != class_id))
+        denominator = 2 * true_positive + false_positive + false_negative
+        f1_values.append(0.0 if denominator == 0 else 2 * true_positive / denominator)
+    return {
+        "accuracy": float(np.mean(true_values == predicted_values)) if true_values.size else float("nan"),
+        "macro_f1": float(np.mean(f1_values)) if f1_values else float("nan"),
+    }
+
+
+def stratified_bootstrap_macro_f1_delta(
+    true_labels: Sequence[int],
+    proposed_predictions: Sequence[int],
+    baseline_predictions: Sequence[int],
+    repeats: int = 500,
+    seed: int = 1,
+    class_ids: Optional[Sequence[int]] = None,
+) -> Dict[str, float]:
+    """Reproducible class-stratified bootstrap of paired Macro-F1 deltas."""
+    labels = np.asarray(true_labels, dtype=np.int64)
+    proposed = np.asarray(proposed_predictions, dtype=np.int64)
+    baseline = np.asarray(baseline_predictions, dtype=np.int64)
+    if labels.shape != proposed.shape or labels.shape != baseline.shape:
+        raise ValueError("labels and both prediction arrays must have equal shape")
+    if repeats <= 0:
+        raise ValueError("repeats must be positive")
+    rng = np.random.default_rng(seed)
+    stratification_classes = np.unique(labels)
+    by_class = [np.flatnonzero(labels == class_id) for class_id in stratification_classes]
+    deltas = []
+    metric_classes = (
+        stratification_classes
+        if class_ids is None
+        else np.asarray(class_ids, dtype=np.int64)
+    )
+    for _ in range(repeats):
+        indices = np.concatenate(
+            [rng.choice(group, size=len(group), replace=True) for group in by_class]
+        )
+        proposed_f1 = classification_metrics(
+            labels[indices], proposed[indices], metric_classes
+        )["macro_f1"]
+        baseline_f1 = classification_metrics(
+            labels[indices], baseline[indices], metric_classes
+        )["macro_f1"]
+        deltas.append(proposed_f1 - baseline_f1)
+    values = np.asarray(deltas, dtype=np.float64)
+    return {
+        "mean_delta": float(values.mean()),
+        "ci_lower": float(np.percentile(values, 2.5)),
+        "ci_upper": float(np.percentile(values, 97.5)),
+        "repeats": int(repeats),
+        "seed": int(seed),
+    }
+
+
+def coarse_fine_hierarchy(
+    coarse_landmarks: Sequence[Landmark],
+    fine_landmarks: Sequence[Landmark],
+) -> Dict[str, float]:
+    """Summarize fine extrema strictly inside adjacent coarse intervals."""
+    intervals = list(zip(coarse_landmarks[:-1], coarse_landmarks[1:]))
+    counts = [
+        sum(left.time < item.time < right.time for item in fine_landmarks)
+        for left, right in intervals
+    ]
+    inside = sum(
+        any(left.time < item.time < right.time for left, right in intervals)
+        for item in fine_landmarks
+    )
+    return {
+        "fine_landmarks_per_coarse_segment_mean": (
+            float(np.mean(counts)) if counts else float("nan")
+        ),
+        "fine_landmarks_per_coarse_segment_std": (
+            float(np.std(counts)) if counts else float("nan")
+        ),
+        "fraction_mode13_inside_coarse_segments": (
+            inside / len(fine_landmarks) if fine_landmarks else float("nan")
+        ),
+    }

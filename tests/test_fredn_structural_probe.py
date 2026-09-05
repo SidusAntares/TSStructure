@@ -1,4 +1,5 @@
 import inspect
+import random
 from pathlib import Path
 
 import numpy as np
@@ -7,23 +8,32 @@ import torch
 
 from models.fredn.structural_probe import (
     Landmark,
+    SourceAlignmentTemplate,
     TopologyMismatchError,
     align_curve_to_landmark_template,
     build_landmark_warp,
+    build_direct_fourier_views,
+    candidate_alignment_prediction,
+    classification_metrics,
+    coarse_fine_hierarchy,
     contrastive_feasibility_by_class,
     compute_topology_comparison,
     detect_structural_landmarks,
     extract_fourier_conditions,
     fit_source_class_projections,
     normalized_l2,
+    nearest_prototype_prediction,
     pareto_modes,
     parse_fredn_checkpoint_specs,
     pointwise_intra_class_variance,
     project_curves,
     segment_shape_descriptors,
+    shape_distance,
+    stratified_bootstrap_macro_f1_delta,
     topology_signature,
 )
 from scripts import probe_fredn_structure
+from scripts import probe_fredn_shape_alignment
 
 
 def _piecewise_curve(grid, landmark_times, landmark_values):
@@ -363,3 +373,255 @@ def test_pareto_modes_excludes_non_finite_points():
     result = pareto_modes(rows, x_key="coverage", y_key="discrimination")
 
     assert [row["mode"] for row in result] == [9]
+
+
+def test_shared_spatial_features_feed_both_fourier_resolutions():
+    class CountingPSE:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, values):
+            self.calls += 1
+            return values
+
+    torch.manual_seed(3)
+    pse = CountingPSE()
+    spatial = pse(torch.randn(2, 21, 4, dtype=torch.float64))
+    positions = torch.stack(
+        [torch.linspace(2.0, 300.0, 21), torch.linspace(4.0, 330.0, 21)]
+    ).to(torch.float64)
+    dense = torch.linspace(1.0, 365.0, 64, dtype=torch.float64).repeat(2, 1)
+
+    views = build_direct_fourier_views(
+        spatial, positions, dense, mode_counts=(9, 13), period_days=365.0, reg=1e-3
+    )
+
+    assert pse.calls == 1
+    assert set(views) == {9, 13}
+    assert views[9].shape == views[13].shape == (2, 64, 4)
+    torch.testing.assert_close(spatial, spatial.clone(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("family", ["absolute", "correlation", "derivative"])
+def test_shape_distance_is_zero_for_identical_curves(family):
+    curve = np.asarray([0.0, 1.0, 0.5, -0.5, 0.0])
+    assert shape_distance(curve, curve, family) == pytest.approx(0.0)
+
+
+def test_absolute_shape_distance_uses_required_time_divisor():
+    first = np.asarray([0.0, 0.0, 0.0, 0.0])
+    second = np.asarray([1.0, 1.0, 1.0, 1.0])
+    assert shape_distance(first, second, "absolute") == pytest.approx(0.5)
+
+
+def test_mode9_warp_is_transferred_unchanged_to_mode13():
+    grid = np.arange(0.0, 101.0)
+    source_landmarks = _landmarks([20, 50, 80], [1, -1, 1])
+    shifted_landmarks = _landmarks([30, 60, 90], [1, -1, 1])
+    fine_source = _piecewise_curve(grid, [20, 35, 50, 65, 80], [1, 0.2, -1, 0.4, 1])
+    fine_shifted = _piecewise_curve(grid, [30, 45, 60, 75, 90], [1, 0.2, -1, 0.4, 1])
+
+    aligned = align_curve_to_landmark_template(
+        grid, fine_shifted, shifted_landmarks, source_landmarks
+    )
+
+    assert normalized_l2(fine_source, aligned) < 0.05
+    assert normalized_l2(fine_source, aligned) < normalized_l2(fine_source, fine_shifted)
+
+
+def _alignment_template(signature, times, values, prototype):
+    return SourceAlignmentTemplate(
+        signature=signature,
+        canonical_landmarks=tuple(_landmarks(times, values)),
+        aligned_prototype=np.asarray(prototype, dtype=float),
+        accepted_indices=(0,),
+    )
+
+
+def test_candidate_alignment_uses_only_signature_compatible_class():
+    grid = np.arange(0.0, 101.0)
+    curve_a = _piecewise_curve(grid, [20, 50, 80], [1, -1, 1])
+    curve_b = _piecewise_curve(grid, [10, 30, 50, 70, 90], [1, -1, 1, -1, 1])
+    templates = {
+        0: _alignment_template((3, "P-V-P"), [20, 50, 80], [1, -1, 1], curve_a),
+        1: _alignment_template((5, "P-V-P-V-P"), [10, 30, 50, 70, 90], [1, -1, 1, -1, 1], curve_b),
+    }
+
+    result = candidate_alignment_prediction(
+        grid=grid,
+        correspondence_curves={0: curve_a, 1: curve_a},
+        comparison_curves={0: curve_a, 1: curve_a},
+        templates=templates,
+        thresholds={0: 0.2, 1: 0.2},
+        unaligned_prototypes={0: curve_a, 1: curve_b},
+        distance_family="absolute",
+        min_distance_days=10.0,
+    )
+
+    assert result.eligible_classes == (0,)
+    assert result.prediction == 0
+    assert result.used_alignment and not result.used_fallback
+
+
+def test_no_eligible_class_falls_back_to_unaligned_mode13_prediction():
+    grid = np.arange(0.0, 101.0)
+    flat = np.zeros_like(grid)
+    proto0 = np.zeros_like(grid)
+    proto1 = np.ones_like(grid)
+    fallback = nearest_prototype_prediction(
+        {0: flat, 1: flat}, {0: proto0, 1: proto1}, "absolute"
+    )
+    templates = {
+        0: _alignment_template((1, "P"), [30], [1], proto0),
+        1: _alignment_template((1, "V"), [60], [-1], proto1),
+    }
+
+    result = candidate_alignment_prediction(
+        grid, {0: flat, 1: flat}, {0: flat, 1: flat}, templates,
+        {0: 0.2, 1: 0.2}, {0: proto0, 1: proto1}, "absolute", 10.0
+    )
+
+    assert result.used_fallback and not result.used_alignment
+    assert result.prediction == fallback.prediction
+
+
+def test_target_label_shuffle_cannot_change_alignment_or_prediction():
+    grid = np.arange(0.0, 101.0)
+    curve = _piecewise_curve(grid, [20, 50, 80], [1, -1, 1])
+    template = _alignment_template((3, "P-V-P"), [20, 50, 80], [1, -1, 1], curve)
+    kwargs = dict(
+        grid=grid,
+        correspondence_curves={0: curve}, comparison_curves={0: curve},
+        templates={0: template}, thresholds={0: 0.2},
+        unaligned_prototypes={0: curve}, distance_family="correlation",
+        min_distance_days=10.0,
+    )
+    first = candidate_alignment_prediction(**kwargs)
+    second = candidate_alignment_prediction(**kwargs)
+
+    assert "target_labels" not in inspect.signature(candidate_alignment_prediction).parameters
+    assert first == second
+    assert classification_metrics([0], [first.prediction])["accuracy"] == 1.0
+    assert classification_metrics([1], [second.prediction])["accuracy"] == 0.0
+
+
+def test_mode13_can_add_discrimination_when_mode9_is_identical():
+    coarse = np.asarray([0.0, 1.0, 0.0])
+    fine0 = np.asarray([0.0, 1.0, 0.4, -0.2, 0.0])
+    fine1 = np.asarray([0.0, 1.0, -0.4, 0.2, 0.0])
+    coarse_prototypes = {0: coarse, 1: coarse}
+    fine_prototypes = {0: fine0, 1: fine1}
+    coarse_predictions = [
+        nearest_prototype_prediction({0: coarse, 1: coarse}, coarse_prototypes, "absolute").prediction
+        for _ in range(2)
+    ]
+    fine_predictions = [
+        nearest_prototype_prediction({0: curve, 1: curve}, fine_prototypes, "absolute").prediction
+        for curve in (fine0, fine1)
+    ]
+
+    assert classification_metrics([0, 1], fine_predictions)["accuracy"] > classification_metrics(
+        [0, 1], coarse_predictions
+    )["accuracy"]
+
+
+def test_coarse_fine_hierarchy_counts_internal_landmarks():
+    coarse = _landmarks([20, 50, 80], [1, -1, 1])
+    fine = _landmarks([20, 30, 40, 50, 60, 70, 80], [1, -1, 1, -1, 1, -1, 1])
+    result = coarse_fine_hierarchy(coarse, fine)
+    assert result["fine_landmarks_per_coarse_segment_mean"] == pytest.approx(2.0)
+    assert result["fraction_mode13_inside_coarse_segments"] == pytest.approx(4 / 7)
+
+
+def test_stratified_bootstrap_is_reproducible():
+    labels = np.asarray([0, 0, 0, 1, 1, 1])
+    baseline = np.asarray([0, 1, 1, 0, 0, 1])
+    proposed = labels.copy()
+    first = stratified_bootstrap_macro_f1_delta(labels, proposed, baseline, 100, 1)
+    second = stratified_bootstrap_macro_f1_delta(labels, proposed, baseline, 100, 1)
+    assert first == second
+    assert first["mean_delta"] > 0
+
+
+def test_bootstrap_uses_explicit_protocol_class_universe():
+    result = stratified_bootstrap_macro_f1_delta(
+        true_labels=[0, 0, 0],
+        proposed_predictions=[0, 0, 0],
+        baseline_predictions=[1, 1, 1],
+        repeats=20,
+        seed=1,
+        class_ids=[0, 1],
+    )
+    assert result["mean_delta"] == pytest.approx(0.5)
+
+
+def test_canonical_grid_is_derived_from_source_only():
+    class SourceDataset:
+        date_positions = np.asarray([12.0, 40.0, 90.0])
+
+    grid = probe_fredn_shape_alignment._source_grid(SourceDataset(), step=2.0)
+    assert grid[0] == 12.0
+    assert grid[-1] == 90.0
+
+
+def test_split_replay_is_deterministic_and_uses_independent_seed_resets():
+    initial_draws = []
+    replay_calls = []
+
+    def historical_fold_creator(datasets, num_folds, num_indices):
+        initial_draws.append(random.random())
+        replay_calls.append(tuple(datasets))
+        splits = {}
+        for dataset in datasets:
+            count = len(num_indices[dataset])
+            n_test, n_val = int(0.2 * count), int(0.1 * count)
+            n_train = count - n_test - n_val
+            splits[dataset] = {
+                "train": set(range(n_train)),
+                "val": set(range(n_train, n_train + n_val)),
+                "test": set(range(n_train + n_val, count)),
+            }
+        return [splits]
+
+    source, target = probe_fredn_shape_alignment.replay_protocol_splits(
+        "AT1", "DK1", range(100), range(80), seed=1,
+        fold_creator=historical_fold_creator,
+    )
+    source_again, target_again = probe_fredn_shape_alignment.replay_protocol_splits(
+        "AT1", "DK1", range(100), range(80), seed=1,
+        fold_creator=historical_fold_creator,
+    )
+
+    assert source == source_again
+    assert target == target_again
+    assert len(source["train"]) == 70
+    assert len(source["val"]) == 10
+    assert len(source["test"]) == 20
+    assert len(target["test"]) == 16
+    assert replay_calls == [
+        ("AT1", "AT1"), ("AT1", "DK1"),
+        ("AT1", "AT1"), ("AT1", "DK1"),
+    ]
+    assert len(set(initial_draws)) == 1
+
+
+def test_shape_probe_and_launcher_are_offline_and_git_free():
+    probe_source = inspect.getsource(probe_fredn_shape_alignment)
+    launcher = Path("scripts/run_fredn_shape_alignment_at1_dk1.sh").read_text(
+        encoding="utf-8"
+    )
+    for source in (probe_source, launcher):
+        lowered = source.lower()
+        assert "subprocess" not in lowered
+        assert "os.system" not in lowered
+        assert "popen(" not in lowered
+        assert "requests" not in lowered
+        assert "urllib" not in lowered
+        assert "huggingface" not in lowered
+        assert "pip install" not in lowered
+        assert "git rev-parse" not in lowered
+        assert "git status" not in lowered
+        assert "git branch" not in lowered
+    assert '--git-commit "$GIT_COMMIT"' in launcher
+    assert '--git-branch "$GIT_BRANCH"' in launcher
+    assert '--git-dirty "$GIT_DIRTY"' in launcher
