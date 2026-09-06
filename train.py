@@ -622,6 +622,17 @@ if __name__ == '__main__':
     timematch.add_argument("--shape_fourier_period_days", type=float, default=365.0)
     timematch.add_argument("--shape_fourier_reg", type=float, default=1e-3)
     timematch.add_argument("--shape_diag_batches", type=int, default=10)
+    timematch.add_argument("--class_residual_phase", type=bool_flag, default=False)
+    timematch.add_argument("--class_phase_mode", type=int, default=9, choices=[9])
+    timematch.add_argument("--class_phase_radius_days", type=int, default=7)
+    timematch.add_argument("--class_phase_step_days", type=int, default=1)
+    timematch.add_argument("--class_phase_start_epoch", type=int, default=1)
+    timematch.add_argument("--class_phase_min_samples", type=int, default=32)
+    timematch.add_argument(
+        "--class_phase_max_samples_per_class", type=int, default=128
+    )
+    timematch.add_argument("--class_phase_min_corr_gain", type=float, default=0.005)
+    timematch.add_argument("--class_phase_seed", type=int, default=1)
 
     cfg = parser.parse_args()
 

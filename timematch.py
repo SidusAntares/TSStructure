@@ -2,6 +2,7 @@ from torch.utils.data.sampler import WeightedRandomSampler
 import sklearn.metrics
 from collections import Counter
 from copy import deepcopy
+import csv
 import json
 import os
 
@@ -16,6 +17,9 @@ from dataset import PixelSetData
 from evaluation import validation
 from models.fredn.diagnostics import log_fredn_diagnostics
 from models.shape_alignment import (
+    ClassPhaseRecord,
+    ClassResidualPhaseEstimator,
+    ClassResidualPhaseResult,
     ShapeAlignment,
     SourceShapeReferenceBank,
     preserve_rng_state,
@@ -134,16 +138,25 @@ def _shape_loss_from_capture(
     pseudo_targets,
     pseudo_mask,
     target_to_source_shift,
+    class_residual_shifts=None,
 ):
     """Apply the sole pseudo gate and express accepted targets in source time."""
     selected_positions = target_positions[pseudo_mask]
     selected_classes = pseudo_targets[pseudo_mask]
     if captured_selected.shape[0] != selected_positions.shape[0]:
         raise ValueError("captured target features do not match the pseudo mask")
+    kwargs = {}
+    if class_residual_shifts is not None:
+        shifts = class_residual_shifts.to(
+            device=selected_classes.device,
+            dtype=selected_positions.dtype,
+        )
+        kwargs["residual_shifts"] = shifts.index_select(0, selected_classes)
     return shape_alignment(
         captured_selected,
         selected_positions + target_to_source_shift,
         selected_classes,
+        **kwargs,
     )
 
 
@@ -243,11 +256,14 @@ def _build_source_shape_alignment(student, config, splits, device, checkpoint_pa
                     sample["label"].to(device, non_blocking=True)
                 )
         student.train(was_training)
+        reference_modes = set(config.shape_modes)
+        if getattr(config, "class_residual_phase", False):
+            reference_modes.add(config.class_phase_mode)
         bank = SourceShapeReferenceBank.from_source_features(
             torch.cat(features),
             torch.cat(positions),
             torch.cat(reference_labels),
-            modes=config.shape_modes,
+            modes=tuple(sorted(reference_modes)),
             grid_points=config.shape_grid_points,
             period_days=config.shape_fourier_period_days,
             reg=config.shape_fourier_reg,
@@ -275,7 +291,243 @@ def _build_source_shape_alignment(student, config, splits, device, checkpoint_pa
         bank,
         morph_weight=config.shape_morph_weight,
         event_weight=config.shape_event_weight,
+        loss_modes=config.shape_modes,
     ).to(device)
+
+
+def _build_class_phase_loader(splits, config):
+    """Build an isolated target-train loader without temporal augmentation."""
+    phase_transform = transforms.Compose(
+        [RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()]
+    )
+    phase_dataset = PixelSetData(
+        config.data_root,
+        config.target,
+        config.classes,
+        transform=phase_transform,
+        indices=splits[config.target]["train"],
+        with_extra=config.with_extra,
+        closed_set=config.closed_set,
+        combine_spring_and_winter=config.combine_spring_and_winter,
+    )
+    return data.DataLoader(
+        phase_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+
+def _maybe_build_class_phase(shape_alignment, _teacher, config, splits, device):
+    if not getattr(config, "class_residual_phase", False):
+        return None, None
+    if shape_alignment is None:
+        raise ValueError("class residual phase requires shape_align=true")
+    phase_loader = _build_class_phase_loader(splits, config)
+    estimator = ClassResidualPhaseEstimator(
+        shape_alignment.reference,
+        mode=config.class_phase_mode,
+        radius_days=config.class_phase_radius_days,
+        step_days=config.class_phase_step_days,
+        min_samples=config.class_phase_min_samples,
+        max_samples_per_class=config.class_phase_max_samples_per_class,
+        min_corr_gain=config.class_phase_min_corr_gain,
+    ).to(device)
+    return phase_loader, estimator
+
+
+def _zero_class_phase_result(num_classes, device, dtype, reason):
+    return ClassResidualPhaseResult(
+        accepted_shifts=torch.zeros(num_classes, device=device, dtype=dtype),
+        records=[
+            ClassPhaseRecord(
+                class_index=class_index,
+                pseudo_count=0,
+                corr_zero=float("nan"),
+                best_corr=float("nan"),
+                corr_gain=float("nan"),
+                raw_delta=0.0,
+                accepted_delta=0.0,
+                accepted=False,
+                reason=reason,
+            )
+            for class_index in range(num_classes)
+        ],
+    )
+
+
+@torch.no_grad()
+def _estimate_class_residual_phase(
+    teacher,
+    estimator,
+    phase_loader,
+    device,
+    target_to_source_shift,
+    config,
+    epoch,
+):
+    if epoch == 0 or epoch < config.class_phase_start_epoch:
+        return _zero_class_phase_result(
+            config.num_classes, device, torch.float32, "before_start_epoch"
+        )
+
+    feature_batches = []
+    position_batches = []
+    pseudo_batches = []
+    retained_per_class = [0] * config.num_classes
+    max_per_class = getattr(config, "class_phase_max_samples_per_class", 128)
+    with preserve_rng_state(seed=config.class_phase_seed):
+        was_training = teacher.training
+        teacher.eval()
+        try:
+            for sample in phase_loader:
+                pixels, valid, positions, extra = to_cuda(sample, device)
+                logits, spatial = _forward_with_spatial_capture(
+                    teacher,
+                    pixels,
+                    valid,
+                    positions,
+                    extra,
+                    temporal_shift=target_to_source_shift,
+                )
+                probabilities = F.softmax(logits, dim=1)
+                confidence, pseudo_classes = probabilities.max(dim=1)
+                selected = confidence > config.pseudo_threshold
+                for class_index in range(config.num_classes):
+                    remaining = max_per_class - retained_per_class[class_index]
+                    if remaining <= 0:
+                        continue
+                    class_selected = torch.nonzero(
+                        selected & (pseudo_classes == class_index), as_tuple=False
+                    ).flatten()[:remaining]
+                    if class_selected.numel() == 0:
+                        continue
+                    feature_batches.append(
+                        spatial.index_select(0, class_selected).detach()
+                    )
+                    position_batches.append(
+                        (
+                            positions.index_select(0, class_selected)
+                            + target_to_source_shift
+                        ).detach()
+                    )
+                    pseudo_batches.append(
+                        pseudo_classes.index_select(0, class_selected).detach()
+                    )
+                    retained_per_class[class_index] += int(class_selected.numel())
+                if all(count >= max_per_class for count in retained_per_class):
+                    break
+        finally:
+            teacher.train(was_training)
+
+    if not feature_batches:
+        dtype = next(teacher.parameters()).dtype
+        return _zero_class_phase_result(
+            config.num_classes, device, dtype, "insufficient_samples"
+        )
+    return estimator.estimate(
+        torch.cat(feature_batches),
+        torch.cat(position_batches),
+        torch.cat(pseudo_batches),
+        num_classes=config.num_classes,
+    )
+
+
+def _append_csv(path, fieldnames, rows):
+    path = os.fspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_class_phase_csvs(
+    output_dir, *, epoch, global_shift, class_names, result
+):
+    phase_fields = [
+        "epoch",
+        "class_index",
+        "class_name",
+        "class",
+        "global_shift",
+        "pseudo_count",
+        "corr_zero",
+        "best_corr",
+        "corr_gain",
+        "raw_delta",
+        "accepted_delta",
+        "accepted",
+        "reason",
+    ]
+    phase_rows = []
+    for record in result.records:
+        phase_rows.append(
+            {
+                "epoch": epoch,
+                "class_index": record.class_index,
+                "class_name": class_names[record.class_index],
+                "class": class_names[record.class_index],
+                "global_shift": global_shift,
+                "pseudo_count": record.pseudo_count,
+                "corr_zero": record.corr_zero,
+                "best_corr": record.best_corr,
+                "corr_gain": record.corr_gain,
+                "raw_delta": record.raw_delta,
+                "accepted_delta": record.accepted_delta,
+                "accepted": record.accepted,
+                "reason": record.reason,
+            }
+        )
+    _append_csv(
+        os.path.join(output_dir, "class_residual_phase.csv"),
+        phase_fields,
+        phase_rows,
+    )
+
+    finite_gains = np.asarray(
+        [record.corr_gain for record in result.records if np.isfinite(record.corr_gain)]
+    )
+    absolute = np.asarray([abs(record.accepted_delta) for record in result.records])
+    enough = sum(
+        record.reason not in ("insufficient_samples", "before_start_epoch")
+        for record in result.records
+    )
+    summary = {
+        "epoch": epoch,
+        "global_shift": global_shift,
+        "num_classes": len(result.records),
+        "num_classes_enough_samples": enough,
+        "num_classes_nonzero_phase": int(np.count_nonzero(absolute)),
+        "mean_abs_delta": float(absolute.mean()) if absolute.size else 0.0,
+        "max_abs_delta": float(absolute.max()) if absolute.size else 0.0,
+        "mean_corr_gain": float(finite_gains.mean()) if finite_gains.size else float("nan"),
+        "median_corr_gain": float(np.median(finite_gains)) if finite_gains.size else float("nan"),
+    }
+    _append_csv(
+        os.path.join(output_dir, "class_phase_epoch_summary.csv"),
+        list(summary),
+        [summary],
+    )
+
+
+def _append_shape_training_metrics(output_dir, metrics):
+    _append_csv(
+        os.path.join(output_dir, "shape_training_metrics.csv"),
+        [
+            "epoch",
+            "morph_loss",
+            "weighted_shape_loss",
+            "shape_loss_ratio",
+            "selected_target_count",
+            "selected_target_rate",
+            "morph_corr_mean",
+        ],
+        [metrics],
+    )
 
 
 def _log_shape_result(writer, result, timematch_loss, config, pseudo_mask, step):
@@ -308,6 +560,7 @@ def _collect_shape_epoch_diagnostics(
     target_to_source_shift,
     pseudo_threshold,
     max_batches,
+    class_residual_shifts=None,
 ):
     totals = {}
     selected_total = 0
@@ -332,10 +585,18 @@ def _collect_shape_epoch_diagnostics(
             count = int(selected.sum().item())
             if count == 0:
                 continue
+            selected_classes = pseudo_classes[selected]
+            residual = None
+            if class_residual_shifts is not None:
+                residual = class_residual_shifts.to(
+                    device=selected_classes.device,
+                    dtype=positions.dtype,
+                ).index_select(0, selected_classes)
             batch_metrics = shape_alignment.diagnostics(
                 spatial[selected],
                 positions[selected] + target_to_source_shift,
-                pseudo_classes[selected],
+                selected_classes,
+                residual_shifts=residual,
             )
             selected_total += count
             for name, value in batch_metrics.items():
@@ -364,6 +625,9 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             device,
             os.path.join(pretrained_path, "model.pt"),
         )
+    class_phase_loader, class_phase_estimator = _maybe_build_class_phase(
+        shape_alignment, teacher, config, splits, device
+    )
 
     # Training setup
     global_step, best_f1 = 0, 0
@@ -442,10 +706,57 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                 min_shift, max_shift = min(target_to_source_shift, 0), max(0, target_to_source_shift)
             writer.add_scalar("train/temporal_shift", target_to_source_shift, epoch)
 
+        class_phase_result = None
+        class_residual_shifts = None
+        if class_phase_estimator is not None:
+            class_phase_result = _estimate_class_residual_phase(
+                teacher,
+                class_phase_estimator,
+                class_phase_loader,
+                device,
+                target_to_source_shift,
+                config,
+                epoch,
+            )
+            class_residual_shifts = class_phase_result.accepted_shifts
+            print(f"Global TimeMatch shift = {target_to_source_shift}")
+            for record in class_phase_result.records:
+                class_name = config.classes[record.class_index]
+                if record.reason in ("insufficient_samples", "before_start_epoch"):
+                    print(
+                        f"CLASS_PHASE class={class_name} n={record.pseudo_count} "
+                        f"{record.reason} accepted_delta=0"
+                    )
+                else:
+                    print(
+                        f"CLASS_PHASE class={class_name} n={record.pseudo_count} "
+                        f"corr0={record.corr_zero:.6f} best={record.best_corr:.6f} "
+                        f"gain={record.corr_gain:.6f} raw_delta={record.raw_delta:+g} "
+                        f"accepted_delta={record.accepted_delta:+g} "
+                        f"accepted={record.accepted} reason={record.reason}"
+                    )
+            _write_class_phase_csvs(
+                config.fold_dir,
+                epoch=epoch,
+                global_shift=target_to_source_shift,
+                class_names=config.classes,
+                result=class_phase_result,
+            )
+
         student.train()
         teacher.eval()  # don't update BN or use dropout for teacher
 
         all_labels, all_pseudo_labels, all_pseudo_mask = [], [], []
+        shape_epoch = None
+        if class_phase_estimator is not None:
+            shape_epoch = {
+                "selected": 0,
+                "target": 0,
+                "morph": 0.0,
+                "weighted": 0.0,
+                "ratio": 0.0,
+                "corr": 0.0,
+            }
         for step in progress_bar:
             collect_diagnostics = global_step % config.log_step == 0
             sample_source, (sample_target_weak, sample_target_strong) = next(source_iter), next(target_iter)
@@ -585,6 +896,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     pseudo_targets,
                     pseudo_mask,
                     target_to_source_shift,
+                    class_residual_shifts=class_residual_shifts,
                 )
             loss = _add_shape_loss(
                 timematch_loss,
@@ -599,6 +911,18 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             if scheduler is not None:
                 scheduler.step()
             update_ema_variables(student, teacher, config.ema_decay)
+
+            if shape_epoch is not None:
+                shape_epoch["target"] += int(pseudo_mask.numel())
+            if shape_epoch is not None and shape_result is not None:
+                selected_count = int(pseudo_mask.sum().item())
+                weighted_shape = config.shape_lambda * shape_result.loss.detach()
+                ratio = weighted_shape / timematch_loss.detach().abs().clamp_min(1e-12)
+                shape_epoch["selected"] += selected_count
+                shape_epoch["morph"] += float(shape_result.morph_loss.detach()) * selected_count
+                shape_epoch["weighted"] += float(weighted_shape) * selected_count
+                shape_epoch["ratio"] += float(ratio) * selected_count
+                shape_epoch["corr"] += float(shape_result.morph_corr_mean) * selected_count
 
             # Metrics
             loss_meter.update(loss.item())
@@ -635,6 +959,22 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         writer.add_scalar("train/pseudo_count", pseudo_count, epoch)
 
         if shape_alignment is not None:
+            if shape_epoch is not None:
+                selected_denominator = max(shape_epoch["selected"], 1)
+                _append_shape_training_metrics(
+                    config.fold_dir,
+                    {
+                        "epoch": epoch,
+                        "morph_loss": shape_epoch["morph"] / selected_denominator,
+                        "weighted_shape_loss": shape_epoch["weighted"] / selected_denominator,
+                        "shape_loss_ratio": shape_epoch["ratio"] / selected_denominator,
+                        "selected_target_count": shape_epoch["selected"],
+                        "selected_target_rate": (
+                            shape_epoch["selected"] / max(shape_epoch["target"], 1)
+                        ),
+                        "morph_corr_mean": shape_epoch["corr"] / selected_denominator,
+                    },
+                )
             shape_diagnostics = _collect_shape_epoch_diagnostics(
                 teacher,
                 shape_alignment,
@@ -643,6 +983,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                 target_to_source_shift,
                 config.pseudo_threshold,
                 config.shape_diag_batches,
+                class_residual_shifts=class_residual_shifts,
             )
             for name, value in shape_diagnostics.items():
                 writer.add_scalar(f"shape_diag/{name}", value, epoch)

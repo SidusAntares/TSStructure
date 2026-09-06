@@ -3,7 +3,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 import random
-from typing import Dict, Iterable, Mapping, Sequence
+from typing import Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -305,6 +305,208 @@ class ShapeAlignmentResult:
     no_event_reference_count: torch.Tensor
 
 
+@dataclass(frozen=True)
+class ClassPhaseRecord:
+    class_index: int
+    pseudo_count: int
+    corr_zero: float
+    best_corr: float
+    corr_gain: float
+    raw_delta: float
+    accepted_delta: float
+    accepted: bool
+    reason: str
+
+
+@dataclass
+class ClassResidualPhaseResult:
+    accepted_shifts: torch.Tensor
+    records: List[ClassPhaseRecord]
+
+
+class ClassResidualPhaseEstimator(nn.Module):
+    """Estimate conservative pseudo-class shifts from frozen mode-9 shapes."""
+
+    def __init__(
+        self,
+        reference: SourceShapeReferenceBank,
+        *,
+        mode: int = 9,
+        radius_days: int = 7,
+        step_days: int = 1,
+        min_samples: int = 32,
+        max_samples_per_class: int = 128,
+        min_corr_gain: float = 0.005,
+        tie_tolerance: float = 1e-8,
+    ):
+        super().__init__()
+        if mode not in reference.modes:
+            raise ValueError(f"phase mode {mode} is missing from the source reference")
+        if radius_days < 0 or step_days <= 0:
+            raise ValueError("phase radius must be non-negative and step must be positive")
+        if radius_days % step_days != 0:
+            raise ValueError("phase step must divide the search radius so zero is included")
+        if min_samples <= 0 or max_samples_per_class < min_samples:
+            raise ValueError("phase sample limits are inconsistent")
+        self.reference = reference
+        self.mode = int(mode)
+        self.radius_days = int(radius_days)
+        self.step_days = int(step_days)
+        self.min_samples = int(min_samples)
+        self.max_samples_per_class = int(max_samples_per_class)
+        self.min_corr_gain = float(min_corr_gain)
+        self.tie_tolerance = float(tie_tolerance)
+        self.analyzer = BatchedDirectFourierAnalyzer(
+            self.mode, reference.period_days, reference.reg
+        )
+        self.synthesizer = BatchedDirectFourierSynthesizer(
+            self.mode, reference.period_days
+        )
+        self.reference.requires_grad_(False)
+
+    def _fallback_record(self, class_index, count, reason):
+        nan = float("nan")
+        return ClassPhaseRecord(
+            class_index=class_index,
+            pseudo_count=count,
+            corr_zero=nan,
+            best_corr=nan,
+            corr_gain=nan,
+            raw_delta=0.0,
+            accepted_delta=0.0,
+            accepted=False,
+            reason=reason,
+        )
+
+    @torch.no_grad()
+    def estimate(
+        self,
+        spatial_features: torch.Tensor,
+        positions: torch.Tensor,
+        pseudo_classes: torch.Tensor,
+        *,
+        num_classes: int,
+    ) -> ClassResidualPhaseResult:
+        if spatial_features.ndim != 3 or positions.shape != spatial_features.shape[:2]:
+            raise ValueError("phase features/positions must be [N,L,D] and [N,L]")
+        if pseudo_classes.shape != (spatial_features.shape[0],):
+            raise ValueError("phase pseudo classes must have shape [N]")
+        if num_classes > self.reference.class_projections.shape[0]:
+            raise ValueError("phase classes exceed the source reference")
+
+        shifts = positions.new_zeros(num_classes, dtype=spatial_features.dtype)
+        records = []
+        if spatial_features.shape[0] == 0:
+            records = [
+                self._fallback_record(index, 0, "insufficient_samples")
+                for index in range(num_classes)
+            ]
+            return ClassResidualPhaseResult(shifts, records)
+
+        try:
+            coefficients, _ = self.analyzer(spatial_features, positions)
+        except RuntimeError:
+            records = [
+                self._fallback_record(index, 0, "numerical_error")
+                for index in range(num_classes)
+            ]
+            return ClassResidualPhaseResult(shifts, records)
+        candidates = torch.arange(
+            -self.radius_days,
+            self.radius_days + self.step_days,
+            self.step_days,
+            device=positions.device,
+            dtype=spatial_features.dtype,
+        )
+        zero_matches = torch.nonzero(candidates == 0, as_tuple=False).flatten()
+        if zero_matches.numel() != 1:
+            raise ValueError("phase candidates must contain exactly one zero shift")
+        zero_index = int(zero_matches[0].item())
+        base_grid = self.reference.grid.to(spatial_features)
+
+        for class_index in range(num_classes):
+            selected_indices = torch.nonzero(
+                pseudo_classes == class_index, as_tuple=False
+            ).flatten()
+            pseudo_count = int(selected_indices.numel())
+            if pseudo_count < self.min_samples:
+                records.append(
+                    self._fallback_record(
+                        class_index, pseudo_count, "insufficient_samples"
+                    )
+                )
+                continue
+            selected_indices = selected_indices[: self.max_samples_per_class]
+            class_coefficients = coefficients.index_select(0, selected_indices)
+            projection = self.reference.class_projections[class_index].to(
+                spatial_features
+            )
+            prototype = self.reference.prototypes[self.mode][class_index].to(
+                spatial_features
+            ).unsqueeze(0)
+            scores = []
+            try:
+                for delta in candidates:
+                    query = (base_grid - delta).unsqueeze(0).expand(
+                        selected_indices.numel(), -1
+                    )
+                    reconstruction = self.synthesizer(class_coefficients, query)
+                    curves = torch.einsum("nld,d->nl", reconstruction, projection)
+                    representative = torch.quantile(
+                        _robust_normalize(curves, detach_statistics=False), 0.5, dim=0
+                    ).unsqueeze(0)
+                    scores.append(_stable_correlation(representative, prototype)[0])
+            except RuntimeError:
+                records.append(
+                    self._fallback_record(class_index, pseudo_count, "numerical_error")
+                )
+                continue
+            scores = torch.stack(scores)
+            finite = torch.isfinite(scores)
+            corr_zero = scores[zero_index]
+            if not bool(finite.any()) or not bool(torch.isfinite(corr_zero)):
+                records.append(
+                    self._fallback_record(class_index, pseudo_count, "nonfinite")
+                )
+                continue
+
+            best_corr = scores[finite].max()
+            tied = torch.nonzero(
+                finite & (scores >= best_corr - self.tie_tolerance),
+                as_tuple=False,
+            ).flatten().tolist()
+            best_index = min(
+                tied,
+                key=lambda index: (
+                    abs(float(candidates[index].item())),
+                    float(candidates[index].item()) != 0.0,
+                    float(candidates[index].item()),
+                ),
+            )
+            raw_delta = float(candidates[best_index].item())
+            best_value = float(scores[best_index].item())
+            zero_value = float(corr_zero.item())
+            gain = best_value - zero_value
+            accepted = bool(np.isfinite(gain) and gain >= self.min_corr_gain)
+            accepted_delta = raw_delta if accepted else 0.0
+            if accepted:
+                shifts[class_index] = accepted_delta
+            records.append(
+                ClassPhaseRecord(
+                    class_index=class_index,
+                    pseudo_count=pseudo_count,
+                    corr_zero=zero_value,
+                    best_corr=best_value,
+                    corr_gain=gain,
+                    raw_delta=raw_delta,
+                    accepted_delta=accepted_delta,
+                    accepted=accepted,
+                    reason="accepted" if accepted else "insufficient_corr_gain",
+                )
+            )
+        return ClassResidualPhaseResult(shifts.detach(), records)
+
+
 class ShapeAlignment(nn.Module):
     """Compare accepted target PSE shapes to frozen pseudo-class references."""
 
@@ -313,11 +515,19 @@ class ShapeAlignment(nn.Module):
         reference: SourceShapeReferenceBank,
         morph_weight: float = 1.0,
         event_weight: float = 0.5,
+        loss_modes: Sequence[int] = None,
     ):
         super().__init__()
         self.reference = reference
         self.morph_weight = float(morph_weight)
         self.event_weight = float(event_weight)
+        self.loss_modes = (
+            reference.modes
+            if loss_modes is None
+            else tuple(sorted(set(int(mode) for mode in loss_modes)))
+        )
+        if not self.loss_modes or any(mode not in reference.modes for mode in self.loss_modes):
+            raise ValueError("shape loss modes must be present in the source reference")
         self.analyzers = nn.ModuleDict(
             {
                 str(mode): BatchedDirectFourierAnalyzer(
@@ -342,7 +552,7 @@ class ShapeAlignment(nn.Module):
             loss=zero,
             morph_loss=zero,
             event_loss=zero,
-            mode_losses={mode: zero for mode in self.reference.modes},
+            mode_losses={mode: zero for mode in self.loss_modes},
             morph_corr_mean=zero.detach(),
             event_amp_abs_gap=zero.detach(),
             no_event_reference_count=torch.zeros(
@@ -350,7 +560,13 @@ class ShapeAlignment(nn.Module):
             ),
         )
 
-    def forward(self, spatial_features, positions, pseudo_classes):
+    def forward(
+        self,
+        spatial_features,
+        positions,
+        pseudo_classes,
+        residual_shifts=None,
+    ):
         if spatial_features.shape[0] == 0:
             return self._zero_result(spatial_features)
         if positions.shape != spatial_features.shape[:2]:
@@ -363,6 +579,15 @@ class ShapeAlignment(nn.Module):
         grid = self.reference.grid.to(
             device=spatial_features.device, dtype=spatial_features.dtype
         ).unsqueeze(0).expand(spatial_features.shape[0], -1)
+        if residual_shifts is not None:
+            residual_shifts = torch.as_tensor(
+                residual_shifts,
+                device=spatial_features.device,
+                dtype=spatial_features.dtype,
+            )
+            if residual_shifts.shape != (spatial_features.shape[0],):
+                raise ValueError("residual shifts must have shape [B]")
+            grid = grid - residual_shifts.detach().unsqueeze(1)
         projections = self.reference.class_projections.index_select(0, pseudo_classes)
         mode_losses = {}
         morph_losses = []
@@ -370,7 +595,7 @@ class ShapeAlignment(nn.Module):
         correlations = []
         event_gaps = []
         no_event_counts = []
-        for mode in self.reference.modes:
+        for mode in self.loss_modes:
             coefficients, _ = self.analyzers[str(mode)](spatial_features, positions)
             reconstruction = self.synthesizers[str(mode)](coefficients, grid)
             curves = torch.einsum("bld,bd->bl", reconstruction, projections)
@@ -410,8 +635,15 @@ class ShapeAlignment(nn.Module):
         )
 
     @torch.no_grad()
-    def diagnostics(self, spatial_features, positions, pseudo_classes):
-        result = self(spatial_features, positions, pseudo_classes)
+    def diagnostics(
+        self, spatial_features, positions, pseudo_classes, residual_shifts=None
+    ):
+        result = self(
+            spatial_features,
+            positions,
+            pseudo_classes,
+            residual_shifts=residual_shifts,
+        )
         metrics = {
             "morphology_correlation": result.morph_corr_mean,
             "event_amplitude_gap": result.event_amp_abs_gap,
@@ -429,10 +661,17 @@ class ShapeAlignment(nn.Module):
             return metrics
 
         grid_np = self.reference.grid.detach().cpu().numpy()
-        for mode in self.reference.modes:
+        for mode in self.loss_modes:
             grid = self.reference.grid.to(spatial_features).unsqueeze(0).expand(
                 spatial_features.shape[0], -1
             )
+            if residual_shifts is not None:
+                shifts = torch.as_tensor(
+                    residual_shifts,
+                    device=spatial_features.device,
+                    dtype=spatial_features.dtype,
+                )
+                grid = grid - shifts.detach().unsqueeze(1)
             coeffs, _ = self.analyzers[str(mode)](spatial_features, positions)
             reconstructed = self.synthesizers[str(mode)](coeffs, grid)
             projections = self.reference.class_projections.index_select(0, pseudo_classes)
