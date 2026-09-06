@@ -2,6 +2,8 @@ from torch.utils.data.sampler import WeightedRandomSampler
 import sklearn.metrics
 from collections import Counter
 from copy import deepcopy
+import json
+import os
 
 import numpy as np
 import torch
@@ -13,6 +15,11 @@ from tqdm import tqdm
 from dataset import PixelSetData
 from evaluation import validation
 from models.fredn.diagnostics import log_fredn_diagnostics
+from models.shape_alignment import (
+    ShapeAlignment,
+    SourceShapeReferenceBank,
+    preserve_rng_state,
+)
 from transforms import (
     Normalize,
     RandomSamplePixels,
@@ -84,6 +91,68 @@ def _forward_with_temporal_shift(
     return model.forward(pixels, mask, positions + temporal_shift, extra)
 
 
+def _forward_with_spatial_capture(
+    model,
+    pixels,
+    mask,
+    positions,
+    extra,
+    temporal_shift=0,
+    collect_diagnostics=False,
+):
+    """Capture the spatial tensor produced by this exact semantic forward."""
+    captured = []
+
+    def capture_spatial(_module, _inputs, output):
+        captured.append(output)
+
+    handle = model.spatial_encoder.register_forward_hook(capture_spatial)
+    try:
+        logits = _forward_with_temporal_shift(
+            model,
+            pixels,
+            mask,
+            positions,
+            extra,
+            temporal_shift=temporal_shift,
+            collect_diagnostics=collect_diagnostics,
+        )
+    finally:
+        handle.remove()
+    if len(captured) != 1:
+        raise RuntimeError(
+            "shape alignment expected exactly one spatial encoder call in the "
+            f"semantic forward, captured {len(captured)}"
+        )
+    return logits, captured[0]
+
+
+def _shape_loss_from_capture(
+    shape_alignment,
+    captured_selected,
+    target_positions,
+    pseudo_targets,
+    pseudo_mask,
+    target_to_source_shift,
+):
+    """Apply the sole pseudo gate and express accepted targets in source time."""
+    selected_positions = target_positions[pseudo_mask]
+    selected_classes = pseudo_targets[pseudo_mask]
+    if captured_selected.shape[0] != selected_positions.shape[0]:
+        raise ValueError("captured target features do not match the pseudo mask")
+    return shape_alignment(
+        captured_selected,
+        selected_positions + target_to_source_shift,
+        selected_classes,
+    )
+
+
+def _add_shape_loss(timematch_loss, shape_result, shape_lambda):
+    if shape_result is None:
+        return timematch_loss
+    return timematch_loss + shape_lambda * shape_result.loss
+
+
 def _prepare_temporal_features(
     model,
     spatial_feats,
@@ -113,6 +182,169 @@ def _classify_prepared(model, prepared, positions, temporal_shift=0):
     )
 
 
+def _build_source_shape_alignment(student, config, splits, device, checkpoint_path):
+    """Build and persist a frozen source-train-only shape reference."""
+    if getattr(config, "model", "pseltae") != "pseltae":
+        raise ValueError("shape alignment is training-only support for model=pseltae")
+    weak_transform = transforms.Compose(
+        [RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()]
+    )
+    with preserve_rng_state(seed=config.shape_reference_seed):
+        candidates = PixelSetData(
+            config.data_root,
+            config.source,
+            config.classes,
+            transform=None,
+            indices=splits[config.source]["train"],
+            with_extra=config.with_extra,
+            closed_set=config.closed_set,
+            combine_spring_and_winter=config.combine_spring_and_winter,
+        )
+        labels = candidates.get_labels()
+        parcel_indices = candidates.get_parcel_indices()
+        rng = np.random.default_rng(config.shape_reference_seed)
+        selected_parcels = []
+        for class_id in range(config.num_classes):
+            class_parcels = parcel_indices[labels == class_id].copy()
+            if len(class_parcels) == 0:
+                raise ValueError(
+                    f"source train split has no shape reference for class {class_id}"
+                )
+            rng.shuffle(class_parcels)
+            selected_parcels.extend(
+                class_parcels[: config.shape_reference_per_class].tolist()
+            )
+        reference_dataset = PixelSetData(
+            config.data_root,
+            config.source,
+            config.classes,
+            transform=weak_transform,
+            indices=selected_parcels,
+            with_extra=config.with_extra,
+            closed_set=config.closed_set,
+            combine_spring_and_winter=config.combine_spring_and_winter,
+        )
+        reference_loader = data.DataLoader(
+            reference_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=True,
+        )
+        was_training = student.training
+        student.eval()
+        features, positions, reference_labels = [], [], []
+        with torch.no_grad():
+            for sample in reference_loader:
+                pixels, valid, timestamps, extra = to_cuda(sample, device)
+                features.append(student.spatial_encoder(pixels, valid, extra))
+                positions.append(timestamps)
+                reference_labels.append(
+                    sample["label"].to(device, non_blocking=True)
+                )
+        student.train(was_training)
+        bank = SourceShapeReferenceBank.from_source_features(
+            torch.cat(features),
+            torch.cat(positions),
+            torch.cat(reference_labels),
+            modes=config.shape_modes,
+            grid_points=config.shape_grid_points,
+            period_days=config.shape_fourier_period_days,
+            reg=config.shape_fourier_reg,
+            prominence_rel=config.shape_prominence_rel,
+            min_distance_days=config.shape_min_distance_days,
+        ).to(device)
+
+    os.makedirs(config.fold_dir, exist_ok=True)
+    torch.save(
+        bank.export_payload(), os.path.join(config.fold_dir, "shape_reference.pt")
+    )
+    manifest = bank.manifest(
+        config.source,
+        checkpoint_path,
+        config.classes,
+        config.shape_reference_per_class,
+    )
+    with open(
+        os.path.join(config.fold_dir, "shape_reference_manifest.json"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(manifest, handle, indent=2)
+    return ShapeAlignment(
+        bank,
+        morph_weight=config.shape_morph_weight,
+        event_weight=config.shape_event_weight,
+    ).to(device)
+
+
+def _log_shape_result(writer, result, timematch_loss, config, pseudo_mask, step):
+    weighted = config.shape_lambda * result.loss.detach()
+    denominator = timematch_loss.detach().abs().clamp_min(1e-12)
+    values = {
+        "shape/raw_loss": result.loss.detach(),
+        "shape/weighted_loss": weighted,
+        "shape/morph_loss": result.morph_loss.detach(),
+        "shape/event_loss": result.event_loss.detach(),
+        "shape/selected_target_count": pseudo_mask.sum().detach(),
+        "shape/selected_target_rate": pseudo_mask.float().mean().detach(),
+        "shape/morph_corr_mean": result.morph_corr_mean,
+        "shape/event_amp_abs_gap": result.event_amp_abs_gap,
+        "shape/loss_ratio": weighted / denominator,
+        "shape/no_event_reference_count": result.no_event_reference_count,
+    }
+    for mode, loss in result.mode_losses.items():
+        values[f"shape/mode{mode}_loss"] = loss.detach()
+    for name, value in values.items():
+        writer.add_scalar(name, value, step)
+
+
+@torch.no_grad()
+def _collect_shape_epoch_diagnostics(
+    teacher,
+    shape_alignment,
+    target_loader,
+    device,
+    target_to_source_shift,
+    pseudo_threshold,
+    max_batches,
+):
+    totals = {}
+    selected_total = 0
+    if max_batches <= 0:
+        return totals
+    with preserve_rng_state():
+        for batch_index, sample in enumerate(target_loader):
+            if batch_index >= max_batches:
+                break
+            pixels, valid, positions, extra = to_cuda(sample, device)
+            logits, spatial = _forward_with_spatial_capture(
+                teacher,
+                pixels,
+                valid,
+                positions,
+                extra,
+                temporal_shift=target_to_source_shift,
+            )
+            probabilities = F.softmax(logits, dim=1)
+            confidence, pseudo_classes = probabilities.max(dim=1)
+            selected = confidence > pseudo_threshold
+            count = int(selected.sum().item())
+            if count == 0:
+                continue
+            batch_metrics = shape_alignment.diagnostics(
+                spatial[selected],
+                positions[selected] + target_to_source_shift,
+                pseudo_classes[selected],
+            )
+            selected_total += count
+            for name, value in batch_metrics.items():
+                totals[name] = totals.get(name, value.new_zeros(())) + value * count
+    if selected_total:
+        totals = {name: value / selected_total for name, value in totals.items()}
+    return totals
+
+
 def train_timematch(student, config, writer, val_loader, device, best_model_path, fold_num, splits):
     source_loader, target_loader_no_aug, target_loader = get_data_loaders(splits, config, config.balance_source)
 
@@ -123,6 +355,15 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
     teacher = deepcopy(student)
     student.to(device)
     teacher.to(device)
+    shape_alignment = None
+    if getattr(config, "shape_align", False):
+        shape_alignment = _build_source_shape_alignment(
+            student,
+            config,
+            splits,
+            device,
+            os.path.join(pretrained_path, "model.pt"),
+        )
 
     # Training setup
     global_step, best_f1 = 0, 0
@@ -232,6 +473,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             source_labels = sample_source['label'].cuda(device, non_blocking=True)
             pixels_t, mask_t, position_t, extra_t = to_cuda(sample_target_strong, device)
             logits_target = None
+            captured_target = None
             loss_target = 0.0
             if config.domain_specific_bn:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
@@ -248,14 +490,23 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                 )
                 if num_pseudo >= 2:  # at least 2 examples required for BN
                     _check_temporal_index_range(student, position_t[pseudo_mask], 0, "target")
-                    logits_target = _forward_with_temporal_shift(
+                    target_args = (
                         student,
                         pixels_t[pseudo_mask],
                         mask_t[pseudo_mask],
                         position_t[pseudo_mask],
                         extra_t[pseudo_mask],
-                        collect_diagnostics=collect_diagnostics,
                     )
+                    if shape_alignment is None:
+                        logits_target = _forward_with_temporal_shift(
+                            *target_args,
+                            collect_diagnostics=collect_diagnostics,
+                        )
+                    else:
+                        logits_target, captured_target = _forward_with_spatial_capture(
+                            *target_args,
+                            collect_diagnostics=collect_diagnostics,
+                        )
             else:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
                 if num_pseudo > 0:
@@ -290,18 +541,25 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     )
                     extra = torch.cat([extra_s, selected_extra_t], dim=0)
 
-                    logits = _forward_with_temporal_shift(
-                        student,
-                        pixels,
-                        mask,
-                        position,
-                        extra,
-                        temporal_shift=temporal_shift,
-                        collect_diagnostics=collect_diagnostics,
-                    )
+                    concat_args = (student, pixels, mask, position, extra)
+                    if shape_alignment is None:
+                        logits = _forward_with_temporal_shift(
+                            *concat_args,
+                            temporal_shift=temporal_shift,
+                            collect_diagnostics=collect_diagnostics,
+                        )
+                        captured = None
+                    else:
+                        logits, captured = _forward_with_spatial_capture(
+                            *concat_args,
+                            temporal_shift=temporal_shift,
+                            collect_diagnostics=collect_diagnostics,
+                        )
                     source_batch_size = pixels_s.shape[0]
                     logits_source = logits[:source_batch_size]
                     logits_target = logits[source_batch_size:]
+                    if captured is not None:
+                        captured_target = captured[source_batch_size:]
                 else:
                     logits_source = _forward_with_temporal_shift(
                         student,
@@ -317,7 +575,22 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             loss_source = criterion(logits_source, source_labels)
             if logits_target is not None:
                 loss_target = criterion(logits_target, pseudo_targets[pseudo_mask])
-            loss = loss_source + config.trade_off * loss_target
+            timematch_loss = loss_source + config.trade_off * loss_target
+            shape_result = None
+            if shape_alignment is not None and captured_target is not None:
+                shape_result = _shape_loss_from_capture(
+                    shape_alignment,
+                    captured_target,
+                    position_t,
+                    pseudo_targets,
+                    pseudo_mask,
+                    target_to_source_shift,
+                )
+            loss = _add_shape_loss(
+                timematch_loss,
+                shape_result,
+                getattr(config, "shape_lambda", 0.1),
+            )
 
             # compute loss and backprop
             optimizer.zero_grad()
@@ -339,6 +612,15 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                 writer.add_scalar("train/target_updates", len(torch.nonzero(pseudo_mask)), global_step)
                 log_fredn_diagnostics(student, writer, global_step)
+                if shape_result is not None:
+                    _log_shape_result(
+                        writer,
+                        shape_result,
+                        timematch_loss,
+                        config,
+                        pseudo_mask,
+                        global_step,
+                    )
 
             global_step += 1
 
@@ -351,6 +633,19 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         print(f"Teacher pseudo label F1 {conf_pseudo_f1:.3f} (n={pseudo_count})")
         writer.add_scalar("train/pseudo_f1", conf_pseudo_f1, epoch)
         writer.add_scalar("train/pseudo_count", pseudo_count, epoch)
+
+        if shape_alignment is not None:
+            shape_diagnostics = _collect_shape_epoch_diagnostics(
+                teacher,
+                shape_alignment,
+                target_loader_no_aug,
+                device,
+                target_to_source_shift,
+                config.pseudo_threshold,
+                config.shape_diag_batches,
+            )
+            for name, value in shape_diagnostics.items():
+                writer.add_scalar(f"shape_diag/{name}", value, epoch)
 
         writer.add_scalar("train/pseudo_f1", conf_pseudo_f1, epoch)
         writer.add_scalar("train/pseudo_count", pseudo_count, epoch)

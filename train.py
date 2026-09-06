@@ -607,6 +607,21 @@ if __name__ == '__main__':
     timematch.add_argument("--shift_estimator", type=str, default='AM', choices=['AM', 'IS', 'ACC', 'ENT'])
     timematch.add_argument('--run_validation', default=True, action='store_true', help='whether to run validation each epoch')
     timematch.add_argument("--output_student", type=bool_flag, default=True, help='output student or teacher')
+    timematch.add_argument("--shape_align", type=bool_flag, default=False)
+    timematch.add_argument(
+        "--shape_modes", nargs="+", type=int, default=[13], choices=[9, 13]
+    )
+    timematch.add_argument("--shape_lambda", type=float, default=0.1)
+    timematch.add_argument("--shape_morph_weight", type=float, default=1.0)
+    timematch.add_argument("--shape_event_weight", type=float, default=0.5)
+    timematch.add_argument("--shape_grid_points", type=int, default=64)
+    timematch.add_argument("--shape_reference_per_class", type=int, default=128)
+    timematch.add_argument("--shape_reference_seed", type=int, default=1)
+    timematch.add_argument("--shape_prominence_rel", type=float, default=0.15)
+    timematch.add_argument("--shape_min_distance_days", type=float, default=14.0)
+    timematch.add_argument("--shape_fourier_period_days", type=float, default=365.0)
+    timematch.add_argument("--shape_fourier_reg", type=float, default=1e-3)
+    timematch.add_argument("--shape_diag_batches", type=int, default=10)
 
     cfg = parser.parse_args()
 
