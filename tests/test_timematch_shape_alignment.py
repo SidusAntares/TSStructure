@@ -334,11 +334,26 @@ def _training_batch(batch_size, value):
 
 
 @pytest.mark.parametrize(
-    "domain_specific_bn,expected_student_pse_calls,class_residual_phase",
-    [(True, 2, False), (False, 1, False), (True, 2, True), (False, 1, True)],
+    (
+        "domain_specific_bn,expected_student_pse_calls,shape_align,"
+        "class_residual_phase,expected_shape_builds,expected_shape_csv_rows"
+    ),
+    [
+        (True, 2, True, False, 1, 1),
+        (False, 1, True, False, 1, 1),
+        (True, 2, True, True, 1, 1),
+        (False, 1, True, True, 1, 1),
+        (True, 2, False, False, 0, 0),
+    ],
 )
 def test_shape_training_reuses_the_existing_student_semantic_forward(
-    monkeypatch, domain_specific_bn, expected_student_pse_calls, class_residual_phase
+    monkeypatch,
+    domain_specific_bn,
+    expected_student_pse_calls,
+    shape_align,
+    class_residual_phase,
+    expected_shape_builds,
+    expected_shape_csv_rows,
 ):
     import timematch
     from models.shape_alignment import ClassResidualPhaseResult, ShapeAlignmentResult
@@ -366,8 +381,11 @@ def test_shape_training_reuses_the_existing_student_semantic_forward(
         ),
     )
     monkeypatch.setattr(torch.Tensor, "cuda", lambda self, *args, **kwargs: self)
+    shape_csv_rows = []
     monkeypatch.setattr(
-        timematch, "_append_shape_training_metrics", lambda *args, **kwargs: None
+        timematch,
+        "_append_shape_training_metrics",
+        lambda output_dir, metrics: shape_csv_rows.append((output_dir, metrics)),
     )
     monkeypatch.setattr(
         timematch, "_write_class_phase_csvs", lambda *args, **kwargs: None
@@ -430,7 +448,7 @@ def test_shape_training_reuses_the_existing_student_semantic_forward(
         run_validation=False,
         output_student=True,
         progress_bar="off",
-        shape_align=True,
+        shape_align=shape_align,
         shape_lambda=0.1,
         shape_diag_batches=0,
         fold_dir="unused-fold",
@@ -449,8 +467,63 @@ def test_shape_training_reuses_the_existing_student_semantic_forward(
     )
 
     assert model.spatial_encoder.calls == expected_student_pse_calls
-    assert len(build_calls) == 1
-    assert build_calls[0][0].shape[0] == 2
+    assert len(build_calls) == expected_shape_builds
+    if build_calls:
+        assert build_calls[0][0].shape[0] == 2
+    assert len(shape_csv_rows) == expected_shape_csv_rows
+    if shape_csv_rows:
+        assert shape_csv_rows[0][0] == "unused-fold"
+        assert shape_csv_rows[0][1]["selected_target_count"] == 2
+
+
+def test_shape_metric_observation_does_not_change_logits_loss_or_gradient():
+    import timematch
+    from models.shape_alignment import ShapeAlignmentResult
+
+    logits_without = torch.tensor([[0.4, -0.2]], requires_grad=True)
+    logits_with = logits_without.detach().clone().requires_grad_(True)
+
+    def losses(logits):
+        timematch_loss = logits.square().sum()
+        morph_loss = (logits[:, 0] - logits[:, 1]).square().mean()
+        zero = morph_loss.detach() * 0
+        shape_result = ShapeAlignmentResult(
+            morph_loss,
+            morph_loss,
+            zero,
+            {13: morph_loss},
+            1 - morph_loss.detach(),
+            zero,
+            zero.long(),
+        )
+        total = timematch._add_shape_loss(timematch_loss, shape_result, 0.1)
+        return timematch_loss, shape_result, total
+
+    _, _, total_without = losses(logits_without)
+    timematch_loss, shape_result, total_with = losses(logits_with)
+    observed = {
+        "selected": 0,
+        "target": 0,
+        "morph": 0.0,
+        "weighted": 0.0,
+        "ratio": 0.0,
+        "corr": 0.0,
+    }
+    timematch._observe_shape_training_step(
+        observed,
+        shape_result,
+        torch.tensor([True]),
+        timematch_loss,
+        shape_lambda=0.1,
+    )
+    total_without.backward()
+    total_with.backward()
+
+    assert torch.equal(logits_without.detach(), logits_with.detach())
+    assert torch.equal(total_without.detach(), total_with.detach())
+    assert torch.equal(logits_without.grad, logits_with.grad)
+    assert observed["selected"] == 1
+    assert all(not isinstance(value, torch.Tensor) for value in observed.values())
 
 
 @pytest.mark.parametrize("modes", [(9,), (13,), (9, 13)])

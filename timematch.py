@@ -530,6 +530,29 @@ def _append_shape_training_metrics(output_dir, metrics):
     )
 
 
+@torch.no_grad()
+def _observe_shape_training_step(
+    shape_epoch,
+    shape_result,
+    pseudo_mask,
+    timematch_loss,
+    *,
+    shape_lambda,
+):
+    """Accumulate detached shape metrics without changing training semantics."""
+    shape_epoch["target"] += int(pseudo_mask.numel())
+    if shape_result is None:
+        return
+    selected_count = int(pseudo_mask.sum().item())
+    weighted_shape = shape_lambda * shape_result.loss.detach()
+    ratio = weighted_shape / timematch_loss.detach().abs().clamp_min(1e-12)
+    shape_epoch["selected"] += selected_count
+    shape_epoch["morph"] += float(shape_result.morph_loss.detach()) * selected_count
+    shape_epoch["weighted"] += float(weighted_shape) * selected_count
+    shape_epoch["ratio"] += float(ratio) * selected_count
+    shape_epoch["corr"] += float(shape_result.morph_corr_mean) * selected_count
+
+
 def _log_shape_result(writer, result, timematch_loss, config, pseudo_mask, step):
     weighted = config.shape_lambda * result.loss.detach()
     denominator = timematch_loss.detach().abs().clamp_min(1e-12)
@@ -748,7 +771,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
 
         all_labels, all_pseudo_labels, all_pseudo_mask = [], [], []
         shape_epoch = None
-        if class_phase_estimator is not None:
+        if shape_alignment is not None:
             shape_epoch = {
                 "selected": 0,
                 "target": 0,
@@ -913,16 +936,13 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             update_ema_variables(student, teacher, config.ema_decay)
 
             if shape_epoch is not None:
-                shape_epoch["target"] += int(pseudo_mask.numel())
-            if shape_epoch is not None and shape_result is not None:
-                selected_count = int(pseudo_mask.sum().item())
-                weighted_shape = config.shape_lambda * shape_result.loss.detach()
-                ratio = weighted_shape / timematch_loss.detach().abs().clamp_min(1e-12)
-                shape_epoch["selected"] += selected_count
-                shape_epoch["morph"] += float(shape_result.morph_loss.detach()) * selected_count
-                shape_epoch["weighted"] += float(weighted_shape) * selected_count
-                shape_epoch["ratio"] += float(ratio) * selected_count
-                shape_epoch["corr"] += float(shape_result.morph_corr_mean) * selected_count
+                _observe_shape_training_step(
+                    shape_epoch,
+                    shape_result,
+                    pseudo_mask,
+                    timematch_loss,
+                    shape_lambda=config.shape_lambda,
+                )
 
             # Metrics
             loss_meter.update(loss.item())
