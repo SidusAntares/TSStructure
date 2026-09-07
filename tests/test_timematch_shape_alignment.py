@@ -2,6 +2,7 @@ import inspect
 import io
 import random
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -968,23 +969,50 @@ def test_phase_and_shape_csvs_have_stable_audit_fields(monkeypatch):
         {
             "epoch": 3,
             "morph_loss": 0.2,
+            "global_corr_mean": 0.8,
+            "local_level_corr_mean": 0.7,
+            "local_slope_corr_mean": 0.6,
+            "local_shape_loss": 0.3,
             "weighted_shape_loss": 0.02,
             "shape_loss_ratio": 0.1,
             "selected_target_count": 10,
             "selected_target_rate": 0.5,
+            "selected_class_count": 2,
             "morph_corr_mean": 0.8,
         },
+    )
+    timematch._append_shape_class_metrics(
+        output_dir,
+        [
+            {
+                "epoch": 3,
+                "class_index": 0,
+                "class_name": "winter_wheat",
+                "selected_count": 4,
+                "global_corr_mean": 0.8,
+                "local_level_corr_mean": 0.7,
+                "local_slope_corr_mean": 0.6,
+                "local_shape_loss": 0.3,
+                "source_activity_weight_min": 0.1,
+                "source_activity_weight_max": 0.2,
+            }
+        ],
     )
 
     phase_stream = files[os.path.join(output_dir, "class_residual_phase.csv")]
     summary_stream = files[os.path.join(output_dir, "class_phase_epoch_summary.csv")]
     shape_stream = files[os.path.join(output_dir, "shape_training_metrics.csv")]
+    shape_class_stream = files[
+        os.path.join(output_dir, "shape_class_metrics.csv")
+    ]
     phase_stream.seek(0)
     summary_stream.seek(0)
     shape_stream.seek(0)
+    shape_class_stream.seek(0)
     phase_row = next(csv.DictReader(phase_stream))
     summary_row = next(csv.DictReader(summary_stream))
     shape_row = next(csv.DictReader(shape_stream))
+    shape_class_row = next(csv.DictReader(shape_class_stream))
 
     assert phase_row == {
         "epoch": "3",
@@ -1004,6 +1032,12 @@ def test_phase_and_shape_csvs_have_stable_audit_fields(monkeypatch):
     assert summary_row["num_classes_nonzero_phase"] == "1"
     assert summary_row["mean_abs_delta"] == "4.0"
     assert shape_row["morph_corr_mean"] == "0.8"
+    assert shape_row["global_corr_mean"] == "0.8"
+    assert shape_row["local_level_corr_mean"] == "0.7"
+    assert shape_row["local_slope_corr_mean"] == "0.6"
+    assert shape_row["selected_class_count"] == "2"
+    assert shape_class_row["class_name"] == "winter_wheat"
+    assert shape_class_row["selected_count"] == "4"
 
 
 def test_disabled_training_does_not_build_or_scan_class_phase(monkeypatch):
@@ -1033,3 +1067,416 @@ def test_disabled_training_does_not_build_or_scan_class_phase(monkeypatch):
 
     assert loader is None
     assert estimator is None
+
+
+def _local_bank(dtype=torch.float64):
+    from models.shape_alignment import SourceShapeReferenceBank
+
+    features, positions, labels = _source_batch(dtype)
+    return SourceShapeReferenceBank.from_source_features(
+        features,
+        positions,
+        labels,
+        modes=(13,),
+        grid_points=64,
+        period_days=365.0,
+        reg=1e-3,
+        prominence_rel=0.15,
+        min_distance_days=14.0,
+    )
+
+
+def test_global_corr_explicit_configuration_preserves_loss_and_gradient_exactly():
+    from models.shape_alignment import ShapeAlignment
+
+    bank = _local_bank(torch.float64)
+    features, positions, labels = _source_batch(torch.float64)
+    legacy_input = features[:3].clone().requires_grad_(True)
+    configured_input = features[:3].clone().requires_grad_(True)
+    legacy = ShapeAlignment(bank, morph_weight=1.0, event_weight=0.0)
+    configured = ShapeAlignment(
+        bank,
+        morph_weight=1.0,
+        event_weight=0.0,
+        loss_type="global_corr",
+        local_window_points=16,
+        local_stride_points=8,
+        local_slope_weight=0.5,
+        class_balanced=False,
+    )
+
+    legacy_result = legacy(legacy_input, positions[:3], labels[:3])
+    configured_result = configured(configured_input, positions[:3], labels[:3])
+    legacy_result.loss.backward()
+    configured_result.loss.backward()
+
+    assert torch.equal(legacy_result.loss, configured_result.loss)
+    assert torch.equal(legacy_input.grad, configured_input.grad)
+    assert configured_result.global_corr_mean == configured_result.morph_corr_mean
+
+
+def test_local_window_bounds_are_seven_overlapping_sixteen_point_windows():
+    from models.shape_alignment import _local_window_bounds
+
+    assert _local_window_bounds(64, 16, 8) == (
+        (0, 16),
+        (8, 24),
+        (16, 32),
+        (24, 40),
+        (32, 48),
+        (40, 56),
+        (48, 64),
+    )
+
+
+def test_source_activity_weights_are_frozen_normalized_and_flat_safe():
+    from models.shape_alignment import _local_window_bounds, _source_activity_weights
+
+    prototype = torch.ones((2, 64), dtype=torch.float64, requires_grad=True)
+    weights = _source_activity_weights(
+        prototype,
+        _local_window_bounds(64, 16, 8),
+    )
+
+    assert weights.shape == (2, 7)
+    assert torch.isfinite(weights).all()
+    assert (weights >= 0).all()
+    assert torch.allclose(weights.sum(dim=1), torch.ones(2, dtype=torch.float64))
+    assert torch.allclose(weights, torch.full_like(weights, 1 / 7))
+    assert not weights.requires_grad
+
+
+def test_flat_local_level_and_slope_correlations_are_finite():
+    from models.shape_alignment import _local_morphology_terms
+
+    flat = torch.ones((2, 16), dtype=torch.float64)
+    loss, level_corr, slope_corr = _local_morphology_terms(
+        flat,
+        flat,
+        torch.ones((2, 1), dtype=torch.float64),
+        ((0, 16),),
+        slope_weight=0.5,
+    )
+
+    assert torch.isfinite(loss).all()
+    assert torch.isfinite(level_corr).all()
+    assert torch.isfinite(slope_corr).all()
+
+
+def test_local_loss_exposes_an_error_hidden_by_global_correlation():
+    from models.shape_alignment import (
+        _local_morphology_terms,
+        _local_window_bounds,
+        _stable_correlation,
+    )
+
+    x = torch.linspace(0, 4 * torch.pi, 64, dtype=torch.float64)
+    prototype = (torch.sin(x) + 0.2 * torch.sin(3 * x)).unsqueeze(0)
+    target = prototype.clone()
+    target[:, 28:36] = -target[:, 28:36]
+    windows = _local_window_bounds(64, 16, 8)
+    weights = torch.full((1, 7), 1 / 7, dtype=torch.float64)
+
+    global_loss = 1 - _stable_correlation(target, prototype)
+    local_loss, _, _ = _local_morphology_terms(
+        target, prototype, weights, windows, slope_weight=0.5
+    )
+
+    assert global_loss.item() < 0.5
+    assert local_loss.item() > global_loss.item() + 0.1
+
+
+def test_local_slope_uses_fifteen_differences_without_extra_normalization():
+    from models.shape_alignment import _local_morphology_terms
+
+    prototype = torch.arange(16, dtype=torch.float64).unsqueeze(0)
+    target = prototype.clone()
+    target[:, 6:10] = torch.tensor([7.5, 6.5, 9.5, 8.5], dtype=torch.float64)
+    loss, level_corr, slope_corr = _local_morphology_terms(
+        target,
+        prototype,
+        torch.ones((1, 1), dtype=torch.float64),
+        ((0, 16),),
+        slope_weight=0.5,
+    )
+
+    assert torch.isfinite(loss).all()
+    assert level_corr.item() > 0.95
+    assert slope_corr.item() < level_corr.item() - 0.2
+    assert torch.diff(target[:, 0:16], dim=1).shape[1] == 15
+
+
+def test_local_window_loss_is_normalized_by_one_plus_slope_weight():
+    from models.shape_alignment import _combine_local_window_losses
+
+    level_corr = torch.tensor([[0.4, 0.8]])
+    slope_corr = torch.tensor([[0.1, 0.7]])
+    actual = _combine_local_window_losses(
+        level_corr, slope_corr, slope_weight=0.5
+    )
+    expected = ((1 - level_corr) + 0.5 * (1 - slope_corr)) / 1.5
+
+    assert torch.equal(actual, expected)
+
+
+def test_class_balanced_mean_weights_present_pseudo_classes_equally():
+    from models.shape_alignment import _class_balanced_mean
+
+    losses = torch.tensor([0.2] * 10 + [0.8])
+    pseudo_classes = torch.tensor([0] * 10 + [1])
+
+    assert torch.allclose(
+        _class_balanced_mean(losses, pseudo_classes), torch.tensor(0.5)
+    )
+
+
+def test_local_shape_uses_one_reconstruction_and_has_only_student_gradient():
+    from models.shape_alignment import ShapeAlignment
+
+    bank = _local_bank(torch.float32)
+    features, positions, labels = _source_batch(torch.float32)
+    student = torch.nn.Linear(3, 3, bias=False)
+    teacher = torch.nn.Linear(3, 3, bias=False)
+    target = student(features[:3])
+    alignment = ShapeAlignment(
+        bank,
+        event_weight=0.0,
+        loss_type="local_morph",
+        local_window_points=16,
+        local_stride_points=8,
+        local_slope_weight=0.5,
+        class_balanced=True,
+    )
+    analysis_calls = []
+    synthesis_calls = []
+    analysis_handle = alignment.analyzers["13"].register_forward_hook(
+        lambda *_: analysis_calls.append(1)
+    )
+    synthesis_handle = alignment.synthesizers["13"].register_forward_hook(
+        lambda *_: synthesis_calls.append(1)
+    )
+    try:
+        result = alignment(target, positions[:3], labels[:3])
+    finally:
+        analysis_handle.remove()
+        synthesis_handle.remove()
+    result.loss.backward()
+
+    assert analysis_calls == [1]
+    assert synthesis_calls == [1]
+    assert student.weight.grad is not None
+    assert student.weight.grad.abs().sum() > 0
+    assert teacher.weight.grad is None
+    assert not any(parameter.requires_grad for parameter in alignment.reference.parameters())
+    assert not getattr(alignment, "local_activity_weights_13").requires_grad
+
+
+def test_local_morph_loss_never_reintroduces_event_loss():
+    from models.shape_alignment import ShapeAlignment
+
+    bank = _local_bank(torch.float64)
+    features, positions, labels = _source_batch(torch.float64)
+    without_event = ShapeAlignment(
+        bank,
+        event_weight=0.0,
+        loss_type="local_morph",
+        class_balanced=True,
+    )(features[:3], positions[:3], labels[:3])
+    configured_event = ShapeAlignment(
+        bank,
+        event_weight=10.0,
+        loss_type="local_morph",
+        class_balanced=True,
+    )(features[:3], positions[:3], labels[:3])
+
+    assert torch.equal(without_event.loss, configured_event.loss)
+
+
+def test_local_diagnostics_reuses_one_mode13_analysis_and_synthesis():
+    from models.shape_alignment import ShapeAlignment
+
+    alignment = ShapeAlignment(
+        _local_bank(torch.float64),
+        event_weight=0.0,
+        loss_type="local_morph",
+        class_balanced=True,
+    )
+    features, positions, labels = _source_batch(torch.float64)
+    analysis_calls = []
+    synthesis_calls = []
+    analysis_handle = alignment.analyzers["13"].register_forward_hook(
+        lambda *_: analysis_calls.append(1)
+    )
+    synthesis_handle = alignment.synthesizers["13"].register_forward_hook(
+        lambda *_: synthesis_calls.append(1)
+    )
+    try:
+        metrics = alignment.diagnostics(features[:2], positions[:2], labels[:2])
+    finally:
+        analysis_handle.remove()
+        synthesis_handle.remove()
+
+    assert analysis_calls == [1]
+    assert synthesis_calls == [1]
+    assert all(torch.isfinite(value) for value in metrics.values())
+
+
+def test_global_corr_does_not_validate_unused_local_window_configuration():
+    from models.shape_alignment import ShapeAlignment, SourceShapeReferenceBank
+
+    features, positions, labels = _source_batch(torch.float64)
+    bank = SourceShapeReferenceBank.from_source_features(
+        features,
+        positions,
+        labels,
+        modes=(13,),
+        grid_points=8,
+        period_days=365.0,
+        reg=1e-3,
+        prominence_rel=0.15,
+        min_distance_days=14.0,
+    )
+
+    alignment = ShapeAlignment(bank, loss_type="global_corr")
+    result = alignment(features[:2], positions[:2], labels[:2])
+
+    assert torch.isfinite(result.loss)
+
+
+def test_local_shape_has_no_target_label_input_and_returns_pseudo_class_metrics():
+    from models.shape_alignment import ShapeAlignment
+
+    bank = _local_bank(torch.float64)
+    features, positions, _ = _source_batch(torch.float64)
+    pseudo_classes = torch.tensor([0, 1])
+    target_a = features[:2].clone().requires_grad_(True)
+    target_b = features[:2].clone().requires_grad_(True)
+    target_true_a = torch.tensor([0, 1])
+    target_true_b = torch.tensor([1, 0])
+    alignment = ShapeAlignment(
+        bank,
+        event_weight=0.0,
+        loss_type="local_morph",
+        class_balanced=True,
+    )
+
+    result_a = alignment(target_a, positions[:2], pseudo_classes)
+    result_b = alignment(target_b, positions[:2], pseudo_classes)
+    result_a.loss.backward()
+    result_b.loss.backward()
+
+    assert not torch.equal(target_true_a, target_true_b)
+    assert torch.equal(result_a.loss, result_b.loss)
+    assert torch.equal(target_a.grad, target_b.grad)
+    assert set(result_a.class_metrics) == {0, 1}
+    assert result_a.class_metrics[0]["selected_count"] == 1
+    assert result_a.class_metrics[1]["selected_count"] == 1
+
+
+def test_local_manifest_records_window_activity_by_class():
+    from models.shape_alignment import ShapeAlignment
+
+    alignment = ShapeAlignment(
+        _local_bank(torch.float64),
+        event_weight=0.0,
+        loss_type="local_morph",
+        class_balanced=True,
+    )
+    metadata = alignment.manifest_metadata(["a", "b"])
+
+    assert metadata["shape_loss_type"] == "local_morph"
+    assert metadata["local_window_points"] == 16
+    assert metadata["local_stride_points"] == 8
+    assert metadata["per_class"]["a"]["window_count"] == 7
+    assert len(metadata["per_class"]["a"]["window_activity_weights"]) == 7
+
+
+def test_local_epoch_observation_reuses_result_and_accumulates_pseudo_classes():
+    import timematch
+    from models.shape_alignment import ShapeAlignmentResult
+
+    scalar = lambda value: torch.tensor(value, dtype=torch.float64)
+    result = ShapeAlignmentResult(
+        loss=scalar(0.4),
+        morph_loss=scalar(0.4),
+        event_loss=scalar(0.0),
+        mode_losses={13: scalar(0.4)},
+        morph_corr_mean=scalar(0.75),
+        event_amp_abs_gap=scalar(0.0),
+        no_event_reference_count=torch.tensor(0),
+        global_corr_mean=scalar(0.75),
+        local_level_corr_mean=scalar(0.65),
+        local_slope_corr_mean=scalar(0.55),
+        local_shape_loss=scalar(0.4),
+        class_metrics={
+            0: {
+                "selected_count": torch.tensor(2),
+                "global_corr_mean": scalar(0.8),
+                "local_level_corr_mean": scalar(0.7),
+                "local_slope_corr_mean": scalar(0.6),
+                "local_shape_loss": scalar(0.3),
+                "source_activity_weight_min": scalar(0.1),
+                "source_activity_weight_max": scalar(0.2),
+            },
+            1: {
+                "selected_count": torch.tensor(1),
+                "global_corr_mean": scalar(0.5),
+                "local_level_corr_mean": scalar(0.4),
+                "local_slope_corr_mean": scalar(0.3),
+                "local_shape_loss": scalar(0.8),
+                "source_activity_weight_min": scalar(0.05),
+                "source_activity_weight_max": scalar(0.25),
+            },
+        },
+    )
+    epoch = timematch._new_shape_epoch_metrics()
+
+    timematch._observe_shape_training_step(
+        epoch,
+        result,
+        torch.tensor([True, True, True, False]),
+        scalar(2.0),
+        shape_lambda=0.1,
+    )
+
+    assert epoch["selected"] == 3
+    assert epoch["global_corr"] == pytest.approx(0.75 * 3)
+    assert epoch["local_level_corr"] == pytest.approx(0.65 * 3)
+    assert epoch["local_slope_corr"] == pytest.approx(0.55 * 3)
+    assert epoch["local_loss"] == pytest.approx(0.4 * 3)
+    assert set(epoch["classes"]) == {0, 1}
+    assert epoch["classes"][0]["selected"] == 2
+    assert epoch["classes"][1]["selected"] == 1
+
+
+def test_train_cli_declares_backward_compatible_local_shape_options():
+    source = Path("train.py").read_text(encoding="utf-8")
+
+    assert '"--shape_loss_type"' in source
+    assert 'default="global_corr"' in source
+    assert '"--shape_local_window_points"' in source
+    assert '"--shape_local_stride_points"' in source
+    assert '"--shape_local_slope_weight"' in source
+    assert '"--shape_class_balanced"' in source
+
+
+def test_local_morph_launcher_freezes_four_tasks_and_disables_class_phase():
+    source = Path(
+        "scripts/run_timematch_shape13_localmorph_4tasks_4gpu.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'launch "$GPU0" AT1 "$AT1" DK1 "$DK1" "$AT1_WEIGHTS"' in source
+    assert 'launch "$GPU1" DK1 "$DK1" FR1 "$FR1" "$DK1_WEIGHTS"' in source
+    assert 'launch "$GPU2" FR1 "$FR1" FR2 "$FR2" "$FR1_WEIGHTS"' in source
+    assert 'launch "$GPU3" FR2 "$FR2" AT1 "$AT1" "$FR2_WEIGHTS"' in source
+    assert "--shape_loss_type local_morph" in source
+    assert "--shape_local_window_points 16" in source
+    assert "--shape_local_stride_points 8" in source
+    assert "--shape_local_slope_weight 0.5" in source
+    assert "--shape_class_balanced true" in source
+    assert "--shape_event_weight 0.0" in source
+    assert "--class_residual_phase false" in source
+    assert 'SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/' in source
+    assert 'nohup bash "$SCRIPT_PATH" --worker' in source
+    for forbidden in ("git ", "pip install", "conda ", "module load"):
+        assert forbidden not in source

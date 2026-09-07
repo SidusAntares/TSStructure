@@ -1,7 +1,7 @@
 """Training-only class-conditional structural alignment for TimeMatch."""
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import random
 from typing import Dict, Iterable, List, Mapping, Sequence
 
@@ -65,6 +65,109 @@ def _stable_correlation(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor
     eps = torch.finfo(left.dtype).eps
     correlation = (numerator / denominator.clamp_min(eps)).clamp(-1.0, 1.0)
     return torch.where(torch.isfinite(correlation), correlation, torch.zeros_like(correlation))
+
+
+def _local_window_bounds(
+    num_points: int,
+    window_points: int,
+    stride_points: int,
+):
+    """Return complete overlapping windows on the structural grid."""
+    num_points = int(num_points)
+    window_points = int(window_points)
+    stride_points = int(stride_points)
+    if num_points < 3:
+        raise ValueError("local morphology requires at least three grid points")
+    if window_points < 3 or window_points > num_points:
+        raise ValueError("local window points must be in [3, grid_points]")
+    if stride_points <= 0:
+        raise ValueError("local stride points must be positive")
+    return tuple(
+        (start, start + window_points)
+        for start in range(0, num_points - window_points + 1, stride_points)
+    )
+
+
+def _source_activity_weights(
+    prototypes: torch.Tensor,
+    window_bounds,
+) -> torch.Tensor:
+    """Build frozen per-class weights from source level and in-window slope activity."""
+    with torch.no_grad():
+        activities = []
+        for start, end in window_bounds:
+            window = prototypes[:, start:end]
+            slopes = torch.diff(window, dim=1)
+            activities.append(
+                window.std(dim=1, correction=0)
+                + slopes.std(dim=1, correction=0)
+            )
+        activity = torch.stack(activities, dim=1)
+        eps = torch.finfo(activity.dtype).eps
+        weights = (activity + eps) / (activity + eps).sum(dim=1, keepdim=True)
+    return weights.detach()
+
+
+def _combine_local_window_losses(
+    level_correlation: torch.Tensor,
+    slope_correlation: torch.Tensor,
+    slope_weight: float,
+) -> torch.Tensor:
+    slope_weight = float(slope_weight)
+    if slope_weight < 0:
+        raise ValueError("local slope weight must be non-negative")
+    return (
+        (1.0 - level_correlation)
+        + slope_weight * (1.0 - slope_correlation)
+    ) / (1.0 + slope_weight)
+
+
+def _local_morphology_terms(
+    normalized_curves: torch.Tensor,
+    normalized_prototypes: torch.Tensor,
+    activity_weights: torch.Tensor,
+    window_bounds,
+    slope_weight: float,
+):
+    """Compute weighted local level/slope terms without cross-window differences."""
+    level_correlations = []
+    slope_correlations = []
+    for start, end in window_bounds:
+        target_window = normalized_curves[:, start:end]
+        source_window = normalized_prototypes[:, start:end]
+        level_correlations.append(
+            _stable_correlation(target_window, source_window)
+        )
+        # Slice first: each 16-point window contributes exactly 15 internal slopes.
+        slope_correlations.append(
+            _stable_correlation(
+                torch.diff(target_window, dim=1),
+                torch.diff(source_window, dim=1),
+            )
+        )
+    level = torch.stack(level_correlations, dim=1)
+    slope = torch.stack(slope_correlations, dim=1)
+    if activity_weights.shape != level.shape:
+        raise ValueError("local activity weights must match [batch, windows]")
+    window_losses = _combine_local_window_losses(level, slope, slope_weight)
+    return (
+        (window_losses * activity_weights).sum(dim=1),
+        (level * activity_weights).sum(dim=1),
+        (slope * activity_weights).sum(dim=1),
+    )
+
+
+def _class_balanced_mean(
+    per_sample_losses: torch.Tensor,
+    pseudo_classes: torch.Tensor,
+) -> torch.Tensor:
+    """Average represented pseudo classes equally, irrespective of sample count."""
+    if per_sample_losses.ndim != 1 or pseudo_classes.shape != per_sample_losses.shape:
+        raise ValueError("class-balanced losses and pseudo classes must be [B]")
+    represented = torch.unique(pseudo_classes, sorted=True)
+    return torch.stack(
+        [per_sample_losses[pseudo_classes == value].mean() for value in represented]
+    ).mean()
 
 
 class SourceShapeReferenceBank(nn.Module):
@@ -303,6 +406,11 @@ class ShapeAlignmentResult:
     morph_corr_mean: torch.Tensor
     event_amp_abs_gap: torch.Tensor
     no_event_reference_count: torch.Tensor
+    global_corr_mean: torch.Tensor = None
+    local_level_corr_mean: torch.Tensor = None
+    local_slope_corr_mean: torch.Tensor = None
+    local_shape_loss: torch.Tensor = None
+    class_metrics: Dict[int, Dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -516,6 +624,11 @@ class ShapeAlignment(nn.Module):
         morph_weight: float = 1.0,
         event_weight: float = 0.5,
         loss_modes: Sequence[int] = None,
+        loss_type: str = "global_corr",
+        local_window_points: int = 16,
+        local_stride_points: int = 8,
+        local_slope_weight: float = 0.5,
+        class_balanced: bool = False,
     ):
         super().__init__()
         self.reference = reference
@@ -528,6 +641,32 @@ class ShapeAlignment(nn.Module):
         )
         if not self.loss_modes or any(mode not in reference.modes for mode in self.loss_modes):
             raise ValueError("shape loss modes must be present in the source reference")
+        if loss_type not in ("global_corr", "local_morph"):
+            raise ValueError("shape loss type must be global_corr or local_morph")
+        if loss_type == "local_morph" and self.loss_modes != (13,):
+            raise ValueError("local morphology requires shape loss mode 13 only")
+        self.loss_type = loss_type
+        self.local_window_points = int(local_window_points)
+        self.local_stride_points = int(local_stride_points)
+        self.local_slope_weight = float(local_slope_weight)
+        self.class_balanced = bool(class_balanced)
+        if self.local_slope_weight < 0:
+            raise ValueError("local slope weight must be non-negative")
+        if self.loss_type == "local_morph":
+            self.local_window_bounds = _local_window_bounds(
+                int(reference.grid.numel()),
+                self.local_window_points,
+                self.local_stride_points,
+            )
+            for mode in self.loss_modes:
+                self.register_buffer(
+                    f"local_activity_weights_{mode}",
+                    _source_activity_weights(
+                        reference.prototypes[mode], self.local_window_bounds
+                    ),
+                )
+        else:
+            self.local_window_bounds = ()
         self.analyzers = nn.ModuleDict(
             {
                 str(mode): BatchedDirectFourierAnalyzer(
@@ -558,7 +697,34 @@ class ShapeAlignment(nn.Module):
             no_event_reference_count=torch.zeros(
                 (), device=spatial_features.device, dtype=torch.long
             ),
+            global_corr_mean=zero.detach(),
+            local_level_corr_mean=zero.detach(),
+            local_slope_corr_mean=zero.detach(),
+            local_shape_loss=zero.detach(),
         )
+
+    def manifest_metadata(self, classes: Sequence[str]):
+        metadata = {
+            "shape_loss_type": self.loss_type,
+            "local_window_points": self.local_window_points,
+            "local_stride_points": self.local_stride_points,
+            "local_slope_weight": self.local_slope_weight,
+            "class_balanced": self.class_balanced,
+        }
+        per_class = {}
+        if self.loss_type == "local_morph":
+            mode = self.loss_modes[0]
+            weights = getattr(self, f"local_activity_weights_{mode}")
+            for class_index, class_name in enumerate(classes):
+                per_class[str(class_name)] = {
+                    "window_count": len(self.local_window_bounds),
+                    "window_activity_weights": weights[class_index]
+                    .detach()
+                    .cpu()
+                    .tolist(),
+                }
+        metadata["per_class"] = per_class
+        return metadata
 
     def forward(
         self,
@@ -573,7 +739,11 @@ class ShapeAlignment(nn.Module):
             raise ValueError("target positions must match [B,L]")
         if pseudo_classes.shape != (spatial_features.shape[0],):
             raise ValueError("pseudo classes must have shape [B]")
-        if pseudo_classes.min() < 0 or pseudo_classes.max() >= self.reference.class_projections.shape[0]:
+        if spatial_features.shape[0] and (
+            pseudo_classes.min() < 0
+            or pseudo_classes.max()
+            >= self.reference.class_projections.shape[0]
+        ):
             raise ValueError("pseudo class is missing from the source reference")
 
         grid = self.reference.grid.to(
@@ -595,6 +765,10 @@ class ShapeAlignment(nn.Module):
         correlations = []
         event_gaps = []
         no_event_counts = []
+        local_level_correlations = []
+        local_slope_correlations = []
+        local_shape_losses = []
+        class_metrics = {}
         for mode in self.loss_modes:
             coefficients, _ = self.analyzers[str(mode)](spatial_features, positions)
             reconstruction = self.synthesizers[str(mode)](coefficients, grid)
@@ -602,7 +776,7 @@ class ShapeAlignment(nn.Module):
             normalized = _robust_normalize(curves, detach_statistics=True)
             prototype = self.reference.prototypes[mode].index_select(0, pseudo_classes)
             correlation = _stable_correlation(normalized, prototype)
-            morph_loss = (1.0 - correlation).mean()
+            global_morph_loss = (1.0 - correlation).mean()
 
             event_mask = getattr(self.reference, f"event_mask_{mode}").index_select(
                 0, pseudo_classes
@@ -616,7 +790,65 @@ class ShapeAlignment(nn.Module):
             per_sample_gap = (pointwise_gap * event_mask).sum(dim=1) / event_count.clamp_min(1)
             event_loss = per_sample_event.mean()
             event_gap = per_sample_gap.mean()
-            mode_loss = self.morph_weight * morph_loss + self.event_weight * event_loss
+            if self.loss_type == "local_morph":
+                activity_weights = getattr(
+                    self, f"local_activity_weights_{mode}"
+                ).index_select(0, pseudo_classes)
+                per_sample_local, per_sample_level, per_sample_slope = (
+                    _local_morphology_terms(
+                        normalized,
+                        prototype,
+                        activity_weights,
+                        self.local_window_bounds,
+                        self.local_slope_weight,
+                    )
+                )
+                if self.class_balanced:
+                    morph_loss = _class_balanced_mean(
+                        per_sample_local, pseudo_classes
+                    )
+                else:
+                    morph_loss = per_sample_local.mean()
+                local_level_correlations.append(per_sample_level.mean())
+                local_slope_correlations.append(per_sample_slope.mean())
+                local_shape_losses.append(morph_loss)
+                for class_index in range(
+                    int(self.reference.class_projections.shape[0])
+                ):
+                    selected = pseudo_classes == class_index
+                    selected_count = selected.sum()
+                    denominator = selected_count.clamp_min(1).to(
+                        dtype=normalized.dtype
+                    )
+                    class_weights = getattr(
+                        self, f"local_activity_weights_{mode}"
+                    )[class_index]
+                    class_metrics[class_index] = {
+                        "selected_count": selected_count.detach(),
+                        "global_corr_mean": (
+                            correlation * selected
+                        ).sum().detach() / denominator,
+                        "local_level_corr_mean": (
+                            per_sample_level * selected
+                        ).sum().detach() / denominator,
+                        "local_slope_corr_mean": (
+                            per_sample_slope * selected
+                        ).sum().detach() / denominator,
+                        "local_shape_loss": (
+                            per_sample_local * selected
+                        ).sum().detach() / denominator,
+                        "source_activity_weight_min": class_weights.min().detach(),
+                        "source_activity_weight_max": class_weights.max().detach(),
+                    }
+            else:
+                morph_loss = global_morph_loss
+            if self.loss_type == "local_morph":
+                mode_loss = self.morph_weight * morph_loss
+            else:
+                mode_loss = (
+                    self.morph_weight * morph_loss
+                    + self.event_weight * event_loss
+                )
             mode_losses[mode] = mode_loss
             morph_losses.append(morph_loss)
             event_losses.append(event_loss)
@@ -632,35 +864,55 @@ class ShapeAlignment(nn.Module):
             morph_corr_mean=torch.stack(correlations).mean().detach(),
             event_amp_abs_gap=torch.stack(event_gaps).mean().detach(),
             no_event_reference_count=torch.stack(no_event_counts).max().detach(),
+            global_corr_mean=torch.stack(correlations).mean().detach(),
+            local_level_corr_mean=(
+                torch.stack(local_level_correlations).mean().detach()
+                if local_level_correlations
+                else torch.stack(correlations).mean().detach()
+            ),
+            local_slope_corr_mean=(
+                torch.stack(local_slope_correlations).mean().detach()
+                if local_slope_correlations
+                else torch.stack(correlations).mean().detach()
+            ),
+            local_shape_loss=(
+                torch.stack(local_shape_losses).mean().detach()
+                if local_shape_losses
+                else torch.stack(morph_losses).mean().detach()
+            ),
+            class_metrics=class_metrics,
         )
 
     @torch.no_grad()
     def diagnostics(
         self, spatial_features, positions, pseudo_classes, residual_shifts=None
     ):
-        result = self(
-            spatial_features,
-            positions,
-            pseudo_classes,
-            residual_shifts=residual_shifts,
-        )
-        metrics = {
-            "morphology_correlation": result.morph_corr_mean,
-            "event_amplitude_gap": result.event_amp_abs_gap,
-        }
+        if positions.shape != spatial_features.shape[:2]:
+            raise ValueError("target positions must match [B,L]")
+        if pseudo_classes.shape != (spatial_features.shape[0],):
+            raise ValueError("pseudo classes must have shape [B]")
+        if spatial_features.shape[0] and (
+            pseudo_classes.min() < 0
+            or pseudo_classes.max()
+            >= self.reference.class_projections.shape[0]
+        ):
+            raise ValueError("pseudo class is missing from the source reference")
         peak_matches = []
         valley_matches = []
         signature_matches = []
         if spatial_features.shape[0] == 0:
-            zero = result.loss.detach()
-            metrics.update(
-                peak_count_match_rate=zero,
-                valley_count_match_rate=zero,
-                landmark_signature_match_rate=zero,
-            )
-            return metrics
+            zero = spatial_features.sum().detach() * 0.0
+            return {
+                "morphology_correlation": zero,
+                "event_amplitude_gap": zero,
+                "peak_count_match_rate": zero,
+                "valley_count_match_rate": zero,
+                "landmark_signature_match_rate": zero,
+            }
 
         grid_np = self.reference.grid.detach().cpu().numpy()
+        correlations = []
+        event_gaps = []
         for mode in self.loss_modes:
             grid = self.reference.grid.to(spatial_features).unsqueeze(0).expand(
                 spatial_features.shape[0], -1
@@ -671,6 +923,8 @@ class ShapeAlignment(nn.Module):
                     device=spatial_features.device,
                     dtype=spatial_features.dtype,
                 )
+                if shifts.shape != (spatial_features.shape[0],):
+                    raise ValueError("residual shifts must have shape [B]")
                 grid = grid - shifts.detach().unsqueeze(1)
             coeffs, _ = self.analyzers[str(mode)](spatial_features, positions)
             reconstructed = self.synthesizers[str(mode)](coeffs, grid)
@@ -678,6 +932,19 @@ class ShapeAlignment(nn.Module):
             curves = _robust_normalize(
                 torch.einsum("bld,bd->bl", reconstructed, projections), True
             )
+            prototype = self.reference.prototypes[mode].index_select(
+                0, pseudo_classes
+            )
+            correlation = _stable_correlation(curves, prototype)
+            event_mask = getattr(
+                self.reference, f"event_mask_{mode}"
+            ).index_select(0, pseudo_classes)
+            event_count = event_mask.sum(dim=1)
+            event_gap = (
+                torch.abs(curves - prototype) * event_mask
+            ).sum(dim=1) / event_count.clamp_min(1)
+            correlations.append(correlation.mean())
+            event_gaps.append(event_gap.mean())
             for index, class_id in enumerate(pseudo_classes.detach().cpu().tolist()):
                 curve = curves[index].detach().cpu().numpy()
                 threshold = self.reference.prominence_rel * robust_signal_scale(curve)
@@ -703,9 +970,17 @@ class ShapeAlignment(nn.Module):
                 signature_matches.append(float(signature == (len(source_kinds), "-".join(source_kinds))))
         device = spatial_features.device
         dtype = spatial_features.dtype
-        metrics.update(
-            peak_count_match_rate=torch.tensor(peak_matches, device=device, dtype=dtype).mean(),
-            valley_count_match_rate=torch.tensor(valley_matches, device=device, dtype=dtype).mean(),
-            landmark_signature_match_rate=torch.tensor(signature_matches, device=device, dtype=dtype).mean(),
-        )
+        metrics = {
+            "morphology_correlation": torch.stack(correlations).mean(),
+            "event_amplitude_gap": torch.stack(event_gaps).mean(),
+            "peak_count_match_rate": torch.tensor(
+                peak_matches, device=device, dtype=dtype
+            ).mean(),
+            "valley_count_match_rate": torch.tensor(
+                valley_matches, device=device, dtype=dtype
+            ).mean(),
+            "landmark_signature_match_rate": torch.tensor(
+                signature_matches, device=device, dtype=dtype
+            ).mean(),
+        }
         return {name: value.detach() for name, value in metrics.items()}

@@ -622,6 +622,16 @@ if __name__ == '__main__':
     timematch.add_argument("--shape_fourier_period_days", type=float, default=365.0)
     timematch.add_argument("--shape_fourier_reg", type=float, default=1e-3)
     timematch.add_argument("--shape_diag_batches", type=int, default=10)
+    timematch.add_argument(
+        "--shape_loss_type",
+        type=str,
+        default="global_corr",
+        choices=["global_corr", "local_morph"],
+    )
+    timematch.add_argument("--shape_local_window_points", type=int, default=16)
+    timematch.add_argument("--shape_local_stride_points", type=int, default=8)
+    timematch.add_argument("--shape_local_slope_weight", type=float, default=0.5)
+    timematch.add_argument("--shape_class_balanced", type=bool_flag, default=False)
     timematch.add_argument("--class_residual_phase", type=bool_flag, default=False)
     timematch.add_argument("--class_phase_mode", type=int, default=9, choices=[9])
     timematch.add_argument("--class_phase_radius_days", type=int, default=7)

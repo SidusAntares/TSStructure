@@ -275,24 +275,35 @@ def _build_source_shape_alignment(student, config, splits, device, checkpoint_pa
     torch.save(
         bank.export_payload(), os.path.join(config.fold_dir, "shape_reference.pt")
     )
+    shape_alignment = ShapeAlignment(
+        bank,
+        morph_weight=config.shape_morph_weight,
+        event_weight=config.shape_event_weight,
+        loss_modes=config.shape_modes,
+        loss_type=getattr(config, "shape_loss_type", "global_corr"),
+        local_window_points=getattr(config, "shape_local_window_points", 16),
+        local_stride_points=getattr(config, "shape_local_stride_points", 8),
+        local_slope_weight=getattr(config, "shape_local_slope_weight", 0.5),
+        class_balanced=getattr(config, "shape_class_balanced", False),
+    ).to(device)
     manifest = bank.manifest(
         config.source,
         checkpoint_path,
         config.classes,
         config.shape_reference_per_class,
     )
+    shape_metadata = shape_alignment.manifest_metadata(config.classes)
+    per_class_metadata = shape_metadata.pop("per_class")
+    manifest.update(shape_metadata)
+    for class_name, values in per_class_metadata.items():
+        manifest["per_class"][class_name].update(values)
     with open(
         os.path.join(config.fold_dir, "shape_reference_manifest.json"),
         "w",
         encoding="utf-8",
     ) as handle:
         json.dump(manifest, handle, indent=2)
-    return ShapeAlignment(
-        bank,
-        morph_weight=config.shape_morph_weight,
-        event_weight=config.shape_event_weight,
-        loss_modes=config.shape_modes,
-    ).to(device)
+    return shape_alignment
 
 
 def _build_class_phase_loader(splits, config):
@@ -520,14 +531,56 @@ def _append_shape_training_metrics(output_dir, metrics):
         [
             "epoch",
             "morph_loss",
+            "global_corr_mean",
+            "local_level_corr_mean",
+            "local_slope_corr_mean",
+            "local_shape_loss",
             "weighted_shape_loss",
             "shape_loss_ratio",
             "selected_target_count",
             "selected_target_rate",
+            "selected_class_count",
             "morph_corr_mean",
         ],
         [metrics],
     )
+
+
+def _append_shape_class_metrics(output_dir, rows):
+    if not rows:
+        return
+    _append_csv(
+        os.path.join(output_dir, "shape_class_metrics.csv"),
+        [
+            "epoch",
+            "class_index",
+            "class_name",
+            "selected_count",
+            "global_corr_mean",
+            "local_level_corr_mean",
+            "local_slope_corr_mean",
+            "local_shape_loss",
+            "source_activity_weight_min",
+            "source_activity_weight_max",
+        ],
+        rows,
+    )
+
+
+def _new_shape_epoch_metrics():
+    return {
+        "selected": 0,
+        "target": 0,
+        "morph": 0.0,
+        "weighted": 0.0,
+        "ratio": 0.0,
+        "corr": 0.0,
+        "global_corr": 0.0,
+        "local_level_corr": 0.0,
+        "local_slope_corr": 0.0,
+        "local_loss": 0.0,
+        "classes": {},
+    }
 
 
 @torch.no_grad()
@@ -540,6 +593,14 @@ def _observe_shape_training_step(
     shape_lambda,
 ):
     """Accumulate detached shape metrics without changing training semantics."""
+    for key in (
+        "global_corr",
+        "local_level_corr",
+        "local_slope_corr",
+        "local_loss",
+    ):
+        shape_epoch.setdefault(key, 0.0)
+    shape_epoch.setdefault("classes", {})
     shape_epoch["target"] += int(pseudo_mask.numel())
     if shape_result is None:
         return
@@ -551,6 +612,59 @@ def _observe_shape_training_step(
     shape_epoch["weighted"] += float(weighted_shape) * selected_count
     shape_epoch["ratio"] += float(ratio) * selected_count
     shape_epoch["corr"] += float(shape_result.morph_corr_mean) * selected_count
+    global_corr = (
+        shape_result.global_corr_mean
+        if shape_result.global_corr_mean is not None
+        else shape_result.morph_corr_mean
+    )
+    local_level = (
+        shape_result.local_level_corr_mean
+        if shape_result.local_level_corr_mean is not None
+        else shape_result.morph_corr_mean
+    )
+    local_slope = (
+        shape_result.local_slope_corr_mean
+        if shape_result.local_slope_corr_mean is not None
+        else shape_result.morph_corr_mean
+    )
+    local_loss = (
+        shape_result.local_shape_loss
+        if shape_result.local_shape_loss is not None
+        else shape_result.morph_loss
+    )
+    shape_epoch["global_corr"] += float(global_corr) * selected_count
+    shape_epoch["local_level_corr"] += float(local_level) * selected_count
+    shape_epoch["local_slope_corr"] += float(local_slope) * selected_count
+    shape_epoch["local_loss"] += float(local_loss) * selected_count
+    for class_index, class_metrics in shape_result.class_metrics.items():
+        count = int(class_metrics["selected_count"])
+        if count == 0:
+            continue
+        accumulator = shape_epoch["classes"].setdefault(
+            int(class_index),
+            {
+                "selected": 0,
+                "global_corr": 0.0,
+                "local_level_corr": 0.0,
+                "local_slope_corr": 0.0,
+                "local_loss": 0.0,
+                "activity_min": float(class_metrics["source_activity_weight_min"]),
+                "activity_max": float(class_metrics["source_activity_weight_max"]),
+            },
+        )
+        accumulator["selected"] += count
+        accumulator["global_corr"] += float(
+            class_metrics["global_corr_mean"]
+        ) * count
+        accumulator["local_level_corr"] += float(
+            class_metrics["local_level_corr_mean"]
+        ) * count
+        accumulator["local_slope_corr"] += float(
+            class_metrics["local_slope_corr_mean"]
+        ) * count
+        accumulator["local_loss"] += float(
+            class_metrics["local_shape_loss"]
+        ) * count
 
 
 def _log_shape_result(writer, result, timematch_loss, config, pseudo_mask, step):
@@ -568,6 +682,14 @@ def _log_shape_result(writer, result, timematch_loss, config, pseudo_mask, step)
         "shape/loss_ratio": weighted / denominator,
         "shape/no_event_reference_count": result.no_event_reference_count,
     }
+    if result.global_corr_mean is not None:
+        values["shape/global_corr_mean"] = result.global_corr_mean
+    if result.local_level_corr_mean is not None:
+        values["shape/local_level_corr_mean"] = result.local_level_corr_mean
+    if result.local_slope_corr_mean is not None:
+        values["shape/local_slope_corr_mean"] = result.local_slope_corr_mean
+    if result.local_shape_loss is not None:
+        values["shape/local_shape_loss"] = result.local_shape_loss
     for mode, loss in result.mode_losses.items():
         values[f"shape/mode{mode}_loss"] = loss.detach()
     for name, value in values.items():
@@ -772,14 +894,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         all_labels, all_pseudo_labels, all_pseudo_mask = [], [], []
         shape_epoch = None
         if shape_alignment is not None:
-            shape_epoch = {
-                "selected": 0,
-                "target": 0,
-                "morph": 0.0,
-                "weighted": 0.0,
-                "ratio": 0.0,
-                "corr": 0.0,
-            }
+            shape_epoch = _new_shape_epoch_metrics()
         for step in progress_bar:
             collect_diagnostics = global_step % config.log_step == 0
             sample_source, (sample_target_weak, sample_target_strong) = next(source_iter), next(target_iter)
@@ -986,15 +1101,44 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     {
                         "epoch": epoch,
                         "morph_loss": shape_epoch["morph"] / selected_denominator,
+                        "global_corr_mean": shape_epoch["global_corr"]
+                        / selected_denominator,
+                        "local_level_corr_mean": shape_epoch["local_level_corr"]
+                        / selected_denominator,
+                        "local_slope_corr_mean": shape_epoch["local_slope_corr"]
+                        / selected_denominator,
+                        "local_shape_loss": shape_epoch["local_loss"]
+                        / selected_denominator,
                         "weighted_shape_loss": shape_epoch["weighted"] / selected_denominator,
                         "shape_loss_ratio": shape_epoch["ratio"] / selected_denominator,
                         "selected_target_count": shape_epoch["selected"],
                         "selected_target_rate": (
                             shape_epoch["selected"] / max(shape_epoch["target"], 1)
                         ),
+                        "selected_class_count": len(shape_epoch["classes"]),
                         "morph_corr_mean": shape_epoch["corr"] / selected_denominator,
                     },
                 )
+                class_rows = []
+                for class_index, metrics in sorted(shape_epoch["classes"].items()):
+                    count = max(metrics["selected"], 1)
+                    class_rows.append(
+                        {
+                            "epoch": epoch,
+                            "class_index": class_index,
+                            "class_name": config.classes[class_index],
+                            "selected_count": metrics["selected"],
+                            "global_corr_mean": metrics["global_corr"] / count,
+                            "local_level_corr_mean": metrics["local_level_corr"]
+                            / count,
+                            "local_slope_corr_mean": metrics["local_slope_corr"]
+                            / count,
+                            "local_shape_loss": metrics["local_loss"] / count,
+                            "source_activity_weight_min": metrics["activity_min"],
+                            "source_activity_weight_max": metrics["activity_max"],
+                        }
+                    )
+                _append_shape_class_metrics(config.fold_dir, class_rows)
             shape_diagnostics = _collect_shape_epoch_diagnostics(
                 teacher,
                 shape_alignment,
