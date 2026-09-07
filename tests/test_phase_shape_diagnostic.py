@@ -189,6 +189,11 @@ def test_launcher_is_offline_and_contains_exact_four_tasks():
         'run "$GPU2" FR1 FR2 "$FR1_WEIGHTS/fold_0/model.pt" & p2=$!',
         'run "$GPU3" FR2 AT1 "$FR2_WEIGHTS/fold_0/model.pt" & p3=$!',
     ]
+    assert 'local gpu="$1"\n' in launcher
+    assert 'local source="$2"\n' in launcher
+    assert 'local target="$3"\n' in launcher
+    assert 'local checkpoint="$4"\n' in launcher
+    assert 'local task="${source}_${target}"\n' in launcher
 
 
 def test_order_preserving_landmark_matching_skips_spurious_early_mark():

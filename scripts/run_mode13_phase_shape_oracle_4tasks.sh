@@ -16,10 +16,16 @@ for weights in "$AT1_WEIGHTS" "$DK1_WEIGHTS" "$FR1_WEIGHTS" "$FR2_WEIGHTS"; do
   [[ -f "$checkpoint" && -f "${weights}/train_config.json" ]] || { echo "ERROR: checkpoint/config missing: $checkpoint" >&2; exit 1; }
 done
 mkdir -p "$OUT" "$LOG"
-run(){ local gpu="$1" source="$2" target="$3" checkpoint="$4" task="${source}_${target}";
+run(){
+  local gpu="$1"
+  local source="$2"
+  local target="$3"
+  local checkpoint="$4"
+  local task="${source}_${target}"
   CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u scripts/diagnose_mode13_phase_shape_oracle.py \
     --data-root "$DATA_ROOT" --source "$source" --target "$target" --checkpoint "$checkpoint" \
-    --device cuda --seed 1 --batch-size 128 --num-pixels 64 --output-dir "$OUT/$task" > "$LOG/$task.log" 2>&1; }
+    --device cuda --seed 1 --batch-size 128 --num-pixels 64 --output-dir "$OUT/$task" > "$LOG/$task.log" 2>&1
+}
 run "$GPU0" AT1 DK1 "$AT1_WEIGHTS/fold_0/model.pt" & p0=$!
 run "$GPU1" DK1 FR1 "$DK1_WEIGHTS/fold_0/model.pt" & p1=$!
 run "$GPU2" FR1 FR2 "$FR1_WEIGHTS/fold_0/model.pt" & p2=$!
