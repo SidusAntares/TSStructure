@@ -3,6 +3,121 @@ import pytest
 import torch
 
 
+def test_phase_normalization_excludes_near_constant_channels():
+    from analysis.phase_shape_diagnostic import normalize_phase_pair
+    t = np.linspace(0, 1, 64)
+    source = np.column_stack([np.sin(6*t), 1 + 1e-12*np.sin(t), np.cos(6*t)])
+    result = normalize_phase_pair(source, 1.5*source)
+    assert result["valid_channels"].tolist() == [True, False, True]
+    assert np.isfinite(result["source"]).all()
+    assert np.abs(result["source"]).max() < 10
+    np.testing.assert_allclose(result["source"], result["target"], atol=1e-10)
+
+
+def test_selection_uses_landmarks_excludes_zero_and_breaks_ties_conservatively():
+    from analysis.phase_shape_diagnostic import select_phase_candidate
+    rows = [
+        dict(lambda_value=lam, candidate_admissible=True, landmark_error_mean=error,
+             gamma_mean_displacement_days=displacement, registration_error=reg)
+        for lam, error, displacement, reg in [
+            (0, 0, 0, 0), (.01, 5, 3, .01), (.1, 2, 2, .8),
+            (1, 2, 1, .9), (10, 2, 1, 1.0)]
+    ]
+    assert select_phase_candidate(rows, 6)["lambda_value"] == 10
+    assert select_phase_candidate(rows, 2) is None
+    assert select_phase_candidate(rows, np.nan) is None
+
+
+def test_overwarp_rejected_and_raw_scalar_retained(monkeypatch):
+    import analysis.phase_shape_diagnostic as diagnostic
+    t = np.linspace(0, 1, 64)
+    source = _curve(t)
+    monkeypatch.setattr(diagnostic, "_solve_joint_gamma",
+                        lambda *args, **kwargs: np.linspace(0, 1, 128)**5)
+    result = diagnostic.constrained_residual_phase(
+        source, source*1.5, np.array([1., 0.]), t*365)
+    assert all(row["rejection_reason"] == "residual_warp_too_large" for row in result["candidates"])
+    assert not result["nonlinear_accepted"]
+    np.testing.assert_array_equal(result["raw_aligned"], source*1.5)
+
+
+def test_no_valid_channels_skips_solver(monkeypatch):
+    import analysis.phase_shape_diagnostic as diagnostic
+    def fail(*args, **kwargs):
+        pytest.fail("SRVF must not be called")
+    monkeypatch.setattr(diagnostic, "_solve_joint_gamma", fail)
+    result = diagnostic.constrained_residual_phase(
+        np.ones((64, 2)), np.ones((64, 2))*1.5, np.array([1., 0.]), np.arange(64))
+    assert result["failure_reason"] == "no_valid_phase_channels"
+    assert result["selected_phase"] == "scalar"
+
+
+def test_residual_solver_receives_scalar_aligned_normalized_data(monkeypatch):
+    import analysis.phase_shape_diagnostic as diagnostic
+    t = np.linspace(0, 1, 64, endpoint=False)
+    source = _curve(t)
+    target = diagnostic._periodic_shift(source, -5, 365)
+    delta, scalar = diagnostic.estimate_scalar_phase(source, target)
+    assert delta == 5
+    expected = diagnostic.normalize_phase_pair(source, scalar)
+    calls = []
+    def solve(a, b, lam):
+        np.testing.assert_allclose(b, diagnostic._resample(expected["target"], 128))
+        calls.append(lam)
+        return np.linspace(0, 1, 128)
+    monkeypatch.setattr(diagnostic, "_solve_joint_gamma", solve)
+    result = diagnostic.constrained_residual_phase(source, scalar, np.array([1., 0.]), t*365)
+    assert calls == [0, .01, .1, 1, 10]
+    assert not result["nonlinear_accepted"]
+    np.testing.assert_array_equal(result["raw_aligned"], scalar)
+
+
+def test_feature_cache_is_opt_in(tmp_path):
+    from scripts.diagnose_mode13_phase_shape_oracle import save_feature_caches
+    save_feature_caches(tmp_path, {}, {})
+    assert not list(tmp_path.glob('*cache.pt'))
+    save_feature_caches(tmp_path, {}, {}, True)
+    assert len(list(tmp_path.glob('*cache.pt'))) == 2
+
+
+def test_actual_penalized_residual_improves_small_local_warp():
+    from analysis.phase_shape_diagnostic import (
+        _periodic_shift, estimate_scalar_phase, constrained_residual_phase,
+        registration_metrics,
+    )
+    t = np.linspace(0, 1, 64)
+    source = _curve(t)
+    target = _periodic_shift(_curve(t**1.15), -3, 365)
+    delta, scalar = estimate_scalar_phase(source, target)
+    assert abs(delta) <= 7
+    assert registration_metrics(source, scalar)["normalized_l2"] < registration_metrics(source, target)["normalized_l2"]
+    result = constrained_residual_phase(source, scalar, np.array([1., 0.]), t*365)
+    assert result["nonlinear_accepted"]
+    assert result["selected_lambda"] > 0
+    assert result["selected_landmark_error"] < result["scalar_landmark_error"]
+    assert result["phase"].max_displacement*365 <= 60
+
+
+def test_amplitude_scaling_selected_shape_stays_raw():
+    from analysis.phase_shape_diagnostic import constrained_residual_phase, amplitude_metrics, estimate_scalar_phase
+    t = np.linspace(0, 1, 64, endpoint=False)
+    source = _curve(t)
+    delta, scalar = estimate_scalar_phase(source, 1.5*source)
+    assert delta == 0
+    result = constrained_residual_phase(source, scalar, np.array([1., 0.]), t*365)
+    np.testing.assert_allclose(result["phase"].gamma, np.linspace(0, 1, 128))
+    for name in ("range_ratio", "std_ratio", "iqr_ratio"):
+        assert amplitude_metrics(source, result["raw_aligned"])[name] == pytest.approx(1.5)
+
+
+def test_nonfinite_phase_input_is_rejected_before_srvf(monkeypatch):
+    import analysis.phase_shape_diagnostic as diagnostic
+    source = _curve(np.linspace(0, 1, 64))
+    target = source.copy(); target[0, 0] = np.nan
+    normalized = diagnostic.normalize_phase_pair(source, target)
+    assert normalized["failure_reason"] == "nonfinite_normalized_phase"
+
+
 def _curve(t):
     return np.stack(
         [np.sin(2 * np.pi * t) + 0.35 * np.sin(6 * np.pi * t),
@@ -120,7 +235,7 @@ def test_oracle_analysis_smoke_emits_complete_metrics_and_artifacts(tmp_path):
         [class_zero + offset for offset in (-0.01, 0.0, 0.01)]
         + [class_one + offset for offset in (-0.01, 0.0, 0.01)]
     )
-    target = source * 1.05
+    target = source * 1.5
     labels = np.array([0, 0, 0, 1, 1, 1])
     cache_source = {
         "mode13_features": torch.tensor(source, dtype=torch.float32),
@@ -159,6 +274,18 @@ def test_oracle_analysis_smoke_emits_complete_metrics_and_artifacts(tmp_path):
     assert (tmp_path / "gamma_by_class.png").is_file()
     assert isinstance(landmarks, list)
     assert isinstance(segments, list)
+    for row in shape:
+        assert row["selected_phase"] == "scalar"
+        assert not row["nonlinear_accepted"]
+        assert row["global_range_ratio"] == pytest.approx(1.5, abs=1e-5)
+        assert row["global_std_ratio"] == pytest.approx(1.5, abs=1e-5)
+        assert row["peak_height_ratio_mean"] == pytest.approx(1.5, abs=1e-5)
+    for rows in (landmarks, segments):
+        assert all(row["selected_phase"] == "scalar" for row in rows)
+    assert not list(tmp_path.glob('*cache.pt'))
+    for name in ('phase_channel_metrics.csv', 'phase_lambda_metrics.csv', 'phase_lambda_summary.csv',
+                 'gamma_candidates_by_class.png'):
+        assert (tmp_path / name).is_file()
 
 
 def test_cache_labels_are_joined_by_parcel_id_not_loader_order():

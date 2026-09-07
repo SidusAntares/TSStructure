@@ -37,8 +37,38 @@ def robust_normalize(prototype):
     values = np.asarray(prototype, dtype=np.float64)
     median = np.median(values, axis=0, keepdims=True)
     q25, q75 = np.percentile(values, (25, 75), axis=0, keepdims=True)
-    scale = np.maximum(q75 - q25, EPS)
-    return (values - median) / scale
+    iqr = q75 - q25
+    positive = iqr[np.isfinite(iqr) & (iqr > EPS)]
+    floor = max(EPS, 1e-3 * np.median(positive)) if positive.size else EPS
+    valid = np.isfinite(iqr) & (iqr > floor)
+    result = np.zeros_like(values)
+    np.divide(values - median, np.maximum(iqr, floor), out=result,
+              where=np.broadcast_to(valid, values.shape))
+    return result
+
+
+def normalize_phase_pair(source, target, floor_ratio=1e-3):
+    """Joint validity mask; separate source/target scales, invalid channels zero."""
+    source, target = np.asarray(source, dtype=float), np.asarray(target, dtype=float)
+    if source.ndim != 2 or source.shape != target.shape:
+        raise ValueError("phase prototypes must have matching [K,D] shapes")
+    if not np.isfinite(floor_ratio) or floor_ratio <= 0:
+        raise ValueError("phase IQR floor ratio must be positive and finite")
+    sq = np.percentile(source, 75, axis=0) - np.percentile(source, 25, axis=0)
+    tq = np.percentile(target, 75, axis=0) - np.percentile(target, 25, axis=0)
+    scales = np.r_[sq, tq]
+    positive = scales[np.isfinite(scales) & (scales > EPS)]
+    floor = max(EPS, floor_ratio * np.median(positive)) if positive.size else EPS
+    valid = (sq > floor) & (tq > floor) & np.isfinite(sq) & np.isfinite(tq)
+    sn, tn = np.zeros_like(source), np.zeros_like(target)
+    sn[:, valid] = (source[:, valid] - np.median(source[:, valid], axis=0)) / np.maximum(sq[valid], floor)
+    tn[:, valid] = (target[:, valid] - np.median(target[:, valid], axis=0)) / np.maximum(tq[valid], floor)
+    finite = np.isfinite(source).all() and np.isfinite(target).all() and np.isfinite(sn).all() and np.isfinite(tn).all()
+    reason = "" if finite and valid.any() else (
+        "nonfinite_normalized_phase" if not finite else "no_valid_phase_channels")
+    return dict(source=sn, target=tn, valid_channels=valid, source_iqr=sq,
+                target_iqr=tq, iqr_floor=floor, failure_reason=reason,
+                normalized_global_max_abs=float(max(np.max(np.abs(sn)), np.max(np.abs(tn)))))
 
 
 def _resample(curve, count):
@@ -48,13 +78,13 @@ def _resample(curve, count):
     return np.stack([np.interp(new, old, curve[:, d]) for d in range(curve.shape[1])], axis=1)
 
 
-def _solve_joint_gamma(source, target):
+def _solve_joint_gamma(source, target, lam=0.0):
     from fdasrsf import curve_functions
 
     q_source = curve_functions.curve_to_q(source.T, mode="O", scale=False)[0]
     q_target = curve_functions.curve_to_q(target.T, mode="O", scale=False)[0]
     return curve_functions.optimum_reparam_curve(
-        q_source, q_target, lam=0.0, method="DP"
+        q_source, q_target, lam=lam, method="DP"
     )
 
 
@@ -246,3 +276,90 @@ def _minimum_cost_ordered_pairs(left, right):
         else:
             j -= 1
     return list(reversed(pairs))
+
+
+def select_phase_candidate(rows, scalar_error, tolerance=1e-9):
+    """Select by landmark error, mean displacement, then larger penalty."""
+    if not np.isfinite(scalar_error):
+        return None
+    eligible = [r for r in rows if r["lambda_value"] > 0
+                and r["candidate_admissible"]
+                and np.isfinite(r["landmark_error_mean"])]
+    if not eligible:
+        return None
+    minimum = min(r["landmark_error_mean"] for r in eligible)
+    tied = [r for r in eligible if r["landmark_error_mean"] <= minimum + tolerance]
+    best = min(tied, key=lambda r: (r["gamma_mean_displacement_days"], -r["lambda_value"]))
+    return best if best["landmark_error_mean"] < scalar_error else None
+
+
+def constrained_residual_phase(source, target_scalar, loading, grid,
+                               lambdas=(0, .01, .1, 1, 10), floor_ratio=1e-3,
+                               max_warp_days=60, prominence=0, min_distance_days=14):
+    """All candidates act on scalar-aligned raw data; only accepted warp escapes."""
+    if not lambdas or any(not np.isfinite(lam) or lam < 0 for lam in lambdas):
+        raise ValueError("phase lambdas must be finite and nonnegative")
+    if not np.isfinite(max_warp_days) or max_warp_days < 0:
+        raise ValueError("maximum residual warp days must be finite and nonnegative")
+    normalized = normalize_phase_pair(source, target_scalar, floor_ratio)
+    mask = normalized["valid_channels"]
+    sn, tn = normalized["source"], normalized["target"]
+    identity = np.linspace(0, 1, 128)
+    scalar_marks = landmark_alignment_metrics(source @ loading, target_scalar @ loading,
+                                             grid, prominence, min_distance_days)
+    rows, gammas = [], {}
+    for lam in lambdas:
+        if normalized["failure_reason"]:
+            phase = _phase_result(identity, False, normalized["failure_reason"])
+        else:
+            try:
+                phase = _phase_result(_solve_joint_gamma(
+                    _resample(sn[:, mask], 128), _resample(tn[:, mask], 128), lam=lam))
+            except Exception as error:
+                phase = _phase_result(identity, False, f"solver_failure:{type(error).__name__}")
+        gammas[lam] = phase.gamma
+        warped = warp_curve(target_scalar, phase.gamma)
+        marks = landmark_alignment_metrics(source @ loading, warped @ loading,
+                                           grid, prominence, min_distance_days)
+        count = marks["matched_peak_count"] + marks["matched_valley_count"]
+        metric_valid = count > 0 and np.isfinite(marks["mean_time_error"])
+        reg = registration_metrics(sn, warp_curve(tn, phase.gamma))
+        reason = phase.failure_reason
+        if phase.valid:
+            if phase.max_displacement * 365 > max_warp_days:
+                reason = "residual_warp_too_large"
+            elif not metric_valid:
+                reason = "no_matched_landmarks"
+            elif lam == 0:
+                reason = "unrestricted_reference"
+        rows.append(dict(
+            lambda_value=float(lam), unrestricted_reference=lam == 0,
+            registration_error=reg["normalized_l2"], registration_corr=reg["correlation"],
+            landmark_error_mean=marks["mean_time_error"],
+            landmark_error_median=marks["median_time_error"],
+            landmark_error_p95=marks["p95_time_error"], matched_landmark_count=count,
+            landmark_metric_valid=metric_valid,
+            gamma_mean_displacement_days=phase.mean_displacement*365,
+            gamma_max_displacement_days=phase.max_displacement*365,
+            gamma_p95_displacement_days=phase.p95_displacement*365,
+            gamma_roughness=phase.roughness, gamma_min_derivative=phase.min_derivative,
+            gamma_max_derivative=phase.max_derivative, gamma_valid=phase.valid,
+            candidate_admissible=bool(phase.valid and not reason), rejection_reason=reason))
+    best = select_phase_candidate(rows, scalar_marks["mean_time_error"])
+    accepted = best is not None
+    if accepted:
+        selected = _phase_result(gammas[best["lambda_value"]])
+        reason = ""
+    else:
+        reason = normalized["failure_reason"] or (
+            "no_matched_landmarks" if not np.isfinite(scalar_marks["mean_time_error"])
+            else "no_landmark_improvement" if any(r["candidate_admissible"] for r in rows)
+            else "no_admissible_candidate")
+        selected = _phase_result(identity, False, reason)
+    return dict(phase=selected, raw_aligned=warp_curve(target_scalar, selected.gamma)
+                if accepted else target_scalar.copy(), normalized=normalized,
+                candidates=rows, candidate_gammas=gammas, selected_lambda=best["lambda_value"] if accepted else None,
+                nonlinear_accepted=accepted, selected_phase="scalar_plus_nonlinear" if accepted else "scalar",
+                scalar_landmark_error=scalar_marks["mean_time_error"],
+                selected_landmark_error=best["landmark_error_mean"] if accepted else scalar_marks["mean_time_error"],
+                failure_reason=reason)

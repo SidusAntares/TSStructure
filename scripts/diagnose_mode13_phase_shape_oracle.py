@@ -21,13 +21,13 @@ from analysis.phase_shape_diagnostic import (
     _periodic_shift,
     amplitude_metrics,
     build_pointwise_median_prototypes,
-    estimate_nonlinear_phase,
     estimate_scalar_phase,
     landmark_alignment_metrics,
     registration_metrics,
     robust_normalize,
     shape_margin,
     warp_curve,
+    constrained_residual_phase,
 )
 from models.fredn.structural_probe import (
     build_direct_fourier_views,
@@ -348,6 +348,9 @@ def analyze(args, source_cache, target_cache, classes):
         "source_pca_direction_by_class": {},
     }
     summaries = []
+    channel_rows, lambda_rows, selections, candidate_gammas = [], [], [], {}
+    artifacts["valid_channel_masks"] = {}
+    artifacts["selected_lambda"] = {}
 
     for class_id in common:
         source_raw = source_prototypes[class_id]
@@ -356,8 +359,43 @@ def analyze(args, source_cache, target_cache, classes):
         target_norm = robust_normalize(target_global)
         scalar_delta, _ = estimate_scalar_phase(source_norm, target_norm)
         target_scalar = _periodic_shift(target_global, scalar_delta, 365.0)
-        nonlinear = estimate_nonlinear_phase(source_norm, target_norm)
-        target_nonlinear = warp_curve(target_global, nonlinear.gamma)
+        loading = projections[class_id].numpy()
+        result = constrained_residual_phase(
+            source_raw, target_scalar, loading, grid,
+            lambdas=getattr(args, "phase_lambdas", (0, .01, .1, 1, 10)),
+            floor_ratio=getattr(args, "phase_iqr_floor_ratio", 1e-3),
+            max_warp_days=getattr(args, "max_residual_warp_days", 60),
+            prominence=args.prominence_rel * max(np.ptp(source_raw @ loading), EPS),
+            min_distance_days=args.min_distance_days)
+        nonlinear = result["phase"]
+        target_nonlinear = result["raw_aligned"]
+        norm = result["normalized"]
+        selected_info = {key: result[key] for key in (
+            "selected_phase", "selected_lambda", "nonlinear_accepted")}
+        selection = dict(selected_info, scalar_delta_days=scalar_delta,
+                         scalar_landmark_error=result["scalar_landmark_error"],
+                         selected_landmark_error=result["selected_landmark_error"],
+                         landmark_gain=result["scalar_landmark_error"]-result["selected_landmark_error"],
+                         valid_phase_channel_count=int(norm["valid_channels"].sum()),
+                         total_channel_count=len(norm["valid_channels"]),
+                         normalized_global_max_abs=norm["normalized_global_max_abs"],
+                         residual_gamma_mean_days=nonlinear.mean_displacement*365,
+                         residual_gamma_max_days=nonlinear.max_displacement*365,
+                         residual_gamma_p95_days=nonlinear.p95_displacement*365,
+                         selection_failure_reason=result["failure_reason"])
+        selections.append(selection)
+        candidate_gammas[class_id] = result["candidate_gammas"]
+        for row in result["candidates"]:
+            lambda_rows.append(dict(task=args.task, **{"class": classes[class_id]},
+                                    **row, **{"lambda": row["lambda_value"]}))
+        for channel in range(len(norm["valid_channels"])):
+            channel_rows.append(dict(task=args.task, **{"class": classes[class_id]}, channel=channel,
+                source_iqr=norm["source_iqr"][channel], target_iqr=norm["target_iqr"][channel],
+                iqr_floor=norm["iqr_floor"], phase_channel_valid=bool(norm["valid_channels"][channel]),
+                source_norm_max_abs=float(np.max(np.abs(norm["source"][:, channel]))),
+                target_norm_max_abs=float(np.max(np.abs(norm["target"][:, channel]))),
+                source_norm_std=float(np.std(norm["source"][:, channel])),
+                target_norm_std=float(np.std(norm["target"][:, channel]))))
         aligned = {
             "global": target_global,
             "scalar": target_scalar,
@@ -368,9 +406,23 @@ def analyze(args, source_cache, target_cache, classes):
         curves = {name: value @ loading for name, value in aligned.items()}
         prominence = args.prominence_rel * max(np.ptp(source_curve), EPS)
         registrations, landmark_metrics = {}, {}
+        # Keep the scalar-frame validity mask and scales fixed across all phases.
+        # These are also the exact tensors used for candidate registration audits.
+        global_phase_norm = np.zeros_like(target_global, dtype=np.float64)
+        valid_channels = norm["valid_channels"]
+        global_phase_norm[:, valid_channels] = (
+            target_global[:, valid_channels]
+            - np.median(target_scalar[:, valid_channels], axis=0)
+        ) / np.maximum(norm["target_iqr"][valid_channels], norm["iqr_floor"])
+        phase_representations = {
+            "global": global_phase_norm,
+            "scalar": norm["target"],
+            "nonlinear": warp_curve(norm["target"], nonlinear.gamma)
+            if result["nonlinear_accepted"] else norm["target"],
+        }
         for phase_type, target_curve in curves.items():
             registrations[phase_type] = registration_metrics(
-                source_norm, robust_normalize(aligned[phase_type])
+                norm["source"], phase_representations[phase_type]
             )
             landmark_metrics[phase_type] = landmark_alignment_metrics(
                 source_curve,
@@ -383,6 +435,8 @@ def analyze(args, source_cache, target_cache, classes):
         global_error = registrations["global"]["normalized_l2"]
         scalar_error = registrations["scalar"]["normalized_l2"]
         nonlinear_error = registrations["nonlinear"]["normalized_l2"]
+        selection.update(scalar_registration_error=scalar_error,
+                         selected_registration_error=nonlinear_error)
         improvements = {
             "scalar_improvement_vs_global": global_error - scalar_error,
             "nonlinear_improvement_vs_global": global_error - nonlinear_error,
@@ -411,6 +465,7 @@ def analyze(args, source_cache, target_cache, classes):
             phase_rows.append(
                 {
                     "task": args.task,
+                    **selection,
                     "class_index": class_id,
                     "class_name": classes[class_id],
                     "source_count": int(np.sum(source_labels == class_id)),
@@ -439,6 +494,8 @@ def analyze(args, source_cache, target_cache, classes):
                     "landmark_time_error_median": landmarks["median_time_error"],
                     "landmark_time_error_p95": landmarks["p95_time_error"],
                     "phase_valid": valid,
+                    "landmark_metric_valid": bool(landmarks["matched_pairs"])
+                    and np.isfinite(landmarks["mean_time_error"]),
                     "phase_failure_reason": reason,
                     "failure_reason": reason,
                 }
@@ -625,11 +682,17 @@ def analyze(args, source_cache, target_cache, classes):
         )
         artifacts["source_raw_prototypes"][class_id] = source_raw
         artifacts["target_raw_prototypes"][class_id] = target_global
-        artifacts["source_norm_prototypes"][class_id] = source_norm
-        artifacts["target_norm_prototypes"][class_id] = target_norm
+        artifacts["source_norm_prototypes"][class_id] = norm["source"]
+        artifacts["target_norm_prototypes"][class_id] = norm["target"]
         artifacts["scalar_delta_by_class"][class_id] = scalar_delta
         artifacts["gamma_by_class"][class_id] = nonlinear.gamma
         artifacts["source_pca_direction_by_class"][class_id] = loading
+        artifacts["valid_channel_masks"][class_id] = norm["valid_channels"]
+        artifacts["selected_lambda"][class_id] = result["selected_lambda"]
+        for rows in (shape_rows, landmark_rows, segment_rows):
+            for row in rows:
+                if row.get("class", row.get("class_name")) == classes[class_id]:
+                    row.update(selected_info)
         summaries.append((registrations, landmark_metrics))
         plot_class(
             args.output_dir / f"class_{class_id}_phase_shape.png",
@@ -637,12 +700,70 @@ def analyze(args, source_cache, target_cache, classes):
             source_curve,
             curves,
             nonlinear.gamma,
-            classes[class_id],
+            f'{classes[class_id]} | lambda={result["selected_lambda"]} | '
+            f'{"ACCEPTED" if result["nonlinear_accepted"] else "REJECTED: scalar retained"} | '
+            f'landmark={result["selected_landmark_error"]:.3f} | '
+            f'max residual={nonlinear.max_displacement*365:.2f} days',
         )
 
     plot_gammas(args.output_dir / "gamma_by_class.png", artifacts, classes)
     summary = task_summary(args.task, summaries, shape_rows, segment_rows)
+    write_csv(args.output_dir / "phase_channel_metrics.csv", channel_rows)
+    write_csv(args.output_dir / "phase_lambda_metrics.csv", lambda_rows)
+    write_csv(args.output_dir / "phase_lambda_summary.csv", summarize_lambdas(args.task, lambda_rows))
+    plot_candidate_gammas(args.output_dir / "gamma_candidates_by_class.png", candidate_gammas, classes)
+    accepted = [s for s in selections if s["nonlinear_accepted"]]
+    accepted_gammas = [artifacts["gamma_by_class"][c] for c in common
+                       if artifacts["selected_lambda"][c] is not None]
+    summary.update(
+        selected_phase_landmark_error_mean=_finite_mean(s["selected_landmark_error"] for s in selections),
+        landmark_improvement_mean=_finite_mean(s["landmark_gain"] for s in selections),
+        landmark_improvement_rate=_finite_mean(s["landmark_gain"] > 0 for s in selections),
+        nonlinear_accepted_count=len(accepted), nonlinear_accepted_rate=len(accepted)/max(1, len(selections)),
+        accepted_nonlinear_class_count=len(accepted), accepted_nonlinear_class_rate=len(accepted)/max(1, len(selections)),
+        residual_mean_days_mean=_finite_mean(s["residual_gamma_mean_days"] for s in accepted),
+        residual_max_days_mean=_finite_mean(s["residual_gamma_max_days"] for s in accepted),
+        residual_mean_displacement_days_mean=_finite_mean(s["residual_gamma_mean_days"] for s in accepted),
+        residual_mean_displacement_days_std=float(np.std([s["residual_gamma_mean_days"] for s in accepted])) if accepted else np.nan,
+        residual_max_displacement_days_mean=_finite_mean(s["residual_gamma_max_days"] for s in accepted),
+        cross_class_gamma_dispersion=float(np.var(accepted_gammas, axis=0).mean()) if accepted_gammas else np.nan,
+        cross_class_gamma_mean=json.dumps(np.mean(accepted_gammas, axis=0).tolist()) if accepted_gammas else "[]",
+        cross_class_gamma_variance=json.dumps(np.var(accepted_gammas, axis=0).tolist()) if accepted_gammas else "[]",
+        valid_phase_channel_rate=sum(s["valid_phase_channel_count"] for s in selections)/max(1, sum(s["total_channel_count"] for s in selections)),
+        numeric_failure_count=sum(not r["gamma_valid"] for r in lambda_rows),
+        overwarp_rejection_count=sum(r["rejection_reason"] == "residual_warp_too_large" for r in lambda_rows),
+        no_landmark_rejection_count=sum(r["rejection_reason"] == "no_matched_landmarks" for r in lambda_rows),
+        no_improvement_rejection_count=sum(s["selection_failure_reason"] == "no_landmark_improvement" for s in selections))
     return phase_rows, shape_rows, landmark_rows, segment_rows, artifacts, summary
+
+
+def summarize_lambdas(task, rows):
+    result = []
+    for lam in sorted({r["lambda_value"] for r in rows}):
+        group = [r for r in rows if r["lambda_value"] == lam]
+        result.append(dict(task=task, **{"lambda": lam},
+            valid_rate=_finite_mean(r["gamma_valid"] for r in group),
+            admissible_rate=_finite_mean(r["candidate_admissible"] for r in group),
+            registration_error_mean=_finite_mean(r["registration_error"] for r in group),
+            landmark_error_mean=_finite_mean(r["landmark_error_mean"] for r in group),
+            mean_residual_displacement_days=_finite_mean(r["gamma_mean_displacement_days"] for r in group),
+            max_residual_displacement_days_mean=_finite_mean(r["gamma_max_displacement_days"] for r in group),
+            overwarp_rate=_finite_mean(r["rejection_reason"] == "residual_warp_too_large" for r in group)))
+    return result
+
+
+def plot_candidate_gammas(path, candidates, classes):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(max(1, len(candidates)), 1, figsize=(8, max(3, 3*len(candidates))), squeeze=False)
+    time = np.linspace(0, 1, 128)
+    for ax, (class_id, gammas) in zip(axes[:, 0], candidates.items()):
+        ax.plot(time, time, "k--", label="identity")
+        for lam, gamma in gammas.items():
+            ax.plot(time, gamma, label=f'lambda={lam}' + (' reference' if lam == 0 else ''))
+        ax.set_title(classes[class_id]); ax.legend()
+    fig.tight_layout(); fig.savefig(path, dpi=150); plt.close(fig)
 
 
 def task_summary(task, summaries, shape_rows, segment_rows):
@@ -731,6 +852,8 @@ def plot_gammas(path, artifacts, classes):
     figure, axis = plt.subplots(figsize=(7, 6))
     axis.plot(time, time, "k--", label="identity")
     for class_id, gamma in artifacts["gamma_by_class"].items():
+        if artifacts["selected_lambda"].get(class_id) is None:
+            continue
         axis.plot(time, gamma, label=classes[class_id])
     axis.legend()
     figure.tight_layout()
@@ -753,6 +876,10 @@ def parse_args():
     parser.add_argument("--shift-sample-size", type=int, default=100)
     parser.add_argument("--prominence-rel", type=float, default=0.15)
     parser.add_argument("--min-distance-days", type=float, default=14.0)
+    parser.add_argument("--phase-iqr-floor-ratio", type=float, default=1e-3)
+    parser.add_argument("--phase-lambdas", type=lambda value: tuple(float(x) for x in value.split(',')), default=(0, .01, .1, 1, 10))
+    parser.add_argument("--max-residual-warp-days", type=float, default=60)
+    parser.add_argument("--save-feature-cache", action="store_true")
     return parser.parse_args()
 
 
@@ -814,8 +941,7 @@ def main():
     target_cache["labels"] = labels_for_cache(target_dataset, target_cache)
 
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    torch.save(source_cache, args.output_dir / "source_mode13_cache.pt")
-    torch.save(target_cache, args.output_dir / "target_mode13_cache.pt")
+    save_feature_caches(args.output_dir, source_cache, target_cache, args.save_feature_cache)
     phase, shape, landmarks, segments, artifacts, summary = analyze(
         args, source_cache, target_cache, classes
     )
@@ -828,6 +954,19 @@ def main():
     metadata = {
         "task": args.task,
         "oracle_target_labels": True,
+        "oracle_phase_selection": True,
+        "nonlinear_semantics": "scalar_plus_constrained_residual_nonlinear",
+        "phase_iqr_floor_ratio": args.phase_iqr_floor_ratio,
+        "phase_lambdas": args.phase_lambdas,
+        "max_residual_warp_days": args.max_residual_warp_days,
+        "save_feature_cache": args.save_feature_cache,
+        "normalization_audit_frame": "source_and_scalar_aligned_target",
+        "invalid_phase_channels": "excluded_from_SRVF_and_zero_in_normalization_audit",
+        "phase_selection_rule": "landmark_mean_then_mean_displacement_then_larger_lambda; strictly_improve_scalar",
+        "numeric_failure_count_unit": "class_lambda_candidates",
+        "overwarp_rejection_count_unit": "class_lambda_candidates_including_reference",
+        "no_landmark_rejection_count_unit": "class_lambda_candidates",
+        "no_improvement_rejection_count_unit": "classes",
         "training_performed": False,
         "target_label_first_use": "after_source_and_target_mode13_cache",
         "split_strategy": "replay_existing_protocol",
@@ -866,6 +1005,12 @@ def main():
     print(json.dumps(metadata, indent=2))
     print("ORACLE_TARGET_LABELS=true")
     print("TRAINING_PERFORMED=false")
+
+
+def save_feature_caches(directory, source, target, enabled=False):
+    if enabled:
+        torch.save(source, directory / "source_mode13_cache.pt")
+        torch.save(target, directory / "target_mode13_cache.pt")
 
 
 if __name__ == "__main__":

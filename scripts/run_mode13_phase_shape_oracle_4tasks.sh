@@ -7,7 +7,10 @@ AT1_WEIGHTS="${AT1_WEIGHTS:-outputs/pseltae_AT1_source_seed1}"
 DK1_WEIGHTS="${DK1_WEIGHTS:-outputs/pseltae_DK1_source_seed1}"
 FR1_WEIGHTS="${FR1_WEIGHTS:-outputs/pseltae_FR1_source_seed1}"
 FR2_WEIGHTS="${FR2_WEIGHTS:-outputs/pseltae_FR2_source_seed1}"
-OUT="outputs/phase_shape_diagnostic_mode13_seed1"; LOG="logs/phase_shape_diagnostic_mode13_seed1"
+OUT="outputs/phase_shape_diagnostic_mode13_constrained_seed1"
+LOG="logs/phase_shape_diagnostic_mode13_constrained_seed1"
+printf '%s\n' 'phase_iqr_floor_ratio=1e-3' 'phase_lambdas=0,0.01,0.1,1,10' \
+  'max_residual_warp_days=60' 'save_feature_cache=false'
 command -v "$PYTHON_BIN" >/dev/null || { echo "ERROR: Python missing" >&2; exit 1; }
 [[ -d "$DATA_ROOT" ]] || { echo "ERROR: DATA_ROOT missing: $DATA_ROOT" >&2; exit 1; }
 "$PYTHON_BIN" -c 'import torch, numpy, scipy, matplotlib, fdasrsf' || { echo "ERROR: required local dependency missing" >&2; exit 1; }
@@ -24,6 +27,7 @@ run(){
   local task="${source}_${target}"
   CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u scripts/diagnose_mode13_phase_shape_oracle.py \
     --data-root "$DATA_ROOT" --source "$source" --target "$target" --checkpoint "$checkpoint" \
+    --phase-iqr-floor-ratio 1e-3 --phase-lambdas '0,0.01,0.1,1,10' --max-residual-warp-days 60 \
     --device cuda --seed 1 --batch-size 128 --num-pixels 64 --output-dir "$OUT/$task" > "$LOG/$task.log" 2>&1
 }
 run "$GPU0" AT1 DK1 "$AT1_WEIGHTS/fold_0/model.pt" & p0=$!
