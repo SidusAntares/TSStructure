@@ -1,3 +1,4 @@
+import csv
 import inspect
 import io
 import random
@@ -1230,6 +1231,36 @@ def test_class_balanced_mean_weights_present_pseudo_classes_equally():
     )
 
 
+def test_local_morph_sample_mean_weights_every_selected_sample_equally(monkeypatch):
+    import models.shape_alignment as shape_alignment
+
+    losses = torch.tensor([0.2] * 10 + [0.8], dtype=torch.float64)
+
+    def fixed_local_terms(target, prototype, activity_weights, windows, slope_weight):
+        values = losses.to(device=target.device, dtype=target.dtype)
+        zeros = torch.zeros_like(values)
+        return values, zeros, zeros
+
+    monkeypatch.setattr(
+        shape_alignment, "_local_morphology_terms", fixed_local_terms
+    )
+    features, positions, _ = _source_batch(torch.float64)
+    features = torch.cat((features, features[:3]), dim=0)
+    positions = torch.cat((positions, positions[:3]), dim=0)
+    pseudo_classes = torch.tensor([0] * 10 + [1])
+    alignment = shape_alignment.ShapeAlignment(
+        _local_bank(torch.float64),
+        event_weight=0.0,
+        loss_type="local_morph",
+        class_balanced=False,
+    )
+
+    result = alignment(features, positions, pseudo_classes)
+
+    assert torch.allclose(result.morph_loss, losses.mean())
+    assert not torch.allclose(result.morph_loss, result.morph_loss.new_tensor(0.5))
+
+
 def test_local_shape_uses_one_reconstruction_and_has_only_student_gradient():
     from models.shape_alignment import ShapeAlignment
 
@@ -1479,4 +1510,146 @@ def test_local_morph_launcher_freezes_four_tasks_and_disables_class_phase():
     assert 'SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/' in source
     assert 'nohup bash "$SCRIPT_PATH" --worker' in source
     for forbidden in ("git ", "pip install", "conda ", "module load"):
+        assert forbidden not in source
+
+
+def _write_ablation_status(path, rows):
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=("group", "task", "exit_code", "status")
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_ablation_log(log_root, group, task, seed=1, include_test=True):
+    experiment = f"timematch_{group}_{task}_seed{seed}"
+    path = log_root / group / f"{task}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "Validation result: loss=0.1, acc=90.00, f1=88.0000\n"
+    if include_test:
+        text += f"Test result for {experiment}: accuracy=91.0000, f1=87.2500\n"
+    path.write_text(text, encoding="utf-8")
+
+
+def test_ablation_summarizer_parses_exact_test_records(tmp_path):
+    from scripts.summarize_timematch_ablation import TASKS, summarize
+
+    log_root = tmp_path / "logs"
+    status_path = tmp_path / "statuses.csv"
+    output_path = tmp_path / "summary.csv"
+    statuses = []
+    for group in ("original", "local_sample"):
+        for task, _, _ in TASKS:
+            _write_ablation_log(log_root, group, task)
+            statuses.append({"group": group, "task": task, "exit_code": 0})
+    _write_ablation_status(status_path, statuses)
+
+    result = summarize(log_root, status_path, output_path, seed=1)
+
+    assert result == 0
+    with output_path.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 4
+    assert rows[0]["original_status"] == "SUCCESS"
+    assert rows[0]["local_sample_status"] == "SUCCESS"
+    assert float(rows[0]["local_minus_original"]) == pytest.approx(0.0)
+
+
+def test_ablation_summarizer_reports_failed_child_process(tmp_path):
+    from scripts.summarize_timematch_ablation import TASKS, summarize
+
+    log_root = tmp_path / "logs"
+    status_path = tmp_path / "statuses.csv"
+    output_path = tmp_path / "summary.csv"
+    statuses = []
+    for task, _, _ in TASKS:
+        _write_ablation_log(log_root, "original", task)
+        statuses.append(
+            {
+                "group": "original",
+                "task": task,
+                "exit_code": 9 if task == "DK1_FR1" else 0,
+                "status": (
+                    "MISSING_SHAPE_ARTIFACT" if task == "FR1_FR2" else ""
+                ),
+            }
+        )
+    _write_ablation_status(status_path, statuses)
+
+    result = summarize(
+        log_root,
+        status_path,
+        output_path,
+        seed=1,
+        required_groups=("original",),
+    )
+
+    assert result == 1
+    with output_path.open(newline="", encoding="utf-8") as stream:
+        rows = {row["task"]: row for row in csv.DictReader(stream)}
+    assert rows["DK1_FR1"]["original_status"] == "PROCESS_FAILED(9)"
+    assert rows["FR1_FR2"]["original_status"] == "MISSING_SHAPE_ARTIFACT"
+
+
+def test_ablation_summarizer_rejects_missing_or_wrong_test_record(tmp_path):
+    from scripts.summarize_timematch_ablation import TASKS, summarize
+
+    log_root = tmp_path / "logs"
+    status_path = tmp_path / "statuses.csv"
+    output_path = tmp_path / "summary.csv"
+    statuses = []
+    for task, _, _ in TASKS:
+        _write_ablation_log(
+            log_root,
+            "original",
+            task,
+            include_test=task != "FR1_FR2",
+        )
+        statuses.append({"group": "original", "task": task, "exit_code": 0})
+    wrong_log = log_root / "original" / "FR1_FR2.log"
+    wrong_log.write_text(
+        "Test result for another_experiment: accuracy=99.0, f1=99.0\n",
+        encoding="utf-8",
+    )
+    _write_ablation_status(status_path, statuses)
+
+    result = summarize(
+        log_root,
+        status_path,
+        output_path,
+        seed=1,
+        required_groups=("original",),
+    )
+
+    assert result == 1
+    with output_path.open(newline="", encoding="utf-8") as stream:
+        rows = {row["task"]: row for row in csv.DictReader(stream)}
+    assert rows["FR1_FR2"]["original_status"] == "MISSING_TEST_F1"
+
+
+def test_ablation_launcher_freezes_two_waves_and_shape_boundaries():
+    source = Path(
+        "scripts/run_timematch_ablation_original_local_sample_4tasks.sh"
+    ).read_text(encoding="utf-8")
+
+    assert '--shape_align false' in source
+    assert '--class_residual_phase false' in source
+    assert '--shape_align true' in source
+    assert '--shape_modes 13' in source
+    assert '--shape_loss_type local_morph' in source
+    assert '--shape_class_balanced false' in source
+    assert '--shape_lambda 0.1' in source
+    assert '--shape_event_weight 0.0' in source
+    assert 'run_wave "original"' in source
+    assert 'run_wave "local_sample"' in source
+    assert 'if [[ "$FOLD" != "0" ]]' in source
+    assert "check_clean_destinations" in source
+    assert "audit_original_artifacts" in source
+    assert "audit_local_sample_artifacts" in source
+    assert "shape_training_metrics.csv" in source
+    assert "shape_class_metrics.csv" in source
+    assert "shape_reference_manifest.json" in source
+    assert "shape_reference.pt" in source
+    for forbidden in ("git ", "pip install", "wget ", "curl ", "conda "):
         assert forbidden not in source
