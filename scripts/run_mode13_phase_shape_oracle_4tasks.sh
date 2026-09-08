@@ -7,10 +7,12 @@ AT1_WEIGHTS="${AT1_WEIGHTS:-outputs/pseltae_AT1_source_seed1}"
 DK1_WEIGHTS="${DK1_WEIGHTS:-outputs/pseltae_DK1_source_seed1}"
 FR1_WEIGHTS="${FR1_WEIGHTS:-outputs/pseltae_FR1_source_seed1}"
 FR2_WEIGHTS="${FR2_WEIGHTS:-outputs/pseltae_FR2_source_seed1}"
-OUT="outputs/phase_shape_diagnostic_mode13_constrained_seed1"
-LOG="logs/phase_shape_diagnostic_mode13_constrained_seed1"
+OUT="outputs/phase_shape_diagnostic_mode13_applicability_seed1"
+LOG="logs/phase_shape_diagnostic_mode13_applicability_seed1"
 printf '%s\n' 'phase_iqr_floor_ratio=1e-3' 'phase_lambdas=0,0.01,0.1,1,10' \
-  'max_residual_warp_days=60' 'save_feature_cache=false'
+  'max_residual_warp_days=60' 'save_feature_cache=false' \
+  'phase_edge_points=8' 'phase_edge_monotonicity=0.75' 'phase_edge_range_ratio=0.15' \
+  'full_landmark_coverage=0.80' 'partial_min_landmarks=2' 'partial_min_time_coverage=0.20'
 command -v "$PYTHON_BIN" >/dev/null || { echo "ERROR: Python missing" >&2; exit 1; }
 [[ -d "$DATA_ROOT" ]] || { echo "ERROR: DATA_ROOT missing: $DATA_ROOT" >&2; exit 1; }
 "$PYTHON_BIN" -c 'import torch, numpy, scipy, matplotlib, fdasrsf' || { echo "ERROR: required local dependency missing" >&2; exit 1; }
@@ -28,6 +30,8 @@ run(){
   CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u scripts/diagnose_mode13_phase_shape_oracle.py \
     --data-root "$DATA_ROOT" --source "$source" --target "$target" --checkpoint "$checkpoint" \
     --phase-iqr-floor-ratio 1e-3 --phase-lambdas '0,0.01,0.1,1,10' --max-residual-warp-days 60 \
+    --phase-edge-points 8 --phase-edge-monotonicity 0.75 --phase-edge-range-ratio 0.15 \
+    --full-landmark-coverage 0.80 --partial-min-landmarks 2 --partial-min-time-coverage 0.20 \
     --device cuda --seed 1 --batch-size 128 --num-pixels 64 --output-dir "$OUT/$task" > "$LOG/$task.log" 2>&1
 }
 run "$GPU0" AT1 DK1 "$AT1_WEIGHTS/fold_0/model.pt" & p0=$!

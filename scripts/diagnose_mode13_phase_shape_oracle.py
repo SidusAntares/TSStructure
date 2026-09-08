@@ -28,6 +28,10 @@ from analysis.phase_shape_diagnostic import (
     shape_margin,
     warp_curve,
     constrained_residual_phase,
+    discover_phase_support,
+    constrained_partial_phase,
+    classify_phase_applicability,
+    _crop_support,
 )
 from models.fredn.structural_probe import (
     build_direct_fourier_views,
@@ -351,6 +355,10 @@ def analyze(args, source_cache, target_cache, classes):
     channel_rows, lambda_rows, selections, candidate_gammas = [], [], [], {}
     artifacts["valid_channel_masks"] = {}
     artifacts["selected_lambda"] = {}
+    applicability_rows = []
+    for key in ("phase_applicability_by_class", "common_support_by_class", "partial_gamma_by_class",
+                "partial_selected_lambda_by_class", "partial_valid_channel_masks"):
+        artifacts[key] = {}
 
     for class_id in common:
         source_raw = source_prototypes[class_id]
@@ -367,6 +375,42 @@ def analyze(args, source_cache, target_cache, classes):
             max_warp_days=getattr(args, "max_residual_warp_days", 60),
             prominence=args.prominence_rel * max(np.ptp(source_raw @ loading), EPS),
             min_distance_days=args.min_distance_days)
+        support = discover_phase_support(
+            source_raw @ loading, target_scalar @ loading, grid,
+            prominence=args.prominence_rel * max(np.ptp(source_raw @ loading), EPS),
+            min_distance_days=args.min_distance_days,
+            edge_points=getattr(args, "phase_edge_points", 8),
+            edge_monotonicity=getattr(args, "phase_edge_monotonicity", .75),
+            edge_range_ratio=getattr(args, "phase_edge_range_ratio", .15),
+            full_landmark_coverage=getattr(args, "full_landmark_coverage", .8),
+            partial_min_landmarks=getattr(args, "partial_min_landmarks", 2),
+            partial_min_time_coverage=getattr(args, "partial_min_time_coverage", .2))
+        partial = constrained_partial_phase(
+            source_raw, target_scalar, grid, support,
+            lambdas=getattr(args, "phase_lambdas", (0, .01, .1, 1, 10)),
+            floor_ratio=getattr(args, "phase_iqr_floor_ratio", 1e-3),
+            max_warp_days=getattr(args, "max_residual_warp_days", 60))
+        applicability = classify_phase_applicability(support, result, partial)
+        state = applicability["phase_applicability"]
+        support_scalars = {k: v for k, v in support.items() if k not in (
+            "source_landmarks", "target_landmarks", "matched_pairs", "common_chain")}
+        applicability_rows.append(dict(task=args.task, class_index=class_id, class_name=classes[class_id],
+            **support_scalars, **applicability, full_selected_phase=result["selected_phase"],
+            full_landmark_error=result["selected_landmark_error"],
+            partial_selected_phase=partial["selected_phase"],
+            partial_landmark_error_before=partial["scalar_landmark_error"],
+            partial_landmark_error_after=partial["selected_landmark_error"],
+            partial_landmark_gain=partial["scalar_landmark_error"]-partial["selected_landmark_error"],
+            partial_nonlinear_accepted=partial["nonlinear_accepted"],
+            partial_solution_valid=partial["solution_valid"], partial_failure_reason=partial["failure_reason"]))
+        artifacts["phase_applicability_by_class"][class_id] = state
+        artifacts["common_support_by_class"][class_id] = dict(support_scalars,
+            chain=[((a.kind, a.time), (b.kind, b.time)) for a, b in support["common_chain"]])
+        if partial["solution_valid"]:
+            artifacts["partial_gamma_by_class"][class_id] = partial["phase"].gamma
+            artifacts["partial_selected_lambda_by_class"][class_id] = partial["selected_lambda"]
+        if "normalized" in partial:
+            artifacts["partial_valid_channel_masks"][class_id] = partial["normalized"]["valid_channels"]
         nonlinear = result["phase"]
         target_nonlinear = result["raw_aligned"]
         norm = result["normalized"]
@@ -386,16 +430,28 @@ def analyze(args, source_cache, target_cache, classes):
         selections.append(selection)
         candidate_gammas[class_id] = result["candidate_gammas"]
         for row in result["candidates"]:
-            lambda_rows.append(dict(task=args.task, **{"class": classes[class_id]},
+            lambda_rows.append(dict(task=args.task, registration_scope="FULL_CONSTRAINED", **{"class": classes[class_id]},
                                     **row, **{"lambda": row["lambda_value"]}))
+        for row in partial["candidates"]:
+            lambda_rows.append(dict(task=args.task, registration_scope="PARTIAL_CONSTRAINED",
+                                    **{"class": classes[class_id]}, **row, **{"lambda": row["lambda_value"]}))
         for channel in range(len(norm["valid_channels"])):
-            channel_rows.append(dict(task=args.task, **{"class": classes[class_id]}, channel=channel,
+            channel_rows.append(dict(task=args.task, registration_scope="FULL_CONSTRAINED", **{"class": classes[class_id]}, channel=channel,
                 source_iqr=norm["source_iqr"][channel], target_iqr=norm["target_iqr"][channel],
                 iqr_floor=norm["iqr_floor"], phase_channel_valid=bool(norm["valid_channels"][channel]),
                 source_norm_max_abs=float(np.max(np.abs(norm["source"][:, channel]))),
                 target_norm_max_abs=float(np.max(np.abs(norm["target"][:, channel]))),
                 source_norm_std=float(np.std(norm["source"][:, channel])),
                 target_norm_std=float(np.std(norm["target"][:, channel]))))
+        if "normalized" in partial:
+            pn = partial["normalized"]
+            for channel in range(len(pn["valid_channels"])):
+                channel_rows.append(dict(task=args.task, registration_scope="PARTIAL_CONSTRAINED",
+                    **{"class": classes[class_id]}, channel=channel, source_iqr=pn["source_iqr"][channel],
+                    target_iqr=pn["target_iqr"][channel], iqr_floor=pn["iqr_floor"],
+                    phase_channel_valid=bool(pn["valid_channels"][channel]),
+                    source_norm_max_abs=float(np.max(np.abs(pn["source"][:, channel]))),
+                    target_norm_max_abs=float(np.max(np.abs(pn["target"][:, channel])))))
         aligned = {
             "global": target_global,
             "scalar": target_scalar,
@@ -465,6 +521,8 @@ def analyze(args, source_cache, target_cache, classes):
             phase_rows.append(
                 {
                     "task": args.task,
+                    "registration_scope": "FULL_CONSTRAINED",
+                    **applicability,
                     **selection,
                     "class_index": class_id,
                     "class_name": classes[class_id],
@@ -500,6 +558,28 @@ def analyze(args, source_cache, target_cache, classes):
                     "failure_reason": reason,
                 }
             )
+
+        # Retain full reference artifacts even when structural applicability rejects full.
+        artifacts["source_raw_prototypes"][class_id] = source_raw
+        artifacts["target_raw_prototypes"][class_id] = target_global
+        artifacts["source_norm_prototypes"][class_id] = norm["source"]
+        artifacts["target_norm_prototypes"][class_id] = norm["target"]
+        artifacts["scalar_delta_by_class"][class_id] = scalar_delta
+        artifacts["gamma_by_class"][class_id] = nonlinear.gamma
+        artifacts["source_pca_direction_by_class"][class_id] = loading
+        artifacts["valid_channel_masks"][class_id] = norm["valid_channels"]
+        artifacts["selected_lambda"][class_id] = result["selected_lambda"]
+        summaries.append((registrations, landmark_metrics))
+        plot_class(args.output_dir / f"class_{class_id}_phase_shape.png", grid, source_curve,
+                   curves, support, partial, loading, applicability, classes[class_id])
+        if state != "FULL_PHASE":
+            shape, marks, segments = support_shape_metrics(
+                args.task, class_id, classes[class_id], source_raw, target_scalar,
+                grid, loading, support, partial, applicability)
+            shape_rows.append(shape)
+            landmark_rows.extend(marks)
+            segment_rows.extend(segments)
+            continue
 
         paired_by_phase = {
             phase_type: {
@@ -607,6 +687,10 @@ def analyze(args, source_cache, target_cache, classes):
                 "task": args.task,
                 "class": classes[class_id],
                 "segment_index": segment_index,
+                "source_start_day": source_a.time,
+                "source_end_day": source_b.time,
+                "target_start_day": target_a.time,
+                "target_end_day": target_b.time,
                 "start_landmark_type": source_a.kind,
                 "end_landmark_type": source_b.kind,
                 "source_length_days": source_b.time - source_a.time,
@@ -635,7 +719,9 @@ def analyze(args, source_cache, target_cache, classes):
             segment_rows.append(row)
             class_segments.append(row)
 
-        margin = shape_margin(class_id, target_nonlinear, source_prototypes)
+        margin = shape_margin(class_id, target_nonlinear, source_prototypes) if len(source_prototypes) > 1 else dict(
+            same_class_shape_distance=np.nan, nearest_wrong_class=np.nan, nearest_wrong_distance=np.nan,
+            shape_margin=np.nan, margin_positive=np.nan)
         amplitude = amplitude_metrics(source_curve, curves["nonlinear"])
         source_pv = _peak_valley_range(
             landmark_metrics["nonlinear"]["source_landmarks"], source_curve
@@ -680,34 +766,58 @@ def analyze(args, source_cache, target_cache, classes):
                 ),
             }
         )
-        artifacts["source_raw_prototypes"][class_id] = source_raw
-        artifacts["target_raw_prototypes"][class_id] = target_global
-        artifacts["source_norm_prototypes"][class_id] = norm["source"]
-        artifacts["target_norm_prototypes"][class_id] = norm["target"]
-        artifacts["scalar_delta_by_class"][class_id] = scalar_delta
-        artifacts["gamma_by_class"][class_id] = nonlinear.gamma
-        artifacts["source_pca_direction_by_class"][class_id] = loading
-        artifacts["valid_channel_masks"][class_id] = norm["valid_channels"]
-        artifacts["selected_lambda"][class_id] = result["selected_lambda"]
+        shape_rows[-1].update(**applicability, shape_phase_conditioned_valid=True,
+            full_shape_metrics_valid=True, partial_shape_metrics_valid=False,
+            shape_metric_scope="full_year",
+            observable_landmark_count=len(nonlinear_pairs), observable_segment_count=len(class_segments),
+            observable_time_coverage=1.)
         for rows in (shape_rows, landmark_rows, segment_rows):
             for row in rows:
                 if row.get("class", row.get("class_name")) == classes[class_id]:
                     row.update(selected_info)
-        summaries.append((registrations, landmark_metrics))
-        plot_class(
-            args.output_dir / f"class_{class_id}_phase_shape.png",
-            grid,
-            source_curve,
-            curves,
-            nonlinear.gamma,
-            f'{classes[class_id]} | lambda={result["selected_lambda"]} | '
-            f'{"ACCEPTED" if result["nonlinear_accepted"] else "REJECTED: scalar retained"} | '
-            f'landmark={result["selected_landmark_error"]:.3f} | '
-            f'max residual={nonlinear.max_displacement*365:.2f} days',
-        )
+                    if rows is not shape_rows:
+                        row.update(**applicability, in_common_support=True, observable_in_both_domains=True)
+        # Full coverage may be >=0.8 yet have unmatched boundary structure. Report it as NA too.
+        missing_support = dict(support, source_landmarks=landmark_metrics["nonlinear"]["source_landmarks"],
+                               target_landmarks=landmark_metrics["nonlinear"]["target_landmarks"])
+        _, all_marks, all_segments = support_shape_metrics(args.task, class_id, classes[class_id],
+            source_raw, target_scalar, grid, loading, missing_support, {},
+            dict(phase_applicability="PHASE_NOT_APPLICABLE", phase_applicability_reason="unmatched_structure"))
+        matched_source = {(a.kind, a.time) for a, _ in nonlinear_pairs}
+        matched_target = {(b.kind, b.time) for _, b in nonlinear_pairs}
+        for row in all_marks:
+            key = (row["landmark_type"], row["source_time"])
+            matched = key in matched_source if np.isfinite(row["source_time"]) else (
+                row["landmark_type"], row["target_time_scalar"]) in matched_target
+            if not matched:
+                row.update(**applicability, **selected_info)
+                landmark_rows.append(row)
+        for row in all_segments:
+            domain = row["segment_domain"]
+            represented = any(r.get(domain + "_start_day") == row.get(domain + "_start_day")
+                              and r.get(domain + "_end_day") == row.get(domain + "_end_day")
+                              for r in class_segments)
+            if not represented:
+                row.update(**applicability, **selected_info)
+                segment_rows.append(row)
 
     plot_gammas(args.output_dir / "gamma_by_class.png", artifacts, classes)
     summary = task_summary(args.task, summaries, shape_rows, segment_rows)
+    write_csv(args.output_dir / "phase_applicability_metrics.csv", applicability_rows)
+    for state, prefix in (("FULL_PHASE", "full_phase"), ("PARTIAL_PHASE", "partial_phase"),
+                          ("PHASE_NOT_APPLICABLE", "phase_not_applicable")):
+        count = sum(r["phase_applicability"] == state for r in applicability_rows)
+        summary[prefix + "_count"] = count
+        summary[prefix + "_rate"] = count/max(1, len(applicability_rows))
+    truncation_count = sum(any(r[s + "_truncation_evidence"] == "strong" for s in ("left", "right"))
+                           for r in applicability_rows)
+    coverages = [r["common_time_coverage_min"] for r in applicability_rows]
+    summary.update(boundary_truncation_class_count=truncation_count,
+        boundary_truncation_class_rate=truncation_count/max(1, len(applicability_rows)),
+        common_support_coverage_mean=_finite_mean(coverages),
+        common_support_coverage_median=float(np.median(coverages)) if coverages else np.nan,
+        partial_landmark_gain_mean=_finite_mean(r["partial_landmark_gain"] for r in applicability_rows
+                                               if r["phase_applicability"] == "PARTIAL_PHASE"))
     write_csv(args.output_dir / "phase_channel_metrics.csv", channel_rows)
     write_csv(args.output_dir / "phase_lambda_metrics.csv", lambda_rows)
     write_csv(args.output_dir / "phase_lambda_summary.csv", summarize_lambdas(args.task, lambda_rows))
@@ -737,11 +847,154 @@ def analyze(args, source_cache, target_cache, classes):
     return phase_rows, shape_rows, landmark_rows, segment_rows, artifacts, summary
 
 
+def support_shape_metrics(task, class_id, name, source, target_scalar, grid, loading,
+                          support, partial, applicability):
+    """No whole-year shape calculation on a partial or rejected correspondence."""
+    valid = applicability["phase_applicability"] == "PARTIAL_PHASE"
+    info = dict(**applicability, selected_phase=partial["selected_phase"] if valid else "none",
+                selected_lambda=partial["selected_lambda"] if valid else None,
+                nonlinear_accepted=bool(valid and partial["nonlinear_accepted"]))
+    shape = dict(task=task, class_index=class_id, class_name=name, **info,
+                 shape_metric_scope="common_support" if valid else "none",
+                 shape_phase_conditioned_valid=valid, full_shape_metrics_valid=False,
+                 partial_shape_metrics_valid=valid, observable_landmark_count=0,
+                 observable_segment_count=0,
+                 observable_time_coverage=support["common_time_coverage_min"] if valid else 0.)
+    for key in ("same_class_shape_distance", "nearest_wrong_class", "nearest_wrong_distance", "shape_margin",
+                "margin_positive", "peak_to_valley_source", "peak_to_valley_target", "peak_to_valley_ratio",
+                "peak_height_diff_mean", "peak_height_ratio_mean", "valley_height_diff_mean", "valley_height_ratio_mean",
+                "prominence_diff_mean", "prominence_ratio_mean", "peak_valley_amplitude_diff_mean",
+                "peak_valley_amplitude_ratio_mean", "segment_auc_ratio_mean", "segment_range_ratio_mean", "segment_l2_mean"):
+        shape[key] = np.nan
+    for metric in ("range", "std", "iqr"):
+        for suffix in ("source", "target", "ratio"):
+            shape["global_" + metric + "_" + suffix] = np.nan
+    pairs = {(a.kind, a.time): b for a, b in support["common_chain"]} if valid else {}
+    if valid:
+        source_curve = partial["raw_source"] @ loading
+        target_curve = partial["raw_aligned"] @ loading
+        local_grid = partial["source_grid"]
+        amplitude = amplitude_metrics(source_curve, target_curve)
+        shape.update({"global_" + key: value for key, value in amplitude.items()})
+        for domain, values in (("source", source), ("target", target_scalar)):
+            times, cropped = _crop_support(values, grid, support[domain + "_common_start_day"],
+                                           support[domain + "_common_end_day"])
+            # Prominence bases must be within the support, never the full-year detector's bases.
+            if domain == "source":
+                source_times, source_local = times, cropped @ loading
+            else:
+                target_times, target_local = times, cropped @ loading
+
+    def local_prominence(mark, times, curve):
+        index = int(np.argmin(np.abs(times-mark.time)))
+        if index == 0 or index == len(times)-1:
+            return np.nan  # Endpoint extrema have no two-sided observable prominence.
+        signed = curve if mark.kind == "peak" else -curve
+        from scipy.signal import peak_prominences
+        return float(peak_prominences(signed, [index])[0][0])
+
+    landmarks = []
+    for index, mark in enumerate(support["source_landmarks"]):
+        mate = pairs.get((mark.kind, mark.time))
+        observable = mate is not None
+        row = dict(task=task, **{"class": name}, **info, landmark_index=index, landmark_type=mark.kind,
+                   source_time=mark.time, source_value=mark.amplitude,
+                   in_common_support=observable, observable_in_both_domains=observable)
+        for key in ("target_time_global", "target_time_scalar", "target_time_nonlinear", "global_time_error",
+                    "scalar_time_error", "nonlinear_time_error", "target_value_aligned", "height_difference",
+                    "height_absolute_difference", "height_relative_difference", "height_ratio",
+                    "source_prominence", "target_prominence", "prominence_difference", "prominence_ratio"):
+            row[key] = np.nan
+        if observable:
+            u = (mark.time-local_grid[0])/(local_grid[-1]-local_grid[0])
+            mapped = float(np.interp(u, np.linspace(0, 1, 128), partial["mapped_target_grid"]))
+            sp = local_prominence(mark, source_times, source_local)
+            tp = local_prominence(mate, target_times, target_local)
+            difference = mate.amplitude-mark.amplitude
+            row.update(target_time_scalar=mate.time, mapped_target_time=mapped,
+                       nonlinear_time_error=abs(mapped-mate.time),
+                       target_value_aligned=mate.amplitude, height_difference=difference,
+                       height_absolute_difference=abs(difference),
+                       height_relative_difference=difference/max(abs(mark.amplitude), EPS),
+                       height_ratio=_ratio(mate.amplitude, mark.amplitude), source_prominence=sp,
+                       target_prominence=tp, prominence_difference=tp-sp,
+                       prominence_ratio=_ratio(tp, sp), prominence_observable=bool(np.isfinite(sp) and np.isfinite(tp)))
+        landmarks.append(row)
+    # Target-only landmarks are also explicitly unobservable, rather than disappearing.
+    matched_targets = {(b.kind, b.time) for b in pairs.values()}
+    for mark in support["target_landmarks"]:
+        if (mark.kind, mark.time) not in matched_targets:
+            landmarks.append(dict(task=task, **{"class": name}, **info, landmark_type=mark.kind,
+                source_time=np.nan, target_time_scalar=mark.time, in_common_support=False,
+                observable_in_both_domains=False, height_ratio=np.nan, prominence_ratio=np.nan))
+    segments = []
+    for index, (left, right) in enumerate(zip(support["source_landmarks"], support["source_landmarks"][1:])):
+        ta, tb = pairs.get((left.kind, left.time)), pairs.get((right.kind, right.time))
+        observable = ta is not None and tb is not None
+        row = dict(task=task, **{"class": name}, **info, segment_index=index,
+                   segment_domain="source",
+                   start_landmark_type=left.kind, end_landmark_type=right.kind,
+                   source_start_day=left.time, source_end_day=right.time,
+                   in_common_support=observable, observable_in_both_domains=observable)
+        for key in ("source_length_days", "target_length_days", "source_auc", "target_auc", "auc_ratio",
+                    "source_range", "target_range", "range_ratio", "source_std", "target_std", "std_ratio",
+                    "source_mean", "target_mean", "segment_l1", "segment_l2", "segment_corr"):
+            row[key] = np.nan
+        if observable:
+            # Slice BOTH selected registered curves on the same source-time interval.
+            # Do not add another segment-level time warp.
+            times, s = _crop_support(source_curve[:, None], local_grid, left.time, right.time)
+            _, t = _crop_support(target_curve[:, None], local_grid, left.time, right.time)
+            s, t = s[:, 0], t[:, 0]
+            sa, tt = float(np.trapz(s, times)), float(np.trapz(t, times))
+            row.update(source_length_days=right.time-left.time, target_length_days=tb.time-ta.time,
+                       source_auc=sa, target_auc=tt, auc_ratio=_ratio(abs(tt), abs(sa)),
+                       source_range=float(np.ptp(s)), target_range=float(np.ptp(t)),
+                       range_ratio=_ratio(np.ptp(t), np.ptp(s)), source_std=float(np.std(s)),
+                       target_std=float(np.std(t)), std_ratio=_ratio(np.std(t), np.std(s)),
+                       source_mean=float(np.mean(s)), target_mean=float(np.mean(t)),
+                       segment_l1=float(np.mean(np.abs(t-s))), segment_l2=float(np.sqrt(np.mean((t-s)**2))),
+                       segment_corr=float(np.corrcoef(s, t)[0, 1]) if np.std(s)*np.std(t) > EPS else 0.)
+            row.update(target_start_day=ta.time, target_end_day=tb.time)
+        segments.append(row)
+    represented_target_edges = {(r.get("target_start_day"), r.get("target_end_day")) for r in segments
+                                if r["observable_in_both_domains"]}
+    for left, right in zip(support["target_landmarks"], support["target_landmarks"][1:]):
+        if (left.time, right.time) not in represented_target_edges:
+            segments.append(dict(task=task, **{"class": name}, **info, segment_domain="target",
+                start_landmark_type=left.kind, end_landmark_type=right.kind,
+                target_start_day=left.time, target_end_day=right.time,
+                source_start_day=np.nan, source_end_day=np.nan,
+                in_common_support=False, observable_in_both_domains=False,
+                auc_ratio=np.nan, range_ratio=np.nan, std_ratio=np.nan, segment_l1=np.nan,
+                segment_l2=np.nan, segment_corr=np.nan))
+    observed = [r for r in landmarks if r["observable_in_both_domains"]]
+    observed_segments = [r for r in segments if r["observable_in_both_domains"]]
+    shape.update(observable_landmark_count=len(observed), observable_segment_count=len(observed_segments))
+    if valid:
+        for kind, label in (("peak", "peak"), ("valley", "valley")):
+            shape[label + "_height_diff_mean"] = _finite_mean(r["height_difference"] for r in observed if r["landmark_type"] == kind)
+            shape[label + "_height_ratio_mean"] = _finite_mean(r["height_ratio"] for r in observed if r["landmark_type"] == kind)
+        shape["prominence_diff_mean"] = _finite_mean(r["prominence_difference"] for r in observed)
+        shape["prominence_ratio_mean"] = _finite_mean(r["prominence_ratio"] for r in observed)
+        for label, key in (("segment_auc_ratio_mean", "auc_ratio"), ("segment_range_ratio_mean", "range_ratio"),
+                           ("segment_l2_mean", "segment_l2")):
+            shape[label] = _finite_mean(r[key] for r in observed_segments)
+        differences, ratios = [], []
+        for (a, b), (c, d) in zip(support["common_chain"], support["common_chain"][1:]):
+            if a.kind != c.kind:
+                s, t = abs(c.amplitude-a.amplitude), abs(d.amplitude-b.amplitude)
+                differences.append(t-s); ratios.append(_ratio(t, s))
+        shape["peak_valley_amplitude_diff_mean"] = _finite_mean(differences)
+        shape["peak_valley_amplitude_ratio_mean"] = _finite_mean(ratios)
+    return shape, landmarks, segments
+
+
 def summarize_lambdas(task, rows):
     result = []
-    for lam in sorted({r["lambda_value"] for r in rows}):
-        group = [r for r in rows if r["lambda_value"] == lam]
-        result.append(dict(task=task, **{"lambda": lam},
+    for scope, lam in sorted({(r["registration_scope"], r["lambda_value"]) for r in rows}):
+        group = [r for r in rows if r["lambda_value"] == lam and r["registration_scope"] == scope]
+        result.append(dict(task=task, registration_scope=scope, **{"lambda": lam},
             valid_rate=_finite_mean(r["gamma_valid"] for r in group),
             admissible_rate=_finite_mean(r["candidate_admissible"] for r in group),
             registration_error_mean=_finite_mean(r["registration_error"] for r in group),
@@ -767,6 +1020,12 @@ def plot_candidate_gammas(path, candidates, classes):
 
 
 def task_summary(task, summaries, shape_rows, segment_rows):
+    partial_shapes = [r for r in shape_rows if r["phase_applicability"] == "PARTIAL_PHASE"]
+    partial_segments = [r for r in segment_rows if r["phase_applicability"] == "PARTIAL_PHASE"
+                        and r["observable_in_both_domains"]]
+    shape_rows = [r for r in shape_rows if r["phase_applicability"] == "FULL_PHASE"]
+    segment_rows = [r for r in segment_rows if r["phase_applicability"] == "FULL_PHASE"
+                    and r["observable_in_both_domains"]]
     def registration(phase_type):
         return _finite_mean(
             value[0][phase_type]["normalized_l2"] for value in summaries
@@ -779,6 +1038,11 @@ def task_summary(task, summaries, shape_rows, segment_rows):
 
     return {
         "task": task,
+        "legacy_shape_summary_scope": "FULL_PHASE_only",
+        "partial_amplitude_ratio_mean": _finite_mean(r["global_range_ratio"] for r in partial_shapes),
+        "partial_prominence_ratio_mean": _finite_mean(r["prominence_ratio_mean"] for r in partial_shapes),
+        "partial_segment_auc_ratio_mean": _finite_mean(r["auc_ratio"] for r in partial_segments),
+        "partial_segment_l2_mean": _finite_mean(r["segment_l2"] for r in partial_segments),
         "num_common_classes": len(summaries),
         "global_registration_error_mean": registration("global"),
         "scalar_registration_error_mean": registration("scalar"),
@@ -804,13 +1068,13 @@ def task_summary(task, summaries, shape_rows, segment_rows):
             row["global_range_ratio"] for row in shape_rows
         ),
         "amplitude_ratio_std": float(
-            np.nanstd([row["global_range_ratio"] for row in shape_rows])
+            np.nanstd([row["global_range_ratio"] for row in shape_rows]) if shape_rows else np.nan
         ),
         "prominence_ratio_mean": _finite_mean(
             row["prominence_ratio_mean"] for row in shape_rows
         ),
         "prominence_ratio_std": float(
-            np.nanstd([row["prominence_ratio_mean"] for row in shape_rows])
+            np.nanstd([row["prominence_ratio_mean"] for row in shape_rows]) if shape_rows else np.nan
         ),
         "segment_auc_ratio_mean": _finite_mean(
             row["auc_ratio"] for row in segment_rows
@@ -823,20 +1087,48 @@ def task_summary(task, summaries, shape_rows, segment_rows):
     }
 
 
-def plot_class(path, grid, source, curves, gamma, name):
+def plot_class(path, grid, source, curves, support, partial, loading, applicability, name):
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     figure, axes = plt.subplots(4, 1, figsize=(9, 11), sharex=True)
-    for axis, phase_type in zip(axes[:3], ("global", "scalar", "nonlinear")):
+    for axis in axes[:3]:
         axis.plot(grid, source, label="source")
-        axis.plot(grid, curves[phase_type], label=f"target {phase_type}")
+        axis.plot(grid, curves["scalar"], label="target scalar")
         axis.legend()
-    axes[3].plot(grid, curves["nonlinear"] - source, label="aligned residual")
-    axes[3].legend()
-    figure.suptitle(name)
+    axes[0].set_title("Global + Scalar frame")
+    axes[1].set_title("Salient landmarks and contiguous correspondence chain")
+    for domain, color in (("source", "C0"), ("target", "C1")):
+        for mark in support[domain + "_landmarks"]:
+            axes[1].scatter(mark.time, mark.amplitude, color=color, marker="^" if mark.kind == "peak" else "v")
+    for a, b in support["common_chain"]:
+        axes[1].plot([a.time, b.time], [a.amplitude, b.amplitude], "k--", alpha=.5)
+    axes[2].set_title("Common support (no padding)")
+    for domain, color in (("source", "C0"), ("target", "C1")):
+        a, b = support[domain + "_common_start_day"], support[domain + "_common_end_day"]
+        if np.isfinite(a) and b > a:
+            axes[2].axvspan(a, b, color=color, alpha=.15, label=domain + " support")
+    for side, x in (("left", grid[0]), ("right", grid[-1])):
+        if any(support[side + "_boundary_active_" + d] for d in ("source", "target")):
+            axes[0].text(x, axes[0].get_ylim()[1], side + " truncation candidate\n" +
+                         support[side + "_truncation_evidence"], va="top",
+                         ha="left" if side == "left" else "right", fontsize=8)
+    state = applicability["phase_applicability"]
+    axes[3].set_title("Selected registration" if state != "PHASE_NOT_APPLICABLE" else "No phase-conditioned comparison")
+    if state == "FULL_PHASE":
+        axes[3].plot(grid, source, label="source")
+        axes[3].plot(grid, curves["nonlinear"], label="target full selected")
+    elif state == "PARTIAL_PHASE":
+        sg = partial["source_grid"]
+        axes[3].plot(sg, partial["raw_source"] @ loading, label="source common support")
+        axes[3].plot(sg, partial["raw_aligned"] @ loading, label="target partial selected")
+        axes[3].axvspan(grid[0], sg[0], color="grey", alpha=.3)
+        axes[3].axvspan(sg[-1], grid[-1], color="grey", alpha=.3)
+    if state != "PHASE_NOT_APPLICABLE":
+        axes[3].legend()
+    figure.suptitle(name + " | " + state + "\n" + applicability["phase_applicability_reason"], fontsize=9)
     figure.tight_layout()
     figure.savefig(path, dpi=150)
     plt.close(figure)
@@ -880,6 +1172,12 @@ def parse_args():
     parser.add_argument("--phase-lambdas", type=lambda value: tuple(float(x) for x in value.split(',')), default=(0, .01, .1, 1, 10))
     parser.add_argument("--max-residual-warp-days", type=float, default=60)
     parser.add_argument("--save-feature-cache", action="store_true")
+    parser.add_argument("--phase-edge-points", type=int, default=8)
+    parser.add_argument("--phase-edge-monotonicity", type=float, default=.75)
+    parser.add_argument("--phase-edge-range-ratio", type=float, default=.15)
+    parser.add_argument("--full-landmark-coverage", type=float, default=.80)
+    parser.add_argument("--partial-min-landmarks", type=int, default=2)
+    parser.add_argument("--partial-min-time-coverage", type=float, default=.20)
     return parser.parse_args()
 
 
@@ -961,6 +1259,24 @@ def main():
         "max_residual_warp_days": args.max_residual_warp_days,
         "save_feature_cache": args.save_feature_cache,
         "normalization_audit_frame": "source_and_scalar_aligned_target",
+        "full_registration_scope": "FULL_CONSTRAINED; unchanged whole-year normalization and solver",
+        "full_support_assumption": "major structure completely observable within both annual windows",
+        "partial_normalization": "crop first; native interval IQR and validity; normalize then resample to 128",
+        "partial_mapping": "target_day = a_t + gamma(u)*(b_t-a_t)",
+        "partial_residual_days": "(gamma(u)-u)*(b_t-a_t)",
+        "partial_landmark_error": "mean abs(mapped source chain landmark - target chain landmark), target days",
+        "partial_shape_scope": "common support only; endpoint prominence NA; no extrapolation",
+        "partial_auc_units": "raw PCA amplitude * source-frame days; full legacy AUC unchanged",
+        "partial_support_padding_days": 0,
+        "contiguous_chain_rule": "both full landmark indices increment by 1; longest; earliest tie",
+        "truncation_rule": "active edge + compatible extremum flank + unmatched boundary extremum in other domain",
+        "phase_applicability_order": ["FULL_PHASE", "PARTIAL_PHASE", "PHASE_NOT_APPLICABLE"],
+        "phase_edge_points": args.phase_edge_points,
+        "phase_edge_monotonicity": args.phase_edge_monotonicity,
+        "phase_edge_range_ratio": args.phase_edge_range_ratio,
+        "full_landmark_coverage": args.full_landmark_coverage,
+        "partial_min_landmarks": args.partial_min_landmarks,
+        "partial_min_time_coverage": args.partial_min_time_coverage,
         "invalid_phase_channels": "excluded_from_SRVF_and_zero_in_normalization_audit",
         "phase_selection_rule": "landmark_mean_then_mean_displacement_then_larger_lambda; strictly_improve_scalar",
         "numeric_failure_count_unit": "class_lambda_candidates",

@@ -321,6 +321,10 @@ def test_launcher_is_offline_and_contains_exact_four_tasks():
     assert 'local target="$3"\n' in launcher
     assert 'local checkpoint="$4"\n' in launcher
     assert 'local task="${source}_${target}"\n' in launcher
+    for flag, value in (("phase-edge-points", "8"), ("phase-edge-monotonicity", "0.75"),
+                        ("phase-edge-range-ratio", "0.15"), ("full-landmark-coverage", "0.80"),
+                        ("partial-min-landmarks", "2"), ("partial-min-time-coverage", "0.20")):
+        assert "--" + flag + " " + value in launcher
 
 
 def test_order_preserving_landmark_matching_skips_spurious_early_mark():
@@ -345,3 +349,311 @@ def test_target_dataset_is_redacted_before_getitem():
     redacted = redact_dataset_labels(original)
     assert [sample[2] for sample in redacted.samples] == [0, 0]
     assert [sample[2] for sample in original.samples] == [7, 8]
+
+
+def _support_curves(side=None):
+    grid = np.linspace(0, 365, 64)
+    source = np.interp(grid, [0, 45, 120, 215, 295, 365], [0, 2, -2, 2, -2, 0])
+    if side == "left":
+        target = np.interp(grid, [0, 120, 215, 295, 365], [3, -2, 2, -2, 0])
+    elif side == "right":
+        target = np.interp(grid, [0, 45, 120, 215, 365], [0, 2, -2, 2, -3])
+    else:
+        target = np.interp(grid, [0, 50, 125, 220, 300, 365], [0, 2, -2, 2, -2, 0])
+    return grid, source, target
+
+
+@pytest.mark.parametrize("side,expected", [(None, "FULL_PHASE"), ("left", "PARTIAL_PHASE"),
+                                          ("right", "PARTIAL_PHASE")])
+def test_scalar_support_completeness_and_full_priority(side, expected, monkeypatch):
+    import analysis.phase_shape_diagnostic as d
+    grid, source, target = _support_curves(side)
+    support = d.discover_phase_support(source, target, grid)
+    assert support["common_chain_landmark_count"] == (4 if side is None else 3)
+    assert support["partial_support_valid"]
+    assert support["full_support_valid"] == (side is None)
+    if side:
+        assert support[side + "_truncation_evidence"] == "strong"
+    monkeypatch.setattr(d, "_solve_joint_gamma", lambda *a, **kw: np.linspace(0, 1, 128))
+    raw_s, raw_t = source[:, None], target[:, None]
+    full = d.constrained_residual_phase(raw_s, raw_t, np.ones(1), grid)
+    partial = d.constrained_partial_phase(raw_s, raw_t, grid, support)
+    state = d.classify_phase_applicability(support, full, partial)
+    assert state["phase_applicability"] == expected
+    assert state["phase_applicability_reason"]
+
+
+def test_single_shared_landmark_and_unrelated_flat_target_are_not_applicable():
+    import analysis.phase_shape_diagnostic as d
+    grid = np.linspace(0, 365, 64)
+    source = np.exp(-((grid-150)/30)**2)
+    for target in (source, source*1e-12):
+        support = d.discover_phase_support(source, target, grid)
+        assert support["common_chain_landmark_count"] <= 1
+        assert not support["partial_support_valid"]
+        assert not support["full_support_valid"]
+        assert d.classify_phase_applicability(support, None, None)["phase_applicability"] == "PHASE_NOT_APPLICABLE"
+
+
+def test_contiguous_chain_cannot_bridge_missing_landmark():
+    from analysis.phase_shape_diagnostic import longest_contiguous_chain
+    from models.fredn.structural_probe import Landmark
+    source = [Landmark("peak" if i % 2 else "valley", float(i), 1., 1.) for i in range(5)]
+    target = [Landmark("peak", float(i), 1., 1.) for i in range(4)]
+    pairs = [(source[1], target[1]), (source[3], target[2]), (source[4], target[3])]
+    assert longest_contiguous_chain(source, target, pairs) == pairs[1:]
+
+
+def test_edge_activity_alone_does_not_reject_complete_support():
+    from analysis.phase_shape_diagnostic import discover_phase_support
+    grid, source, _ = _support_curves()
+    support = discover_phase_support(source, source, grid)
+    assert support["left_boundary_active_source"]
+    assert support["left_truncation_evidence"] != "strong"
+    assert support["full_support_valid"]
+    assert support["source_left_monotonicity_ratio"] == 1
+
+
+def test_partial_isolated_normalization_gamma_errors_and_raw_shape(monkeypatch):
+    import analysis.phase_shape_diagnostic as d
+    grid, source, target = _support_curves("left")
+    support = d.discover_phase_support(source, target, grid)
+    raw_s = np.column_stack((source, 1 + source*1e-12))
+    raw_t = np.column_stack((target*1.5, 1 + target*1e-12))
+    calls = []
+    def solve(s, t, lam):
+        calls.append((s.copy(), t.copy()))
+        assert s.shape == t.shape == (128, 1)
+        return np.linspace(0, 1, 128)
+    monkeypatch.setattr(d, "_solve_joint_gamma", solve)
+    a = d.constrained_partial_phase(raw_s, raw_t, grid, support)
+    raw_s[grid < support["source_common_start_day"]] = 1e8
+    raw_t[grid < support["target_common_start_day"]] = -1e8
+    b = d.constrained_partial_phase(raw_s, raw_t, grid, support)
+    assert a["solution_valid"] and b["solution_valid"]
+    assert a["normalized"]["valid_channels"].tolist() == [True, False]
+    for key in ("raw_source", "raw_aligned"):
+        np.testing.assert_array_equal(a[key], b[key])
+    np.testing.assert_array_equal(a["phase"].gamma, b["phase"].gamma)
+    assert a["selected_landmark_error"] == b["selected_landmark_error"]
+    for first, second in zip(calls[:5], calls[5:]):
+        np.testing.assert_array_equal(first[0], second[0])
+        np.testing.assert_array_equal(first[1], second[1])
+
+
+def test_partial_overwarp_uses_target_interval_days(monkeypatch):
+    import analysis.phase_shape_diagnostic as d
+    grid, source, target = _support_curves("left")
+    support = d.discover_phase_support(source, target, grid)
+    gamma = np.linspace(0, 1, 128)**5
+    monkeypatch.setattr(d, "_solve_joint_gamma", lambda *a, **kw: gamma)
+    result = d.constrained_partial_phase(source[:, None], target[:, None], grid, support)
+    duration = support["target_common_end_day"] - support["target_common_start_day"]
+    displacement = np.max(np.abs(gamma - np.linspace(0, 1, 128))) * duration
+    assert displacement > 60
+    assert all(r["gamma_max_displacement_days"] == pytest.approx(displacement) for r in result["candidates"])
+    assert all(r["rejection_reason"] == "residual_warp_too_large" for r in result["candidates"])
+    assert not result["nonlinear_accepted"]
+    assert result["selected_phase"] == "partial_linear"
+
+
+def test_partial_csv_observability_and_scope_separated_summary(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import csv
+    import analysis.phase_shape_diagnostic as d
+    from scripts.diagnose_mode13_phase_shape_oracle import analyze
+    monkeypatch.setattr(d, "_solve_joint_gamma", lambda *a, **kw: np.linspace(0, 1, 128))
+    # This fixture IS the scalar frame; do not introduce a second coarse shift.
+    monkeypatch.setattr("scripts.diagnose_mode13_phase_shape_oracle.estimate_scalar_phase",
+                        lambda s, t: (0, t))
+    _, source, target = _support_curves("left")
+    def cache(curve):
+        return {"mode13_features": torch.tensor(curve[None, :, None]), "labels": np.array([0])}
+    args = SimpleNamespace(task="S_T", output_dir=tmp_path, prominence_rel=.05, min_distance_days=14)
+    _, shapes, landmarks, segments, artifacts, summary = analyze(args, cache(source), cache(target), ["crop"])
+    assert shapes[0]["phase_applicability"] == "PARTIAL_PHASE"
+    assert shapes[0]["partial_shape_metrics_valid"] and not shapes[0]["full_shape_metrics_valid"]
+    missing = [r for r in landmarks if not r["observable_in_both_domains"]]
+    assert missing
+    assert all(np.isnan(r["height_ratio"]) and np.isnan(r["prominence_ratio"]) for r in missing)
+    assert any(not r["observable_in_both_domains"] for r in segments)
+    assert summary["partial_phase_count"] == 1 and summary["full_phase_count"] == 0
+    assert artifacts["phase_applicability_by_class"][0] == "PARTIAL_PHASE"
+    assert 0 in artifacts["partial_gamma_by_class"]
+    with (tmp_path / "phase_applicability_metrics.csv").open() as stream:
+        row = next(csv.DictReader(stream))
+    assert row["left_truncation_evidence"] == "strong"
+    assert float(row["common_time_coverage_min"]) >= .20
+
+
+def test_partial_shape_values_ignore_outside_peak_with_fixed_support(monkeypatch):
+    import analysis.phase_shape_diagnostic as d
+    from scripts.diagnose_mode13_phase_shape_oracle import support_shape_metrics
+    grid, source, target = _support_curves("left")
+    source, target = source[:, None], target[:, None]
+    loading = np.ones(1)
+    support = d.discover_phase_support(source[:, 0], target[:, 0], grid)
+    monkeypatch.setattr(d, "_solve_joint_gamma", lambda *a, **kw: np.linspace(0, 1, 128))
+    def measure():
+        partial = d.constrained_partial_phase(source, target, grid, support)
+        state = d.classify_phase_applicability(support, None, partial)
+        return support_shape_metrics("S_T", 0, "crop", source, target, grid, loading, support, partial, state)
+    a = measure()
+    source[0] = 1e8
+    target[0] = -1e8
+    b = measure()
+    for rows_a, rows_b in zip(([a[0]], a[1], a[2]), ([b[0]], b[1], b[2])):
+        for ra, rb in zip(rows_a, rows_b):
+            assert ra.keys() == rb.keys()
+            for key in ra:
+                if isinstance(ra[key], (float, np.floating)):
+                    np.testing.assert_allclose(ra[key], rb[key], equal_nan=True)
+                else:
+                    assert ra[key] == rb[key]
+
+
+def test_partial_iqr_is_computed_before_resampling_unequal_crops(monkeypatch):
+    import analysis.phase_shape_diagnostic as d
+    from models.fredn.structural_probe import Landmark
+    grid = np.linspace(0, 365, 64)
+    raw = _curve(grid/365)
+    chain = [(Landmark("peak", grid[10], 1., 1.), Landmark("peak", grid[15], 1., 1.)),
+             (Landmark("valley", grid[50], -1., 1.), Landmark("valley", grid[45], -1., 1.))]
+    support = dict(partial_support_valid=True, common_chain=chain,
+                   source_common_start_day=grid[10], source_common_end_day=grid[50],
+                   target_common_start_day=grid[15], target_common_end_day=grid[45])
+    monkeypatch.setattr(d, "_solve_joint_gamma", lambda *a, **kw: np.linspace(0, 1, 128))
+    result = d.constrained_partial_phase(raw, raw*1.5, grid, support)
+    assert result["normalized"]["source"].shape[0] == 41
+    assert result["normalized"]["target"].shape[0] == 31
+    np.testing.assert_allclose(result["normalized"]["source_iqr"], np.percentile(raw[10:51], 75, axis=0)-np.percentile(raw[10:51], 25, axis=0))
+    np.testing.assert_allclose(result["normalized"]["target_iqr"], np.percentile(raw[15:46]*1.5, 75, axis=0)-np.percentile(raw[15:46]*1.5, 25, axis=0))
+
+
+def test_no_applicable_phase_emits_only_na_shape_and_no_partial_gamma(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import analysis.phase_shape_diagnostic as d
+    from scripts.diagnose_mode13_phase_shape_oracle import analyze
+    monkeypatch.setattr(d, "_solve_joint_gamma", lambda *a, **kw: np.linspace(0, 1, 128))
+    monkeypatch.setattr("scripts.diagnose_mode13_phase_shape_oracle.estimate_scalar_phase", lambda s, t: (0, t))
+    grid, source, _ = _support_curves()
+    target = np.exp(-((grid-150)/30)**2)*1e-12
+    def cache(x):
+        return dict(mode13_features=torch.tensor(x[None, :, None]), labels=np.array([0]))
+    args = SimpleNamespace(task="S_T", output_dir=tmp_path, prominence_rel=.05, min_distance_days=14)
+    _, shapes, marks, segments, artifacts, summary = analyze(args, cache(source), cache(target), ["crop"])
+    assert shapes[0]["phase_applicability"] == "PHASE_NOT_APPLICABLE"
+    assert not shapes[0]["shape_phase_conditioned_valid"]
+    for key in ("global_range_ratio", "peak_height_ratio_mean", "segment_auc_ratio_mean", "same_class_shape_distance"):
+        assert np.isnan(shapes[0][key])
+    assert all(not r["observable_in_both_domains"] for r in marks + segments)
+    assert artifacts["partial_gamma_by_class"] == {}
+    assert summary["phase_not_applicable_count"] == 1
+
+
+def test_full_support_with_missing_boundary_landmark_reports_unobservable(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import analysis.phase_shape_diagnostic as d
+    from scripts.diagnose_mode13_phase_shape_oracle import analyze
+    monkeypatch.setattr(d, "_solve_joint_gamma", lambda *a, **kw: np.linspace(0, 1, 128))
+    monkeypatch.setattr("scripts.diagnose_mode13_phase_shape_oracle.estimate_scalar_phase", lambda s, t: (0, t))
+    grid = np.linspace(0, 365, 64)
+    source = np.interp(grid, [0, 35, 90, 145, 200, 255, 310, 365], [0, 2, -2, 2, -2, 2, -2, 0])
+    target = source.copy()
+    # Missing leading peak but almost flat first eight points: no strong edge evidence.
+    target[grid < 90] = np.interp(grid[grid < 90], [0, 50, 90], [0, -.1, -2])
+    def cache(x):
+        return dict(mode13_features=torch.tensor(x[None, :, None]), labels=np.array([0]))
+    args = SimpleNamespace(task="S_T", output_dir=tmp_path, prominence_rel=.05, min_distance_days=14)
+    _, shapes, marks, segments, _, _ = analyze(args, cache(source), cache(target), ["crop"])
+    assert shapes[0]["phase_applicability"] == "FULL_PHASE"
+    missing = [r for r in marks if not r["observable_in_both_domains"]]
+    assert missing and all(np.isnan(r["height_ratio"]) for r in missing)
+    assert any(not r["observable_in_both_domains"] for r in segments)
+
+
+def test_target_only_boundary_segment_is_explicitly_unobservable(monkeypatch):
+    import analysis.phase_shape_diagnostic as d
+    from scripts.diagnose_mode13_phase_shape_oracle import support_shape_metrics
+    grid, complete, truncated = _support_curves("left")
+    source, target = truncated[:, None], complete[:, None]
+    support = d.discover_phase_support(source[:, 0], target[:, 0], grid)
+    monkeypatch.setattr(d, "_solve_joint_gamma", lambda *a, **kw: np.linspace(0, 1, 128))
+    partial = d.constrained_partial_phase(source, target, grid, support)
+    state = d.classify_phase_applicability(support, None, partial)
+    _, _, segments = support_shape_metrics("S_T", 0, "crop", source, target, grid,
+                                           np.ones(1), support, partial, state)
+    missing = [r for r in segments if not r["observable_in_both_domains"]]
+    assert missing and all(np.isnan(r["auc_ratio"]) for r in missing)
+
+
+def test_partial_real_srvf_preserves_joint_gamma_and_amplitude():
+    import analysis.phase_shape_diagnostic as d
+    grid, source, target = _support_curves("left")
+    support = d.discover_phase_support(source, target, grid)
+    raw_s = np.column_stack((source, source**2))
+    raw_t = np.column_stack((target, target**2))*1.5
+    result = d.constrained_partial_phase(raw_s, raw_t, grid, support)
+    assert result["solution_valid"]
+    assert result["phase"].gamma.shape == (128,)
+    assert np.all(np.diff(result["phase"].gamma) >= 0)
+    assert result["phase"].max_displacement * (support["target_common_end_day"]-support["target_common_start_day"]) <= 60
+    assert result["selected_lambda"] != 0
+    np.testing.assert_allclose(result["raw_aligned"], result["raw_source"]*1.5, atol=1e-8)
+
+
+def test_partial_acceptance_uses_chain_error_and_excludes_unrestricted(monkeypatch):
+    import analysis.phase_shape_diagnostic as d
+    from models.fredn.structural_probe import Landmark
+    grid = np.linspace(0, 365, 64)
+    source = _curve(grid/365)
+    chain = [(Landmark(k, s, 1., 1.), Landmark(k, t, 1., 1.))
+             for k, s, t in (("valley", 50, 80), ("peak", 150, 200), ("valley", 300, 280))]
+    support = dict(partial_support_valid=True, common_chain=chain,
+                   source_common_start_day=50., source_common_end_day=300.,
+                   target_common_start_day=80., target_common_end_day=280.)
+    identity = np.linspace(0, 1, 128)
+    gamma = np.interp(identity, [0, .4, 1], [0, .6, 1])
+    monkeypatch.setattr(d, "_solve_joint_gamma", lambda *a, **kw: gamma)
+    result = d.constrained_partial_phase(source, source*1.5, grid, support)
+    assert result["nonlinear_accepted"]
+    assert result["selected_lambda"] == 10  # Same landmark error/displacement: conservative penalty tie-break.
+    assert result["scalar_landmark_error"] == pytest.approx(40/3)
+    assert result["selected_landmark_error"] < .3
+    np.testing.assert_allclose(result["mapped_target_grid"], 80 + gamma*200)
+    assert not result["candidates"][0]["candidate_admissible"]
+
+
+def test_partial_invalid_crop_channels_skip_solver_and_not_applicable(monkeypatch):
+    import analysis.phase_shape_diagnostic as d
+    grid, s, t = _support_curves("left")
+    support = d.discover_phase_support(s, t, grid)
+    def fail(*a, **kw):
+        pytest.fail("no valid cropped channels must skip SRVF")
+    monkeypatch.setattr(d, "_solve_joint_gamma", fail)
+    partial = d.constrained_partial_phase(np.ones((64, 2)), np.ones((64, 2)), grid, support)
+    assert not partial["solution_valid"]
+    assert partial["failure_reason"] == "no_valid_phase_channels"
+    assert d.classify_phase_applicability(support, None, partial)["phase_applicability"] == "PHASE_NOT_APPLICABLE"
+
+
+def test_partial_coverage_gate_rejects_short_common_interval():
+    from analysis.phase_shape_diagnostic import discover_phase_support
+    grid = np.linspace(0, 365, 64)
+    curve = np.interp(grid, [0, 125, 145, 165, 185, 365], [0, 0, 2, -2, 0, 0])
+    support = discover_phase_support(curve, curve, grid, prominence=.1)
+    assert support["common_chain_landmark_count"] == 2
+    assert support["common_time_coverage_min"] < .2
+    assert not support["partial_support_valid"]
+
+
+def test_lambda_summaries_do_not_mix_full_and_partial_scopes():
+    from scripts.diagnose_mode13_phase_shape_oracle import summarize_lambdas
+    rows = [dict(registration_scope=scope, lambda_value=.1, gamma_valid=True,
+                 candidate_admissible=True, registration_error=error, landmark_error_mean=error,
+                 gamma_mean_displacement_days=0., gamma_max_displacement_days=0., rejection_reason="")
+            for scope, error in (("FULL_CONSTRAINED", 10.), ("PARTIAL_CONSTRAINED", 1.))]
+    summary = summarize_lambdas("S_T", rows)
+    assert len(summary) == 2
+    assert {r["registration_scope"]: r["landmark_error_mean"] for r in summary} == {
+        "FULL_CONSTRAINED": 10., "PARTIAL_CONSTRAINED": 1.}

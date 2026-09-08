@@ -363,3 +363,217 @@ def constrained_residual_phase(source, target_scalar, loading, grid,
                 scalar_landmark_error=scalar_marks["mean_time_error"],
                 selected_landmark_error=best["landmark_error_mean"] if accepted else scalar_marks["mean_time_error"],
                 failure_reason=reason)
+
+
+def edge_activity(curve, edge_points=8, monotonicity=.75, range_ratio=.15):
+    """Boundary activity is evidence only, never a standalone rejection gate."""
+    curve = np.asarray(curve, dtype=float)
+    if curve.ndim != 1 or not 2 <= edge_points <= len(curve):
+        raise ValueError("edge_points must be between 2 and curve length")
+    result = {}
+    for side, window in (("left", curve[:edge_points]), ("right", curve[-edge_points:])):
+        diff = np.diff(window)
+        ratio = float(max(np.count_nonzero(diff > 0), np.count_nonzero(diff < 0)) / len(diff))
+        relative_range = float(np.ptp(window) / max(float(np.ptp(curve)), EPS))
+        result[side] = dict(net_change=float(window[-1]-window[0]),
+                            absolute_total_change=float(np.abs(diff).sum()),
+                            monotonicity_ratio=ratio, edge_range=float(np.ptp(window)),
+                            edge_range_ratio=relative_range, mean_slope=float(diff.mean()),
+                            active=bool(ratio >= monotonicity and relative_range >= range_ratio))
+    return result
+
+
+def longest_contiguous_chain(source_marks, target_marks, pairs):
+    """Both full-sequence indices must increment by one; ties choose earliest."""
+    si = {(m.kind, m.time): i for i, m in enumerate(source_marks)}
+    ti = {(m.kind, m.time): i for i, m in enumerate(target_marks)}
+    best, current, previous = [], [], None
+    for pair in sorted(pairs, key=lambda p: p[0].time):
+        index = (si[(pair[0].kind, pair[0].time)], ti[(pair[1].kind, pair[1].time)])
+        if previous is None or index != (previous[0]+1, previous[1]+1):
+            current = []
+        current.append(pair)
+        if len(current) > len(best):
+            best = current.copy()
+        previous = index
+    return best
+
+
+def discover_phase_support(source, target_scalar, grid, prominence=0., min_distance_days=14.,
+                           edge_points=8, edge_monotonicity=.75, edge_range_ratio=.15,
+                           full_landmark_coverage=.80, partial_min_landmarks=2,
+                           partial_min_time_coverage=.20):
+    """Discover structure only in the Global+Scalar frame. No padding or extension."""
+    if partial_min_landmarks < 2 or not 0 <= partial_min_time_coverage <= 1:
+        raise ValueError("partial support needs >=2 landmarks and coverage in [0,1]")
+    if not all(0 <= x <= 1 for x in (edge_monotonicity, edge_range_ratio, full_landmark_coverage)):
+        raise ValueError("support ratios must be in [0,1]")
+    marks = landmark_alignment_metrics(source, target_scalar, grid, prominence, min_distance_days)
+    sm, tm, pairs = marks["source_landmarks"], marks["target_landmarks"], marks["matched_pairs"]
+    chain = longest_contiguous_chain(sm, tm, pairs)
+    edges = {"source": edge_activity(source, edge_points, edge_monotonicity, edge_range_ratio),
+             "target": edge_activity(target_scalar, edge_points, edge_monotonicity, edge_range_ratio)}
+    result = dict(source_landmark_count=len(sm), target_landmark_count=len(tm),
+                  matched_landmark_count=len(pairs), common_chain_landmark_count=len(chain),
+                  source_landmark_coverage=len(chain)/len(sm) if sm else 0.,
+                  target_landmark_coverage=len(chain)/len(tm) if tm else 0.,
+                  source_landmarks=sm, target_landmarks=tm, matched_pairs=pairs, common_chain=chain)
+    for domain, edge in edges.items():
+        for side, metrics in edge.items():
+            result[side + "_boundary_active_" + domain] = metrics["active"]
+            for key, value in metrics.items():
+                result[domain + "_" + side + "_" + key] = value
+    for side in ("left", "right"):
+        strong = False
+        for domain, own, other, oriented in (("source", sm, tm, pairs),
+                                             ("target", tm, sm, [(b, a) for a, b in pairs])):
+            if not own or not oriented or not edges[domain][side]["active"]:
+                continue
+            anchor = own[0 if side == "left" else -1]
+            mate = next((b for a, b in oriented if a == anchor), None)
+            if mate is None:
+                continue
+            slope = edges[domain][side]["mean_slope"]
+            # Left declining into valley => missing peak; right declining out of peak => missing valley.
+            expected_anchor = ("valley" if slope < 0 else "peak") if side == "left" else (
+                "peak" if slope < 0 else "valley")
+            missing_kind = "peak" if expected_anchor == "valley" else "valley"
+            matched_other = {(b.kind, b.time) for _, b in oriented}
+            unmatched = [m for m in other if (m.kind, m.time) not in matched_other
+                         and (m.time < mate.time if side == "left" else m.time > mate.time)]
+            strong |= anchor.kind == expected_anchor and any(m.kind == missing_kind for m in unmatched)
+        result[side + "_truncation_evidence"] = "strong" if strong else (
+            "candidate" if any(edges[d][side]["active"] for d in edges) else "none")
+    for domain, column in (("source", 0), ("target", 1)):
+        start, end = (chain[0][column].time, chain[-1][column].time) if chain else (np.nan, np.nan)
+        result[domain + "_common_start_day"] = start
+        result[domain + "_common_end_day"] = end
+        result[domain + "_common_time_coverage"] = (end-start)/365 if chain else 0.
+    coverage = min(result["source_common_time_coverage"], result["target_common_time_coverage"])
+    result["common_time_coverage_min"] = coverage
+    result["partial_support_valid"] = len(chain) >= partial_min_landmarks and coverage >= partial_min_time_coverage and coverage > 0
+    result["full_support_valid"] = (len(chain) >= 2 and coverage > 0
+        and min(result["source_landmark_coverage"], result["target_landmark_coverage"]) >= full_landmark_coverage
+        and all(result[s + "_truncation_evidence"] != "strong" for s in ("left", "right")))
+    return result
+
+
+def _crop_support(values, grid, start, end):
+    grid, values = np.asarray(grid, dtype=float), np.asarray(values, dtype=float)
+    if not grid[0] <= start < end <= grid[-1]:
+        raise ValueError("common support must be a nonempty interval within the observed grid")
+    times = np.r_[start, grid[(grid > start) & (grid < end)], end]
+    return times, np.column_stack([np.interp(times, grid, v) for v in values.T])
+
+
+def _normalize_partial_pair(source, target, floor_ratio):
+    """Native cropped samples, BEFORE resampling; supports unequal crop lengths."""
+    if not np.isfinite(floor_ratio) or floor_ratio <= 0:
+        raise ValueError("phase IQR floor ratio must be positive and finite")
+    sq = np.percentile(source, 75, axis=0)-np.percentile(source, 25, axis=0)
+    tq = np.percentile(target, 75, axis=0)-np.percentile(target, 25, axis=0)
+    scales = np.r_[sq, tq]
+    positive = scales[np.isfinite(scales) & (scales > EPS)]
+    floor = max(EPS, floor_ratio*np.median(positive)) if positive.size else EPS
+    mask = np.isfinite(sq) & np.isfinite(tq) & (sq > floor) & (tq > floor)
+    sn, tn = np.zeros_like(source), np.zeros_like(target)
+    sn[:, mask] = (source[:, mask]-np.median(source[:, mask], axis=0))/sq[mask]
+    tn[:, mask] = (target[:, mask]-np.median(target[:, mask], axis=0))/tq[mask]
+    finite = all(np.isfinite(v).all() for v in (source, target, sn, tn))
+    return dict(source=sn, target=tn, valid_channels=mask, source_iqr=sq, target_iqr=tq,
+                iqr_floor=floor, failure_reason="" if finite and mask.any() else (
+                    "nonfinite_normalized_phase" if not finite else "no_valid_phase_channels"))
+
+
+def constrained_partial_phase(source, target_scalar, grid, support,
+                              lambdas=(0, .01, .1, 1, 10), floor_ratio=1e-3, max_warp_days=60):
+    """Same joint SRVF and selection gates as full; operates ONLY inside support."""
+    if not lambdas or any(not np.isfinite(lam) or lam < 0 for lam in lambdas):
+        raise ValueError("phase lambdas must be finite and nonnegative")
+    if not np.isfinite(max_warp_days) or max_warp_days < 0:
+        raise ValueError("maximum residual warp days must be finite and nonnegative")
+    if not support["partial_support_valid"]:
+        return dict(solution_valid=False, selected_phase="none", failure_reason="invalid_partial_support",
+                    selected_lambda=None, nonlinear_accepted=False, candidates=[], candidate_gammas={},
+                    scalar_landmark_error=np.nan, selected_landmark_error=np.nan)
+    a_s, b_s = (support["source_common_" + k + "_day"] for k in ("start", "end"))
+    a_t, b_t = (support["target_common_" + k + "_day"] for k in ("start", "end"))
+    st, sr = _crop_support(source, grid, a_s, b_s)
+    tt, tr = _crop_support(target_scalar, grid, a_t, b_t)
+    normalized = _normalize_partial_pair(sr, tr, floor_ratio)
+    identity = np.linspace(0., 1., 128)
+    source_grid = a_s + identity*(b_s-a_s)
+    target_grid = a_t + identity*(b_t-a_t)
+    def resample(values, times, query):
+        return np.column_stack([np.interp(query, times, v) for v in values.T])
+    sn = resample(normalized["source"], st, source_grid)
+    tn = resample(normalized["target"], tt, target_grid)
+    chain = support["common_chain"]
+    u_s = (np.array([a.time for a, _ in chain])-a_s)/(b_s-a_s)
+    target_times = np.array([b.time for _, b in chain])
+    def errors(gamma):
+        return np.abs(a_t + np.interp(u_s, identity, gamma)*(b_t-a_t)-target_times)
+    baseline = float(errors(identity).mean())
+    rows, gammas = [], {}
+    mask = normalized["valid_channels"]
+    for lam in lambdas:
+        if normalized["failure_reason"]:
+            phase = _phase_result(identity, False, normalized["failure_reason"])
+        else:
+            try:
+                phase = _phase_result(_solve_joint_gamma(sn[:, mask], tn[:, mask], lam=lam))
+            except Exception as error:
+                phase = _phase_result(identity, False, f"solver_failure:{type(error).__name__}")
+        gammas[lam] = phase.gamma
+        error = errors(phase.gamma)
+        metric_valid = len(chain) >= 2 and np.isfinite(error).all()
+        reg = registration_metrics(sn, warp_curve(tn, phase.gamma))
+        reason = phase.failure_reason
+        if phase.valid:
+            if phase.max_displacement*(b_t-a_t) > max_warp_days:
+                reason = "residual_warp_too_large"
+            elif not metric_valid:
+                reason = "no_matched_landmarks"
+            elif lam == 0:
+                reason = "unrestricted_reference"
+        rows.append(dict(lambda_value=float(lam), unrestricted_reference=lam == 0,
+                         registration_error=reg["normalized_l2"], registration_corr=reg["correlation"],
+                         landmark_error_mean=float(error.mean()), landmark_error_median=float(np.median(error)),
+                         landmark_error_p95=float(np.percentile(error, 95)), matched_landmark_count=len(chain),
+                         landmark_metric_valid=bool(metric_valid), gamma_valid=phase.valid,
+                         gamma_mean_displacement_days=phase.mean_displacement*(b_t-a_t),
+                         gamma_max_displacement_days=phase.max_displacement*(b_t-a_t),
+                         gamma_p95_displacement_days=phase.p95_displacement*(b_t-a_t),
+                         gamma_roughness=phase.roughness, gamma_min_derivative=phase.min_derivative,
+                         gamma_max_derivative=phase.max_derivative,
+                         candidate_admissible=bool(phase.valid and not reason), rejection_reason=reason))
+    best = select_phase_candidate(rows, baseline)
+    selected = _phase_result(gammas[best["lambda_value"]] if best else identity)
+    valid = not normalized["failure_reason"] and np.isfinite(baseline)
+    return dict(phase=selected, solution_valid=bool(valid), normalized=normalized, candidates=rows,
+                candidate_gammas=gammas, selected_lambda=best["lambda_value"] if best else None,
+                nonlinear_accepted=best is not None, selected_phase=("partial_nonlinear" if best else "partial_linear") if valid else "none",
+                scalar_landmark_error=baseline, selected_landmark_error=best["landmark_error_mean"] if best else baseline,
+                failure_reason=normalized["failure_reason"] or ("" if best else "no_landmark_improvement"),
+                raw_source=resample(sr, st, source_grid),
+                raw_aligned=resample(tr, tt, a_t + selected.gamma*(b_t-a_t)),
+                source_grid=source_grid, mapped_target_grid=a_t + selected.gamma*(b_t-a_t))
+
+
+def classify_phase_applicability(support, full, partial):
+    full_valid = (full is not None and not full["normalized"]["failure_reason"]
+                  and np.isfinite(full["selected_landmark_error"])
+                  and (not full["nonlinear_accepted"] or full["phase"].valid))
+    if support["full_support_valid"] and full_valid:
+        return dict(phase_applicability="FULL_PHASE", phase_applicability_reason=
+                    "full_landmark_coverage_high;no_boundary_truncation;full_warp_valid:" + full["selected_phase"])
+    reasons = [side + "_boundary_truncation" for side in ("left", "right")
+               if support[side + "_truncation_evidence"] == "strong"]
+    if support["partial_support_valid"] and partial is not None and partial["solution_valid"]:
+        reasons += [f'{support["common_chain_landmark_count"]}_contiguous_landmarks',
+                    f'common_support={support["common_time_coverage_min"]:.6f}', partial["selected_phase"],
+                    f'partial_landmark_gain={partial["scalar_landmark_error"]-partial["selected_landmark_error"]:.6f}d']
+        return dict(phase_applicability="PARTIAL_PHASE", phase_applicability_reason=";".join(reasons))
+    reasons.append("insufficient_common_structure" if not support["partial_support_valid"] else
+                   "invalid_partial_alignment:" + (partial["failure_reason"] if partial else "not_attempted"))
+    return dict(phase_applicability="PHASE_NOT_APPLICABLE", phase_applicability_reason=";".join(reasons))
