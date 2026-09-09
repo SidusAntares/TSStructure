@@ -828,6 +828,20 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     shift_estimator=config.shift_estimator,
                     progress_bar=getattr(config, "progress_bar", "auto"))
             if epoch == 0:
+                if getattr(config, "model", None) == "psefourierreconltae":
+                    aliases = {
+                        "austria/33UVP/2017": "AT1",
+                        "denmark/32VNH/2017": "DK1",
+                        "france/30TXT/2017": "FR1",
+                        "france/31TCJ/2017": "FR2",
+                    }
+                    print(
+                        "INITIAL_SHIFT|"
+                        f"source={aliases.get(config.source, config.source)}|"
+                        f"target={aliases.get(config.target, config.target)}|"
+                        f"mode={config.fourier_num_modes}|"
+                        f"shift_days={target_to_source_shift}"
+                    )
                 if config.shift_source:
                     source_to_target_shift = -target_to_source_shift
                 else:
