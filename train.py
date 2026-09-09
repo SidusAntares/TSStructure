@@ -20,11 +20,13 @@ from competitors.mmd.train_mmd import train_mmd
 from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
-from models.fredn.diagnostics import (
-    log_fredn_checkpoint_mask,
-    log_fredn_diagnostics,
+from models.stclassifier import (
+    PseFourierReconLTae,
+    PseGru,
+    PseLTae,
+    PseTae,
+    PseTempCNN,
 )
-from models.stclassifier import PseFreDNLTae, PseLTae, PseTae, PseTempCNN, PseGru
 from timematch import train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
 from utils import label_utils
@@ -43,22 +45,20 @@ def add_model_arguments(parser):
     parser.add_argument(
         '--model',
         default='pseltae',
-        choices=['psetae', 'pseltae', 'psetcnn', 'psegru', 'psefrednltae'],
+        choices=['psetae', 'pseltae', 'psetcnn', 'psegru', 'psefourierreconltae'],
     )
-    parser.add_argument('--fredn_num_modes', default=9, type=int)
-    parser.add_argument('--fredn_nufft_reg', default=1e-3, type=float)
-    parser.add_argument('--fredn_nufft_tol', default=1e-5, type=float)
-    parser.add_argument('--fredn_nufft_max_iter', default=20, type=int)
-    parser.add_argument('--fredn_period_days', default=365.0, type=float)
+    parser.add_argument('--fourier_num_modes', default=13, type=int)
+    parser.add_argument('--fourier_reg', default=1e-3, type=float)
+    parser.add_argument('--fourier_period_days', default=365.0, type=float)
     parser.add_argument(
-        '--fredn_fourier_solver',
+        '--fourier_solver',
         default='dense_direct',
-        choices=['dense_direct', 'nufft_cg'],
+        choices=['dense_direct'],
     )
     return parser
 
 
-def create_model(config, nufft_backend=None):
+def create_model(config):
     common = dict(
         input_dim=config.input_dim,
         num_classes=config.num_classes,
@@ -72,20 +72,13 @@ def create_model(config, nufft_backend=None):
         return PseTempCNN(**common)
     if config.model == 'psegru':
         return PseGru(**common)
-    if config.model == 'psefrednltae':
-        return PseFreDNLTae(
+    if config.model == 'psefourierreconltae':
+        return PseFourierReconLTae(
             **common,
-            fredn_num_modes=config.fredn_num_modes,
-            fredn_nufft_reg=config.fredn_nufft_reg,
-            fredn_nufft_tol=config.fredn_nufft_tol,
-            fredn_nufft_max_iter=config.fredn_nufft_max_iter,
-            fredn_period_days=config.fredn_period_days,
-            fredn_fourier_solver=getattr(
-                config,
-                'fredn_fourier_solver',
-                'dense_direct',
-            ),
-            nufft_backend=nufft_backend,
+            fourier_num_modes=config.fourier_num_modes,
+            fourier_reg=config.fourier_reg,
+            fourier_period_days=config.fourier_period_days,
+            fourier_solver=config.fourier_solver,
         )
     raise NotImplementedError(config.model)
 
@@ -156,20 +149,6 @@ def main(config):
 
         state_dict = torch.load(best_model_path, weights_only=False)['state_dict']
         model.load_state_dict(state_dict)
-        checkpoint_stage = (
-            'timematch_test'
-            if getattr(config, 'method', None) == 'timematch'
-            else 'source_best'
-        )
-        log_fredn_checkpoint_mask(
-            model,
-            stage=checkpoint_stage,
-            output_path=os.path.join(
-                config.fold_dir,
-                f'fredn_mask_{checkpoint_stage}.pt',
-            ),
-        )
-
         test_metrics = evaluation(
             model,
             test_loader,
@@ -372,18 +351,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             targets = sample['label'].cuda(device=device, non_blocking=True)
 
             pixels, mask, positions, extra = to_cuda(sample, device)
-            current_step = global_step + step
-            collect_diagnostics = step % config.log_step == 0
-            if getattr(model, 'supports_fredn_diagnostics', False):
-                outputs = model.forward(
-                    pixels,
-                    mask,
-                    positions,
-                    extra,
-                    collect_diagnostics=collect_diagnostics,
-                )
-            else:
-                outputs = model.forward(pixels, mask, positions, extra)
+            outputs = model.forward(pixels, mask, positions, extra)
             loss = criterion(outputs, targets)
 
             optimizer.zero_grad()
@@ -394,7 +362,6 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             loss_meter.update(loss.item(), n=config.batch_size)
 
             if step % config.log_step == 0:
-                log_fredn_diagnostics(model, writer, current_step)
                 lr = optimizer.param_groups[0]["lr"]
                 progress_bar.set_postfix(lr=f'{lr:.1E}', loss=f"{loss_meter.avg:.3f}")
                 writer.add_scalar("train/loss", loss_meter.val, global_step + step)

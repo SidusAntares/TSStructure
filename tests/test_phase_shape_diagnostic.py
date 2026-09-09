@@ -329,7 +329,7 @@ def test_launcher_is_offline_and_contains_exact_four_tasks():
 
 def test_order_preserving_landmark_matching_skips_spurious_early_mark():
     from analysis.phase_shape_diagnostic import _minimum_cost_ordered_pairs
-    from models.fredn.structural_probe import Landmark
+    from models.structural_probe import Landmark
 
     source = [Landmark("peak", time, 1.0, 1.0) for time in (10.0, 30.0)]
     target = [Landmark("peak", time, 1.0, 1.0) for time in (1.0, 11.0, 31.0)]
@@ -397,7 +397,7 @@ def test_single_shared_landmark_and_unrelated_flat_target_are_not_applicable():
 
 def test_contiguous_chain_cannot_bridge_missing_landmark():
     from analysis.phase_shape_diagnostic import longest_contiguous_chain
-    from models.fredn.structural_probe import Landmark
+    from models.structural_probe import Landmark
     source = [Landmark("peak" if i % 2 else "valley", float(i), 1., 1.) for i in range(5)]
     target = [Landmark("peak", float(i), 1., 1.) for i in range(4)]
     pairs = [(source[1], target[1]), (source[3], target[2]), (source[4], target[3])]
@@ -514,7 +514,7 @@ def test_partial_shape_values_ignore_outside_peak_with_fixed_support(monkeypatch
 
 def test_partial_iqr_is_computed_before_resampling_unequal_crops(monkeypatch):
     import analysis.phase_shape_diagnostic as d
-    from models.fredn.structural_probe import Landmark
+    from models.structural_probe import Landmark
     grid = np.linspace(0, 365, 64)
     raw = _curve(grid/365)
     chain = [(Landmark("peak", grid[10], 1., 1.), Landmark("peak", grid[15], 1., 1.)),
@@ -604,7 +604,7 @@ def test_partial_real_srvf_preserves_joint_gamma_and_amplitude():
 
 def test_partial_acceptance_uses_chain_error_and_excludes_unrestricted(monkeypatch):
     import analysis.phase_shape_diagnostic as d
-    from models.fredn.structural_probe import Landmark
+    from models.structural_probe import Landmark
     grid = np.linspace(0, 365, 64)
     source = _curve(grid/365)
     chain = [(Landmark(k, s, 1., 1.), Landmark(k, t, 1., 1.))

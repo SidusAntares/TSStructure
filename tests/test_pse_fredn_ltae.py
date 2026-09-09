@@ -3,7 +3,7 @@ from copy import deepcopy
 import pytest
 import torch
 
-from models.stclassifier import PseFreDNLTae
+from models.fredn.model import PseFreDNLTae
 
 
 def _tiny_model(num_classes=3):

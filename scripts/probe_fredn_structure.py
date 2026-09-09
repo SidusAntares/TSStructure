@@ -38,7 +38,8 @@ from models.fredn.structural_probe import (
     summarize_topology,
     topology_signature,
 )
-from models.stclassifier import PseFreDNLTae, PseLTae
+from models.fredn.model import PseFreDNLTae
+from models.stclassifier import PseLTae
 
 
 DOMAIN_PATHS = {

@@ -33,7 +33,7 @@ from models.fredn.structural_probe import (
     stratified_bootstrap_macro_f1_delta,
     topology_signature,
 )
-from models.stclassifier import PseFreDNLTae
+from models.fredn.model import PseFreDNLTae
 
 
 DOMAIN_PATHS = {

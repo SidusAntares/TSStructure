@@ -10,11 +10,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from models.fredn.nufft import (
+from models.fourier_reconstruction import (
     BatchedDirectFourierAnalyzer,
     BatchedDirectFourierSynthesizer,
 )
-from models.fredn.structural_probe import (
+from models.structural_probe import (
     detect_structural_landmarks,
     fit_source_class_projections,
     robust_signal_scale,

@@ -205,22 +205,6 @@ def test_probe_never_invokes_git_or_subprocess():
     assert "pip install" not in source.lower()
 
 
-def test_source_mode_sweep_launcher_is_offline_and_maps_four_gpus():
-    path = Path("scripts/run_fredn_source_mode_sweep_at1_4gpu.sh")
-    source = path.read_text(encoding="utf-8")
-
-    assert 'launch_source "$GPU0" 11' in source
-    assert 'launch_source "$GPU1" 13' in source
-    assert 'launch_source "$GPU2" 15' in source
-    assert 'launch_source "$GPU3" 19' in source
-    assert "--fredn_num_modes" in source
-    assert "--fredn_fourier_solver dense_direct" in source
-    assert "nohup" in source
-    assert "\n        timematch" not in source.lower()
-    assert "git " not in source.lower()
-    assert "wait " not in source
-
-
 def test_unified_probe_launcher_passes_checkpoints_and_manual_version_metadata():
     path = Path("scripts/run_fredn_structural_probe_mode_sweep_at1_dk1.sh")
     source = path.read_text(encoding="utf-8")

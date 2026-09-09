@@ -15,7 +15,6 @@ from tqdm import tqdm
 
 from dataset import PixelSetData
 from evaluation import validation
-from models.fredn.diagnostics import log_fredn_diagnostics
 from models.shape_alignment import (
     ClassPhaseRecord,
     ClassResidualPhaseEstimator,
@@ -76,15 +75,6 @@ def _forward_with_temporal_shift(
     collect_diagnostics=False,
 ):
     if hasattr(model, "forward_with_temporal_shift"):
-        if getattr(model, "supports_fredn_diagnostics", False):
-            return model.forward_with_temporal_shift(
-                pixels,
-                mask,
-                positions,
-                extra,
-                temporal_shift=temporal_shift,
-                collect_diagnostics=collect_diagnostics,
-            )
         return model.forward_with_temporal_shift(
             pixels,
             mask,
@@ -173,12 +163,6 @@ def _prepare_temporal_features(
     collect_diagnostics=False,
 ):
     if hasattr(model, "prepare_temporal_features"):
-        if getattr(model, "supports_fredn_diagnostics", False):
-            return model.prepare_temporal_features(
-                spatial_feats,
-                positions,
-                collect_diagnostics=collect_diagnostics,
-            )
         return model.prepare_temporal_features(spatial_feats, positions)
     return spatial_feats
 
@@ -1070,7 +1054,6 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                 writer.add_scalar("train/loss", loss_meter.val, global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                 writer.add_scalar("train/target_updates", len(torch.nonzero(pseudo_mask)), global_step)
-                log_fredn_diagnostics(student, writer, global_step)
                 if shape_result is not None:
                     _log_shape_result(
                         writer,

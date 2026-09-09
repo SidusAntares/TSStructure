@@ -218,7 +218,7 @@ def shape_margin(class_id, target, source_prototypes: Mapping[int, np.ndarray]):
 
 
 def landmark_alignment_metrics(source, target, times, prominence=0.0, min_distance_days=0.0):
-    from models.fredn.structural_probe import detect_structural_landmarks
+    from models.structural_probe import detect_structural_landmarks
 
     source_marks = detect_structural_landmarks(times, source, min_distance_days, prominence)
     target_marks = detect_structural_landmarks(times, target, min_distance_days, prominence)

@@ -37,7 +37,7 @@ from analysis.phase_shape_diagnostic import (
     prepare_visualization_group,
     visualization_distance_matrices,
 )
-from models.fredn.structural_probe import (
+from models.structural_probe import (
     build_direct_fourier_views,
     fit_source_class_projections,
 )

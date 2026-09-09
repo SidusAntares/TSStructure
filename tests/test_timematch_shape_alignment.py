@@ -603,7 +603,7 @@ def _phase_target(shifts, samples_per_class=36, dtype=torch.float64):
 
 
 def test_fourier_residual_shift_sign_matches_reanalysis():
-    from models.fredn.nufft import (
+    from models.fourier_reconstruction import (
         BatchedDirectFourierAnalyzer,
         BatchedDirectFourierSynthesizer,
     )
