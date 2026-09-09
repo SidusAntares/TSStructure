@@ -113,6 +113,14 @@ def test_launcher_is_a_mode_only_sweep_with_the_frozen_protocol():
     assert all(token not in source for token in forbidden)
 
 
+def test_launcher_does_not_expand_a_local_variable_in_its_own_declaration():
+    source = LAUNCHER_PATH.read_text(encoding="utf-8")
+    assert not any(
+        "source_root=" in line and "source_weights=" in line
+        for line in source.splitlines()
+    )
+
+
 def test_summary_parser_extracts_all_core_metrics(monkeypatch):
     module = _load_summary_module()
     logs = {
