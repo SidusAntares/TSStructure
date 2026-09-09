@@ -7,8 +7,11 @@ AT1_WEIGHTS="${AT1_WEIGHTS:-outputs/pseltae_AT1_source_seed1}"
 DK1_WEIGHTS="${DK1_WEIGHTS:-outputs/pseltae_DK1_source_seed1}"
 FR1_WEIGHTS="${FR1_WEIGHTS:-outputs/pseltae_FR1_source_seed1}"
 FR2_WEIGHTS="${FR2_WEIGHTS:-outputs/pseltae_FR2_source_seed1}"
-OUT="outputs/phase_shape_diagnostic_mode13_applicability_seed1"
-LOG="logs/phase_shape_diagnostic_mode13_applicability_seed1"
+OUT="outputs/phase_shape_diagnostic_mode13_visualizations_seed1"
+LOG="logs/phase_shape_diagnostic_mode13_visualizations_seed1"
+VIZ_MAX_CURVES="${VIZ_MAX_CURVES:-40}"
+VIZ_DPI="${VIZ_DPI:-160}"
+printf '%s\n' 'visualization enabled = true' "viz_max_curves_per_group = $VIZ_MAX_CURVES" "viz_dpi = $VIZ_DPI"
 printf '%s\n' 'phase_iqr_floor_ratio=1e-3' 'phase_lambdas=0,0.01,0.1,1,10' \
   'max_residual_warp_days=60' 'save_feature_cache=false' \
   'phase_edge_points=8' 'phase_edge_monotonicity=0.75' 'phase_edge_range_ratio=0.15' \
@@ -32,6 +35,7 @@ run(){
     --phase-iqr-floor-ratio 1e-3 --phase-lambdas '0,0.01,0.1,1,10' --max-residual-warp-days 60 \
     --phase-edge-points 8 --phase-edge-monotonicity 0.75 --phase-edge-range-ratio 0.15 \
     --full-landmark-coverage 0.80 --partial-min-landmarks 2 --partial-min-time-coverage 0.20 \
+    --viz-max-curves-per-group "$VIZ_MAX_CURVES" --viz-dpi "$VIZ_DPI" \
     --device cuda --seed 1 --batch-size 128 --num-pixels 64 --output-dir "$OUT/$task" > "$LOG/$task.log" 2>&1
 }
 run "$GPU0" AT1 DK1 "$AT1_WEIGHTS/fold_0/model.pt" & p0=$!
@@ -42,4 +46,8 @@ failed=0
 for item in "AT1_DK1:$p0" "DK1_FR1:$p1" "FR1_FR2:$p2" "FR2_AT1:$p3"; do
   task="${item%%:*}"; pid="${item##*:}"; if wait "$pid"; then echo "SUCCESS $task"; else echo "FAILED $task" >&2; failed=1; fi
 done
+if (( failed == 0 )); then
+  "$PYTHON_BIN" -u scripts/diagnose_mode13_phase_shape_oracle.py \
+    --aggregate-phase-applicability-root "$OUT" --viz-dpi "$VIZ_DPI"
+fi
 exit "$failed"

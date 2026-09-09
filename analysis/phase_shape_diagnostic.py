@@ -577,3 +577,125 @@ def classify_phase_applicability(support, full, partial):
     reasons.append("insufficient_common_structure" if not support["partial_support_valid"] else
                    "invalid_partial_alignment:" + (partial["failure_reason"] if partial else "not_attempted"))
     return dict(phase_applicability="PHASE_NOT_APPLICABLE", phase_applicability_reason=";".join(reasons))
+
+
+class VisualizationUnavailable(ValueError):
+    """Expected missing/invalid plotting data; numerical diagnostics stay intact."""
+
+
+def fit_visualization_shared_pca(source_prototypes):
+    """Source-only equal-class prototype PCA, centered for fitting, raw projection."""
+    if not source_prototypes:
+        raise VisualizationUnavailable("no source prototypes for shared PCA")
+    values = np.concatenate([source_prototypes[c] for c in sorted(source_prototypes)], axis=0)
+    if not np.isfinite(values).all():
+        raise VisualizationUnavailable("nonfinite source prototypes for shared PCA")
+    centered = values - values.mean(axis=0)
+    if np.linalg.norm(centered) <= EPS:
+        raise VisualizationUnavailable("no variation for shared PCA")
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    direction = vh[0].copy()
+    if direction[np.argmax(np.abs(direction))] < 0:
+        direction *= -1
+    return direction
+
+
+def select_visualization_samples(sample_ids, maximum=40):
+    ids = np.asarray(sample_ids)
+    if ids.ndim != 1 or maximum < 1:
+        raise ValueError("sample IDs must be a vector and maximum must be positive")
+    if len(np.unique(ids)) != len(ids):
+        raise ValueError("visualization sample IDs must be unique within each group")
+    order = np.argsort(ids, kind="stable")
+    return order[np.linspace(0, len(order)-1, min(maximum, len(order))).astype(int)] if len(order) else order
+
+
+def _visualization_bundle(curves, prototype, indices):
+    """Summaries use the whole group; only thin curves are subsampled."""
+    curves, prototype = np.asarray(curves), np.asarray(prototype)
+    quantiles = np.full((3, curves.shape[1]), np.nan)
+    for column in range(curves.shape[1]):
+        finite = curves[:, column][np.isfinite(curves[:, column])]
+        if finite.size:
+            quantiles[:, column] = np.percentile(finite, [25, 50, 75])
+    finite = curves[np.isfinite(curves)]
+    bounds = (float(finite.min()), float(finite.max())) if finite.size else (0., 0.)
+    return dict(samples=curves[indices], prototype=prototype, quantiles=quantiles, bounds=bounds)
+
+
+def prepare_visualization_group(source, target, source_ids, target_ids, source_prototype,
+                                target_prototype, direction, grid, scalar_delta, state,
+                                gamma=None, support=None, partial_gamma=None, max_curves=40):
+    """Read-only post-diagnostic projection/warp. No model, loader or Fourier API."""
+    source, target, grid = np.asarray(source), np.asarray(target), np.asarray(grid)
+    if source.ndim != 3 or target.ndim != 3 or source.shape[1:] != target.shape[1:]:
+        raise ValueError("visualization representations must have matching [N,K,D] dimensions")
+    if len(source_ids) != len(source) or len(target_ids) != len(target):
+        raise ValueError("sample IDs must correspond to representations")
+    if not len(source) or not len(target):
+        raise VisualizationUnavailable("empty sample group")
+    if state not in ("FULL_PHASE", "PARTIAL_PHASE", "PHASE_NOT_APPLICABLE"):
+        raise ValueError("unknown phase applicability")
+    sc, tc = source @ direction, target @ direction
+    sp, tp = source_prototype @ direction, target_prototype @ direction
+    if not all(np.isfinite(x).all() for x in (sc, tc, sp, tp)):
+        raise VisualizationUnavailable("nonfinite projected group")
+    si, ti = select_visualization_samples(source_ids, max_curves), select_visualization_samples(target_ids, max_curves)
+    scalar = _periodic_shift(tc.T, scalar_delta, 365).T
+    scalar_proto = _periodic_shift(tp[:, None], scalar_delta, 365)[:, 0]
+    selected, selected_proto = scalar.copy(), scalar_proto.copy()
+    selected_sc, selected_sp = sc.copy(), sp.copy()
+    support_mask = np.ones(len(grid), dtype=bool)
+    if state == "FULL_PHASE" and gamma is not None:
+        selected = warp_curve(scalar.T, gamma).T
+        selected_proto = warp_curve(scalar_proto[:, None], gamma)[:, 0]
+    elif state == "PARTIAL_PHASE":
+        if support is None or partial_gamma is None:
+            raise ValueError("partial visualization needs existing support and selected gamma")
+        a_s, b_s = (support["source_common_" + k + "_day"] for k in ("start", "end"))
+        a_t, b_t = (support["target_common_" + k + "_day"] for k in ("start", "end"))
+        support_mask = (grid >= a_s) & (grid <= b_s)
+        if not support_mask.any():
+            raise VisualizationUnavailable("no grid points inside common support")
+        u = (grid[support_mask]-a_s)/(b_s-a_s)
+        query = a_t + np.interp(u, np.linspace(0, 1, len(partial_gamma)), partial_gamma)*(b_t-a_t)
+        times, cropped = _crop_support(scalar.T, grid, a_t, b_t)
+        _, cropped_proto = _crop_support(scalar_proto[:, None], grid, a_t, b_t)
+        selected[:] = np.nan
+        selected[:, support_mask] = np.stack([np.interp(query, times, c) for c in cropped.T])
+        selected_proto[:] = np.nan
+        selected_proto[support_mask] = np.interp(query, times, cropped_proto[:, 0])
+        selected_sc[:, ~support_mask] = np.nan
+        selected_sp[~support_mask] = np.nan
+    residual = selected - sp
+    residual_proto = selected_proto - sp
+    if state == "PHASE_NOT_APPLICABLE":
+        residual[:] = np.nan
+        residual_proto[:] = np.nan
+    return dict(grid=grid, state=state, support=support or {}, support_mask=support_mask,
+                source_ids=np.asarray(source_ids)[si], target_ids=np.asarray(target_ids)[ti],
+                source=_visualization_bundle(sc, sp, si),
+                target_global=_visualization_bundle(tc, tp, ti),
+                target_scalar=_visualization_bundle(scalar, scalar_proto, ti),
+                source_selected=_visualization_bundle(selected_sc, selected_sp, si),
+                target_selected=_visualization_bundle(selected, selected_proto, ti),
+                residual=_visualization_bundle(residual, residual_proto, ti))
+
+
+def visualization_distance_matrices(artifacts, class_ids):
+    """Use the unchanged multidimensional metric; never construct cross-class partial warps."""
+    before = np.full((len(class_ids), len(class_ids)), np.nan)
+    selected = before.copy()
+    for column, target_id in enumerate(class_ids):
+        target = artifacts["target_raw_prototypes"][target_id]
+        scalar = _periodic_shift(target, artifacts["scalar_delta_by_class"][target_id], 365)
+        full = artifacts["phase_applicability_by_class"][target_id] == "FULL_PHASE"
+        aligned = (warp_curve(scalar, artifacts["gamma_by_class"][target_id])
+                   if full and artifacts["selected_lambda"][target_id] is not None else scalar)
+        for row, source_id in enumerate(class_ids):
+            source = artifacts["source_raw_prototypes"][source_id]
+            if np.isfinite(source).all() and np.isfinite(scalar).all():
+                before[row, column] = normalized_l2(source, scalar)
+                if full:
+                    selected[row, column] = normalized_l2(source, aligned)
+    return before, selected

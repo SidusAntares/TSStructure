@@ -32,6 +32,10 @@ from analysis.phase_shape_diagnostic import (
     constrained_partial_phase,
     classify_phase_applicability,
     _crop_support,
+    VisualizationUnavailable,
+    fit_visualization_shared_pca,
+    prepare_visualization_group,
+    visualization_distance_matrices,
 )
 from models.fredn.structural_probe import (
     build_direct_fourier_views,
@@ -1178,10 +1182,20 @@ def parse_args():
     parser.add_argument("--full-landmark-coverage", type=float, default=.80)
     parser.add_argument("--partial-min-landmarks", type=int, default=2)
     parser.add_argument("--partial-min-time-coverage", type=float, default=.20)
+    parser.add_argument("--viz-max-curves-per-group", type=int, default=40)
+    parser.add_argument("--viz-dpi", type=int, default=160)
     return parser.parse_args()
 
 
 def main():
+    if "--aggregate-phase-applicability-root" in sys.argv:
+        parser = argparse.ArgumentParser(description="Aggregate completed phase applicability visualizations")
+        parser.add_argument("--aggregate-phase-applicability-root", type=Path, required=True)
+        parser.add_argument("--viz-dpi", type=int, default=160)
+        aggregate_args = parser.parse_args()
+        generate_global_phase_applicability_figure(
+            aggregate_args.aggregate_phase_applicability_root, dpi=aggregate_args.viz_dpi)
+        return
     args = parse_args()
     args.task = f"{args.source}_{args.target}"
     if args.source == args.target:
@@ -1321,12 +1335,487 @@ def main():
     print(json.dumps(metadata, indent=2))
     print("ORACLE_TARGET_LABELS=true")
     print("TRAINING_PERFORMED=false")
+    # All existing numerical CSV/JSON/artifacts are complete before plotting begins.
+    with (args.output_dir / "phase_applicability_metrics.csv").open(encoding="utf-8", newline="") as stream:
+        visualization_states = list(csv.DictReader(stream))
+    generate_diagnostic_visualizations(args.output_dir, args.task, classes, source_cache, target_cache,
+                                       artifacts, visualization_states,
+                                       max_curves=args.viz_max_curves_per_group, dpi=args.viz_dpi)
 
 
 def save_feature_caches(directory, source, target, enabled=False):
     if enabled:
         torch.save(source, directory / "source_mode13_cache.pt")
         torch.save(target, directory / "target_mode13_cache.pt")
+
+
+def _visualization_pyplot():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    return plt
+
+
+def _visualization_ylim(bundles):
+    low, high = 0., 0.
+    for bundle in bundles:
+        for key in ("samples", "prototype", "quantiles"):
+            values = np.asarray(bundle[key])
+            finite = values[np.isfinite(values)]
+            if finite.size:
+                low, high = min(low, float(finite.min())), max(high, float(finite.max()))
+        if "bounds" in bundle:
+            low, high = min(low, bundle["bounds"][0]), max(high, bundle["bounds"][1])
+    padding = .05 * max(high-low, 1e-6)
+    return low-padding, high+padding
+
+
+def _plot_visualization_bundle(axis, grid, bundle, color, label, samples=True):
+    if samples:
+        axis.plot(grid, bundle["samples"].T, color=color, alpha=.12, linewidth=.6)
+    axis.fill_between(grid, bundle["quantiles"][0], bundle["quantiles"][2], color=color, alpha=.16)
+    axis.plot(grid, bundle["prototype"], color=color, linewidth=2.2, label=label + " prototype")
+    if samples:
+        axis.plot(grid, bundle["quantiles"][1], color=color, linestyle="--", linewidth=1.2,
+                  label=label + " sample median")
+
+
+def _shade_visualization_support(axis, data):
+    if data["state"] == "PARTIAL_PHASE":
+        axis.axvspan(0, data["support"]["source_common_start_day"], color="grey", alpha=.2)
+        axis.axvspan(data["support"]["source_common_end_day"], 365, color="grey", alpha=.2)
+
+
+def plot_visualization_spaghetti(data, task, name, status):
+    plt = _visualization_pyplot()
+    figure, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True, sharey=True)
+    axes = axes.ravel()
+    grid, state = data["grid"], data["state"]
+    for axis, source_key, target_key, title in (
+            (axes[0], "source", "target_global", "A: Global"),
+            (axes[1], "source", "target_scalar", "B: Global + Scalar"),
+            (axes[2], "source_selected", "target_selected", "C: Selected phase")):
+        _plot_visualization_bundle(axis, grid, data[source_key], "C0", "source")
+        _plot_visualization_bundle(axis, grid, data[target_key], "C1", "target")
+        axis.set_title(title)
+        axis.legend(fontsize=7, loc="best")
+    if state == "PHASE_NOT_APPLICABLE":
+        axes[2].set_title("C: PHASE NOT APPLICABLE (Scalar reference)")
+        axes[3].set_title("D: Aligned residual unavailable")
+        axes[3].text(.5, .5, "No phase-conditioned residual", transform=axes[3].transAxes, ha="center")
+    else:
+        _plot_visualization_bundle(axes[3], grid, data["residual"], "C3", "target - source prototype")
+        axes[3].axhline(0, color="black", linewidth=.7)
+        axes[3].set_title("D: Aligned shape residual (raw amplitude)")
+        axes[3].legend(fontsize=7)
+    _shade_visualization_support(axes[2], data)
+    _shade_visualization_support(axes[3], data)
+    ylim = _visualization_ylim(data[k] for k in (
+        "source", "target_global", "target_scalar", "source_selected", "target_selected", "residual"))
+    for axis in axes:
+        axis.set(xlim=(0,365), ylim=ylim, xlabel="Day of Year", ylabel="Raw Mode13 projection")
+    if state == "PARTIAL_PHASE":
+        s = data["support"]
+        detail = (f'source support=[{s["source_common_start_day"]:.1f}, {s["source_common_end_day"]:.1f}], '
+                  f'target support=[{s["target_common_start_day"]:.1f}, {s["target_common_end_day"]:.1f}]\n'
+                  f'coverage={s.get("common_time_coverage_min", np.nan):.3f}, '
+                  f'lambda={status.get("partial_selected_lambda", data.get("selected_lambda"))}, '
+                  f'landmark {status.get("partial_landmark_error_before", "NA")} -> '
+                  f'{status.get("partial_landmark_error_after", "NA")} days')
+    elif state == "FULL_PHASE":
+        detail = f'selected={status.get("full_selected_phase", "scalar")}, lambda={data.get("selected_lambda")}'
+    else:
+        detail = status.get("phase_applicability_reason", "no admissible phase correspondence")
+    figure.suptitle(f"{task} | {name}\n{state}\n{detail}", fontsize=10)
+    figure.tight_layout(rect=(0,0,1,.88))
+    return figure
+
+
+def _plot_visualization_gallery(groups, classes, key, title, ylim):
+    plt = _visualization_pyplot()
+    columns = min(3, len(groups))
+    figure, axes = plt.subplots(int(np.ceil(len(groups)/columns)), columns,
+                               figsize=(5*columns, 3.2*np.ceil(len(groups)/columns)),
+                               sharex=True, sharey=True, squeeze=False)
+    for axis, (class_id, data) in zip(axes.ravel(), groups.items()):
+        _plot_visualization_bundle(axis, data["grid"], data[key], "C0" if key == "source" else "C1", "class")
+        label = classes[class_id]
+        if key == "target_selected":
+            label += "\n" + data["state"]
+            if data["state"] == "PHASE_NOT_APPLICABLE":
+                label += " (Scalar reference)"
+            _shade_visualization_support(axis, data)
+        axis.set(title=label, xlim=(0,365), ylim=ylim, xlabel="Day of Year")
+    for axis in axes.ravel()[len(groups):]:
+        axis.set_visible(False)
+    figure.suptitle(title + "\nShared source-only PCA axis; solid=prototype, dashed=sample median", fontsize=10)
+    figure.tight_layout(rect=(0,0,1,.91))
+    return figure
+
+
+def _plot_visualization_overlay(groups, classes, key, title, ylim):
+    plt = _visualization_pyplot()
+    figure, axis = plt.subplots(figsize=(10,5))
+    for class_id, data in groups.items():
+        axis.plot(data["grid"], data[key]["prototype"], label=classes[class_id])
+    axis.set(xlim=(0,365), ylim=ylim, xlabel="Day of Year", ylabel="Raw shared PCA projection", title=title)
+    axis.legend(fontsize=8)
+    figure.tight_layout()
+    return figure
+
+
+def _plot_visualization_residuals(groups, classes, task):
+    plt = _visualization_pyplot()
+    columns = min(3, len(groups))
+    figure, axes = plt.subplots(int(np.ceil(len(groups)/columns)), columns,
+        figsize=(5*columns, 3.2*np.ceil(len(groups)/columns)), sharex=True, sharey=False, squeeze=False)
+    for axis, (class_id, data) in zip(axes.ravel(), groups.items()):
+        if data["state"] == "PHASE_NOT_APPLICABLE":
+            axis.text(.5,.5,"Residual unavailable",transform=axis.transAxes,ha="center")
+        else:
+            _plot_visualization_bundle(axis, data["grid"], data["residual"], "C3", "residual", samples=False)
+            axis.axhline(0,color="black",linewidth=.7)
+            _shade_visualization_support(axis,data)
+        axis.set(title=classes[class_id] + "\n" + data["state"], xlim=(0,365), xlabel="Day of Year")
+    for axis in axes.ravel()[len(groups):]:
+        axis.set_visible(False)
+    figure.suptitle(task + " | Each panel uses its own source-class PCA axis.\n"
+                   "Compare temporal residual pattern within each class; do not compare absolute y magnitude across classes.", fontsize=10)
+    figure.tight_layout(rect=(0,0,1,.89))
+    return figure
+
+
+def _plot_visualization_matrix(matrix, labels, title, vmax):
+    from matplotlib.patches import Rectangle
+    plt = _visualization_pyplot()
+    figure, axis = plt.subplots(figsize=(max(6,len(labels)*.8), max(5,len(labels)*.65)))
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad("lightgrey")
+    artist = axis.imshow(np.ma.masked_invalid(matrix), cmap=cmap, vmin=0, vmax=vmax)
+    for row in range(len(labels)):
+        axis.add_patch(Rectangle((row-.5,row-.5),1,1,fill=False,edgecolor="red",linewidth=1.5))
+        for column in range(len(labels)):
+            text = f'{matrix[row,column]:.2f}' if np.isfinite(matrix[row,column]) else "NA"
+            axis.text(column,row,text,ha="center",va="center",fontsize=7, color="black" if text == "NA" else "white")
+    axis.set(xticks=np.arange(len(labels)),yticks=np.arange(len(labels)),yticklabels=labels,
+             xlabel="Target class",ylabel="Source class",title=title)
+    axis.set_xticklabels(labels,rotation=45,ha="right")
+    figure.colorbar(artist,ax=axis,label="Multidimensional normalized L2")
+    figure.tight_layout()
+    return figure
+
+
+_PHASE_APPLICABILITY_ORDER = ("FULL_PHASE", "PARTIAL_PHASE", "PHASE_NOT_APPLICABLE")
+
+
+def _finite_number(value, default):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if np.isfinite(value) else default
+
+
+def _truthy(value):
+    return value is True or str(value).strip().lower() in ("true", "1", "yes")
+
+
+def select_phase_applicability_representatives(records):
+    """Select auditable cases with the frozen state-specific quality ordering."""
+    chosen = {}
+    for state in _PHASE_APPLICABILITY_ORDER:
+        candidates = [record for record in records if record.get("state") == state]
+        if state == "FULL_PHASE":
+            key = lambda r: (-_finite_number(r.get("common_coverage"), -np.inf),
+                             _finite_number(r.get("landmark_error"), np.inf),
+                             _finite_number(r.get("warp_days"), np.inf),
+                             str(r.get("task", "")), int(r.get("class_index", -1)))
+        elif state == "PARTIAL_PHASE":
+            key = lambda r: (not _truthy(r.get("nonlinear_accepted")),
+                             -_finite_number(r.get("landmark_gain"), -np.inf),
+                             -_finite_number(r.get("common_coverage"), -np.inf),
+                             str(r.get("task", "")), int(r.get("class_index", -1)))
+        else:
+            key = lambda r: (not _truthy(r.get("strong_truncation")),
+                             _finite_number(r.get("common_coverage"), np.inf),
+                             -_finite_number(r.get("topology_mismatch"), -np.inf),
+                             str(r.get("task", "")), int(r.get("class_index", -1)))
+        chosen[state] = min(candidates, key=key) if candidates else None
+    return chosen
+
+
+def _phase_applicability_record(task, class_id, class_name, data, status, artifacts):
+    state = data["state"]
+    raw_support = data.get("support") or None
+    support_keys = ("source_common_start_day", "source_common_end_day",
+                    "target_common_start_day", "target_common_end_day",
+                    "common_time_coverage_min")
+    support = ({key: float(raw_support[key]) for key in support_keys if key in raw_support}
+               if raw_support else None)
+    gamma = None
+    phase_x = phase_y = phase_identity = None
+    if state == "FULL_PHASE":
+        gamma = (artifacts["gamma_by_class"][class_id]
+                 if artifacts["selected_lambda"][class_id] is not None else np.linspace(0, 1, 128))
+        phase_x = np.linspace(0, 365, len(gamma))
+        phase_y = np.asarray(gamma) * 365
+        phase_identity = phase_x.copy()
+    elif state == "PARTIAL_PHASE":
+        gamma = artifacts["partial_gamma_by_class"].get(class_id)
+        if artifacts["partial_selected_lambda_by_class"].get(class_id) is None:
+            gamma = np.linspace(0, 1, 128)
+        if gamma is not None and support:
+            source_start, source_end = (float(support["source_common_" + suffix + "_day"])
+                                        for suffix in ("start", "end"))
+            target_start, target_end = (float(support["target_common_" + suffix + "_day"])
+                                        for suffix in ("start", "end"))
+            unit = np.linspace(0, 1, len(gamma))
+            phase_x = source_start + unit * (source_end-source_start)
+            phase_y = target_start + np.asarray(gamma) * (target_end-target_start)
+            phase_identity = target_start + unit * (target_end-target_start)
+    reason = status.get("phase_applicability_reason", "")
+    strong_truncation = any(status.get(side + "_truncation_evidence") == "strong"
+                            for side in ("left", "right"))
+    mismatch_words = ("mismatch", "unmatched", "insufficient", "invalid")
+    return dict(task=task, class_index=int(class_id), class_name=class_name, state=state,
+        common_coverage=_finite_number(status.get("common_time_coverage_min"), np.nan),
+        landmark_error=_finite_number(status.get("full_landmark_error"), np.nan),
+        warp_days=float(np.max(np.abs(np.asarray(gamma)-np.linspace(0, 1, len(gamma)))) *
+                        (365 if state == "FULL_PHASE" else
+                         (float(support["target_common_end_day"])-float(support["target_common_start_day"])))
+                        if gamma is not None else 0.0),
+        nonlinear_accepted=_truthy(status.get("partial_nonlinear_accepted")),
+        landmark_gain=_finite_number(status.get("partial_landmark_gain"), np.nan),
+        strong_truncation=strong_truncation,
+        topology_mismatch=sum(word in reason.lower() for word in mismatch_words), reason=reason,
+        grid=np.asarray(data["grid"]).tolist(), source=np.asarray(data["source"]["prototype"]).tolist(),
+        target_before=np.asarray(data["target_scalar"]["prototype"]).tolist(),
+        source_selected=np.asarray(data["source_selected"]["prototype"]).tolist(),
+        target_selected=np.asarray(data["target_selected"]["prototype"]).tolist(),
+        support=support, phase_x=None if phase_x is None else phase_x.tolist(),
+        phase_y=None if phase_y is None else phase_y.tolist(),
+        phase_identity=None if phase_identity is None else phase_identity.tolist())
+
+
+def _plot_phase_applicability_row(axes, record, expected_state):
+    for axis, title in zip(axes, ("Before registration", "Shape after selected registration", "Phase")):
+        axis.set_title(title, fontsize=9)
+    if record is None:
+        for axis in axes:
+            axis.text(.5, .5, "No case in this task", transform=axis.transAxes, ha="center", va="center")
+            axis.set_xticks([]); axis.set_yticks([])
+        axes[0].set_ylabel(expected_state)
+        return
+    grid = np.asarray(record["grid"])
+    source, before = np.asarray(record["source"]), np.asarray(record["target_before"])
+    axes[0].plot(grid, source, color="C0", linewidth=2.2, label="source")
+    axes[0].plot(grid, before, color="C1", linewidth=2.2, label="target Scalar")
+    axes[0].legend(fontsize=7)
+    if expected_state == "PHASE_NOT_APPLICABLE":
+        axes[1].text(.5, .54, "No reliable shape correspondence", transform=axes[1].transAxes,
+                     ha="center", va="center", fontweight="bold")
+        axes[1].text(.5, .40, record.get("reason", ""), transform=axes[1].transAxes,
+                     ha="center", va="center", fontsize=7, wrap=True)
+        axes[2].text(.5, .56, "PHASE REJECTED", transform=axes[2].transAxes,
+                     ha="center", va="center", fontweight="bold", color="0.35")
+        axes[2].text(.5, .40, record.get("reason", ""), transform=axes[2].transAxes,
+                     ha="center", va="center", fontsize=7, wrap=True)
+    else:
+        axes[1].plot(grid, np.asarray(record["source_selected"]), color="C0", linewidth=2.2, label="source")
+        axes[1].plot(grid, np.asarray(record["target_selected"]), color="C1", linewidth=2.2,
+                     label="target selected")
+        axes[1].legend(fontsize=7)
+        axes[2].plot(record["phase_x"], record["phase_y"], color="C3", linewidth=2.2, label="selected gamma")
+        axes[2].plot(record["phase_x"], record["phase_identity"], color="0.45", linestyle="--",
+                     linewidth=1.2, label="identity")
+        axes[2].legend(fontsize=7)
+        axes[2].set_ylabel("Target day")
+    if expected_state == "PARTIAL_PHASE" and record.get("support"):
+        support = record["support"]
+        for axis in axes[:2]:
+            axis.axvspan(0, float(support["source_common_start_day"]), color="grey", alpha=.2)
+            axis.axvspan(float(support["source_common_end_day"]), 365, color="grey", alpha=.2)
+        source_range = f'[{float(support["source_common_start_day"]):.1f}, {float(support["source_common_end_day"]):.1f}]'
+        target_range = f'[{float(support["target_common_start_day"]):.1f}, {float(support["target_common_end_day"]):.1f}]'
+        axes[0].set_title(f"Before registration\nsource={source_range}, target={target_range}", fontsize=9)
+        axes[1].set_title(f"Shape after selected registration\nsource={source_range}, target={target_range}", fontsize=9)
+    low = min(np.nanmin(source), np.nanmin(before))
+    high = max(np.nanmax(source), np.nanmax(before))
+    if expected_state != "PHASE_NOT_APPLICABLE":
+        for values in (record["source_selected"], record["target_selected"]):
+            values = np.asarray(values); finite = values[np.isfinite(values)]
+            if finite.size:
+                low, high = min(low, finite.min()), max(high, finite.max())
+    padding = .05 * max(float(high-low), 1e-6)
+    for axis in axes[:2]:
+        axis.set(xlim=(0,365), ylim=(low-padding, high+padding), xlabel="Day of Year")
+    axes[0].set_ylabel(expected_state + "\nsource-class PC1")
+    axes[0].text(.01, .98, f'{record["task"]} | {record["class_name"]}', transform=axes[0].transAxes,
+                 ha="left", va="top", fontsize=7)
+    if record.get("phase_x") is not None:
+        axes[2].set_xlabel("Source day")
+
+
+def plot_phase_applicability_grid(representatives, title):
+    plt = _visualization_pyplot()
+    figure, axes = plt.subplots(3, 3, figsize=(15, 11), squeeze=False)
+    for row, state in enumerate(_PHASE_APPLICABILITY_ORDER):
+        _plot_phase_applicability_row(axes[row], representatives.get(state), state)
+    figure.suptitle(title + "\nregistration_space = multivariate Mode13 | "
+                    "visualization_space = source_class_PC1 | phase_level = class_level_cross_domain",
+                    fontsize=11)
+    figure.tight_layout(rect=(0,0,1,.94))
+    return figure
+
+
+def plot_phase_applicability_triptych(record):
+    plt = _visualization_pyplot()
+    figure, axes = plt.subplots(1, 3, figsize=(15, 3.8), squeeze=False)
+    _plot_phase_applicability_row(axes[0], record, record["state"])
+    figure.suptitle(f'{record["task"]} | {record["class_name"]} | {record["state"]}\n'
+                    "registration_space = multivariate Mode13 | visualization_space = source_class_PC1 | "
+                    "phase_level = class_level_cross_domain", fontsize=10)
+    figure.tight_layout(rect=(0,0,1,.84))
+    return figure
+
+
+def generate_global_phase_applicability_figure(output_root, dpi=160):
+    if dpi < 1:
+        raise ValueError("visualization DPI must be positive")
+    output_root = Path(output_root)
+    candidates = []
+    manifests = sorted(output_root.glob("*/visualizations/visualization_manifest.json"))
+    if len(manifests) != 4:
+        raise ValueError(f"exactly four completed task visualization manifests required; found {len(manifests)}")
+    for path in manifests:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        candidates.extend(record for record in manifest.get("phase_applicability_representatives", {}).values()
+                          if record is not None)
+    chosen = select_phase_applicability_representatives(candidates)
+    destination = output_root / "visualizations/phase_applicability"
+    destination.mkdir(parents=True, exist_ok=True)
+    figure = plot_phase_applicability_grid(chosen, "Four-task representative phase applicability")
+    try:
+        figure.savefig(destination / "phase_applicability_representative_global.png", dpi=dpi)
+    finally:
+        _visualization_pyplot().close(figure)
+    (destination / "phase_applicability_representative_global.json").write_text(json.dumps(dict(
+        registration_space="multivariate Mode13", visualization_space="source_class_PC1",
+        phase_level="class_level_cross_domain", representatives=chosen), indent=2), encoding="utf-8")
+    return chosen
+
+
+def generate_diagnostic_visualizations(output_dir, task, classes, source_cache, target_cache,
+                                       artifacts, states, max_curves=40, dpi=160):
+    """Post-save plotting consumer; inputs contain data/results, never models or loaders."""
+    import re
+    import warnings
+    if max_curves < 1 or dpi < 1:
+        raise ValueError("visualization maximum curves and DPI must be positive")
+    root = Path(output_dir) / "visualizations"
+    root.mkdir(parents=True,exist_ok=True)
+    plt = _visualization_pyplot()
+    common = sorted(artifacts["phase_applicability_by_class"])
+    manifest = dict(task=task, mode=13, same_class_projection="source_class_pca",
+        registration_space="multivariate Mode13", visualization_space="source_class_PC1",
+        phase_level="class_level_cross_domain",
+        cross_class_projection="source_shared_pca", shared_pca_fit_source_only=True,
+        max_curves_per_group=max_curves, dpi=dpi, sample_selection="deterministic_linspace",
+        prototype="projection_of_existing_multidimensional_pointwise_median",
+        sample_median="full_group_projection_median_dashed", band="full_group_q25_q75",
+        target_gallery_phase="scalar", target_selected_gallery_phase="selected",
+        partial_outside_support="NaN", before_matrix_phase="global_plus_scalar",
+        selected_matrix_non_full_target_columns="NA", sample_ids={"source":{},"target":{}},
+        shared_pca_classes=common, shared_pca_sign="largest_absolute_loading_positive",
+        gallery_ylims={}, files=[], warnings=[], same_class_projection_directions={})
+    def warn(message):
+        manifest["warnings"].append(message)
+        warnings.warn("visualization: " + message, RuntimeWarning)
+    def save(figure, relative):
+        path = root / relative
+        path.parent.mkdir(parents=True,exist_ok=True)
+        try:
+            figure.savefig(path,dpi=dpi)
+        finally:
+            plt.close(figure)
+        manifest["files"].append(relative)
+    state_by_class = {int(row["class_index"]):row for row in states}
+    try:
+        shared = fit_visualization_shared_pca({c:artifacts["source_raw_prototypes"][c] for c in common})
+        manifest["shared_pca_direction"] = shared.tolist()
+    except VisualizationUnavailable as error:
+        shared = None
+        warn(str(error))
+    same_groups, shared_groups, applicability_records = {}, {}, []
+    grid = np.linspace(0,365,64,endpoint=False)
+    for c in common:
+        # Class slicing is transient. Only compact 1-D plotting bundles survive this loop.
+        sc = np.asarray(source_cache["labels"]) == c
+        tc = np.asarray(target_cache["labels"]) == c
+        if "sample_id" not in source_cache or "sample_id" not in target_cache:
+            warn(f"class {c}: missing stable sample IDs; sample plots skipped")
+            continue
+        kwargs = dict(source=source_cache["mode13_features"].numpy()[sc],
+            target=target_cache["mode13_features"].numpy()[tc],
+            source_ids=np.asarray(source_cache["sample_id"])[sc],target_ids=np.asarray(target_cache["sample_id"])[tc],
+            source_prototype=artifacts["source_raw_prototypes"][c],target_prototype=artifacts["target_raw_prototypes"][c],
+            grid=grid,scalar_delta=artifacts["scalar_delta_by_class"][c],
+            state=artifacts["phase_applicability_by_class"][c],
+            gamma=artifacts["gamma_by_class"][c] if artifacts["selected_lambda"][c] is not None else None,
+            support=artifacts["common_support_by_class"].get(c,{}),
+            partial_gamma=artifacts["partial_gamma_by_class"].get(c),max_curves=max_curves)
+        try:
+            same = prepare_visualization_group(**kwargs,direction=artifacts["source_pca_direction_by_class"][c])
+            same["selected_lambda"] = (artifacts["partial_selected_lambda_by_class"].get(c)
+                if same["state"] == "PARTIAL_PHASE" else artifacts["selected_lambda"][c])
+            same_groups[c] = same
+            manifest["sample_ids"]["source"][str(c)] = same["source_ids"].tolist()
+            manifest["sample_ids"]["target"][str(c)] = same["target_ids"].tolist()
+            manifest["same_class_projection_directions"][str(c)] = artifacts["source_pca_direction_by_class"][c].tolist()
+            slug = re.sub(r"[^\w.-]+", "_", classes[c]).strip("._") or f"class_{c}"
+            # Prefixing the class index avoids sanitized-name collisions and accidental overwrite.
+            save(plot_visualization_spaghetti(same,task,classes[c],state_by_class.get(c,{})),
+                 f"cross_domain_same_class/{c}_{slug}_phase_shape_spaghetti.png")
+            record = _phase_applicability_record(task, c, classes[c], same, state_by_class.get(c,{}), artifacts)
+            applicability_records.append(record)
+            save(plot_phase_applicability_triptych(record),
+                 f"phase_applicability/paper_style_triptychs/{c}_{slug}.png")
+            if shared is not None:
+                shared_groups[c] = prepare_visualization_group(**kwargs,direction=shared)
+        except VisualizationUnavailable as error:
+            warn(f"class {c}: {error}")
+        del kwargs
+    representatives = select_phase_applicability_representatives(applicability_records)
+    manifest["phase_applicability_representatives"] = representatives
+    save(plot_phase_applicability_grid(representatives, task + " | Phase applicability cases"),
+         "phase_applicability/phase_applicability_cases.png")
+    if shared_groups:
+        ylim = _visualization_ylim(g[k] for g in shared_groups.values() for k in ("source","target_scalar","target_selected"))
+        for key, name, title in (("source","source_class_gallery","Source"),
+                ("target_scalar","target_class_gallery","Target Global + Scalar"),
+                ("target_selected","target_selected_phase_gallery","Target selected phase")):
+            save(_plot_visualization_gallery(shared_groups,classes,key,task + " | " + title,ylim),
+                 f"within_domain_class_gallery/{name}.png")
+            manifest["gallery_ylims"][name] = list(ylim)
+        for key, name in (("source","source"),("target_scalar","target")):
+            save(_plot_visualization_overlay(shared_groups,classes,key,task + " | " + name + " shared PCA prototypes",ylim),
+                 f"within_domain_class_gallery/{name}_class_prototypes_overlay.png")
+    if same_groups:
+        save(_plot_visualization_residuals(same_groups,classes,task),"cross_domain_residual/shape_residual_by_class.png")
+    if common:
+        before, selected = visualization_distance_matrices(artifacts,common)
+        finite = np.r_[before[np.isfinite(before)],selected[np.isfinite(selected)]]
+        if finite.size:
+            vmax = max(float(finite.max()),EPS)
+            for matrix, stage in ((before,"before"),(selected,"selected")):
+                save(_plot_visualization_matrix(matrix,[classes[c] for c in common],
+                    task + " | " + ("Before: Global + Scalar" if stage == "before" else "Selected: FULL_PHASE columns only"),vmax),
+                    f"cross_class_matrix/source_target_shape_distance_{stage}.png")
+        else:
+            warn("no finite multidimensional distances; matrices skipped")
+    manifest["residual_axis_caveat"] = "Each panel uses its own source-class PCA axis; do not compare absolute y magnitude across classes."
+    (root / "visualization_manifest.json").write_text(json.dumps(manifest,indent=2),encoding="utf-8")
+    return manifest
 
 
 if __name__ == "__main__":

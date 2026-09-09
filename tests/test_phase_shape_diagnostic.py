@@ -657,3 +657,315 @@ def test_lambda_summaries_do_not_mix_full_and_partial_scopes():
     assert len(summary) == 2
     assert {r["registration_scope"]: r["landmark_error_mean"] for r in summary} == {
         "FULL_CONSTRAINED": 10., "PARTIAL_CONSTRAINED": 1.}
+
+
+def _viz_fixture():
+    grid = np.linspace(0, 365, 64, endpoint=False)
+    source = np.stack([_curve(grid/365) + [i*.1, -i*.05] for i in range(5)])
+    target = source*1.5
+    return grid, source, target
+
+
+def test_viz_shared_pca_is_source_only_sign_fixed_and_not_class_axes():
+    from analysis.phase_shape_diagnostic import fit_visualization_shared_pca
+    grid = np.linspace(0, 1, 64)
+    prototypes = {0: np.column_stack([grid*3, grid*0]), 1: np.column_stack([grid*0, grid*2])}
+    w = fit_visualization_shared_pca(prototypes)
+    assert w[np.argmax(np.abs(w))] > 0
+    assert np.linalg.norm(w) == pytest.approx(1.)
+    assert not np.allclose(w, [1, 0]) and not np.allclose(w, [0, 1])
+    np.testing.assert_array_equal(w, fit_visualization_shared_pca(dict(reversed(list(prototypes.items())))))
+
+
+def test_viz_deterministic_selection_uses_sorted_real_ids_and_no_rng():
+    from analysis.phase_shape_diagnostic import select_visualization_samples
+    ids = np.arange(100)[::-1]
+    before = np.random.get_state()
+    indices = select_visualization_samples(ids, 40)
+    expected = np.linspace(0, 99, 40).astype(int)
+    np.testing.assert_array_equal(ids[indices], expected)
+    np.testing.assert_array_equal(indices, select_visualization_samples(ids, 40))
+    np.testing.assert_array_equal(before[1], np.random.get_state()[1])
+    np.testing.assert_array_equal(np.array([5, 1])[select_visualization_samples([5, 1], 40)], [1, 5])
+
+
+def test_viz_group_reuses_one_axis_preserves_prototype_and_full_group_bands():
+    from analysis.phase_shape_diagnostic import prepare_visualization_group
+    grid, source, target = _viz_fixture()
+    # Deliberately noncommuting coordinate median and projection.
+    source[:3] = np.array([[0., 0.], [0., 10.], [10., 0.]])[:, None, :]
+    direction = np.array([1., 1.])/np.sqrt(2)
+    sp, tp = np.median(source, axis=0), np.median(target, axis=0)
+    data = prepare_visualization_group(source, target, np.arange(5), np.arange(5)+10,
+        sp, tp, direction, grid, 0, "FULL_PHASE", max_curves=2)
+    np.testing.assert_allclose(data["source"]["prototype"], sp @ direction)
+    np.testing.assert_allclose(data["target_global"]["prototype"], tp @ direction)
+    np.testing.assert_allclose(data["source"]["quantiles"], np.percentile(source @ direction, [25,50,75], axis=0))
+    assert not np.allclose(data["source"]["prototype"], data["source"]["quantiles"][1])
+    assert data["source"]["samples"].shape == (2,64)
+    np.testing.assert_allclose(data["residual"]["quantiles"],
+        np.percentile(target @ direction - sp @ direction, [25,50,75], axis=0))
+
+
+@pytest.mark.parametrize("state", ["FULL_PHASE", "PARTIAL_PHASE", "PHASE_NOT_APPLICABLE"])
+def test_viz_applicability_nan_masks_and_projection_warp_commute(state):
+    from analysis.phase_shape_diagnostic import prepare_visualization_group, warp_curve
+    grid, source, target = _viz_fixture()
+    sp, tp = np.median(source, axis=0), np.median(target, axis=0)
+    w = np.array([.6,.8])
+    gamma = np.linspace(0,1,128)**1.2
+    support = dict(source_common_start_day=100., source_common_end_day=220.,
+                   target_common_start_day=120., target_common_end_day=260.)
+    data = prepare_visualization_group(source, target, np.arange(5), np.arange(5),
+        sp, tp, w, grid, 0, state, gamma=gamma, support=support, partial_gamma=gamma)
+    if state == "FULL_PHASE":
+        np.testing.assert_allclose(data["target_selected"]["samples"][0], warp_curve(target[0], gamma) @ w)
+        assert np.isfinite(data["residual"]["samples"]).all()
+        assert data["support_mask"].all()
+    elif state == "PARTIAL_PHASE":
+        mask = (grid >=100)&(grid <=220)
+        assert np.isnan(data["residual"]["samples"][:,~mask]).all()
+        assert np.isfinite(data["residual"]["samples"][:,mask]).all()
+        assert np.isnan(data["target_selected"]["prototype"][~mask]).all()
+    else:
+        assert np.isnan(data["residual"]["samples"]).all()
+        np.testing.assert_array_equal(data["target_selected"]["samples"], data["target_scalar"]["samples"])
+
+
+def test_viz_distance_matrix_multidimensional_before_scalar_and_selected_na():
+    from analysis.phase_shape_diagnostic import visualization_distance_matrices, normalized_l2, _periodic_shift
+    grid, source, _ = _viz_fixture()
+    prototypes = {i: source[i] for i in range(3)}
+    artifacts = dict(source_raw_prototypes=prototypes, target_raw_prototypes=prototypes,
+        scalar_delta_by_class={0:3,1:0,2:0}, gamma_by_class={0:np.linspace(0,1,128)},
+        selected_lambda={0:None}, phase_applicability_by_class={0:"FULL_PHASE",1:"PARTIAL_PHASE",2:"PHASE_NOT_APPLICABLE"})
+    before, selected = visualization_distance_matrices(artifacts, [0,1,2])
+    assert before[1,0] == pytest.approx(normalized_l2(prototypes[1], _periodic_shift(prototypes[0],3,365)))
+    assert np.isfinite(selected[:,0]).all()
+    assert np.isnan(selected[:,1:]).all()
+
+
+def test_viz_spaghetti_shared_ylim_and_no_fake_not_applicable_residual():
+    from analysis.phase_shape_diagnostic import prepare_visualization_group
+    from scripts.diagnose_mode13_phase_shape_oracle import plot_visualization_spaghetti
+    import matplotlib.pyplot as plt
+    grid, s, t = _viz_fixture()
+    data = prepare_visualization_group(s,t,np.arange(5),np.arange(5),np.median(s,0),np.median(t,0),
+                                      np.ones(2),grid,0,"PHASE_NOT_APPLICABLE")
+    figure = plot_visualization_spaghetti(data, "S_T", "crop", {"phase_applicability_reason":"no_support"})
+    try:
+        assert len({ax.get_ylim() for ax in figure.axes}) == 1
+        assert all(ax.get_xlim() == (0,365) for ax in figure.axes)
+        assert "NOT APPLICABLE" in figure.axes[2].get_title()
+        assert not figure.axes[3].lines
+    finally:
+        plt.close(figure)
+
+
+def test_viz_manifest_outputs_no_cache_and_no_numeric_mutation(tmp_path, monkeypatch):
+    import copy
+    import json
+    import scripts.diagnose_mode13_phase_shape_oracle as script
+    from scripts.diagnose_mode13_phase_shape_oracle import generate_diagnostic_visualizations
+    grid, s, t = _viz_fixture()
+    s, t = np.concatenate([s,s+1]), np.concatenate([t,t+1])
+    labels = np.repeat([0,1],5)
+    sc = dict(mode13_features=torch.from_numpy(s), labels=labels, sample_id=torch.arange(10))
+    tc = dict(mode13_features=torch.from_numpy(t), labels=labels, sample_id=torch.arange(100,110))
+    artifacts = dict(source_raw_prototypes={i:np.median(s[labels==i],0) for i in (0,1)},
+        target_raw_prototypes={i:np.median(t[labels==i],0) for i in (0,1)},
+        source_pca_direction_by_class={0:np.array([1.,0.]),1:np.array([0.,1.])},
+        scalar_delta_by_class={0:0,1:0}, gamma_by_class={i:np.linspace(0,1,128) for i in (0,1)},
+        selected_lambda={0:None,1:None}, phase_applicability_by_class={0:"FULL_PHASE",1:"PHASE_NOT_APPLICABLE"},
+        common_support_by_class={0:{},1:{}}, partial_gamma_by_class={}, partial_selected_lambda_by_class={})
+    original = copy.deepcopy(artifacts)
+    directions = []
+    prepare = script.prepare_visualization_group
+    def capture(**kwargs):
+        directions.append(kwargs["direction"].copy())
+        return prepare(**kwargs)
+    monkeypatch.setattr(script, "prepare_visualization_group", capture)
+    sentinel = tmp_path / "shape_class_metrics.csv"
+    sentinel.write_text("unchanged\n")
+    manifest = generate_diagnostic_visualizations(tmp_path, "S_T", ["cropA","cropB"], sc,tc,artifacts,
+                                                  [], max_curves=2, dpi=40)
+    assert sentinel.read_text() == "unchanged\n"
+    assert manifest["shared_pca_fit_source_only"]
+    assert manifest["sample_ids"]["source"]["0"] == [0,4]
+    assert manifest["sample_ids"]["target"]["1"] == [105,109]
+    assert len(set(tuple(lim) for lim in manifest["gallery_ylims"].values())) == 1
+    assert not list(tmp_path.rglob('*.pt'))
+    assert (tmp_path / 'visualizations/visualization_manifest.json').is_file()
+    assert len(list(tmp_path.rglob('*.png'))) == 13
+    np.testing.assert_array_equal(artifacts["source_raw_prototypes"][0], original["source_raw_prototypes"][0])
+    assert json.loads((tmp_path / 'visualizations/visualization_manifest.json').read_text())["mode"] == 13
+    # Each class uses its own axis for same-class plots, but precisely the SAME
+    # shared source axis for gallery/overlay, including all target panels.
+    np.testing.assert_array_equal(directions[0], artifacts["source_pca_direction_by_class"][0])
+    np.testing.assert_array_equal(directions[2], artifacts["source_pca_direction_by_class"][1])
+    np.testing.assert_array_equal(directions[1], directions[3])
+    np.testing.assert_array_equal(directions[1], manifest["shared_pca_direction"])
+    altered = copy.deepcopy(artifacts)
+    altered["target_raw_prototypes"] = {c: p * [-3., 5.] for c,p in altered["target_raw_prototypes"].items()}
+    altered_tc = dict(tc, mode13_features=tc["mode13_features"] * torch.tensor([-3.,5.]))
+    second = generate_diagnostic_visualizations(tmp_path / "altered_target", "S_T", ["cropA","cropB"],
+        sc,altered_tc,altered,[],max_curves=2,dpi=40)
+    np.testing.assert_array_equal(manifest["shared_pca_direction"], second["shared_pca_direction"])
+
+
+def test_phase_applicability_visualizations_are_fixed_triptychs(tmp_path):
+    import json
+    import scripts.diagnose_mode13_phase_shape_oracle as script
+    grid, s, t = _viz_fixture()
+    labels = np.repeat([0, 1], 5)
+    source = np.concatenate([s, s + 1])
+    target = np.concatenate([t, t + 1])
+    sc = dict(mode13_features=torch.from_numpy(source), labels=labels, sample_id=torch.arange(10))
+    tc = dict(mode13_features=torch.from_numpy(target), labels=labels, sample_id=torch.arange(100, 110))
+    artifacts = dict(
+        source_raw_prototypes={i: np.median(source[labels == i], 0) for i in (0, 1)},
+        target_raw_prototypes={i: np.median(target[labels == i], 0) for i in (0, 1)},
+        source_pca_direction_by_class={0: np.array([1., 0.]), 1: np.array([0., 1.])},
+        scalar_delta_by_class={0: 0, 1: 0},
+        gamma_by_class={0: np.linspace(0, 1, 128), 1: np.linspace(0, 1, 128)},
+        selected_lambda={0: 0.1, 1: None},
+        phase_applicability_by_class={0: "FULL_PHASE", 1: "PHASE_NOT_APPLICABLE"},
+        common_support_by_class={0: {}, 1: {}}, partial_gamma_by_class={},
+        partial_selected_lambda_by_class={})
+    states = [
+        dict(class_index="0", phase_applicability="FULL_PHASE", common_time_coverage_min="1.0",
+             full_landmark_error="2", phase_applicability_reason="full"),
+        dict(class_index="1", phase_applicability="PHASE_NOT_APPLICABLE", common_time_coverage_min="0.1",
+             left_truncation_evidence="strong", right_truncation_evidence="none",
+             phase_applicability_reason="topology mismatch"),
+    ]
+    manifest = script.generate_diagnostic_visualizations(
+        tmp_path, "S_T", ["crop/A", "crop B"], sc, tc, artifacts, states, max_curves=2, dpi=40)
+    root = tmp_path / "visualizations" / "phase_applicability"
+    assert (root / "phase_applicability_cases.png").is_file()
+    assert (root / "paper_style_triptychs/0_crop_A.png").is_file()
+    assert (root / "paper_style_triptychs/1_crop_B.png").is_file()
+    assert manifest["registration_space"] == "multivariate Mode13"
+    assert manifest["visualization_space"] == "source_class_PC1"
+    assert manifest["phase_level"] == "class_level_cross_domain"
+    assert manifest["phase_applicability_representatives"]["PARTIAL_PHASE"] is None
+    saved = json.loads((tmp_path / "visualizations/visualization_manifest.json").read_text())
+    assert saved["phase_applicability_representatives"]["FULL_PHASE"]["class_index"] == 0
+
+
+def test_phase_applicability_representative_selection_uses_frozen_priority():
+    from scripts.diagnose_mode13_phase_shape_oracle import select_phase_applicability_representatives
+    rows = [
+        dict(task="Z", class_index=0, state="FULL_PHASE", common_coverage=.8,
+             landmark_error=1., warp_days=1.),
+        dict(task="A", class_index=1, state="FULL_PHASE", common_coverage=.9,
+             landmark_error=8., warp_days=20.),
+        dict(task="A", class_index=2, state="PARTIAL_PHASE", nonlinear_accepted=False,
+             landmark_gain=99., common_coverage=.9),
+        dict(task="Z", class_index=3, state="PARTIAL_PHASE", nonlinear_accepted=True,
+             landmark_gain=2., common_coverage=.3),
+        dict(task="A", class_index=4, state="PHASE_NOT_APPLICABLE", strong_truncation=False,
+             common_coverage=0., topology_mismatch=9),
+        dict(task="Z", class_index=5, state="PHASE_NOT_APPLICABLE", strong_truncation=True,
+             common_coverage=.7, topology_mismatch=0),
+    ]
+    chosen = select_phase_applicability_representatives(rows)
+    assert chosen["FULL_PHASE"]["class_index"] == 1
+    assert chosen["PARTIAL_PHASE"]["class_index"] == 3
+    assert chosen["PHASE_NOT_APPLICABLE"]["class_index"] == 5
+
+
+def test_global_phase_applicability_figure_aggregates_task_manifests(tmp_path):
+    import json
+    from scripts.diagnose_mode13_phase_shape_oracle import generate_global_phase_applicability_figure
+    for task, state in (("Z_T", "FULL_PHASE"), ("A_T", "PHASE_NOT_APPLICABLE"),
+                        ("B_T", "FULL_PHASE"), ("C_T", "PHASE_NOT_APPLICABLE")):
+        directory = tmp_path / task / "visualizations"
+        directory.mkdir(parents=True)
+        record = dict(task=task, class_index=0, class_name="crop", state=state,
+            common_coverage=1., landmark_error=0., warp_days=0., nonlinear_accepted=False,
+            landmark_gain=0., strong_truncation=state == "PHASE_NOT_APPLICABLE", topology_mismatch=0,
+            reason="synthetic", grid=list(np.linspace(0, 365, 64, endpoint=False)),
+            source=list(np.sin(np.linspace(0, 2*np.pi, 64))),
+            target_before=list(np.sin(np.linspace(0, 2*np.pi, 64))),
+            source_selected=list(np.sin(np.linspace(0, 2*np.pi, 64))),
+            target_selected=list(np.sin(np.linspace(0, 2*np.pi, 64))),
+            support=None,
+            phase_x=list(np.linspace(0, 365, 128)) if state == "FULL_PHASE" else None,
+            phase_y=list(np.linspace(0, 365, 128)) if state == "FULL_PHASE" else None,
+            phase_identity=list(np.linspace(0, 365, 128)) if state == "FULL_PHASE" else None)
+        (directory / "visualization_manifest.json").write_text(json.dumps(dict(
+            phase_applicability_representatives={state: record})))
+    selected = generate_global_phase_applicability_figure(tmp_path, dpi=40)
+    output = tmp_path / "visualizations/phase_applicability/phase_applicability_representative_global.png"
+    assert output.is_file()
+    assert selected["FULL_PHASE"]["task"] == "B_T"
+    assert selected["PARTIAL_PHASE"] is None
+    assert selected["PHASE_NOT_APPLICABLE"]["task"] == "A_T"
+
+
+def test_global_phase_applicability_requires_all_four_task_manifests(tmp_path):
+    import pytest
+    from scripts.diagnose_mode13_phase_shape_oracle import generate_global_phase_applicability_figure
+    with pytest.raises(ValueError, match="exactly four"):
+        generate_global_phase_applicability_figure(tmp_path, dpi=40)
+
+
+def test_viz_ylim_includes_unselected_outlier_not_only_iqr():
+    from analysis.phase_shape_diagnostic import prepare_visualization_group
+    from scripts.diagnose_mode13_phase_shape_oracle import plot_visualization_spaghetti
+    import matplotlib.pyplot as plt
+    grid,s,t = _viz_fixture()
+    s[2,:,0] = 1000
+    data = prepare_visualization_group(s,t,np.arange(5),np.arange(5),np.median(s,0),np.median(t,0),
+                                      np.array([1.,0.]),grid,0,"FULL_PHASE",max_curves=2)
+    figure = plot_visualization_spaghetti(data,"S_T","crop",{})
+    try:
+        assert figure.axes[0].get_ylim()[1] > 1000
+    finally:
+        plt.close(figure)
+
+
+@pytest.mark.parametrize("state", ["FULL_PHASE", "PARTIAL_PHASE"])
+def test_viz_full_and_partial_plot_shading(state):
+    from analysis.phase_shape_diagnostic import prepare_visualization_group
+    from scripts.diagnose_mode13_phase_shape_oracle import plot_visualization_spaghetti
+    import matplotlib.pyplot as plt
+    grid,s,t = _viz_fixture()
+    support = dict(source_common_start_day=100.,source_common_end_day=220.,
+                   target_common_start_day=120.,target_common_end_day=260.)
+    data = prepare_visualization_group(s,t,np.arange(5),np.arange(5),np.median(s,0),np.median(t,0),
+        np.array([1.,0.]),grid,0,state,support=support,partial_gamma=np.linspace(0,1,128))
+    figure = plot_visualization_spaghetti(data,"S_T","crop",{})
+    try:
+        assert len(figure.axes[2].patches) == (2 if state == "PARTIAL_PHASE" else 0)
+        assert len(figure.axes[3].patches) == (2 if state == "PARTIAL_PHASE" else 0)
+        assert len({ax.get_ylim() for ax in figure.axes}) == 1
+    finally:
+        plt.close(figure)
+
+
+def test_viz_helpers_have_no_extraction_or_phase_estimation_dependency():
+    import inspect
+    from analysis.phase_shape_diagnostic import prepare_visualization_group
+    from scripts.diagnose_mode13_phase_shape_oracle import generate_diagnostic_visualizations, main
+    for helper in (prepare_visualization_group,generate_diagnostic_visualizations):
+        parameters = inspect.signature(helper).parameters
+        assert not any(k in parameters for k in ('model','dataloader','spatial_encoder','analyzer','synthesizer'))
+        code = inspect.getsource(helper)
+        assert not any(token in code for token in ('extract_cache(', 'constrained_residual_phase(',
+                      'constrained_partial_phase(', 'fit_source_class_projections(', 'build_direct_fourier_views('))
+    code = inspect.getsource(main)
+    assert code.index('generate_diagnostic_visualizations(') > code.index('(args.output_dir / "metadata.json").write_text(')
+
+
+def test_viz_empty_nonfinite_groups_are_explicit_unavailable_and_bugs_raise():
+    from analysis.phase_shape_diagnostic import prepare_visualization_group, VisualizationUnavailable
+    grid,s,t = _viz_fixture()
+    with pytest.raises(VisualizationUnavailable,match="empty"):
+        prepare_visualization_group(s[:0],t,[],np.arange(5),s[0],t[0],np.ones(2),grid,0,"FULL_PHASE")
+    with pytest.raises(ValueError,match="sample IDs"):
+        prepare_visualization_group(s,t,[],np.arange(5),s[0],t[0],np.ones(2),grid,0,"FULL_PHASE")
+    s[0,0,0] = np.nan
+    with pytest.raises(VisualizationUnavailable,match="nonfinite"):
+        prepare_visualization_group(s,t,np.arange(5),np.arange(5),s[0],t[0],np.ones(2),grid,0,"FULL_PHASE")
