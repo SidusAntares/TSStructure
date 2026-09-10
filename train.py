@@ -27,7 +27,7 @@ from models.stclassifier import (
     PseTae,
     PseTempCNN,
 )
-from timematch import train_timematch
+from timematch import add_shift_estimation_arguments, train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
 from utils import label_utils
 from utils.focal_loss import FocalLoss
@@ -572,6 +572,7 @@ if __name__ == '__main__':
     timematch.add_argument("--max_temporal_shift", type=int, default=60, help='maximum temporal shift to consider')
     timematch.add_argument("--domain_specific_bn", type=bool_flag, default=True, help='whether to use domain specific batch normalization')
     timematch.add_argument("--shift_estimator", type=str, default='AM', choices=['AM', 'IS', 'ACC', 'ENT'])
+    add_shift_estimation_arguments(timematch)
     timematch.add_argument('--run_validation', default=True, action='store_true', help='whether to run validation each epoch')
     timematch.add_argument("--output_student", type=bool_flag, default=True, help='output student or teacher')
     timematch.add_argument("--shape_align", type=bool_flag, default=False)

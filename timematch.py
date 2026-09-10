@@ -15,6 +15,10 @@ from tqdm import tqdm
 
 from dataset import PixelSetData
 from evaluation import validation
+from models.fourier_reconstruction import (
+    BatchedDirectFourierAnalyzer,
+    BatchedDirectFourierSynthesizer,
+)
 from models.shape_alignment import (
     ClassPhaseRecord,
     ClassResidualPhaseEstimator,
@@ -38,6 +42,112 @@ from utils.train_utils import (
     progress_bar_disabled,
     to_cuda,
 )
+
+
+def add_shift_estimation_arguments(parser):
+    parser.add_argument(
+        "--shift-estimation-view",
+        "--shift_estimation_view",
+        dest="shift_estimation_view",
+        default="raw",
+        choices=["raw", "fourier_recon"],
+    )
+    parser.add_argument(
+        "--shift-fourier-num-modes",
+        "--shift_fourier_num_modes",
+        dest="shift_fourier_num_modes",
+        default=13,
+        type=int,
+    )
+    parser.add_argument(
+        "--shift-fourier-reg",
+        "--shift_fourier_reg",
+        dest="shift_fourier_reg",
+        default=1e-3,
+        type=float,
+    )
+    parser.add_argument(
+        "--shift-fourier-period-days",
+        "--shift_fourier_period_days",
+        dest="shift_fourier_period_days",
+        default=365.0,
+        type=float,
+    )
+    parser.add_argument(
+        "--shift-fourier-solver",
+        "--shift_fourier_solver",
+        dest="shift_fourier_solver",
+        default="dense_direct",
+        choices=["dense_direct"],
+    )
+    return parser
+
+
+def _shift_estimation_kwargs(config):
+    view = getattr(config, "shift_estimation_view", "raw")
+    if view == "raw":
+        return {"shift_estimation_view": "raw"}
+    return {
+        "shift_estimation_view": view,
+        "shift_fourier_num_modes": config.shift_fourier_num_modes,
+        "shift_fourier_reg": config.shift_fourier_reg,
+        "shift_fourier_period_days": config.shift_fourier_period_days,
+        "shift_fourier_solver": config.shift_fourier_solver,
+    }
+
+
+def _estimate_temporal_shift_for_config(
+    model,
+    target_loader,
+    device,
+    config,
+    class_distribution=None,
+    **kwargs,
+):
+    if class_distribution is not None:
+        kwargs["class_distribution"] = class_distribution
+    return estimate_temporal_shift(
+        model,
+        target_loader,
+        device,
+        **kwargs,
+        **_shift_estimation_kwargs(config),
+    )
+
+
+def _log_shift_view_config(config):
+    view = getattr(config, "shift_estimation_view", "raw")
+    print(f"SHIFT_ESTIMATION_VIEW|{view}")
+    if view == "fourier_recon":
+        print(
+            "SHIFT_FOURIER_CONFIG|"
+            f"modes={config.shift_fourier_num_modes}|"
+            f"reg={config.shift_fourier_reg}|"
+            f"period_days={config.shift_fourier_period_days}|"
+            f"solver={config.shift_fourier_solver}"
+        )
+
+
+def _log_shift_view_compare(epoch, initial_diagnostics, epoch_diagnostics):
+    raw_is = initial_diagnostics["raw_selected_shift"]
+    recon_is = initial_diagnostics["selected_shift"]
+    raw_am = epoch_diagnostics["raw_selected_shift"]
+    recon_am = epoch_diagnostics["selected_shift"]
+    print(
+        "SHIFT_VIEW_COMPARE|"
+        f"epoch={epoch}|raw_shift={raw_am}|recon_shift={recon_am}|"
+        f"delta={recon_am - raw_am}|"
+        f"raw_is_shift={raw_is}|recon_is_shift={recon_is}|"
+        f"raw_am_shift={raw_am}|recon_am_shift={recon_am}"
+    )
+    print(
+        "RECON_SHIFT_VIEW_DIAG|"
+        f"mean_confidence={epoch_diagnostics['mean_confidence']:.6f}|"
+        f"prediction_entropy={epoch_diagnostics['prediction_entropy']:.6f}|"
+        f"num_predicted_classes={epoch_diagnostics['num_predicted_classes']}|"
+        f"am_score_range={epoch_diagnostics['score_range']:.6f}|"
+        f"is_score_range={initial_diagnostics['score_range']:.6f}"
+    )
 
 
 def _check_temporal_index_range(model, positions, applied_shift, tag):
@@ -774,6 +884,10 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
     target_iter = iter(cycle(target_loader))
     min_shift, max_shift = -config.max_temporal_shift, config.max_temporal_shift
     target_to_source_shift = 0
+    recon_shift_view = (
+        getattr(config, "shift_estimation_view", "raw") == "fourier_recon"
+    )
+    initial_shift_diagnostics = None
 
     # To evaluate how well we estimate class distribution
     target_labels = target_loader_no_aug.dataset.get_labels()
@@ -781,17 +895,26 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
 
     # estimate an initial guess for shift using Inception Score
     if config.estimate_shift:
+        if recon_shift_view:
+            _log_shift_view_config(config)
         shift_estimator = 'IS' if config.shift_estimator == 'AM' else config.shift_estimator
-        target_to_source_shift = estimate_temporal_shift(
+        initial_shift_result = _estimate_temporal_shift_for_config(
             teacher,
             target_loader_no_aug,
             device,
+            config,
             min_shift=min_shift,
             max_shift=max_shift,
             sample_size=config.sample_size,
             shift_estimator=shift_estimator,
             progress_bar=getattr(config, "progress_bar", "auto"),
+            compare_raw=recon_shift_view,
+            return_diagnostics=recon_shift_view,
         )
+        if recon_shift_view:
+            target_to_source_shift, initial_shift_diagnostics = initial_shift_result
+        else:
+            target_to_source_shift = initial_shift_result
         if target_to_source_shift >= 0:
             min_shift = 0
         else:
@@ -818,15 +941,34 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             ),
         )
         loss_meter = AverageMeter()
+        epoch_shift_diagnostics = None
 
         if config.estimate_shift:
             estimated_class_distr = estimate_class_distribution(all_pseudo_labels, config.num_classes)
             writer.add_scalar("train/kl_d", kl_divergence(actual_class_distr, estimated_class_distr), epoch)
-            target_to_source_shift = estimate_temporal_shift(teacher,
-                    target_loader_no_aug, device, estimated_class_distr,
-                    min_shift=min_shift, max_shift=max_shift, sample_size=config.sample_size,
-                    shift_estimator=config.shift_estimator,
-                    progress_bar=getattr(config, "progress_bar", "auto"))
+            epoch_shift_result = _estimate_temporal_shift_for_config(
+                teacher,
+                target_loader_no_aug,
+                device,
+                config,
+                estimated_class_distr,
+                min_shift=min_shift,
+                max_shift=max_shift,
+                sample_size=config.sample_size,
+                shift_estimator=config.shift_estimator,
+                progress_bar=getattr(config, "progress_bar", "auto"),
+                compare_raw=(recon_shift_view and epoch == 0),
+                return_diagnostics=(recon_shift_view and epoch == 0),
+            )
+            if recon_shift_view and epoch == 0:
+                target_to_source_shift, epoch_shift_diagnostics = epoch_shift_result
+                _log_shift_view_compare(
+                    epoch,
+                    initial_shift_diagnostics,
+                    epoch_shift_diagnostics,
+                )
+            else:
+                target_to_source_shift = epoch_shift_result
             if epoch == 0:
                 if getattr(config, "model", None) == "psefourierreconltae":
                     aliases = {
@@ -840,6 +982,21 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                         f"source={aliases.get(config.source, config.source)}|"
                         f"target={aliases.get(config.target, config.target)}|"
                         f"mode={config.fourier_num_modes}|"
+                        f"shift_days={target_to_source_shift}"
+                    )
+                elif recon_shift_view:
+                    aliases = {
+                        "austria/33UVP/2017": "AT1",
+                        "denmark/32VNH/2017": "DK1",
+                        "france/30TXT/2017": "FR1",
+                        "france/31TCJ/2017": "FR2",
+                    }
+                    print(
+                        "INITIAL_SHIFT|"
+                        f"source={aliases.get(config.source, config.source)}|"
+                        f"target={aliases.get(config.target, config.target)}|"
+                        f"view=fourier_recon|"
+                        f"mode={config.shift_fourier_num_modes}|"
                         f"shift_days={target_to_source_shift}"
                     )
                 if config.shift_source:
@@ -890,6 +1047,8 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         teacher.eval()  # don't update BN or use dropout for teacher
 
         all_labels, all_pseudo_labels, all_pseudo_mask = [], [], []
+        teacher_confidence_sum = None
+        teacher_confidence_count = 0
         shape_epoch = None
         if shape_alignment is not None:
             shape_epoch = _new_shape_epoch_metrics()
@@ -912,6 +1071,13 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     dim=1,
                 )
             pseudo_conf, pseudo_targets = torch.max(teacher_preds, dim=1)
+            confidence_total = pseudo_conf.detach().sum()
+            teacher_confidence_sum = (
+                confidence_total
+                if teacher_confidence_sum is None
+                else teacher_confidence_sum + confidence_total
+            )
+            teacher_confidence_count += pseudo_conf.numel()
             pseudo_mask = pseudo_conf > config.pseudo_threshold
             num_pseudo = int(pseudo_mask.sum().item())
 
@@ -1089,6 +1255,31 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         print(f"Teacher pseudo label F1 {conf_pseudo_f1:.3f} (n={pseudo_count})")
         writer.add_scalar("train/pseudo_f1", conf_pseudo_f1, epoch)
         writer.add_scalar("train/pseudo_count", pseudo_count, epoch)
+        if recon_shift_view:
+            raw_is = initial_shift_diagnostics["raw_selected_shift"]
+            recon_is = initial_shift_diagnostics["selected_shift"]
+            raw_am = (
+                epoch_shift_diagnostics["raw_selected_shift"]
+                if epoch_shift_diagnostics is not None
+                else "NA"
+            )
+            recon_am = (
+                epoch_shift_diagnostics["selected_shift"]
+                if epoch_shift_diagnostics is not None
+                else target_to_source_shift
+            )
+            mean_teacher_confidence = (
+                float(teacher_confidence_sum.cpu()) / teacher_confidence_count
+            )
+            pseudo_coverage = pseudo_count / max(len(all_pseudo_mask), 1)
+            print(
+                "SHIFT_TRAJECTORY|"
+                f"epoch={epoch}|raw_is_shift={raw_is}|raw_am_shift={raw_am}|"
+                f"recon_is_shift={recon_is}|recon_am_shift={recon_am}|"
+                f"actual_training_shift={target_to_source_shift}|"
+                f"pseudo_label_coverage={pseudo_coverage:.6f}|"
+                f"mean_teacher_confidence={mean_teacher_confidence:.6f}"
+            )
 
         if shape_alignment is not None:
             if shape_epoch is not None:
@@ -1280,6 +1471,105 @@ class TupleDataset(data.Dataset):
         return (self.weak[index], self.strong[index])
 
 
+def _select_temporal_shift(
+    shift_softmaxes,
+    labels,
+    shifts,
+    shift_estimator,
+    class_distribution,
+    print_summary,
+):
+    shift_predictions = np.argmax(shift_softmaxes, axis=2)
+    shift_acc_scores = np.asarray(
+        [
+            (labels == predictions).mean()
+            for predictions in np.moveaxis(shift_predictions, 0, 1)
+        ]
+    )
+    if print_summary:
+        print(
+            f"Most accurate shift {shifts[np.argmax(shift_acc_scores)]} "
+            f"with {np.max(shift_acc_scores):.3f}"
+        )
+
+    p_yx = shift_softmaxes
+    p_y = shift_softmaxes.mean(axis=0)
+    if shift_estimator == 'IS':
+        scores = np.mean(
+            np.sum(
+                p_yx
+                * (
+                    np.log(p_yx + 1e-5)
+                    - np.log(p_y[np.newaxis] + 1e-5)
+                ),
+                axis=2,
+            ),
+            axis=0,
+        )
+        best_shift_idx = np.argsort(scores)[::-1][0]
+        summary_name = "Inception Score"
+    elif shift_estimator == 'ENT':
+        scores = -np.mean(
+            np.sum(p_yx * np.log(p_yx + 1e-5), axis=2), axis=0
+        )
+        best_shift_idx = np.argsort(scores)[0]
+        summary_name = "Entropy Score"
+    elif shift_estimator == 'AM':
+        assert class_distribution is not None, (
+            'Target class distribution required to compute AM score'
+        )
+        one_hot_p_y = np.zeros_like(p_y)
+        for i in range(len(shifts)):
+            one_hot = np.zeros(
+                (shift_softmaxes.shape[0], shift_softmaxes.shape[-1])
+            )
+            one_hot[np.arange(one_hot.shape[0]), shift_predictions[:, i]] = 1
+            one_hot_p_y[i] = one_hot.mean(axis=0)
+        kl_d = np.sum(
+            class_distribution
+            * (
+                np.log(class_distribution + 1e-5)
+                - np.log(one_hot_p_y + 1e-5)
+            ),
+            axis=1,
+        )
+        entropy = np.mean(
+            np.sum(-p_yx * np.log(p_yx + 1e-5), axis=2), axis=0
+        )
+        scores = kl_d + entropy
+        best_shift_idx = np.argsort(scores)[0]
+        summary_name = "AM Score"
+    elif shift_estimator == 'ACC':
+        scores = shift_acc_scores
+        best_shift_idx = np.argmax(scores)
+        summary_name = "Accuracy"
+    else:
+        raise NotImplementedError(shift_estimator)
+
+    best_shift = shifts[best_shift_idx]
+    if print_summary and shift_estimator != 'ACC':
+        print(
+            f"Best {summary_name} shift {best_shift} with accuracy "
+            f"{shift_acc_scores[best_shift_idx]:.3f}"
+        )
+    selected_probs = p_yx[:, best_shift_idx]
+    selected_predictions = shift_predictions[:, best_shift_idx]
+    diagnostics = {
+        "selected_shift": best_shift,
+        "mean_confidence": float(selected_probs.max(axis=1).mean()),
+        "prediction_entropy": float(
+            np.mean(
+                np.sum(
+                    -selected_probs * np.log(selected_probs + 1e-5), axis=1
+                )
+            )
+        ),
+        "num_predicted_classes": int(np.unique(selected_predictions).size),
+        "score_range": float(np.max(scores) - np.min(scores)),
+    }
+    return best_shift, diagnostics
+
+
 @torch.no_grad()
 def estimate_temporal_shift(
     model,
@@ -1291,14 +1581,38 @@ def estimate_temporal_shift(
     sample_size=100,
     shift_estimator='IS',
     progress_bar='auto',
+    shift_estimation_view='raw',
+    shift_fourier_num_modes=13,
+    shift_fourier_reg=1e-3,
+    shift_fourier_period_days=365.0,
+    shift_fourier_solver='dense_direct',
+    compare_raw=False,
+    return_diagnostics=False,
 ):
     shifts = list(range(min_shift, max_shift + 1))
     model.eval()
+    if shift_estimation_view not in ('raw', 'fourier_recon'):
+        raise ValueError(f"unsupported shift estimation view: {shift_estimation_view}")
+    analyzer = synthesizer = None
+    if shift_estimation_view == 'fourier_recon':
+        if shift_fourier_solver != 'dense_direct':
+            raise ValueError(
+                f"unsupported shift Fourier solver: {shift_fourier_solver}"
+            )
+        analyzer = BatchedDirectFourierAnalyzer(
+            num_modes=shift_fourier_num_modes,
+            period_days=shift_fourier_period_days,
+            reg=shift_fourier_reg,
+        )
+        synthesizer = BatchedDirectFourierSynthesizer(
+            num_modes=shift_fourier_num_modes,
+            period_days=shift_fourier_period_days,
+        )
     if sample_size is None:
         sample_size = len(target_loader)
 
     target_iter = iter(target_loader)
-    shift_softmaxes, labels = [], []
+    shift_softmaxes, raw_shift_softmaxes, labels = [], [], []
     for _ in tqdm(
         range(sample_size),
         desc=f'Estimating shift between [{min_shift}, {max_shift}]',
@@ -1308,7 +1622,11 @@ def estimate_temporal_shift(
         labels.extend(sample['label'].tolist())
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
         spatial_feats = model.spatial_encoder.forward(pixels, valid_pixels, extra)
-        prepared = _prepare_temporal_features(model, spatial_feats, positions)
+        raw_prepared = _prepare_temporal_features(model, spatial_feats, positions)
+        prepared = raw_prepared
+        if shift_estimation_view == 'fourier_recon':
+            coeffs, _ = analyzer(prepared, positions)
+            prepared = synthesizer(coeffs, positions)
         shift_logits = torch.stack(
             [
                 _classify_prepared(
@@ -1323,61 +1641,48 @@ def estimate_temporal_shift(
         )
         shift_probs = F.softmax(shift_logits, dim=2)
         shift_softmaxes.append(shift_probs)
+        if compare_raw:
+            if shift_estimation_view == 'raw':
+                raw_shift_softmaxes.append(shift_probs)
+            else:
+                raw_logits = torch.stack(
+                    [
+                        _classify_prepared(
+                            model,
+                            raw_prepared,
+                            positions,
+                            temporal_shift=shift,
+                        )
+                        for shift in shifts
+                    ],
+                    dim=1,
+                )
+                raw_shift_softmaxes.append(F.softmax(raw_logits, dim=2))
     shift_softmaxes = torch.cat(shift_softmaxes).cpu().numpy()  # (N, n_shifts, n_classes)
     labels = np.array(labels)
-    shift_predictions = np.argmax(shift_softmaxes, axis=2)  # (N, n_shifts)
-
-    # shift_f1_scores = [f1_score(labels, shift_predictions, num_classes) for shift_predictions in all_shift_predictions]
-    shift_acc_scores = [(labels == predictions).mean() for predictions in np.moveaxis(shift_predictions, 0, 1)]
-    print(f"Most accurate shift {shifts[np.argmax(shift_acc_scores)]} with {np.max(shift_acc_scores):.3f}")
-
-    p_yx = shift_softmaxes # (N, n_shifts, n_classes)
-    p_y = shift_softmaxes.mean(axis=0)  # (n_shifts, n_classes)
-
-
-    if shift_estimator == 'IS':
-        inception_score = np.mean(np.sum(p_yx * (np.log(p_yx + 1e-5) - np.log(p_y[np.newaxis] + 1e-5)), axis=2), axis=0)  # (n_shifts)
-
-        shift_indices_ranked = np.argsort(inception_score)[::-1]  # max is best
-        best_shift_idx = shift_indices_ranked[0]
-        best_shift = shifts[best_shift_idx]
-        print(f"Best Inception Score shift {best_shift} with accuracy {shift_acc_scores[best_shift_idx]:.3f}")
-        return best_shift
-
-    elif shift_estimator == 'ENT':
-        entropy_score = -np.mean(np.sum(p_yx * np.log(p_yx + 1e-5), axis=2), axis=0)  # (n_shifts)
-        shift_indices_ranked = np.argsort(entropy_score)  # min is best
-        best_shift_idx = shift_indices_ranked[0]
-        best_shift = shifts[best_shift_idx]
-        print(f"Best Entropy Score shift {best_shift} with accuracy {shift_acc_scores[best_shift_idx]:.3f}")
-        return best_shift
-
-    elif shift_estimator == 'AM':
-        assert class_distribution is not None, 'Target class distribution required to compute AM score'
-
-        # estimate class distribution
-        one_hot_p_y = np.zeros_like(p_y)
-        for i in range(len(shifts)):
-            one_hot = np.zeros((shift_softmaxes.shape[0], shift_softmaxes.shape[-1]))  # (n, classes)
-            one_hot[np.arange(one_hot.shape[0]), shift_predictions[:, i]] = 1
-            one_hot_p_y[i] = one_hot.mean(axis=0)
-
-        c_train = class_distribution
-        # kl_d = np.sum(c_train * (np.log(c_train + 1e-5) - np.log(p_y + 1e-5)), axis=1) # soft class distr
-        kl_d = np.sum(c_train * (np.log(c_train + 1e-5) - np.log(one_hot_p_y + 1e-5)), axis=1)
-        entropy = np.mean(np.sum(-p_yx * np.log(p_yx + 1e-5), axis=2), axis=0)
-        am = kl_d + entropy
-        shift_indices_ranked = np.argsort(am)  # min is best
-        best_shift_idx = shift_indices_ranked[0]
-        best_shift = shifts[best_shift_idx]
-        print(f"Best AM Score shift {best_shift} with accuracy {shift_acc_scores[best_shift_idx]:.3f}")
-
-        return best_shift
-    elif shift_estimator == 'ACC':  # for upperbound comparison
-        shift_indices_ranked = np.argsort(shift_acc_scores)[::-1]  # max is best
-        return shifts[np.argmax(shift_acc_scores)]
-    else:
-        raise NotImplementedError
+    best_shift, diagnostics = _select_temporal_shift(
+        shift_softmaxes,
+        labels,
+        shifts,
+        shift_estimator,
+        class_distribution,
+        print_summary=True,
+    )
+    if compare_raw:
+        raw_softmaxes = torch.cat(raw_shift_softmaxes).cpu().numpy()
+        raw_shift, raw_diagnostics = _select_temporal_shift(
+            raw_softmaxes,
+            labels,
+            shifts,
+            shift_estimator,
+            class_distribution,
+            print_summary=False,
+        )
+        diagnostics["raw_selected_shift"] = raw_shift
+        diagnostics["raw_score_range"] = raw_diagnostics["score_range"]
+    if return_diagnostics:
+        return best_shift, diagnostics
+    return best_shift
 
 
 
