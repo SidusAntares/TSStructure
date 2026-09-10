@@ -2,7 +2,7 @@
 import argparse, csv, re
 from pathlib import Path
 
-MODES = (9, 11, 13, 15, 17, 19)
+MODES = (17, 19, 21, 23)
 ORIGINAL = 0.8437
 NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 FIELDS = ("mode", "source_test_accuracy", "source_test_macro_f1",

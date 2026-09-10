@@ -7,24 +7,27 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 SKIP_SOURCE="${SKIP_SOURCE:-0}"
 SEED=1
-RUN_NAME="fourier_recon_mode_sweep_at1_dk1_seed1"
+RUN_NAME="fourier_recon_high_mode_sweep_at1_dk1_seed1"
 OUTPUT_ROOT="outputs/${RUN_NAME}"
 TENSORBOARD_ROOT="runs/${RUN_NAME}"
 LOG_ROOT="logs/${RUN_NAME}"
 SUMMARY_SCRIPT="scripts/summarize_fourier_recon_modes_at1_dk1.py"
 AT1="austria/33UVP/2017"
 DK1="denmark/32VNH/2017"
-MODES=(9 11 13 15 17 19)
-MODE_QUEUE_GPU0=(9 17)
-MODE_QUEUE_GPU1=(11 19)
-MODE_QUEUE_GPU2=(13)
-MODE_QUEUE_GPU3=(15)
+MODES=(17 19 21 23)
+MODE_QUEUE_GPU0=(17)
+MODE_QUEUE_GPU1=(19)
+MODE_QUEUE_GPU2=(21)
+MODE_QUEUE_GPU3=(23)
+TORCH_LINALG_PREFER_CUSOLVER="${TORCH_LINALG_PREFER_CUSOLVER:-1}"
+export TORCH_LINALG_PREFER_CUSOLVER
 export PYTHONUNBUFFERED=1
 
 [[ "$SKIP_SOURCE" == 0 || "$SKIP_SOURCE" == 1 ]] || { echo "ERROR: SKIP_SOURCE must be 0 or 1"; exit 2; }
 command -v "$PYTHON_BIN" >/dev/null || { echo "ERROR: Python not found: $PYTHON_BIN"; exit 1; }
 [[ -d "$DATA_ROOT" ]] || { echo "ERROR: DATA_ROOT not found: $DATA_ROOT"; exit 1; }
 mkdir -p "$OUTPUT_ROOT" "$TENSORBOARD_ROOT" "$LOG_ROOT"
+echo "TORCH_LINALG_PREFER_CUSOLVER=${TORCH_LINALG_PREFER_CUSOLVER}"
 
 run_mode() {
     local gpu="$1" mode="$2" tag
@@ -93,5 +96,5 @@ run_queue 3 "${MODE_QUEUE_GPU3[@]}" >"${LOG_ROOT}/worker_gpu3.log" 2>&1 & PID3=$
 status=0
 for pid in "$PID0" "$PID1" "$PID2" "$PID3"; do if ! wait "$pid"; then status=1; fi; done
 if ! "$PYTHON_BIN" "$SUMMARY_SCRIPT" --log-root "$LOG_ROOT" --output-dir "$OUTPUT_ROOT" --seed "$SEED"; then status=1; fi
-[[ "$status" == 0 ]] && echo "[ALL FINISHED] Six FourierRecon modes completed."
+[[ "$status" == 0 ]] && echo "[ALL FINISHED] Four high-resolution FourierRecon modes completed."
 exit "$status"
