@@ -63,6 +63,8 @@ CUDA_VISIBLE_DEVICES="$GPU_ID" "$PYTHON_BIN" -u scripts/visualize_shift_configs_
     --seed "$SEED" \
     --fold "$FOLD" \
     --grid-size "$GRID_SIZE" \
+    --add-class-residual-shift \
+    --class-residual-max-days 20 \
     --device "$DEVICE"
 
 echo "[ALL FINISHED] Offline shift visualizations written to $OUTPUT_ROOT"

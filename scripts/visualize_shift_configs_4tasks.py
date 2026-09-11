@@ -17,11 +17,19 @@ if str(ROOT) not in sys.path:
 
 from analysis.shift_visualization import (
     SourceClassPC1,
+    estimate_class_residual_shift,
     interpolate_latent,
     read_best_validation_shift,
+    render_class_residual_figure,
     render_task_class_figures,
     replay_train_indices,
+    update_class_residual_outputs,
+    validate_existing_task_outputs,
     write_task_outputs,
+)
+from models.fourier_reconstruction import (
+    BatchedDirectFourierAnalyzer,
+    BatchedDirectFourierSynthesizer,
 )
 from models.stclassifier import PseLTae
 
@@ -259,14 +267,33 @@ def fit_class_projections(spatial_encoder, dataset, class_count, grid, batch_siz
 
 
 @torch.inference_mode()
-def project_dataset(spatial_encoder, dataset, projections, grid, batch_size, device, with_extra):
+def project_dataset(
+    spatial_encoder,
+    dataset,
+    projections,
+    grid,
+    batch_size,
+    device,
+    with_extra,
+    fourier_analyzer=None,
+):
     curves = defaultdict(list)
+    coefficients = defaultdict(list)
     for sample in _loader(dataset, batch_size):
         pixels = sample["pixels"].to(device)
         mask = sample["valid_pixels"].to(device)
         extra = sample["extra"].to(device) if with_extra else None
-        features = spatial_encoder(pixels, mask, extra).cpu().numpy()
-        positions = sample["positions"].numpy()
+        feature_tensor = spatial_encoder(pixels, mask, extra)
+        position_tensor = sample["positions"].to(
+            device=device, dtype=feature_tensor.dtype
+        )
+        coefficient_tensor = None
+        if fourier_analyzer is not None:
+            coefficient_tensor, _ = fourier_analyzer(
+                feature_tensor, position_tensor, collect_diagnostics=False
+            )
+        features = feature_tensor.cpu().numpy()
+        positions = position_tensor.cpu().numpy()
         labels = sample["label"].numpy()
         for feature, position, label in zip(features, positions, labels):
             class_id = int(label)
@@ -274,7 +301,58 @@ def project_dataset(spatial_encoder, dataset, projections, grid, batch_size, dev
                 continue
             dense = interpolate_latent(position, feature, grid)
             curves[class_id].append(projections[class_id].transform(dense[None])[0])
-    return {class_id: np.stack(values) for class_id, values in curves.items()}
+        if coefficient_tensor is not None:
+            coefficient_values = coefficient_tensor.cpu().numpy()
+            for class_id in np.unique(labels):
+                class_id = int(class_id)
+                if class_id in projections:
+                    coefficients[class_id].append(
+                        coefficient_values[labels == class_id]
+                    )
+    projected = {class_id: np.stack(values) for class_id, values in curves.items()}
+    if fourier_analyzer is None:
+        return projected
+    coefficient_groups = {
+        class_id: np.concatenate(values, axis=0)
+        for class_id, values in coefficients.items()
+    }
+    return projected, coefficient_groups
+
+
+@torch.inference_mode()
+def reconstruct_class_prototype(
+    coefficients,
+    synthesizer,
+    device,
+    sample_batch_size=256,
+    day_chunk_size=16,
+):
+    """Pointwise median Recon13 prototype on the non-wrapped day 0..364 grid."""
+    coefficients = np.asarray(coefficients)
+    if coefficients.ndim != 3 or coefficients.shape[0] == 0:
+        raise ValueError("coefficients must be non-empty [N,F,D]")
+    count, _, latent_dim = coefficients.shape
+    prototype = np.empty((365, latent_dim), dtype=np.float32)
+    for day_start in range(0, 365, day_chunk_size):
+        days = np.arange(
+            day_start, min(day_start + day_chunk_size, 365), dtype=np.float32
+        )
+        reconstructed = np.empty((count, len(days), latent_dim), dtype=np.float32)
+        for sample_start in range(0, count, sample_batch_size):
+            sample_stop = min(sample_start + sample_batch_size, count)
+            coefficient_batch = torch.as_tensor(
+                coefficients[sample_start:sample_stop], device=device
+            )
+            positions = torch.as_tensor(days, device=device).unsqueeze(0).expand(
+                sample_stop - sample_start, -1
+            )
+            reconstructed[sample_start:sample_stop] = (
+                synthesizer(coefficient_batch, positions).cpu().numpy()
+            )
+        prototype[day_start : day_start + len(days)] = np.median(
+            reconstructed, axis=0
+        )
+    return prototype
 
 
 def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_overrides, recon_log_overrides):
@@ -299,15 +377,161 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
     projections, latent_dim = fit_class_projections(
         spatial_encoder, source_dataset, len(classes), grid, args.batch_size, device, bool(config.get("with_extra", False))
     )
-    source_curves = project_dataset(
-        spatial_encoder, source_dataset, projections, grid, args.batch_size, device, bool(config.get("with_extra", False))
-    )
-    target_curves = project_dataset(
-        spatial_encoder, target_dataset, projections, grid, args.batch_size, device, bool(config.get("with_extra", False))
-    )
-
     task_name = f"{source_alias}_{target_alias}"
     output_dir = Path(args.output_root) / task_name
+    existing_manifest = None
+    expected_filenames = None
+    if args.add_class_residual_shift:
+        existing_manifest, expected_filenames = validate_existing_task_outputs(output_dir)
+
+    fourier_analyzer = None
+    fourier_synthesizer = None
+    if args.add_class_residual_shift:
+        fourier_analyzer = BatchedDirectFourierAnalyzer(
+            num_modes=13, period_days=365.0, reg=0.001
+        ).to(device)
+        fourier_synthesizer = BatchedDirectFourierSynthesizer(
+            num_modes=13, period_days=365.0
+        ).to(device)
+    source_projected = project_dataset(
+        spatial_encoder,
+        source_dataset,
+        projections,
+        grid,
+        args.batch_size,
+        device,
+        bool(config.get("with_extra", False)),
+        fourier_analyzer,
+    )
+    source_prototypes = None
+    if args.add_class_residual_shift:
+        source_curves, source_coefficients = source_projected
+        source_prototypes = {
+            class_id: reconstruct_class_prototype(
+                values, fourier_synthesizer, device, args.batch_size
+            )
+            for class_id, values in source_coefficients.items()
+        }
+        del source_coefficients
+    target_projected = project_dataset(
+        spatial_encoder,
+        target_dataset,
+        projections,
+        grid,
+        args.batch_size,
+        device,
+        bool(config.get("with_extra", False)),
+        fourier_analyzer,
+    )
+    if args.add_class_residual_shift:
+        target_curves, target_coefficients = target_projected
+        target_prototypes = {
+            class_id: reconstruct_class_prototype(
+                values, fourier_synthesizer, device, args.batch_size
+            )
+            for class_id, values in target_coefficients.items()
+        }
+        del target_coefficients
+    else:
+        source_curves, target_curves = source_projected, target_projected
+
+    if args.add_class_residual_shift:
+        summary_rows = []
+        score_curves = {}
+        class_metadata = {}
+        for class_id, class_name in enumerate(classes):
+            matching = [
+                name for name in expected_filenames if name.startswith(f"{class_id:02d}_")
+            ]
+            if not matching:
+                continue
+            source_group = source_curves.get(class_id)
+            target_group = target_curves.get(class_id)
+            source_prototype = source_prototypes.get(class_id)
+            target_prototype = target_prototypes.get(class_id)
+            if any(
+                group is None
+                for group in (
+                    source_group,
+                    target_group,
+                    source_prototype,
+                    target_prototype,
+                )
+            ):
+                raise RuntimeError(
+                    f"missing extracted class data for {task_name} class {class_id}"
+                )
+            result = estimate_class_residual_shift(
+                source_prototype,
+                target_prototype,
+                recon_shift.shift_days,
+                args.class_residual_max_days,
+            )
+            raw_metadata = (
+                existing_manifest.get("class_outputs", {})
+                .get(str(class_id), {})
+                .get("raw")
+            )
+            if not raw_metadata or "ylim" not in raw_metadata:
+                raise ValueError(
+                    f"missing baseline Raw ylim for {task_name} class {class_id}"
+                )
+            metadata = render_class_residual_figure(
+                output_dir,
+                task_name.replace("_", "→"),
+                class_id,
+                class_name,
+                grid,
+                source_group,
+                target_group,
+                recon_shift.shift_days,
+                result.class_residual_shift_days,
+                result.score_at_residual_0,
+                result.best_score,
+                result.score_gain,
+                tuple(raw_metadata["ylim"]),
+                args.max_spaghetti,
+                args.seed,
+            )
+            class_metadata[str(class_id)] = metadata
+            score_curves[class_id] = result.candidates
+            summary_rows.append(
+                {
+                    "class_id": class_id,
+                    "class_name": class_name,
+                    "source_count": len(source_group),
+                    "target_count": len(target_group),
+                    "global_reconshift_days": result.global_shift_days,
+                    "class_residual_shift_days": result.class_residual_shift_days,
+                    "final_shift_days": result.final_shift_days,
+                    "score_at_residual_0": result.score_at_residual_0,
+                    "best_score": result.best_score,
+                    "score_gain": result.score_gain,
+                    "boundary_hit": result.boundary_hit,
+                    "num_valid_channels": result.num_valid_channels,
+                    "common_support_days": result.common_support_days,
+                }
+            )
+        generated = {
+            path.name
+            for path in (output_dir / "04_reconshift13_class_shift20").glob("*.png")
+        }
+        if generated != expected_filenames:
+            raise RuntimeError(
+                "configuration 04 class files differ from 01/02/03: "
+                f"expected={sorted(expected_filenames)}, generated={sorted(generated)}"
+            )
+        update_class_residual_outputs(
+            output_dir,
+            existing_manifest,
+            summary_rows,
+            score_curves,
+            class_metadata,
+            args.class_residual_max_days,
+        )
+        print(f"[FINISHED] {task_name} class residual extension: {output_dir}")
+        return
+
     class_records, summary_rows, skipped = {}, [], []
     for class_id, class_name in enumerate(classes):
         source_group = source_curves.get(class_id)
@@ -394,6 +618,8 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--max-spaghetti", type=int, default=40)
     parser.add_argument("--min-class-samples", type=int, default=2)
+    parser.add_argument("--add-class-residual-shift", action="store_true")
+    parser.add_argument("--class-residual-max-days", type=int, default=20)
     parser.add_argument("--device", default="cuda")
     return parser
 

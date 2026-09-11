@@ -1,7 +1,8 @@
 """Offline Raw-PSE visualization helpers for comparing temporal shifts.
 
-This module does not import training entry points and never estimates a shift.
-It only reads recorded shifts and changes the plotted target time coordinates.
+This module does not import training entry points. It reads recorded global shifts,
+optionally estimates an oracle-grouped residual from supplied Recon13 prototypes,
+and changes only the plotted target time coordinates.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ CONFIG_FOLDERS = {
     "raw": "01_raw_pse",
     "timematch": "02_timematch_shift",
     "reconshift13": "03_reconshift13_shift",
+    "reconshift13_class_shift20": "04_reconshift13_class_shift20",
 }
 
 
@@ -53,6 +55,27 @@ class ShiftSelection:
             "source_path": self.source_path,
             "fallback": self.fallback,
         }
+
+
+@dataclass(frozen=True)
+class ResidualShiftCandidate:
+    residual_shift_days: int
+    score: float
+    common_support_days: int
+
+
+@dataclass(frozen=True)
+class ClassResidualShiftResult:
+    global_shift_days: float
+    class_residual_shift_days: int
+    final_shift_days: float
+    score_at_residual_0: float
+    best_score: float
+    score_gain: float
+    boundary_hit: bool
+    num_valid_channels: int
+    common_support_days: int
+    candidates: Tuple[ResidualShiftCandidate, ...]
 
 
 @dataclass(frozen=True)
@@ -118,12 +141,13 @@ def build_shift_views(
     target_curves: np.ndarray,
     timematch_shift: float,
     reconshift_shift: float,
+    class_residual_shift: Optional[float] = None,
 ) -> Dict[str, ShiftedCurves]:
-    """Create three coordinate views while preserving all curve values."""
+    """Create coordinate views while preserving every source/target value."""
     grid = np.asarray(grid, dtype=np.float64)
     source = np.asarray(source_curves)
     target = np.asarray(target_curves)
-    return {
+    views = {
         "raw": ShiftedCurves(grid, source, grid, target),
         "timematch": ShiftedCurves(
             grid, source, grid + float(timematch_shift), target
@@ -132,6 +156,116 @@ def build_shift_views(
             grid, source, grid + float(reconshift_shift), target
         ),
     }
+    if class_residual_shift is not None:
+        views["reconshift13_class_shift20"] = ShiftedCurves(
+            grid,
+            source,
+            grid + float(reconshift_shift) + float(class_residual_shift),
+            target,
+        )
+    return views
+
+
+def _robust_temporal_normalize(prototype: np.ndarray, eps: float = 1e-8):
+    prototype = np.asarray(prototype, dtype=np.float64)
+    if prototype.ndim != 2 or prototype.shape[0] < 2:
+        raise ValueError("prototype must have shape [T,D] with T >= 2")
+    median = np.median(prototype, axis=0)
+    q25, q75 = np.quantile(prototype, (0.25, 0.75), axis=0)
+    iqr = q75 - q25
+    normalized = (prototype - median) / (iqr + eps)
+    return normalized, iqr
+
+
+def _common_support_score(
+    source: np.ndarray,
+    target: np.ndarray,
+    total_shift_days: float,
+    valid_channels: np.ndarray,
+) -> Tuple[float, int]:
+    """Correlate target(t-total_shift) with source(t), without padding/wrap."""
+    length = source.shape[0]
+    source_days = np.arange(length, dtype=np.float64)
+    target_days = source_days - float(total_shift_days)
+    support = (target_days >= 0.0) & (target_days <= float(length - 1))
+    source_index = np.flatnonzero(support)
+    if source_index.size < 2 or not np.any(valid_channels):
+        return float("nan"), int(source_index.size)
+    query = target_days[support]
+    source_part = source[source_index][:, valid_channels]
+    target_part = np.column_stack(
+        [
+            np.interp(query, source_days, target[:, channel])
+            for channel in np.flatnonzero(valid_channels)
+        ]
+    )
+    source_centered = source_part - source_part.mean(axis=0, keepdims=True)
+    target_centered = target_part - target_part.mean(axis=0, keepdims=True)
+    numerator = np.sum(source_centered * target_centered, axis=0)
+    denominator = np.sqrt(
+        np.sum(source_centered**2, axis=0)
+        * np.sum(target_centered**2, axis=0)
+    )
+    correlations = np.divide(
+        numerator,
+        denominator,
+        out=np.full_like(numerator, np.nan),
+        where=denominator > np.finfo(np.float64).eps,
+    )
+    finite = correlations[np.isfinite(correlations)]
+    return (
+        float(finite.mean()) if finite.size else float("nan"),
+        int(source_index.size),
+    )
+
+
+def estimate_class_residual_shift(
+    source_prototype: np.ndarray,
+    target_prototype: np.ndarray,
+    global_shift_days: float,
+    max_residual_days: int = 20,
+    iqr_floor: float = 1e-6,
+) -> ClassResidualShiftResult:
+    """Estimate an oracle-grouped class residual from multivariate Recon curves."""
+    source, source_iqr = _robust_temporal_normalize(source_prototype)
+    target, target_iqr = _robust_temporal_normalize(target_prototype)
+    if source.shape != target.shape:
+        raise ValueError("source and target prototypes must have identical [T,D] shape")
+    if max_residual_days < 0:
+        raise ValueError("max_residual_days must be non-negative")
+    valid = (
+        np.isfinite(source).all(axis=0)
+        & np.isfinite(target).all(axis=0)
+        & np.isfinite(source_iqr)
+        & np.isfinite(target_iqr)
+        & (source_iqr > iqr_floor)
+        & (target_iqr > iqr_floor)
+    )
+    if not np.any(valid):
+        raise ValueError("no non-flat finite channels for class residual estimation")
+    candidates = []
+    for residual in range(-int(max_residual_days), int(max_residual_days) + 1):
+        score, support_days = _common_support_score(
+            source, target, float(global_shift_days) + residual, valid
+        )
+        candidates.append(ResidualShiftCandidate(residual, score, support_days))
+    finite = [candidate for candidate in candidates if np.isfinite(candidate.score)]
+    if not finite:
+        raise ValueError("no finite class residual candidate scores")
+    best = min(finite, key=lambda item: (-item.score, abs(item.residual_shift_days), item.residual_shift_days))
+    zero = candidates[int(max_residual_days)]
+    return ClassResidualShiftResult(
+        global_shift_days=float(global_shift_days),
+        class_residual_shift_days=best.residual_shift_days,
+        final_shift_days=float(global_shift_days) + best.residual_shift_days,
+        score_at_residual_0=zero.score,
+        best_score=best.score,
+        score_gain=best.score - zero.score,
+        boundary_hit=abs(best.residual_shift_days) == int(max_residual_days),
+        num_valid_channels=int(valid.sum()),
+        common_support_days=best.common_support_days,
+        candidates=tuple(candidates),
+    )
 
 
 def _read_validation_scores(text: str) -> Sequence[float]:
@@ -300,6 +434,7 @@ def _plot_view(
     max_spaghetti: int,
     seed: int,
     delta_days: Optional[float] = None,
+    extra_subtitle: Optional[str] = None,
 ):
     import matplotlib
 
@@ -316,6 +451,7 @@ def _plot_view(
         "raw": "Raw PSE (no shift)",
         "timematch": "Original TimeMatch shift",
         "reconshift13": "Recon-guided TimeMatch shift",
+        "reconshift13_class_shift20": "ReconShift13 global + class residual",
     }
     fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.2), sharex=True)
     for curve in source_sample:
@@ -345,6 +481,8 @@ def _plot_view(
     )
     if delta_days is not None:
         subtitle += f" | difference from Original TimeMatch={delta_days:+g} days"
+    if extra_subtitle:
+        subtitle += f"\n{extra_subtitle}"
     fig.suptitle(f"{task_name} | {class_name} | {labels[config_key]}\n{subtitle}")
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -394,6 +532,198 @@ def render_task_class_figures(
         )
         metadata[key] = {"path": str(output_path), "ylim": [ylim[0], ylim[1]]}
     return metadata
+
+
+def render_class_residual_figure(
+    output_dir: Path,
+    task_name: str,
+    class_id: int,
+    class_name: str,
+    grid: np.ndarray,
+    source_curves: np.ndarray,
+    target_curves: np.ndarray,
+    global_shift_days: float,
+    class_residual_shift_days: int,
+    score_at_residual_0: float,
+    best_score: float,
+    score_gain: float,
+    ylim: Tuple[float, float],
+    max_spaghetti: int = 40,
+    seed: int = 1,
+) -> dict:
+    """Render only configuration 04; existing 01/02/03 are never opened."""
+    source = np.asarray(source_curves, dtype=np.float64)
+    target = np.asarray(target_curves, dtype=np.float64)
+    if len(source) == 0 or len(target) == 0:
+        raise ValueError("both source and target need at least one class sample")
+    view = build_shift_views(
+        grid,
+        source,
+        target,
+        0.0,
+        global_shift_days,
+        class_residual_shift_days,
+    )["reconshift13_class_shift20"]
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", class_name).strip("_")
+    filename = f"{int(class_id):02d}_{safe_name}.png"
+    output_path = (
+        Path(output_dir)
+        / CONFIG_FOLDERS["reconshift13_class_shift20"]
+        / filename
+    )
+    final_shift = float(global_shift_days) + int(class_residual_shift_days)
+    _plot_view(
+        output_path,
+        task_name,
+        class_name,
+        "reconshift13_class_shift20",
+        view,
+        final_shift,
+        ylim,
+        max_spaghetti,
+        seed + int(class_id),
+        extra_subtitle=(
+            f"global={global_shift_days:+g} d | residual={class_residual_shift_days:+d} d | "
+            f"final={final_shift:+g} d | score0={score_at_residual_0:.4f} | "
+            f"best={best_score:.4f} | gain={score_gain:+.4f}"
+        ),
+    )
+    return {"path": str(output_path), "ylim": [float(ylim[0]), float(ylim[1])]}
+
+
+def validate_existing_task_outputs(output_dir: Path):
+    """Fail fast unless the complete, mutually consistent baseline views exist."""
+    output_dir = Path(output_dir)
+    manifest_path = output_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"existing manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    file_sets = []
+    for key in ("raw", "timematch", "reconshift13"):
+        folder = output_dir / CONFIG_FOLDERS[key]
+        if not folder.is_dir():
+            raise FileNotFoundError(f"existing visualization folder not found: {folder}")
+        file_sets.append({path.name for path in folder.glob("*.png")})
+    if not file_sets[0] or any(names != file_sets[0] for names in file_sets[1:]):
+        raise ValueError("existing 01/02/03 class image sets are empty or inconsistent")
+    return manifest, file_sets[0]
+
+
+def _candidate_values(candidate):
+    if isinstance(candidate, ResidualShiftCandidate):
+        return (
+            candidate.residual_shift_days,
+            candidate.score,
+            candidate.common_support_days,
+        )
+    return tuple(candidate)
+
+
+def _safe_class_filename(class_id: int, class_name: str, suffix: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", class_name).strip("_")
+    return f"{int(class_id):02d}_{safe_name}.{suffix}"
+
+
+def _plot_class_shift_overview(
+    output_path: Path,
+    summary_rows: Sequence[Mapping],
+    max_residual_days: int,
+):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = [str(row["class_name"]) for row in summary_rows]
+    shifts = [float(row["class_residual_shift_days"]) for row in summary_rows]
+    figure, axis = plt.subplots(figsize=(max(8.0, 0.75 * len(labels)), 4.8))
+    axis.bar(np.arange(len(labels)), shifts, color="#4C78A8")
+    axis.axhline(0.0, color="black", lw=1.0)
+    axis.axhline(float(max_residual_days), color="#D62728", lw=1.0, ls="--")
+    axis.axhline(-float(max_residual_days), color="#D62728", lw=1.0, ls="--")
+    axis.set_xticks(np.arange(len(labels)), labels, rotation=35, ha="right")
+    axis.set_ylabel("Class residual shift (days)")
+    axis.set_title("ReconShift13 class residual shifts")
+    axis.grid(axis="y", alpha=0.2)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+
+def update_class_residual_outputs(
+    output_dir: Path,
+    manifest: Mapping,
+    summary_rows: Sequence[Mapping],
+    score_curves: Mapping[int, Sequence],
+    class_metadata: Mapping[str, Mapping],
+    max_residual_days: int = 20,
+) -> None:
+    """Add configuration 04 artifacts while preserving baseline manifest fields."""
+    output_dir = Path(output_dir)
+    summary_fields = [
+        "class_id",
+        "class_name",
+        "source_count",
+        "target_count",
+        "global_reconshift_days",
+        "class_residual_shift_days",
+        "final_shift_days",
+        "score_at_residual_0",
+        "best_score",
+        "score_gain",
+        "boundary_hit",
+        "num_valid_channels",
+        "common_support_days",
+    ]
+    with (output_dir / "class_shift20_summary.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as stream:
+        writer = csv.DictWriter(stream, fieldnames=summary_fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(summary_rows)
+    score_dir = output_dir / "class_shift20_scores"
+    score_dir.mkdir(parents=True, exist_ok=True)
+    for row in summary_rows:
+        class_id = int(row["class_id"])
+        class_name = str(row["class_name"])
+        candidates = score_curves[class_id]
+        with (score_dir / _safe_class_filename(class_id, class_name, "csv")).open(
+            "w", newline="", encoding="utf-8"
+        ) as stream:
+            writer = csv.writer(stream)
+            writer.writerow(("residual_shift_days", "score", "common_support_days"))
+            writer.writerows(_candidate_values(candidate) for candidate in candidates)
+    if summary_rows:
+        _plot_class_shift_overview(
+            output_dir / "class_shift20_overview.png",
+            summary_rows,
+            max_residual_days,
+        )
+
+    updated = dict(manifest)
+    updated["class_residual_shift"] = {
+        "enabled": True,
+        "base_shift": "reconshift13",
+        "search_min_days": -int(max_residual_days),
+        "search_max_days": int(max_residual_days),
+        "search_step_days": 1,
+        "metric": "robust_normalized_multivariate_correlation",
+        "reconstruction": {
+            "num_modes": 13,
+            "period_days": 365.0,
+            "reg": 0.001,
+            "solver": "dense_direct",
+        },
+        "target_grouping": "oracle_true_labels_offline_only",
+        "padding": "none; common calendar support only; no circular wrap",
+    }
+    outputs = {str(key): dict(value) for key, value in updated.get("class_outputs", {}).items()}
+    for class_id, metadata in class_metadata.items():
+        outputs.setdefault(str(class_id), {})["reconshift13_class_shift20"] = dict(metadata)
+    updated["class_outputs"] = outputs
+    (output_dir / "manifest.json").write_text(
+        json.dumps(updated, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def replay_train_indices(
