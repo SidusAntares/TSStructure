@@ -87,6 +87,36 @@ def test_target_bootstrap_uses_global_shift_predictions_without_reading_labels()
     assert model.shift == 6
 
 
+def test_class_residual_bootstrap_initializes_its_deterministic_rng(monkeypatch):
+    config = types.SimpleNamespace(
+        model="pseltae",
+        shift_estimation_view="fourier_recon",
+        shift_fourier_num_modes=13,
+        source_class_residual_max_days=20,
+        source_class_residual_min_samples=32,
+        source_class_residual_max_samples=128,
+        source_class_residual_min_gain=0.005,
+        seed=1,
+        source="source",
+        target="target",
+    )
+
+    def reached_dataset_construction(*args, **kwargs):
+        raise RuntimeError("reached dataset construction")
+
+    monkeypatch.setattr(
+        timematch, "_class_residual_dataset", reached_dataset_construction
+    )
+    with pytest.raises(RuntimeError, match="reached dataset construction"):
+        timematch._bootstrap_source_class_residual_shifts(
+            torch.nn.Module(),
+            config,
+            {"source": {"train": []}, "target": {"train": []}},
+            "cpu",
+            0,
+        )
+
+
 class _Spatial(torch.nn.Module):
     def __init__(self):
         super().__init__()
