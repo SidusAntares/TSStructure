@@ -9,6 +9,56 @@ import numpy as np
 import torch
 
 
+def test_visualization_and_training_share_the_exact_residual_estimator():
+    from analysis import shift_visualization as sv
+    from class_residual_shift import estimate_class_residual_shift
+
+    assert sv.estimate_class_residual_shift is estimate_class_residual_shift
+
+
+def test_shared_residual_estimator_recovers_shift_and_has_strict_range():
+    from class_residual_shift import decide_class_residual_shift, estimate_class_residual_shift
+
+    grid = np.arange(365, dtype=np.float64)
+    source = np.column_stack(
+        [np.sin(2 * np.pi * grid / 365), np.cos(4 * np.pi * grid / 365)]
+    )
+    target = np.column_stack(
+        [
+            np.sin(2 * np.pi * (grid + 7) / 365),
+            np.cos(4 * np.pi * (grid + 7) / 365),
+        ]
+    )
+    result = estimate_class_residual_shift(source, target, 3, max_residual_days=20)
+    assert [x.residual_shift_days for x in result.candidates] == list(range(-20, 21))
+    assert result.class_residual_shift_days == 4
+    decision = decide_class_residual_shift(result, pseudo_count=64, min_samples=32, min_gain=0.005)
+    assert decision.accepted
+    assert decision.accepted_residual_shift == 4
+    assert decision.final_target_to_source_shift == 7
+    assert decision.final_source_to_target_shift == -7
+
+
+def test_shared_residual_estimator_gates_and_accepts_boundary():
+    from dataclasses import replace
+    from class_residual_shift import decide_class_residual_shift, estimate_class_residual_shift
+
+    grid = np.arange(365, dtype=np.float64)
+    source = np.column_stack([np.sin(grid / 13), np.cos(grid / 17)])
+    target = np.column_stack([np.sin((grid + 20) / 13), np.cos((grid + 20) / 17)])
+    result = estimate_class_residual_shift(source, target, 0, max_residual_days=20)
+    boundary = decide_class_residual_shift(result, 64, 32, 0.0)
+    assert boundary.accepted and boundary.boundary_hit
+    assert boundary.accepted_residual_shift == 20
+    insufficient = decide_class_residual_shift(result, 31, 32, 0.0)
+    assert not insufficient.accepted
+    assert insufficient.accepted_residual_shift == 0
+    assert insufficient.fallback_reason == "insufficient_samples"
+    low_gain = decide_class_residual_shift(replace(result, score_gain=0.004), 64, 32, 0.005)
+    assert not low_gain.accepted
+    assert low_gain.fallback_reason == "insufficient_gain"
+
+
 @contextmanager
 def _workspace_tmp():
     path = Path.cwd() / f"shift-viz-test-{uuid.uuid4().hex}"

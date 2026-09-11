@@ -38,10 +38,12 @@ from transforms import (
 from utils.focal_loss import FocalLoss
 from utils.train_utils import (
     AverageMeter,
+    bool_flag,
     cycle,
     progress_bar_disabled,
     to_cuda,
 )
+from class_residual_shift import decide_class_residual_shift, estimate_class_residual_shift
 
 
 def add_shift_estimation_arguments(parser):
@@ -80,7 +82,222 @@ def add_shift_estimation_arguments(parser):
         default="dense_direct",
         choices=["dense_direct"],
     )
+    parser.add_argument(
+        "--source-class-residual-shift", "--source_class_residual_shift",
+        dest="source_class_residual_shift", type=bool_flag, default=False,
+    )
+    parser.add_argument(
+        "--source-class-residual-max-days", "--source_class_residual_max_days",
+        dest="source_class_residual_max_days", type=int, default=20,
+    )
+    parser.add_argument(
+        "--source-class-residual-min-samples", "--source_class_residual_min_samples",
+        dest="source_class_residual_min_samples", type=int, default=32,
+    )
+    parser.add_argument(
+        "--source-class-residual-max-samples", "--source_class_residual_max_samples",
+        dest="source_class_residual_max_samples", type=int, default=128,
+    )
+    parser.add_argument(
+        "--source-class-residual-min-gain", "--source_class_residual_min_gain",
+        dest="source_class_residual_min_gain", type=float, default=0.005,
+    )
     return parser
+
+
+def _compose_source_class_shifts(global_target_to_source_shift, residuals):
+    return -(torch.as_tensor(residuals) + float(global_target_to_source_shift))
+
+
+def _source_batch_temporal_shift(class_shifts, source_labels, dtype):
+    table = torch.as_tensor(class_shifts, device=source_labels.device, dtype=dtype)
+    return table.index_select(0, source_labels.long()).reshape(-1, 1)
+
+
+def _class_residual_dataset(config, domain, indices):
+    transform = transforms.Compose([
+        RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()
+    ])
+    return PixelSetData(
+        config.data_root, domain, config.classes, transform,
+        indices=indices, closed_set=config.closed_set,
+        combine_spring_and_winter=config.combine_spring_and_winter,
+    )
+
+
+@torch.no_grad()
+def _collect_class_residual_coefficients(
+    model, loader, analyzer, device, global_shift, *, target
+):
+    coefficients, classes, confidences = [], [], []
+    model.eval()
+    for sample in loader:
+        pixels, mask, positions, extra = to_cuda(sample, device)
+        spatial = model.spatial_encoder(pixels, mask, extra)
+        coeffs, _ = analyzer(spatial, positions)
+        coefficients.append(coeffs.detach().cpu())
+        if target:
+            logits = model.classify_prepared(
+                spatial, positions, temporal_shift=global_shift
+            )
+            confidence, predicted = F.softmax(logits, dim=1).max(dim=1)
+            classes.append(predicted.detach().cpu())
+            confidences.append(confidence.detach().cpu())
+        else:
+            # Target labels are deliberately never inspected in the target branch.
+            classes.append(torch.as_tensor(sample["label"]).detach().cpu())
+    return (
+        torch.cat(coefficients), torch.cat(classes),
+        torch.cat(confidences) if confidences else None,
+    )
+
+
+def _write_class_residual_shift_outputs(output_dir, records, score_rows, global_shift):
+    os.makedirs(output_dir, exist_ok=True)
+    payload = {
+        "global_target_to_source_shift": float(global_shift),
+        "classes": records,
+    }
+    with open(os.path.join(output_dir, "class_residual_shifts.json"), "w") as handle:
+        json.dump(payload, handle, indent=2)
+    path = os.path.join(output_dir, "class_residual_shift_scores.csv")
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["class_id", "class_name", "residual_shift_days", "score", "common_support_days"],
+        )
+        writer.writeheader()
+        writer.writerows(score_rows)
+
+
+def _bootstrap_source_class_residual_shifts(model, config, splits, device, global_shift):
+    if getattr(config, "model", None) not in ("pse", "pseltae"):
+        raise ValueError("source class residual shift requires the Raw PseLTae model")
+    if getattr(config, "shift_estimation_view", "raw") != "fourier_recon":
+        raise ValueError("source class residual shift requires fourier_recon shift view")
+    if int(config.shift_fourier_num_modes) != 13:
+        raise ValueError("source class residual shift is fixed to Recon13")
+    print(
+        "CLASS_RESIDUAL_SHIFT_CONFIG|enabled=true|view=fourier_recon|modes=13|"
+        f"max_days={config.source_class_residual_max_days}|"
+        f"min_samples={config.source_class_residual_min_samples}|"
+        f"max_samples={config.source_class_residual_max_samples}|"
+        f"min_gain={config.source_class_residual_min_gain}|"
+        "update=bootstrap_once|apply_to=source_only"
+    )
+    analyzer = BatchedDirectFourierAnalyzer(
+        num_modes=13, period_days=365.0, reg=0.001
+    ).to(device)
+    synthesizer = BatchedDirectFourierSynthesizer(
+        num_modes=13, period_days=365.0
+    ).to(device)
+    seed = int(getattr(config, "seed", 1))
+    with preserve_rng_state():
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        source_dataset = _class_residual_dataset(
+            config, config.source, splits[config.source]["train"]
+        )
+        target_dataset = _class_residual_dataset(
+            config, config.target, splits[config.target]["train"]
+        )
+        source_loader = data.DataLoader(
+            source_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0
+        )
+        target_loader = data.DataLoader(
+            target_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0
+        )
+        source_coeffs, source_classes, _ = _collect_class_residual_coefficients(
+            model, source_loader, analyzer, device, global_shift, target=False
+        )
+        target_coeffs, target_classes, target_confidence = _collect_class_residual_coefficients(
+            model, target_loader, analyzer, device, global_shift, target=True
+        )
+
+    grid = torch.arange(365, device=device).reshape(1, -1)
+    residuals = torch.zeros(config.num_classes, dtype=torch.float32)
+    records, score_rows = [], []
+    rng = np.random.default_rng(seed)
+    max_samples = int(config.source_class_residual_max_samples)
+    for class_id, class_name in enumerate(config.classes):
+        source_index = torch.nonzero(source_classes == class_id).flatten().numpy()
+        target_index = torch.nonzero(
+            (target_classes == class_id)
+            & (target_confidence >= float(config.pseudo_threshold))
+        ).flatten().numpy()
+        pseudo_count, source_count = len(target_index), len(source_index)
+        record = {
+            "class_id": class_id, "class_name": class_name,
+            "pseudo_count": pseudo_count, "source_count": source_count,
+            "global_target_to_source_shift": float(global_shift),
+        }
+        try:
+            if pseudo_count == 0:
+                raise RuntimeError("insufficient_samples")
+            if source_count == 0:
+                raise RuntimeError("missing_source_class")
+            if len(source_index) > max_samples:
+                source_index = np.sort(rng.choice(source_index, max_samples, replace=False))
+            if len(target_index) > max_samples:
+                target_index = np.sort(rng.choice(target_index, max_samples, replace=False))
+            source_selected = source_coeffs[source_index].to(device)
+            target_selected = target_coeffs[target_index].to(device)
+            source_grid = grid.expand(len(source_index), -1)
+            target_grid = grid.expand(len(target_index), -1)
+            source_proto = synthesizer(source_selected, source_grid).median(dim=0).values.cpu().numpy()
+            target_proto = synthesizer(target_selected, target_grid).median(dim=0).values.cpu().numpy()
+            result = estimate_class_residual_shift(
+                source_proto, target_proto, float(global_shift),
+                max_residual_days=config.source_class_residual_max_days,
+            )
+            decision = decide_class_residual_shift(
+                result, pseudo_count, config.source_class_residual_min_samples,
+                config.source_class_residual_min_gain,
+            )
+            residuals[class_id] = decision.accepted_residual_shift
+            record.update({
+                "score_at_zero": result.score_at_residual_0,
+                "best_score": result.best_score, "gain": result.score_gain,
+                "raw_best_residual_shift": result.class_residual_shift_days,
+                "accepted_residual_shift": decision.accepted_residual_shift,
+                "final_target_to_source_class_shift": decision.final_target_to_source_shift,
+                "final_source_to_target_class_shift": decision.final_source_to_target_shift,
+                "boundary_hit": decision.boundary_hit,
+                "valid_channels": result.num_valid_channels,
+                "fallback_reason": decision.fallback_reason,
+            })
+            for candidate in result.candidates:
+                score_rows.append({
+                    "class_id": class_id, "class_name": class_name,
+                    "residual_shift_days": candidate.residual_shift_days,
+                    "score": candidate.score,
+                    "common_support_days": candidate.common_support_days,
+                })
+        except Exception as error:
+            reason = str(error) or type(error).__name__
+            record.update({
+                "score_at_zero": None, "best_score": None, "gain": None,
+                "raw_best_residual_shift": 0, "accepted_residual_shift": 0,
+                "final_target_to_source_class_shift": float(global_shift),
+                "final_source_to_target_class_shift": -float(global_shift),
+                "boundary_hit": False, "valid_channels": 0,
+                "fallback_reason": reason,
+            })
+        records.append(record)
+        print(
+            "CLASS_RESIDUAL_SHIFT|"
+            f"class={class_name}|pseudo_count={pseudo_count}|global_t2s={global_shift}|"
+            f"raw_best_residual={record['raw_best_residual_shift']}|gain={record['gain']}|"
+            f"accepted={not bool(record['fallback_reason'])}|"
+            f"residual_t2s={record['accepted_residual_shift']}|"
+            f"final_t2s={record['final_target_to_source_class_shift']}|"
+            f"source_s2t={record['final_source_to_target_class_shift']}|"
+            f"boundary_hit={str(record['boundary_hit']).lower()}|"
+            f"fallback_reason={record['fallback_reason'] or 'none'}"
+        )
+    _write_class_residual_shift_outputs(config.fold_dir, records, score_rows, global_shift)
+    return _compose_source_class_shifts(global_shift, residuals), records
 
 
 def _shift_estimation_kwargs(config):
@@ -156,19 +373,22 @@ def _check_temporal_index_range(model, positions, applied_shift, tag):
 
     min_pos = int(positions.min().item())
     max_pos = int(positions.max().item())
+    shift_tensor = torch.as_tensor(applied_shift)
+    min_shift = float(shift_tensor.min().item())
+    max_shift = float(shift_tensor.max().item())
     if hasattr(model, "get_temporal_encoders"):
         temporal_encoders = model.get_temporal_encoders()
     else:
         temporal_encoders = (model.temporal_encoder,)
     for encoder_index, temporal_encoder in enumerate(temporal_encoders):
-        min_idx = min_pos + applied_shift + temporal_encoder.max_temporal_shift
-        max_idx = max_pos + applied_shift + temporal_encoder.max_temporal_shift
+        min_idx = min_pos + min_shift + temporal_encoder.max_temporal_shift
+        max_idx = max_pos + max_shift + temporal_encoder.max_temporal_shift
         table_size = temporal_encoder.positional_enc.num_embeddings
 
         if min_idx < 0 or max_idx >= table_size:
             raise ValueError(
                 f"{tag} temporal indices out of range: encoder={encoder_index}, "
-                f"positions=[{min_pos}, {max_pos}], shift={applied_shift}, "
+                f"positions=[{min_pos}, {max_pos}], shift=[{min_shift}, {max_shift}], "
                 f"embedding_indices=[{min_idx}, {max_idx}], table_size={table_size}. "
                 "This usually means an extra temporal shift was applied on top of TimeMatch "
                 "alignment or the positional encoding range is inconsistent with the dataset dates."
@@ -932,6 +1152,15 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         all_pseudo_labels = torch.max(pseudo_softmaxes, dim=1)[1]
 
     source_to_target_shift = 0
+    source_class_shifts = None
+    if getattr(config, "source_class_residual_shift", False):
+        if not config.estimate_shift or not config.shift_source:
+            raise ValueError(
+                "source class residual shift requires estimate_shift=true and shift_source=true"
+            )
+        source_class_shifts, _ = _bootstrap_source_class_residual_shifts(
+            teacher, config, splits, device, target_to_source_shift
+        )
     for epoch in range(config.epochs):
         progress_bar = tqdm(
             range(steps_per_epoch),
@@ -999,9 +1228,9 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                         f"mode={config.shift_fourier_num_modes}|"
                         f"shift_days={target_to_source_shift}"
                     )
-                if config.shift_source:
+                if config.shift_source and source_class_shifts is None:
                     source_to_target_shift = -target_to_source_shift
-                else:
+                elif not config.shift_source:
                     source_to_target_shift = 0
                 min_shift, max_shift = min(target_to_source_shift, 0), max(0, target_to_source_shift)
             writer.add_scalar("train/temporal_shift", target_to_source_shift, epoch)
@@ -1084,19 +1313,26 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             # Update student on shifted source data and pseudo-labeled target data
             pixels_s, mask_s, position_s, extra_s = to_cuda(sample_source, device)
             source_labels = sample_source['label'].cuda(device, non_blocking=True)
+            source_batch_shift = (
+                _source_batch_temporal_shift(
+                    source_class_shifts, source_labels, position_s.dtype
+                )
+                if source_class_shifts is not None
+                else source_to_target_shift
+            )
             pixels_t, mask_t, position_t, extra_t = to_cuda(sample_target_strong, device)
             logits_target = None
             captured_target = None
             loss_target = 0.0
             if config.domain_specific_bn:
-                _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
+                _check_temporal_index_range(student, position_s, source_batch_shift, "source")
                 logits_source = _forward_with_temporal_shift(
                     student,
                     pixels_s,
                     mask_s,
                     position_s,
                     extra_s,
-                    temporal_shift=source_to_target_shift,
+                    temporal_shift=source_batch_shift,
                     collect_diagnostics=(
                         collect_diagnostics and num_pseudo < 2
                     ),
@@ -1121,7 +1357,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                             collect_diagnostics=collect_diagnostics,
                         )
             else:
-                _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
+                _check_temporal_index_range(student, position_s, source_batch_shift, "source")
                 if num_pseudo > 0:
                     selected_pixels_t = pixels_t[pseudo_mask]
                     selected_mask_t = mask_t[pseudo_mask]
@@ -1138,11 +1374,9 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     )
                     temporal_shift = torch.cat(
                         [
-                            torch.full(
-                                (position_s.shape[0], 1),
-                                source_to_target_shift,
-                                device=position_s.device,
-                                dtype=position_s.dtype,
+                            source_batch_shift if torch.is_tensor(source_batch_shift) else torch.full(
+                                (position_s.shape[0], 1), source_batch_shift,
+                                device=position_s.device, dtype=position_s.dtype,
                             ),
                             torch.zeros(
                                 (selected_position_t.shape[0], 1),
@@ -1180,7 +1414,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                         mask_s,
                         position_s,
                         extra_s,
-                        temporal_shift=source_to_target_shift,
+                        temporal_shift=source_batch_shift,
                         collect_diagnostics=collect_diagnostics,
                     )
                     logits_target = None

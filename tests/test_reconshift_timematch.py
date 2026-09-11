@@ -32,6 +32,61 @@ sys.modules.setdefault("torch.utils.tensorboard", tensorboard_stub)
 import timematch
 
 
+def test_source_class_residual_cli_defaults_are_isolated():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    timematch.add_shift_estimation_arguments(parser)
+    cfg = parser.parse_args([])
+    assert cfg.source_class_residual_shift is False
+    assert cfg.source_class_residual_max_days == 20
+    assert cfg.source_class_residual_min_samples == 32
+    assert cfg.source_class_residual_max_samples == 128
+    assert cfg.source_class_residual_min_gain == pytest.approx(0.005)
+
+
+def test_class_shift_helpers_compose_sign_and_map_per_sample():
+    residuals = torch.tensor([-4.0, 0.0, 7.0])
+    source_shifts = timematch._compose_source_class_shifts(5.0, residuals)
+    assert torch.equal(source_shifts, torch.tensor([-1.0, -5.0, -12.0]))
+    labels = torch.tensor([2, 0, 1, 2])
+    batch = timematch._source_batch_temporal_shift(source_shifts, labels, torch.float32)
+    assert batch.shape == (4, 1)
+    assert torch.equal(batch[:, 0], torch.tensor([-12.0, -1.0, -5.0, -12.0]))
+
+
+def test_target_bootstrap_uses_global_shift_predictions_without_reading_labels():
+    class LabelTrap(dict):
+        def __getitem__(self, key):
+            if key == "label":
+                raise AssertionError("target true label was read")
+            return super().__getitem__(key)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.spatial_encoder = _Spatial()
+            self.shift = None
+
+        def classify_prepared(self, spatial, positions, temporal_shift=0):
+            self.shift = temporal_shift
+            return torch.tensor([[0.0, 8.0], [9.0, 0.0]])
+
+    class Analyzer(torch.nn.Module):
+        def forward(self, spatial, positions):
+            return torch.complex(spatial, torch.zeros_like(spatial)), {}
+
+    sample = LabelTrap(_sample())
+    model = Model()
+    coeffs, predicted, confidence = timematch._collect_class_residual_coefficients(
+        model, [sample], Analyzer(), "cpu", 6, target=True
+    )
+    assert coeffs.shape[0] == 2
+    assert predicted.tolist() == [1, 0]
+    assert torch.all(confidence > 0.99)
+    assert model.shift == 6
+
+
 class _Spatial(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -361,6 +416,24 @@ def test_four_task_launcher_uses_raw_model_and_recon_shift_only():
     assert "models.fredn" not in text
 
 
+def test_source_class_residual_launcher_is_four_task_source_only_control():
+    script = Path("scripts/run_reconshift13_classres20_sourceonly_4tasks_seed1.sh")
+    text = script.read_text(encoding="utf-8")
+    assert "--source-class-residual-shift true" in text
+    assert "--source-class-residual-max-days 20" in text
+    assert "--source-class-residual-min-samples 32" in text
+    assert "--source-class-residual-max-samples 128" in text
+    assert "--source-class-residual-min-gain 0.005" in text
+    assert "--shift-estimation-view fourier_recon" in text
+    assert "--shift-fourier-num-modes 13" in text
+    assert "--model pseltae" in text
+    assert "SOURCE PRETRAIN" not in text
+    assert 'launch "$GPU0" AT1 "$AT1" DK1 "$DK1" "$AT1_WEIGHTS"' in text
+    assert 'launch "$GPU1" DK1 "$DK1" FR1 "$FR1" "$DK1_WEIGHTS"' in text
+    assert 'launch "$GPU2" FR1 "$FR1" FR2 "$FR2" "$FR1_WEIGHTS"' in text
+    assert 'launch "$GPU3" FR2 "$FR2" AT1 "$AT1" "$FR2_WEIGHTS"' in text
+
+
 class _TrainingModel(torch.nn.Module):
     calls = []
 
@@ -451,6 +524,15 @@ def test_training_reestimates_with_recon_but_semantic_forwards_stay_raw(
         return selected
 
     monkeypatch.setattr(timematch, "estimate_temporal_shift", fake_estimator)
+    bootstrap_calls = []
+
+    def fake_bootstrap(*args, **kwargs):
+        bootstrap_calls.append((args, kwargs))
+        return torch.tensor([-2.0, -9.0]), []
+
+    monkeypatch.setattr(
+        timematch, "_bootstrap_source_class_residual_shifts", fake_bootstrap
+    )
     config = types.SimpleNamespace(
         balance_source=False,
         weights="weights",
@@ -458,7 +540,7 @@ def test_training_reestimates_with_recon_but_semantic_forwards_stay_raw(
         steps_per_epoch=1,
         lr=0.01,
         weight_decay=0.0,
-        epochs=1,
+        epochs=2,
         max_temporal_shift=60,
         num_classes=2,
         estimate_shift=True,
@@ -486,6 +568,11 @@ def test_training_reestimates_with_recon_but_semantic_forwards_stay_raw(
         shift_fourier_reg=0.001,
         shift_fourier_period_days=365.0,
         shift_fourier_solver="dense_direct",
+        source_class_residual_shift=True,
+        source_class_residual_max_days=20,
+        source_class_residual_min_samples=32,
+        source_class_residual_max_samples=128,
+        source_class_residual_min_gain=0.005,
     )
     _TrainingModel.calls = []
     timematch.train_timematch(
@@ -499,13 +586,16 @@ def test_training_reestimates_with_recon_but_semantic_forwards_stay_raw(
         splits={},
     )
 
-    assert len(estimator_calls) == 2
+    assert len(estimator_calls) == 3
+    assert len(bootstrap_calls) == 1
     assert all(
         call["shift_estimation_view"] == "fourier_recon"
         for call in estimator_calls
     )
     assert all(call["shift_fourier_num_modes"] == 13 for call in estimator_calls)
     shifts = [shift for _, shift in _TrainingModel.calls]
-    assert 4 in shifts  # current teacher target-to-source shift
-    assert -4 in shifts  # fixed source-to-target shift from epoch zero
-    assert 0 in shifts  # target student remains on raw, unshifted positions
+    scalar_shifts = [shift for shift in shifts if not torch.is_tensor(shift)]
+    tensor_shifts = [shift for shift in shifts if torch.is_tensor(shift)]
+    assert 4 in scalar_shifts  # current teacher target-to-source shift
+    assert 0 in scalar_shifts  # target student remains on raw, unshifted positions
+    assert any(torch.equal(shift[:, 0], torch.tensor([-2.0, -9.0])) for shift in tensor_shifts)
