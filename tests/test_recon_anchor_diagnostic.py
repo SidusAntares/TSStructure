@@ -748,3 +748,140 @@ def test_projected_query_reconstruction_matches_scalar_fourier_definition():
     projected = np.einsum("nfd,d->nf",coeff,projection.axis)
     expected = np.einsum("ntf,nf->nt",np.exp(1j*points[...,None]*modes),projected).real-projection.center@projection.axis
     np.testing.assert_allclose(actual,expected,atol=1e-4,rtol=2e-5)
+
+
+def test_joint_anchor_window_uses_shared_calendar_and_support_gate():
+    from analysis.recon_anchor_diagnostic import build_joint_anchor_window
+
+    window = build_joint_anchor_window(
+        source_anchor_day=150,
+        target_anchor_day=160,
+        source_support=(100, 220),
+        target_support=(110, 210),
+        margin_days=20,
+        max_anchor_distance_days=20,
+        min_anchor_side_support_days=15,
+    )
+    assert window.valid
+    assert (window.start_day, window.end_day, window.width_days) == (130, 180, 50)
+
+    too_far = build_joint_anchor_window(150, 171, (0, 364), (0, 364))
+    assert not too_far.valid
+    assert too_far.failure_reason == "LOCAL_INELIGIBLE_ANCHOR_TOO_FAR"
+
+    incomplete = build_joint_anchor_window(12, 18, (0, 364), (5, 364))
+    assert not incomplete.valid
+    assert incomplete.failure_reason == "LOCAL_INELIGIBLE_INCOMPLETE_ANCHOR_SUPPORT"
+
+
+def test_whole_window_phase_calls_estimator_once_without_anchor_constraint(monkeypatch):
+    import pytest
+    from types import SimpleNamespace
+    from analysis import phase_shape_diagnostic as phase_module
+    from analysis.recon_anchor_diagnostic import estimate_whole_window_local_phase
+
+    days = np.linspace(130.0, 180.0, 51)
+    source = np.column_stack((np.sin(days / 8), np.cos(days / 11)))
+    target = np.column_stack((np.sin((days - 7) / 8), np.cos((days - 7) / 11)))
+    source_before, target_before = source.copy(), target.copy()
+    gamma = np.linspace(0, 1, 128) ** 1.12
+    calls = []
+
+    def fake(left, right, k_reg=128):
+        calls.append((left.copy(), right.copy(), k_reg))
+        return SimpleNamespace(gamma=gamma, valid=True, failure_reason="")
+
+    monkeypatch.setattr(phase_module, "estimate_nonlinear_phase", fake)
+    result = estimate_whole_window_local_phase(source, target, days)
+    assert result.valid
+    assert len(calls) == 1 and calls[0][2] == 128
+    np.testing.assert_array_equal(calls[0][0], source_before)
+    np.testing.assert_array_equal(calls[0][1], target_before)
+    np.testing.assert_array_equal(source, source_before)
+    np.testing.assert_array_equal(target, target_before)
+    assert result.query_days[0] == pytest.approx(130)
+    assert result.query_days[-1] == pytest.approx(180)
+    assert np.interp(150, result.reference_days, result.query_days) != pytest.approx(150)
+
+
+def test_whole_window_query_inverse_and_no_cherry_pick(monkeypatch):
+    from types import SimpleNamespace
+    from analysis import phase_shape_diagnostic as phase_module
+    from analysis.recon_anchor_diagnostic import (
+        apply_whole_window_forward_map,
+        estimate_whole_window_local_phase,
+        sample_curve_with_query,
+    )
+
+    days = np.linspace(100.0, 160.0, 61)
+    source = np.column_stack((np.sin(days / 7), np.cos(days / 9)))
+    target = -source
+    gamma = np.linspace(0, 1, 128) ** 1.2
+    monkeypatch.setattr(
+        phase_module,
+        "estimate_nonlinear_phase",
+        lambda *args, **kwargs: SimpleNamespace(gamma=gamma, valid=True, failure_reason=""),
+    )
+    result = estimate_whole_window_local_phase(source, target, days)
+    assert result.valid
+    assert sample_curve_with_query(target, days, result.query_days).shape == source.shape
+
+    mapped = apply_whole_window_forward_map(result.query_days, result)
+    np.testing.assert_allclose(mapped, result.reference_days, atol=1e-10)
+    outside = np.array([20.0, 99.0, 161.0, 300.0])
+    np.testing.assert_array_equal(apply_whole_window_forward_map(outside, result), outside)
+    assert result.forward_min_derivative > 0
+
+
+def test_whole_window_phase_invalid_gamma_falls_back_to_identity(monkeypatch):
+    from types import SimpleNamespace
+    from analysis import phase_shape_diagnostic as phase_module
+    from analysis.recon_anchor_diagnostic import estimate_whole_window_local_phase
+
+    days = np.linspace(100.0, 150.0, 51)
+    curve = np.column_stack((np.sin(days), np.cos(days)))
+    bad = np.linspace(0, 1, 128)
+    bad[64] = bad[63]
+    monkeypatch.setattr(
+        phase_module,
+        "estimate_nonlinear_phase",
+        lambda *args, **kwargs: SimpleNamespace(gamma=bad, valid=True, failure_reason=""),
+    )
+    result = estimate_whole_window_local_phase(curve, curve, days)
+    assert not result.valid
+    assert result.failure_reason == "NONLINEAR_INVALID_NON_STRICT_GAMMA"
+    np.testing.assert_array_equal(result.query_days, result.reference_days)
+
+
+def test_whole_window_phase_uses_lam_zero_and_query_direction_moves_anchor_naturally(monkeypatch):
+    from types import SimpleNamespace
+    from analysis import phase_shape_diagnostic as phase_module
+    from analysis.recon_anchor_diagnostic import (
+        apply_whole_window_forward_map,
+        estimate_whole_window_local_phase,
+    )
+
+    days = np.linspace(130.0, 180.0, 128)
+    source = np.column_stack((np.sin(days / 9), np.cos(days / 13)))
+    target = source.copy()
+    normalized_source_anchor = (150.0 - 130.0) / 50.0
+    normalized_target_anchor = (160.0 - 130.0) / 50.0
+    base = np.linspace(0, 1, 128)
+    gamma = np.interp(
+        base,
+        [0.0, normalized_source_anchor, 1.0],
+        [0.0, normalized_target_anchor, 1.0],
+    )
+    observed_lam = []
+
+    def fake_solver(left, right, lam=0.0):
+        observed_lam.append(lam)
+        return gamma
+
+    monkeypatch.setattr(phase_module, "_solve_joint_gamma", fake_solver)
+    result = estimate_whole_window_local_phase(source, target, days)
+    assert result.valid
+    assert observed_lam == [0.0]
+    mapped_anchor = apply_whole_window_forward_map(np.array([160.0]), result)[0]
+    assert abs(mapped_anchor - 150.0) < 0.2
+    assert abs(mapped_anchor - 150.0) < abs(160.0 - 150.0)

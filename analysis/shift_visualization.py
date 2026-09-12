@@ -29,6 +29,7 @@ CONFIG_FOLDERS = {
     "timematch": "02_timematch_shift",
     "reconshift13": "03_reconshift13_shift",
     "reconshift13_class_shift20": "04_reconshift13_class_shift20",
+    "reconshift13_local_nonlinear": "04_reconshift13_local_nonlinear",
 }
 
 
@@ -38,6 +39,52 @@ class ShiftedCurves:
     source_y: np.ndarray
     target_x: np.ndarray
     target_y: np.ndarray
+
+
+@dataclass(frozen=True)
+class SamplewiseTimeMappedCurves:
+    source_x: np.ndarray
+    source_y: np.ndarray
+    target_x: np.ndarray
+    target_y: np.ndarray
+    raw_target_x: Tuple[np.ndarray, ...]
+    raw_target_y: Tuple[np.ndarray, ...]
+    mapped_target_x: Tuple[np.ndarray, ...]
+
+
+def build_samplewise_time_mapped_curves(
+    display_grid,
+    source_curves,
+    raw_target_positions,
+    raw_target_values,
+    mapped_target_positions,
+):
+    """Map each sample's x coordinates, then interpolate only for display aggregation."""
+    grid = np.asarray(display_grid, dtype=np.float64)
+    source = np.asarray(source_curves, dtype=np.float64)
+    raw_x = tuple(np.asarray(value, dtype=np.float64).copy() for value in raw_target_positions)
+    raw_y = tuple(np.asarray(value, dtype=np.float64).copy() for value in raw_target_values)
+    mapped_x = tuple(
+        np.asarray(value, dtype=np.float64).copy() for value in mapped_target_positions
+    )
+    if not (len(raw_x) == len(raw_y) == len(mapped_x)) or not len(raw_x):
+        raise ValueError("sample-wise x/y collections must be nonempty and equal-length")
+    displayed = []
+    for x, y, mapped in zip(raw_x, raw_y, mapped_x):
+        if x.ndim != 1 or y.shape != x.shape or mapped.shape != x.shape:
+            raise ValueError("each sample requires equal-length 1D x/y/mapped coordinates")
+        if not np.isfinite(mapped).all() or np.any(np.diff(mapped) <= 0):
+            raise ValueError("mapped target timestamps must be finite and strictly increasing")
+        displayed.append(np.interp(grid, mapped, y))
+    return SamplewiseTimeMappedCurves(
+        grid,
+        source,
+        grid,
+        np.stack(displayed),
+        raw_x,
+        raw_y,
+        mapped_x,
+    )
 
 
 @dataclass(frozen=True)
@@ -334,6 +381,7 @@ def _plot_view(
         "timematch": "Original TimeMatch shift",
         "reconshift13": "Recon-guided TimeMatch shift",
         "reconshift13_class_shift20": "ReconShift13 global + class residual",
+        "reconshift13_local_nonlinear": "Recon13 global + local nonlinear",
     }
     fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.2), sharex=True)
     for curve in source_sample:
@@ -471,6 +519,131 @@ def render_class_residual_figure(
         ),
     )
     return {"path": str(output_path), "ylim": [float(ylim[0]), float(ylim[1])]}
+
+
+def render_local_nonlinear_figure(
+    output_dir,
+    task_name,
+    class_id,
+    class_name,
+    curves,
+    global_shift_days,
+    ylim,
+    eligible_rate,
+    valid_rate,
+    anchor_error_before,
+    anchor_error_after,
+    corr_before,
+    corr_after,
+    max_spaghetti=40,
+    seed=1,
+    global_only_reason="",
+):
+    """Render sample-wise Raw-PSE time maps with the established two-panel style."""
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", class_name).strip("_")
+    output_path = (
+        Path(output_dir)
+        / CONFIG_FOLDERS["reconshift13_local_nonlinear"]
+        / f"{int(class_id):02d}_{safe_name}.png"
+    )
+    if global_only_reason:
+        subtitle = f"Recon13 global only | {global_only_reason}"
+    else:
+        subtitle = (
+            f"eligible target={100 * float(eligible_rate):.1f}% | "
+            f"valid nonlinear={100 * float(valid_rate):.1f}% | "
+            f"anchor error median: {float(anchor_error_before):.1f} d → "
+            f"{float(anchor_error_after):.1f} d\n"
+            f"local corr median: {float(corr_before):.3f} → {float(corr_after):.3f}"
+        )
+    view = ShiftedCurves(
+        curves.source_x,
+        curves.source_y,
+        curves.target_x,
+        curves.target_y,
+    )
+    _plot_view(
+        output_path,
+        task_name,
+        class_name,
+        "reconshift13_local_nonlinear",
+        view,
+        float(global_shift_days),
+        tuple(ylim),
+        int(max_spaghetti),
+        int(seed) + int(class_id),
+        extra_subtitle=subtitle,
+    )
+    return {
+        "path": str(output_path),
+        "ylim": [float(ylim[0]), float(ylim[1])],
+        "source_count": int(len(curves.source_y)),
+        "target_count": int(len(curves.target_y)),
+    }
+
+
+def _write_mapping_rows(path, rows):
+    rows = list(rows)
+    fields = []
+    for row in rows:
+        for key in row:
+            if key not in fields:
+                fields.append(key)
+    with Path(path).open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+        if fields:
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def update_local_nonlinear_outputs(
+    output_dir,
+    manifest,
+    sample_rows,
+    class_rows,
+    class_metadata,
+):
+    """Persist only the new local-nonlinear extension and preserve prior views."""
+    output_dir = Path(output_dir)
+    _write_mapping_rows(output_dir / "local_nonlinear_sample_summary.csv", sample_rows)
+    _write_mapping_rows(output_dir / "local_nonlinear_class_summary.csv", class_rows)
+    updated = dict(manifest)
+    updated["reconshift13_local_nonlinear"] = {
+        "enabled": True,
+        "mode": 13,
+        "base": "reconshift13_global",
+        "target_grouping": "oracle_true_label_offline_only",
+        "target_label_usage": "offline_oracle_class_correspondence_only",
+        "anchor_role": "correspondence_and_window_gate_only",
+        "anchor_max_distance_days": 20,
+        "joint_window_margin_days": 20,
+        "min_anchor_side_support_days": 15,
+        "relative_prominence_threshold": 0.20,
+        "domain_elevation_threshold": 0.75,
+        "source_occurrence_threshold": 0.70,
+        "source_timing_mad_threshold_days": 20,
+        "nonlinear_registration": "multivariate_srvf_whole_window",
+        "srvf_lambda": 0,
+        "k_reg": 128,
+        "query_map": "source/reference output day -> target global input day",
+        "raw_forward_map": "inverse(query_map)",
+        "anchor_hard_constraint": False,
+        "padding": False,
+        "circular_wrap": False,
+        "raw_features_modified": False,
+    }
+    outputs = {
+        str(key): dict(value)
+        for key, value in updated.get("class_outputs", {}).items()
+    }
+    for class_id, metadata in class_metadata.items():
+        outputs.setdefault(str(class_id), {})[
+            "reconshift13_local_nonlinear"
+        ] = dict(metadata)
+    updated["class_outputs"] = outputs
+    (output_dir / "manifest.json").write_text(
+        json.dumps(updated, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def validate_existing_task_outputs(output_dir: Path):

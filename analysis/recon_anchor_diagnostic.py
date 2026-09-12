@@ -108,6 +108,28 @@ class LocalPhaseResult:
 
 
 @dataclass(frozen=True)
+class JointAnchorWindow:
+    start_day: float
+    end_day: float
+    width_days: float
+    valid: bool
+    failure_reason: str
+
+
+@dataclass(frozen=True)
+class WholeWindowPhaseResult:
+    reference_days: np.ndarray
+    query_days: np.ndarray
+    valid: bool
+    failure_reason: str
+    max_displacement_days: float
+    forward_min_derivative: float
+    forward_median_derivative: float
+    forward_max_derivative: float
+    extreme: bool
+
+
+@dataclass(frozen=True)
 class PreparedAnchorPhaseReference:
     days: np.ndarray
     anchor_day: float
@@ -127,6 +149,145 @@ def robust_normalize_curve(curve: np.ndarray, eps: float = 1e-8):
     if dynamic <= eps:
         return np.zeros_like(values), 0.0
     return (values - np.median(finite)) / (scale + eps), scale
+
+
+def build_joint_anchor_window(
+    source_anchor_day,
+    target_anchor_day,
+    source_support,
+    target_support,
+    margin_days=20,
+    max_anchor_distance_days=20,
+    min_anchor_side_support_days=15,
+):
+    """Build one unpadded source/target calendar window around corresponding anchors."""
+    source_anchor = float(source_anchor_day)
+    target_anchor = float(target_anchor_day)
+    margin = float(margin_days)
+    start = min(source_anchor, target_anchor) - margin
+    end = max(source_anchor, target_anchor) + margin
+    if abs(target_anchor - source_anchor) > float(max_anchor_distance_days):
+        return JointAnchorWindow(
+            start, end, end - start, False, "LOCAL_INELIGIBLE_ANCHOR_TOO_FAR"
+        )
+    source_start, source_end = map(float, source_support)
+    target_start, target_end = map(float, target_support)
+    common_start = max(source_start, target_start)
+    common_end = min(source_end, target_end)
+    side = float(min_anchor_side_support_days)
+    complete = (
+        start >= common_start
+        and end <= common_end
+        and source_anchor - common_start >= side
+        and common_end - source_anchor >= side
+        and target_anchor - common_start >= side
+        and common_end - target_anchor >= side
+    )
+    if not complete:
+        return JointAnchorWindow(
+            start,
+            end,
+            end - start,
+            False,
+            "LOCAL_INELIGIBLE_INCOMPLETE_ANCHOR_SUPPORT",
+        )
+    return JointAnchorWindow(start, end, end - start, True, "")
+
+
+def _invalid_whole_window(reference_days, reason):
+    reference = np.asarray(reference_days, dtype=np.float64).copy()
+    return WholeWindowPhaseResult(
+        reference,
+        reference.copy(),
+        False,
+        reason,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        False,
+    )
+
+
+def estimate_whole_window_local_phase(source_window, target_window, days):
+    """Estimate one endpoint-fixed query map over the complete joint window.
+
+    The returned query map is always source/reference output day -> target input day.
+    No anchor is moved or fixed inside this adapter, and validity is purely numerical.
+    """
+    from analysis import phase_shape_diagnostic as phase_module
+
+    source = np.asarray(source_window, dtype=np.float64)
+    target = np.asarray(target_window, dtype=np.float64)
+    reference = np.asarray(days, dtype=np.float64)
+    if (
+        source.ndim != 2
+        or source.shape != target.shape
+        or len(source) != len(reference)
+        or len(reference) < 3
+        or not np.all(np.diff(reference) > 0)
+    ):
+        raise ValueError("whole-window inputs must share [T,D] on an increasing grid")
+    if not np.isfinite(source).all() or not np.isfinite(target).all():
+        return _invalid_whole_window(reference, "NONLINEAR_NONFINITE_INPUT")
+    phase = phase_module.estimate_nonlinear_phase(source, target, k_reg=128)
+    if not phase.valid:
+        return _invalid_whole_window(
+            reference, "NONLINEAR_SOLVER_FAILURE:" + str(phase.failure_reason)
+        )
+    gamma = np.asarray(phase.gamma, dtype=np.float64)
+    if (
+        gamma.shape != (128,)
+        or not np.isfinite(gamma).all()
+        or np.any(np.diff(gamma) <= 0)
+        or not np.isclose(gamma[0], 0.0, atol=1e-5)
+        or not np.isclose(gamma[-1], 1.0, atol=1e-5)
+    ):
+        return _invalid_whole_window(reference, "NONLINEAR_INVALID_NON_STRICT_GAMMA")
+    normalized = np.interp(
+        np.linspace(0.0, 1.0, len(reference)),
+        np.linspace(0.0, 1.0, len(gamma)),
+        gamma,
+    )
+    query = reference[0] + (reference[-1] - reference[0]) * normalized
+    query[0], query[-1] = reference[0], reference[-1]
+    if np.any(np.diff(query) <= 0):
+        return _invalid_whole_window(reference, "NONLINEAR_INVALID_NON_STRICT_GAMMA")
+    forward_derivative = np.diff(reference) / np.diff(query)
+    low, median, high = map(
+        float,
+        (
+            forward_derivative.min(),
+            np.median(forward_derivative),
+            forward_derivative.max(),
+        ),
+    )
+    displacement = float(np.max(np.abs(query - reference)))
+    return WholeWindowPhaseResult(
+        reference.copy(),
+        query,
+        True,
+        "",
+        displacement,
+        low,
+        median,
+        high,
+        bool(displacement > 15.0 or low < 0.5 or high > 2.0),
+    )
+
+
+def apply_whole_window_forward_map(target_global_days, phase):
+    """Apply F=Q^-1 inside the joint window and identity outside it."""
+    values = np.asarray(target_global_days, dtype=np.float64)
+    if not phase.valid:
+        return values.copy()
+    result = values.copy()
+    start, end = phase.reference_days[0], phase.reference_days[-1]
+    inside = (values >= start) & (values <= end)
+    result[inside] = invert_monotone_map(
+        phase.reference_days, phase.query_days, values[inside]
+    )
+    return result
 
 
 def domain_projection_baseline(features, axis, center):

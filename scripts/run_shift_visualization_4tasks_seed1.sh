@@ -17,6 +17,40 @@ SEED="${SEED:-1}"
 FOLD="${FOLD:-0}"
 GRID_SIZE="${GRID_SIZE:-128}"
 DEVICE="${DEVICE:-cuda}"
+ADD_RECON13_LOCAL_NONLINEAR="${ADD_RECON13_LOCAL_NONLINEAR:-0}"
+LOCAL_LOG_ROOT="${LOCAL_LOG_ROOT:-logs/reconshift13_local_nonlinear_visualization_seed1}"
+
+run_local_task() {
+    local gpu="$1"
+    local source="$2"
+    local target="$3"
+    local task="${source}_${target}"
+    local source_weights
+    case "$source" in
+        AT1) source_weights="$AT1_WEIGHTS" ;;
+        DK1) source_weights="$DK1_WEIGHTS" ;;
+        FR1) source_weights="$FR1_WEIGHTS" ;;
+        FR2) source_weights="$FR2_WEIGHTS" ;;
+        *) echo "ERROR: unknown source alias: $source" >&2; return 2 ;;
+    esac
+    echo "[START] GPU${gpu} ${source} -> ${target}"
+    CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u scripts/visualize_shift_configs_4tasks.py \
+        --data-root "$DATA_ROOT" \
+        --source-checkpoint-root "$SOURCE_CHECKPOINT_ROOT" \
+        --source-checkpoint "${source}=${source_weights}" \
+        --timematch-output-root "$TIMEMATCH_OUTPUT_ROOT" \
+        --timematch-log-root "$TIMEMATCH_LOG_ROOT" \
+        --reconshift-output-root "$RECONSHIFT_OUTPUT_ROOT" \
+        --reconshift-log-root "$RECONSHIFT_LOG_ROOT" \
+        --output-root "$OUTPUT_ROOT" \
+        --source-domain "$source" \
+        --target-domain "$target" \
+        --seed "$SEED" \
+        --fold "$FOLD" \
+        --grid-size "$GRID_SIZE" \
+        --add-recon13-local-nonlinear \
+        --device "$DEVICE"
+}
 
 AT1_WEIGHTS="${AT1_WEIGHTS:-outputs/pseltae_AT1_source_seed1}"
 DK1_WEIGHTS="${DK1_WEIGHTS:-outputs/pseltae_DK1_source_seed1}"
@@ -38,6 +72,26 @@ done
 
 mkdir -p "$OUTPUT_ROOT"
 export PYTHONUNBUFFERED=1
+
+if [[ "$ADD_RECON13_LOCAL_NONLINEAR" == "1" ]]; then
+    mkdir -p "$LOCAL_LOG_ROOT"
+    run_local_task 0 AT1 DK1 > "$LOCAL_LOG_ROOT/AT1_DK1.log" 2>&1 & pid0=$!
+    run_local_task 1 DK1 FR1 > "$LOCAL_LOG_ROOT/DK1_FR1.log" 2>&1 & pid1=$!
+    run_local_task 2 FR1 FR2 > "$LOCAL_LOG_ROOT/FR1_FR2.log" 2>&1 & pid2=$!
+    run_local_task 3 FR2 AT1 > "$LOCAL_LOG_ROOT/FR2_AT1.log" 2>&1 & pid3=$!
+    status=0
+    for pid in "$pid0" "$pid1" "$pid2" "$pid3"; do
+        if ! wait "$pid"; then
+            status=1
+        fi
+    done
+    if [[ "$status" -ne 0 ]]; then
+        echo "ERROR: one or more local nonlinear visualizations failed; inspect $LOCAL_LOG_ROOT" >&2
+        exit 1
+    fi
+    echo "[ALL FINISHED] Recon13 local nonlinear visualizations written to $OUTPUT_ROOT"
+    exit 0
+fi
 
 printf '%s\n' \
     "============================================================" \

@@ -419,6 +419,62 @@ def test_launcher_extends_same_baseline_output_root():
     assert '"$OUTPUT_ROOT"' in text
 
 
+def test_launcher_can_run_local_nonlinear_four_task_gpu_wave_without_changing_default():
+    text = Path("scripts/run_shift_visualization_4tasks_seed1.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'ADD_RECON13_LOCAL_NONLINEAR="${ADD_RECON13_LOCAL_NONLINEAR:-0}"' in text
+    assert "--add-recon13-local-nonlinear" in text
+    for gpu, task in enumerate(("AT1 DK1", "DK1 FR1", "FR1 FR2", "FR2 AT1")):
+        assert f"run_local_task {gpu} {task}" in text
+    assert "--add-class-residual-shift" in text
+    assert all(token not in text for token in ("git ", "curl ", "wget ", "pip install"))
+
+
+def test_local_nonlinear_runner_uses_whole_window_path_not_anchor_fixed_helpers():
+    text = Path("scripts/visualize_shift_configs_4tasks.py").read_text(encoding="utf-8")
+    assert "--add-recon13-local-nonlinear" in text
+    assert "estimate_whole_window_local_phase(" in text
+    active = text[text.index("def run_local_nonlinear_extension(") : text.index("def run_task(")]
+    assert "reconstruct_windows_batched(" in active
+    assert "reconstruct_one_window(" not in active
+    for forbidden in (
+        "build_anchor_time_maps(",
+        "stitch_half_phase_gammas(",
+        "estimate_anchor_fixed_local_phase(",
+        "estimate_anchor_fixed_local_phases(",
+        "estimate_anchor_fixed_local_phase_prepared(",
+    ):
+        assert forbidden not in active
+
+
+def test_sample_specific_fourier_windows_are_reconstructed_in_one_batch():
+    import torch
+    from scripts.visualize_shift_configs_4tasks import reconstruct_windows_batched
+
+    class Synthesizer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, coefficients, positions):
+            self.calls += 1
+            scale = coefficients.real.sum(dim=1)[:, None, :]
+            return positions[:, :, None] + scale
+
+    synthesizer = Synthesizer()
+    coefficients = np.ones((3, 5, 2), dtype=np.complex64)
+    queries = np.stack(
+        (np.linspace(10, 20, 8), np.linspace(11, 21, 8), np.linspace(12, 22, 8))
+    )
+    actual = reconstruct_windows_batched(
+        coefficients, queries, synthesizer, torch.device("cpu"), batch_size=16
+    )
+    expected = np.repeat(queries[:, :, None] + 5.0, 2, axis=2)
+    np.testing.assert_allclose(actual, expected)
+    assert synthesizer.calls == 1
+
+
 def test_cli_uses_neutral_mode13_reconstruction_and_oracle_labels_only_for_grouping():
     path = Path("scripts/visualize_shift_configs_4tasks.py")
     text = path.read_text(encoding="utf-8")
@@ -465,3 +521,102 @@ def test_daily_prototype_is_median_of_neutral_fourier_recon13_curves():
     daily = torch.arange(365, dtype=torch.float32).repeat(3, 1)
     expected = torch.median(synthesizer(coefficients, daily), dim=0).values.numpy()
     np.testing.assert_allclose(prototype, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_samplewise_time_mapping_preserves_raw_y_and_warps_before_aggregation():
+    from analysis.shift_visualization import build_samplewise_time_mapped_curves
+
+    display = np.linspace(0, 10, 11)
+    source = np.stack((display, display + 1))
+    positions = (np.array([0.0, 5.0, 10.0]), np.array([0.0, 5.0, 10.0]))
+    values = (np.array([0.0, 5.0, 10.0]), np.array([0.0, 5.0, 10.0]))
+    mapped = (positions[0].copy(), np.array([0.0, 7.0, 10.0]))
+    result = build_samplewise_time_mapped_curves(
+        display, source, positions, values, mapped
+    )
+    np.testing.assert_array_equal(result.raw_target_y[0], values[0])
+    np.testing.assert_array_equal(result.raw_target_y[1], values[1])
+    np.testing.assert_array_equal(result.mapped_target_x[0], mapped[0])
+    np.testing.assert_array_equal(result.mapped_target_x[1], mapped[1])
+    assert not np.array_equal(result.target_y[0], result.target_y[1])
+    assert result.target_y.shape == (2, 11)
+
+
+def test_samplewise_time_mapping_rejects_non_monotone_timestamps():
+    import pytest
+    from analysis.shift_visualization import build_samplewise_time_mapped_curves
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        build_samplewise_time_mapped_curves(
+            np.arange(4.0),
+            np.ones((1, 4)),
+            (np.array([0.0, 1.0, 2.0]),),
+            (np.array([1.0, 2.0, 3.0]),),
+            (np.array([0.0, 2.0, 1.0]),),
+        )
+
+
+def test_local_nonlinear_output_is_parallel_04_and_old_folders_untouched(tmp_path):
+    import json
+    from analysis.shift_visualization import (
+        build_samplewise_time_mapped_curves,
+        render_local_nonlinear_figure,
+        update_local_nonlinear_outputs,
+    )
+
+    old_paths = []
+    for folder in (
+        "01_raw_pse",
+        "02_timematch_shift",
+        "03_reconshift13_shift",
+        "04_reconshift13_class_shift20",
+    ):
+        path = tmp_path / folder / "00_crop.png"
+        path.parent.mkdir(parents=True)
+        path.write_bytes((folder + "-sentinel").encode())
+        old_paths.append(path)
+    old_bytes = {path: path.read_bytes() for path in old_paths}
+    manifest = {"class_outputs": {"0": {"raw": {"ylim": [-2, 4]}}}, "keep": 7}
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    grid = np.linspace(0, 365, 32)
+    source = np.stack((np.sin(grid / 40), np.sin(grid / 40) + 0.1))
+    raw_x = (np.array([20.0, 100.0, 180.0, 260.0, 340.0]),)
+    raw_y = (np.sin(raw_x[0] / 40),)
+    mapped_x = (raw_x[0] + np.array([0.0, 2.0, 0.0, 0.0, 0.0]),)
+    curves = build_samplewise_time_mapped_curves(grid, source, raw_x, raw_y, mapped_x)
+    metadata = render_local_nonlinear_figure(
+        tmp_path,
+        "AT1→DK1",
+        0,
+        "crop",
+        curves,
+        global_shift_days=-5,
+        ylim=(-2, 4),
+        eligible_rate=1.0,
+        valid_rate=1.0,
+        anchor_error_before=8.0,
+        anchor_error_after=3.0,
+        corr_before=0.2,
+        corr_after=0.5,
+    )
+    update_local_nonlinear_outputs(
+        tmp_path,
+        manifest,
+        [{"sample_id": 1, "class_id": 0}],
+        [{"class_id": 0, "class_name": "crop"}],
+        {"0": metadata},
+    )
+
+    assert (tmp_path / "04_reconshift13_local_nonlinear" / "00_crop.png").is_file()
+    assert (tmp_path / "local_nonlinear_sample_summary.csv").is_file()
+    assert (tmp_path / "local_nonlinear_class_summary.csv").is_file()
+    for path, content in old_bytes.items():
+        assert path.read_bytes() == content
+    updated = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert updated["keep"] == 7
+    config = updated["reconshift13_local_nonlinear"]
+    assert config["anchor_role"] == "correspondence_and_window_gate_only"
+    assert config["anchor_hard_constraint"] is False
+    assert config["raw_features_modified"] is False
+    assert updated["class_outputs"]["0"]["reconshift13_local_nonlinear"] == metadata
