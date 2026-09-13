@@ -30,6 +30,7 @@ CONFIG_FOLDERS = {
     "reconshift13": "03_reconshift13_shift",
     "reconshift13_class_shift20": "04_reconshift13_class_shift20",
     "reconshift13_local_nonlinear": "04_reconshift13_local_nonlinear",
+    "reconshift13_multi_event": "04_reconshift13_multi_event",
 }
 
 
@@ -640,6 +641,50 @@ def update_local_nonlinear_outputs(
         outputs.setdefault(str(class_id), {})[
             "reconshift13_local_nonlinear"
         ] = dict(metadata)
+    updated["class_outputs"] = outputs
+    (output_dir / "manifest.json").write_text(
+        json.dumps(updated, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def update_multi_event_outputs(
+    output_dir,
+    manifest,
+    detector_config,
+    source_rows,
+    target_rows,
+    match_rows,
+    class_rows,
+    class_metadata,
+):
+    """Persist the parallel Mode13 event audit without touching prior views."""
+    output_dir = Path(output_dir)
+    folder = output_dir / CONFIG_FOLDERS["reconshift13_multi_event"]
+    folder.mkdir(parents=True, exist_ok=True)
+    for filename, rows in (
+        ("source_events.csv", source_rows),
+        ("target_events.csv", target_rows),
+        ("event_matches.csv", match_rows),
+        ("class_summary.csv", class_rows),
+    ):
+        _write_mapping_rows(folder / filename, rows)
+    updated = dict(manifest)
+    updated["multi_event"] = {
+        "mode": 13,
+        "global_shift_source": "existing_reconshift13",
+        "circular_detection": True,
+        **dict(detector_config),
+        "correspondence_solver": "greedy_nearest_same_type",
+        "nonlinear_registration": False,
+        "raw_timestamp_modified": False,
+        "target_label_usage": "offline_oracle_class_correspondence_only",
+    }
+    outputs = {
+        str(key): dict(value)
+        for key, value in updated.get("class_outputs", {}).items()
+    }
+    for class_id, metadata in class_metadata.items():
+        outputs.setdefault(str(class_id), {})["reconshift13_multi_event"] = dict(metadata)
     updated["class_outputs"] = outputs
     (output_dir / "manifest.json").write_text(
         json.dumps(updated, indent=2, ensure_ascii=False), encoding="utf-8"

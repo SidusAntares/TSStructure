@@ -620,3 +620,104 @@ def test_local_nonlinear_output_is_parallel_04_and_old_folders_untouched(tmp_pat
     assert config["anchor_hard_constraint"] is False
     assert config["raw_features_modified"] is False
     assert updated["class_outputs"]["0"]["reconshift13_local_nonlinear"] == metadata
+
+
+def test_multi_event_extension_is_mode13_non_warping_and_cli_tunable():
+    runner = Path("scripts/visualize_shift_configs_4tasks.py").read_text(encoding="utf-8")
+    launcher = Path("scripts/run_shift_visualization_4tasks_seed1.sh").read_text(encoding="utf-8")
+    assert "--add-recon13-multi-event" in runner
+    defaults = {
+        "--event-min-distance-days": "15",
+        "--event-min-width-days": "5",
+        "--event-min-relative-prominence": "0.15",
+        "--event-min-domain-prominence": "0.20",
+        "--event-min-domain-elevation": "0.50",
+        "--event-source-occurrence-radius-days": "20",
+        "--event-min-source-occurrence": "0.60",
+        "--event-max-source-timing-mad-days": "20",
+        "--event-match-radius-days": "25",
+    }
+    for option, default in defaults.items():
+        assert option in runner and f"default={default}" in runner
+    active = runner[runner.index("def run_multi_event_extension(") : runner.index("def run_local_nonlinear_extension(")]
+    for forbidden in ("estimate_nonlinear_phase", "SRVF", "apply_whole_window_forward_map"):
+        assert forbidden not in active
+    assert '["positions"]' not in active
+    assert 'ADD_RECON13_MULTI_EVENT="${ADD_RECON13_MULTI_EVENT:-0}"' in launcher
+    for gpu, task in enumerate(("AT1 DK1", "DK1 FR1", "FR1 FR2", "FR2 AT1")):
+        assert f"run_multi_event_task {gpu} {task}" in launcher
+
+
+def test_multi_event_outputs_are_parallel_and_preserve_existing_views(tmp_path):
+    import json
+    from analysis.shift_visualization import update_multi_event_outputs
+
+    sentinels = {}
+    for folder in (
+        "01_raw_pse",
+        "02_timematch_shift",
+        "03_reconshift13_shift",
+        "04_reconshift13_class_shift20",
+        "04_reconshift13_local_nonlinear",
+    ):
+        path = tmp_path / folder / "00_crop.png"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(folder.encode())
+        sentinels[path] = path.read_bytes()
+    manifest = {"keep": 9, "class_outputs": {"0": {"raw": {"ylim": [-1, 2]}}}}
+    update_multi_event_outputs(
+        tmp_path,
+        manifest,
+        {"min_distance_days": 15, "match_radius_days": 25},
+        [{"task": "A_B", "event_id": "S0"}],
+        [{"task": "A_B", "event_id": "T0"}],
+        [{"task": "A_B", "match_status": "MATCHED"}],
+        [{"class_id": 0, "num_source_candidates": 1}],
+        {"0": {"path": "04_reconshift13_multi_event/00_crop.png"}},
+    )
+    for path, value in sentinels.items():
+        assert path.read_bytes() == value
+    folder = tmp_path / "04_reconshift13_multi_event"
+    for name in ("source_events.csv", "target_events.csv", "event_matches.csv", "class_summary.csv"):
+        assert (folder / name).is_file()
+    updated = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert updated["keep"] == 9
+    assert updated["multi_event"]["mode"] == 13
+    assert updated["multi_event"]["nonlinear_registration"] is False
+    assert updated["multi_event"]["raw_timestamp_modified"] is False
+
+
+def test_multi_event_two_panel_and_acceptance_detail_figures_render(tmp_path):
+    from analysis.recon_anchor_diagnostic import DomainProjectionBaseline
+    from analysis.recon_event_diagnostic import detect_circular_events, greedy_match_events
+    from scripts.visualize_shift_configs_4tasks import _plot_multi_event_class
+
+    days = np.arange(365.0)
+    source = (
+        2.8 * np.exp(-0.5 * ((days - 110) / 10) ** 2)
+        - 2.2 * np.exp(-0.5 * ((days - 205) / 12) ** 2)
+        + 2.0 * np.exp(-0.5 * ((days - 290) / 9) ** 2)
+    )
+    target = np.stack([np.roll(source, shift) for shift in (3, 6)])
+    baseline = DomainProjectionBaseline(0.0, 1.0)
+    source_events = detect_circular_events(source, days, baseline, event_prefix="S")
+    target_events = [
+        detect_circular_events(curve, days, baseline, event_prefix="T")
+        for curve in target
+    ]
+    matches = [greedy_match_events(source_events, events) for events in target_events]
+    main = tmp_path / "04_reconshift13_multi_event" / "05_winter_barley.png"
+    detail = tmp_path / "04_reconshift13_multi_event" / "diagnostics" / "05_winter_barley_event_detail.png"
+    _plot_multi_event_class(
+        main,
+        detail,
+        "winter_barley",
+        source,
+        target,
+        source_events,
+        target_events,
+        matches,
+    )
+    assert main.is_file() and main.stat().st_size > 0
+    assert detail.is_file() and detail.stat().st_size > 0
+    assert len([event for event in source_events if event.accepted]) >= 3

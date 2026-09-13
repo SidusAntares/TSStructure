@@ -885,3 +885,169 @@ def test_whole_window_phase_uses_lam_zero_and_query_direction_moves_anchor_natur
     mapped_anchor = apply_whole_window_forward_map(np.array([160.0]), result)[0]
     assert abs(mapped_anchor - 150.0) < 0.2
     assert abs(mapped_anchor - 150.0) < abs(160.0 - 150.0)
+
+
+def test_circular_event_detector_finds_peak_valley_and_secondary_structures():
+    from analysis.recon_anchor_diagnostic import DomainProjectionBaseline
+    from analysis.recon_event_diagnostic import detect_circular_events
+
+    days = np.arange(365.0)
+    curve = (
+        3.0 * np.exp(-0.5 * ((days - 80) / 9) ** 2)
+        - 2.5 * np.exp(-0.5 * ((days - 155) / 11) ** 2)
+        + 2.2 * np.exp(-0.5 * ((days - 245) / 10) ** 2)
+        - 2.0 * np.exp(-0.5 * ((days - 310) / 9) ** 2)
+    )
+    events = detect_circular_events(
+        curve,
+        days,
+        DomainProjectionBaseline(0.0, 1.0),
+        min_distance_days=15,
+        min_width_days=5,
+        min_relative_prominence=0.15,
+        min_domain_prominence=0.20,
+        min_domain_elevation=0.50,
+    )
+    accepted = [event for event in events if event.accepted]
+    assert len([event for event in accepted if event.kind == "peak"]) >= 2
+    assert len([event for event in accepted if event.kind == "valley"]) >= 2
+    assert any(abs(event.day - 245) < 3 for event in accepted)
+
+
+def test_event_salience_records_rejections_and_width_distance_gates():
+    from analysis.recon_anchor_diagnostic import DomainProjectionBaseline
+    from analysis.recon_event_diagnostic import detect_circular_events
+
+    days = np.arange(365.0)
+    broad = np.exp(-0.5 * ((days - 100) / 8) ** 2)
+    narrow = 0.8 * np.exp(-0.5 * ((days - 180) / 0.8) ** 2)
+    neighbor = 0.7 * np.exp(-0.5 * ((days - 107) / 2) ** 2)
+    events = detect_circular_events(
+        broad + narrow + neighbor,
+        days,
+        DomainProjectionBaseline(10.0, 20.0),
+        min_distance_days=15,
+        min_width_days=5,
+        min_relative_prominence=0.05,
+        min_domain_prominence=0.20,
+        min_domain_elevation=0.50,
+    )
+    assert sum(abs(event.day - 100) < 12 for event in events if event.kind == "peak") == 1
+    rejected = [event for event in events if not event.accepted]
+    assert any("too_narrow" in event.rejection_reason for event in rejected)
+    assert any("low_domain_prominence" in event.rejection_reason for event in events)
+
+
+def test_circular_boundary_detection_and_statistics_do_not_duplicate_events():
+    from analysis.recon_anchor_diagnostic import DomainProjectionBaseline
+    from analysis.recon_event_diagnostic import (
+        circular_day_distance,
+        circular_day_residual,
+        circular_mad_days,
+        detect_circular_events,
+    )
+
+    assert circular_day_distance(355, 8) == 18
+    assert circular_day_residual(8, 355) == 18
+    assert circular_mad_days([355, 2, 5], reference_day=355) < 6
+    days = np.arange(365.0)
+    distance = np.minimum((days - 358) % 365, (358 - days) % 365)
+    curve = np.exp(-0.5 * (distance / 8) ** 2)
+    events = detect_circular_events(
+        curve,
+        days,
+        DomainProjectionBaseline(0.0, 0.2),
+        min_distance_days=15,
+        min_width_days=5,
+        min_relative_prominence=0.15,
+        min_domain_prominence=0.20,
+        min_domain_elevation=0.50,
+    )
+    peaks = [event for event in events if event.kind == "peak"]
+    assert len(peaks) == 1
+    assert abs(peaks[0].day - 358) < 2
+    assert peaks[0].boundary_crossing
+
+
+def test_source_event_stability_uses_circular_occurrence_and_timing():
+    from analysis.recon_anchor_diagnostic import DomainProjectionBaseline
+    from analysis.recon_event_diagnostic import (
+        detect_circular_events,
+        evaluate_source_event_stability,
+    )
+
+    days = np.arange(365.0)
+
+    def circular_peak(day):
+        distance = np.minimum((days - day) % 365, (day - days) % 365)
+        return 3.0 * np.exp(-0.5 * (distance / 8) ** 2)
+
+    prototype = circular_peak(355)
+    candidate = next(
+        event
+        for event in detect_circular_events(
+            prototype, days, DomainProjectionBaseline(0.0, 1.0), 15, 5, 0.15, 0.2, 0.5
+        )
+        if event.kind == "peak"
+    )
+    stable = evaluate_source_event_stability(
+        candidate,
+        np.stack([circular_peak(day) for day in (355, 2, 5)]),
+        days,
+        DomainProjectionBaseline(0.0, 1.0),
+        occurrence_radius_days=20,
+        min_occurrence=0.60,
+        max_timing_mad_days=20,
+        min_distance_days=15,
+        min_width_days=5,
+        min_relative_prominence=0.15,
+        min_domain_prominence=0.20,
+        min_domain_elevation=0.50,
+    )
+    assert stable.accepted
+    assert stable.source_occurrence_rate == 1.0
+    assert stable.source_timing_mad_days < 6
+
+
+def test_greedy_event_matching_is_same_type_one_to_one_and_audits_boundary():
+    from analysis.recon_event_diagnostic import StructuralEvent, greedy_match_events
+
+    def event(event_id, kind, day):
+        return StructuralEvent(
+            event_id, kind, day, 1.0, 1.0, 0.5, 0.5, 1.0, 8.0,
+            day - 4, day + 4, True, "", False, 1.0, 2.0
+        )
+
+    source = [event("S0", "peak", 355), event("S1", "valley", 100), event("S2", "peak", 200)]
+    target = [event("T0", "peak", 8), event("T1", "peak", 102), event("T2", "valley", 130)]
+    first = greedy_match_events(source, target, match_radius_days=25)
+    second = greedy_match_events(source, target, match_radius_days=25)
+    keys = lambda values: [
+        (item.source_event_id, item.target_event_id, item.match_status) for item in values
+    ]
+    assert keys(first) == keys(second)
+    matched = [item for item in first if item.match_status.startswith("MATCHED")]
+    assert len(matched) == 1
+    assert matched[0].source_event_id == "S0" and matched[0].target_event_id == "T0"
+    assert matched[0].match_status == "MATCHED_CIRCULAR_CANDIDATE"
+    assert matched[0].boundary_crossing_candidate
+    assert any(item.match_status == "UNMATCHED_SOURCE" for item in first)
+    assert any(item.match_status == "UNMATCHED_TARGET" for item in first)
+
+
+def test_greedy_event_matching_prefers_nearest_same_type_deterministically():
+    from analysis.recon_event_diagnostic import StructuralEvent, greedy_match_events
+
+    def event(event_id, kind, day):
+        return StructuralEvent(
+            event_id, kind, day, 1.0, 1.0, 0.5, 0.5, 1.0, 8.0,
+            day - 4, day + 4, True, "", False
+        )
+
+    source = [event("S0", "peak", 100), event("S1", "peak", 110), event("S2", "valley", 108)]
+    target = [event("T0", "peak", 108)]
+    results = greedy_match_events(source, target, match_radius_days=25)
+    matched = [item for item in results if item.match_status == "MATCHED"]
+    assert len(matched) == 1
+    assert (matched[0].source_event_id, matched[0].target_event_id) == ("S1", "T0")
+    assert all(item.source_event_id != "S2" for item in matched)

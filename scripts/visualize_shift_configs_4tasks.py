@@ -27,8 +27,14 @@ from analysis.shift_visualization import (
     replay_train_indices,
     update_class_residual_outputs,
     update_local_nonlinear_outputs,
+    update_multi_event_outputs,
     validate_existing_task_outputs,
     write_task_outputs,
+)
+from analysis.recon_event_diagnostic import (
+    detect_circular_events,
+    evaluate_source_event_stability,
+    greedy_match_events,
 )
 from analysis.recon_anchor_diagnostic import (
     Extremum,
@@ -590,6 +596,409 @@ def _plot_local_nonlinear_diagnostic(
     plt.close(figure)
 
 
+def _event_detector_config(args):
+    return {
+        "min_distance_days": args.event_min_distance_days,
+        "min_width_days": args.event_min_width_days,
+        "min_relative_prominence": args.event_min_relative_prominence,
+        "min_domain_prominence": args.event_min_domain_prominence,
+        "min_domain_elevation": args.event_min_domain_elevation,
+        "source_occurrence_radius_days": args.event_source_occurrence_radius_days,
+        "min_source_occurrence": args.event_min_source_occurrence,
+        "max_source_timing_mad_days": args.event_max_source_timing_mad_days,
+        "match_radius_days": args.event_match_radius_days,
+    }
+
+
+def _event_detection_kwargs(config):
+    return {
+        "min_distance_days": config["min_distance_days"],
+        "min_width_days": config["min_width_days"],
+        "min_relative_prominence": config["min_relative_prominence"],
+        "min_domain_prominence": config["min_domain_prominence"],
+        "min_domain_elevation": config["min_domain_elevation"],
+    }
+
+
+def _event_row(task, class_id, class_name, event, source=True, sample_id=""):
+    row = {
+        "task": task,
+        "class_id" if source else "true_class": class_id,
+        "class_name": class_name,
+        "event_id": event.event_id,
+        "kind": event.kind,
+        "day" if source else "day_global": event.day,
+        "value": event.value,
+        "prominence": event.prominence,
+        "relative_prominence": event.relative_prominence,
+        "domain_prominence": event.domain_relative_prominence,
+        "domain_elevation": event.domain_relative_elevation,
+        "width_days": event.width_days,
+        "left_base_day": event.left_base_day,
+        "right_base_day": event.right_base_day,
+        "accepted": event.accepted,
+        "rejection_reason": event.rejection_reason,
+        "crosses_year_boundary": event.boundary_crossing,
+    }
+    if source:
+        row.update(
+            source_occurrence_rate=event.source_occurrence_rate,
+            source_timing_mad_days=event.source_timing_mad_days,
+        )
+    else:
+        row["sample_id"] = sample_id
+    return row
+
+
+def _match_row(task, class_id, class_name, sample_id, match):
+    return {
+        "task": task,
+        "class_id": class_id,
+        "class_name": class_name,
+        "sample_id": sample_id,
+        "source_event_id": match.source_event_id,
+        "source_kind": match.source_kind,
+        "source_day": match.source_day,
+        "target_event_id": match.target_event_id,
+        "target_kind": match.target_kind,
+        "target_day": match.target_day,
+        "linear_day_distance": match.linear_day_distance,
+        "circular_day_distance": match.circular_day_distance,
+        "width_ratio": match.width_ratio,
+        "relative_prominence_difference": match.relative_prominence_difference,
+        "domain_elevation_difference": match.domain_elevation_difference,
+        "match_status": match.match_status,
+        "boundary_crossing_candidate": match.boundary_crossing_candidate,
+    }
+
+
+def _boundary_view(curve):
+    values = np.asarray(curve)
+    return np.arange(300.0, 425.0), np.concatenate((values[300:365], values[:60]))
+
+
+def _plot_multi_event_class(
+    output_path,
+    detail_path,
+    class_name,
+    source_curve,
+    target_curves,
+    source_events,
+    target_events_by_sample,
+    matches_by_sample,
+):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    days = np.arange(365.0)
+    target_median = np.median(np.asarray(target_curves), axis=0)
+    figure, axes = plt.subplots(2, 1, figsize=(11, 8), sharey=True)
+    axes[0].plot(days, source_curve, color="#1F4E79", lw=2.3, label="source prototype")
+    axes[0].plot(days, target_median, color="#B85C00", lw=2.0, label="target median")
+    for event in source_events:
+        marker = "^" if event.kind == "peak" else "v"
+        if event.accepted:
+            axes[0].scatter(event.day, event.value, marker=marker, color="#1F4E79", s=55)
+            axes[0].annotate(event.event_id, (event.day, event.value), xytext=(3, 5), textcoords="offset points")
+        else:
+            axes[0].scatter(event.day, event.value, marker="x", color="#777777", s=36)
+    for kind, marker in (("peak", "^"), ("valley", "v")):
+        event_days = np.asarray(
+            [
+                event.day
+                for sample_events in target_events_by_sample
+                for event in sample_events
+                if event.accepted and event.kind == kind
+            ],
+            dtype=np.float64,
+        )
+        if event_days.size:
+            axes[0].scatter(
+                event_days,
+                np.interp(event_days, days, target_median),
+                marker=marker,
+                color="#F28E2B",
+                alpha=0.18,
+                s=18,
+            )
+    displayed = 0
+    for sample_matches in matches_by_sample:
+        for match in sample_matches:
+            if match.match_status.startswith("MATCHED") and displayed < 30:
+                axes[0].plot(
+                    [match.source_day, match.target_day],
+                    [np.interp(match.source_day, days, source_curve), np.interp(match.target_day, days, target_median)],
+                    color="#777777",
+                    ls="--",
+                    lw=0.6,
+                    alpha=0.25,
+                )
+                axes[0].annotate(
+                    match.target_event_id,
+                    (match.target_day, np.interp(match.target_day, days, target_median)),
+                    xytext=(3, -10),
+                    textcoords="offset points",
+                    fontsize=7,
+                    color="#B85C00",
+                )
+                displayed += 1
+    axes[0].set_xlim(0, 364)
+    axes[0].set_title("Full-year global-aligned Recon13")
+    axes[0].set_xlabel("Day in global source calendar")
+    axes[0].set_ylabel("Source-class PC1 score")
+    axes[0].legend(frameon=False)
+    axes[0].grid(alpha=0.2)
+
+    boundary_days, source_boundary = _boundary_view(source_curve)
+    _, target_boundary = _boundary_view(target_median)
+    axes[1].plot(boundary_days, source_boundary, color="#1F4E79", lw=2.3)
+    axes[1].plot(boundary_days, target_boundary, color="#B85C00", lw=2.0)
+    axes[1].axvline(365, color="#555555", ls=":", lw=1.1, label="year boundary")
+    for event in source_events:
+        shown_day = event.day + 365 if event.day < 60 else event.day
+        if 300 <= shown_day <= 425:
+            axes[1].scatter(
+                shown_day,
+                np.interp(event.day, days, source_curve),
+                marker=("^" if event.kind == "peak" else "v") if event.accepted else "x",
+                color="#1F4E79" if event.accepted else "#777777",
+                s=48,
+            )
+            axes[1].annotate(event.event_id, (shown_day, np.interp(event.day, days, source_curve)), xytext=(3, 5), textcoords="offset points")
+    for kind, marker in (("peak", "^"), ("valley", "v")):
+        shown_target_days = np.asarray(
+            [
+                event.day + 365 if event.day < 60 else event.day
+                for events in target_events_by_sample
+                for event in events
+                if event.accepted
+                and event.kind == kind
+                and (event.day >= 300 or event.day < 60)
+            ],
+            dtype=np.float64,
+        )
+        if shown_target_days.size:
+            raw_days = np.mod(shown_target_days, 365.0)
+            axes[1].scatter(
+                shown_target_days,
+                np.interp(raw_days, days, target_median),
+                marker=marker,
+                color="#F28E2B",
+                alpha=0.22,
+                s=20,
+            )
+    displayed_boundary = 0
+    for matches in matches_by_sample:
+        for match in matches:
+            if not match.boundary_crossing_candidate or displayed_boundary >= 30:
+                continue
+            source_day = match.source_day + 365 if match.source_day < 60 else match.source_day
+            target_day = match.target_day + 365 if match.target_day < 60 else match.target_day
+            axes[1].plot(
+                [source_day, target_day],
+                [
+                    np.interp(match.source_day, days, source_curve),
+                    np.interp(match.target_day, days, target_median),
+                ],
+                color="#777777",
+                ls="--",
+                lw=0.7,
+                alpha=0.35,
+            )
+            displayed_boundary += 1
+    axes[1].set_xlim(300, 425)
+    axes[1].set_xticks([300, 330, 360, 365, 380, 395, 425], ["300", "330", "360", "365", "Jan+15", "Jan+30", "Jan+60"])
+    axes[1].set_title("Circular year-boundary view")
+    axes[1].set_xlabel("Unwrapped calendar day")
+    axes[1].set_ylabel("Source-class PC1 score")
+    axes[1].grid(alpha=0.2)
+    figure.suptitle(f"{class_name} | Mode13 multi-event structural capture")
+    figure.tight_layout(rect=(0, 0, 1, 0.96))
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+    detail, axis = plt.subplots(figsize=(13, 5.5))
+    axis.plot(days, source_curve, color="#1F4E79", lw=2)
+    for event in source_events:
+        axis.scatter(event.day, event.value, marker="o" if event.accepted else "x", color="#2F7D32" if event.accepted else "#B22222")
+        label = (
+            f"{event.event_id} {event.kind} d={event.day:.0f}\n"
+            f"P_rel={event.relative_prominence:.2f} P_dom={event.domain_relative_prominence:.2f} "
+            f"E_dom={event.domain_relative_elevation:.2f} w={event.width_days:.1f}\n"
+            f"occ={event.source_occurrence_rate:.2f} MAD={event.source_timing_mad_days:.1f} "
+            f"{'accepted' if event.accepted else event.rejection_reason}"
+        )
+        axis.annotate(label, (event.day, event.value), xytext=(5, 8), textcoords="offset points", fontsize=7)
+    axis.set_xlim(0, 364)
+    axis.set_title(f"{class_name} | source event acceptance audit")
+    axis.set_xlabel("Day")
+    axis.set_ylabel("Source-class PC1 score")
+    axis.grid(alpha=0.2)
+    detail.tight_layout()
+    detail_path = Path(detail_path)
+    detail_path.parent.mkdir(parents=True, exist_ok=True)
+    detail.savefig(detail_path, dpi=180, bbox_inches="tight")
+    plt.close(detail)
+
+
+def run_multi_event_extension(
+    args,
+    output_dir,
+    task_name,
+    classes,
+    projections,
+    source_coefficients,
+    target_coefficients,
+    source_records,
+    target_records,
+    source_baselines,
+    target_baselines,
+    source_prototypes,
+    recon_shift_days,
+    existing_manifest,
+    expected_filenames,
+):
+    config = _event_detector_config(args)
+    detection_kwargs = _event_detection_kwargs(config)
+    daily = np.arange(365.0)
+    source_rows, target_rows, match_rows, class_rows, metadata = [], [], [], [], {}
+    folder = Path(output_dir) / "04_reconshift13_multi_event"
+    for class_id, class_name in enumerate(classes):
+        projection = projections[class_id]
+        source_pc1 = projection.transform(source_prototypes[class_id][None])[0]
+        source_sample_curves = reconstruct_projected_coefficients(
+            source_coefficients[class_id], projection, daily
+        )
+        source_candidates = detect_circular_events(
+            source_pc1,
+            daily,
+            source_baselines[class_id],
+            event_prefix="S",
+            **detection_kwargs,
+        )
+        source_events = tuple(
+            evaluate_source_event_stability(
+                event,
+                source_sample_curves,
+                daily,
+                source_baselines[class_id],
+                occurrence_radius_days=config["source_occurrence_radius_days"],
+                min_occurrence=config["min_source_occurrence"],
+                max_timing_mad_days=config["max_source_timing_mad_days"],
+                **detection_kwargs,
+            )
+            for event in source_candidates
+        )
+        source_rows.extend(
+            _event_row(task_name, class_id, class_name, event, source=True)
+            for event in source_events
+        )
+        target_curves = reconstruct_projected_coefficients(
+            target_coefficients[class_id],
+            projection,
+            daily - float(recon_shift_days),
+        )
+        target_events_by_sample, matches_by_sample = [], []
+        for record, curve in zip(target_records[class_id], target_curves):
+            events = detect_circular_events(
+                curve,
+                daily,
+                target_baselines[class_id],
+                event_prefix="T",
+                **detection_kwargs,
+            )
+            target_events_by_sample.append(events)
+            target_rows.extend(
+                _event_row(
+                    task_name,
+                    class_id,
+                    class_name,
+                    event,
+                    source=False,
+                    sample_id=record["sample_id"],
+                )
+                for event in events
+            )
+            matches = greedy_match_events(
+                source_events, events, config["match_radius_days"]
+            )
+            matches_by_sample.append(matches)
+            match_rows.extend(
+                _match_row(
+                    task_name,
+                    class_id,
+                    class_name,
+                    record["sample_id"],
+                    match,
+                )
+                for match in matches
+            )
+        safe_name = next(
+            name for name in expected_filenames if name.startswith(f"{class_id:02d}_")
+        )
+        output_path = folder / safe_name
+        detail_path = folder / "diagnostics" / safe_name.replace(".png", "_event_detail.png")
+        _plot_multi_event_class(
+            output_path,
+            detail_path,
+            class_name,
+            source_pc1,
+            target_curves,
+            source_events,
+            target_events_by_sample,
+            matches_by_sample,
+        )
+        metadata[str(class_id)] = {
+            "path": str(output_path),
+            "diagnostic_path": str(detail_path),
+            "source_event_count": sum(event.accepted for event in source_events),
+        }
+        accepted_target_counts = [sum(event.accepted for event in events) for events in target_events_by_sample]
+        flat_matches = [match for matches in matches_by_sample for match in matches]
+        matched = [item for item in flat_matches if item.match_status.startswith("MATCHED")]
+        unmatched_source = [item for item in flat_matches if item.match_status == "UNMATCHED_SOURCE"]
+        unmatched_target = [item for item in flat_matches if item.match_status == "UNMATCHED_TARGET"]
+        stable = [event for event in source_events if event.accepted]
+        class_rows.append(
+            {
+                "class_id": class_id,
+                "class_name": class_name,
+                "num_source_candidates": len(source_events),
+                "num_source_stable_events": len(stable),
+                "num_source_peaks": sum(event.kind == "peak" for event in stable),
+                "num_source_valleys": sum(event.kind == "valley" for event in stable),
+                "mean_target_events_per_sample": float(np.mean(accepted_target_counts)) if accepted_target_counts else np.nan,
+                "matched_rate": len(matched) / max(1, len(matched) + len(unmatched_target)),
+                "boundary_candidate_rate": sum(item.boundary_crossing_candidate for item in matched) / max(1, len(matched)),
+                "unmatched_source_rate": len(unmatched_source) / max(1, len(unmatched_source) + len(matched)),
+                "unmatched_target_rate": len(unmatched_target) / max(1, len(unmatched_target) + len(matched)),
+                "median_match_circular_distance": _finite_median(item.circular_day_distance for item in matched),
+                "source_event_days": ";".join(f"{event.day:.1f}" for event in stable),
+                "source_event_types": ";".join(event.kind for event in stable),
+            }
+        )
+    generated = {path.name for path in folder.glob("*.png")}
+    if generated != expected_filenames:
+        raise RuntimeError(
+            "multi-event class files differ from existing views: "
+            f"expected={sorted(expected_filenames)}, generated={sorted(generated)}"
+        )
+    update_multi_event_outputs(
+        output_dir,
+        existing_manifest,
+        config,
+        source_rows,
+        target_rows,
+        match_rows,
+        class_rows,
+        metadata,
+    )
+
+
 def run_local_nonlinear_extension(
     args,
     output_dir,
@@ -1035,8 +1444,10 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
     output_dir = Path(args.output_root) / task_name
     existing_manifest = None
     expected_filenames = None
-    extension_count = int(args.add_class_residual_shift) + int(
-        args.add_recon13_local_nonlinear
+    extension_count = (
+        int(args.add_class_residual_shift)
+        + int(args.add_recon13_local_nonlinear)
+        + int(args.add_recon13_multi_event)
     )
     if extension_count > 1:
         raise ValueError("select only one visualization extension per invocation")
@@ -1061,7 +1472,9 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
         device,
         bool(config.get("with_extra", False)),
         fourier_analyzer,
-        collect_samplewise=args.add_recon13_local_nonlinear,
+        collect_samplewise=(
+            args.add_recon13_local_nonlinear or args.add_recon13_multi_event
+        ),
     )
     source_prototypes = None
     if args.add_class_residual_shift:
@@ -1073,7 +1486,7 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
             for class_id, values in source_coefficients.items()
         }
         del source_coefficients
-    elif args.add_recon13_local_nonlinear:
+    elif args.add_recon13_local_nonlinear or args.add_recon13_multi_event:
         (
             source_curves,
             source_coefficients,
@@ -1095,7 +1508,9 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
         device,
         bool(config.get("with_extra", False)),
         fourier_analyzer,
-        collect_samplewise=args.add_recon13_local_nonlinear,
+        collect_samplewise=(
+            args.add_recon13_local_nonlinear or args.add_recon13_multi_event
+        ),
     )
     if args.add_class_residual_shift:
         target_curves, target_coefficients = target_projected
@@ -1106,7 +1521,7 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
             for class_id, values in target_coefficients.items()
         }
         del target_coefficients
-    elif args.add_recon13_local_nonlinear:
+    elif args.add_recon13_local_nonlinear or args.add_recon13_multi_event:
         (
             target_curves,
             target_coefficients,
@@ -1211,6 +1626,27 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
             args.class_residual_max_days,
         )
         print(f"[FINISHED] {task_name} class residual extension: {output_dir}")
+        return
+
+    if args.add_recon13_multi_event:
+        run_multi_event_extension(
+            args,
+            output_dir,
+            task_name,
+            classes,
+            projections,
+            source_coefficients,
+            target_coefficients,
+            source_records,
+            target_records,
+            source_baselines,
+            target_baselines,
+            source_prototypes,
+            recon_shift.shift_days,
+            existing_manifest,
+            expected_filenames,
+        )
+        print(f"[FINISHED] {task_name} multi-event extension: {output_dir}")
         return
 
     if args.add_recon13_local_nonlinear:
@@ -1327,7 +1763,17 @@ def build_parser():
     parser.add_argument("--min-class-samples", type=int, default=2)
     parser.add_argument("--add-class-residual-shift", action="store_true")
     parser.add_argument("--add-recon13-local-nonlinear", action="store_true")
+    parser.add_argument("--add-recon13-multi-event", action="store_true")
     parser.add_argument("--class-residual-max-days", type=int, default=20)
+    parser.add_argument("--event-min-distance-days", type=float, default=15)
+    parser.add_argument("--event-min-width-days", type=float, default=5)
+    parser.add_argument("--event-min-relative-prominence", type=float, default=0.15)
+    parser.add_argument("--event-min-domain-prominence", type=float, default=0.20)
+    parser.add_argument("--event-min-domain-elevation", type=float, default=0.50)
+    parser.add_argument("--event-source-occurrence-radius-days", type=float, default=20)
+    parser.add_argument("--event-min-source-occurrence", type=float, default=0.60)
+    parser.add_argument("--event-max-source-timing-mad-days", type=float, default=20)
+    parser.add_argument("--event-match-radius-days", type=float, default=25)
     parser.add_argument("--device", default="cuda")
     return parser
 

@@ -19,6 +19,48 @@ GRID_SIZE="${GRID_SIZE:-128}"
 DEVICE="${DEVICE:-cuda}"
 ADD_RECON13_LOCAL_NONLINEAR="${ADD_RECON13_LOCAL_NONLINEAR:-0}"
 LOCAL_LOG_ROOT="${LOCAL_LOG_ROOT:-logs/reconshift13_local_nonlinear_visualization_seed1}"
+ADD_RECON13_MULTI_EVENT="${ADD_RECON13_MULTI_EVENT:-0}"
+MULTI_EVENT_LOG_ROOT="${MULTI_EVENT_LOG_ROOT:-logs/reconshift13_multi_event_visualization_seed1}"
+
+run_multi_event_task() {
+    local gpu="$1"
+    local source="$2"
+    local target="$3"
+    local source_weights
+    case "$source" in
+        AT1) source_weights="$AT1_WEIGHTS" ;;
+        DK1) source_weights="$DK1_WEIGHTS" ;;
+        FR1) source_weights="$FR1_WEIGHTS" ;;
+        FR2) source_weights="$FR2_WEIGHTS" ;;
+        *) echo "ERROR: unknown source alias: $source" >&2; return 2 ;;
+    esac
+    echo "[START] GPU${gpu} ${source} -> ${target} multi-event"
+    CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u scripts/visualize_shift_configs_4tasks.py \
+        --data-root "$DATA_ROOT" \
+        --source-checkpoint-root "$SOURCE_CHECKPOINT_ROOT" \
+        --source-checkpoint "${source}=${source_weights}" \
+        --timematch-output-root "$TIMEMATCH_OUTPUT_ROOT" \
+        --timematch-log-root "$TIMEMATCH_LOG_ROOT" \
+        --reconshift-output-root "$RECONSHIFT_OUTPUT_ROOT" \
+        --reconshift-log-root "$RECONSHIFT_LOG_ROOT" \
+        --output-root "$OUTPUT_ROOT" \
+        --source-domain "$source" \
+        --target-domain "$target" \
+        --seed "$SEED" \
+        --fold "$FOLD" \
+        --grid-size "$GRID_SIZE" \
+        --add-recon13-multi-event \
+        --event-min-distance-days "${EVENT_MIN_DISTANCE_DAYS:-15}" \
+        --event-min-width-days "${EVENT_MIN_WIDTH_DAYS:-5}" \
+        --event-min-relative-prominence "${EVENT_MIN_RELATIVE_PROMINENCE:-0.15}" \
+        --event-min-domain-prominence "${EVENT_MIN_DOMAIN_PROMINENCE:-0.20}" \
+        --event-min-domain-elevation "${EVENT_MIN_DOMAIN_ELEVATION:-0.50}" \
+        --event-source-occurrence-radius-days "${EVENT_SOURCE_OCCURRENCE_RADIUS_DAYS:-20}" \
+        --event-min-source-occurrence "${EVENT_MIN_SOURCE_OCCURRENCE:-0.60}" \
+        --event-max-source-timing-mad-days "${EVENT_MAX_SOURCE_TIMING_MAD_DAYS:-20}" \
+        --event-match-radius-days "${EVENT_MATCH_RADIUS_DAYS:-25}" \
+        --device "$DEVICE"
+}
 
 run_local_task() {
     local gpu="$1"
@@ -72,6 +114,24 @@ done
 
 mkdir -p "$OUTPUT_ROOT"
 export PYTHONUNBUFFERED=1
+
+if [[ "$ADD_RECON13_MULTI_EVENT" == "1" ]]; then
+    mkdir -p "$MULTI_EVENT_LOG_ROOT"
+    run_multi_event_task 0 AT1 DK1 > "$MULTI_EVENT_LOG_ROOT/AT1_DK1.log" 2>&1 & pid0=$!
+    run_multi_event_task 1 DK1 FR1 > "$MULTI_EVENT_LOG_ROOT/DK1_FR1.log" 2>&1 & pid1=$!
+    run_multi_event_task 2 FR1 FR2 > "$MULTI_EVENT_LOG_ROOT/FR1_FR2.log" 2>&1 & pid2=$!
+    run_multi_event_task 3 FR2 AT1 > "$MULTI_EVENT_LOG_ROOT/FR2_AT1.log" 2>&1 & pid3=$!
+    status=0
+    for pid in "$pid0" "$pid1" "$pid2" "$pid3"; do
+        if ! wait "$pid"; then status=1; fi
+    done
+    if [[ "$status" -ne 0 ]]; then
+        echo "ERROR: one or more multi-event visualizations failed; inspect $MULTI_EVENT_LOG_ROOT" >&2
+        exit 1
+    fi
+    echo "[ALL FINISHED] Recon13 multi-event visualizations written to $OUTPUT_ROOT"
+    exit 0
+fi
 
 if [[ "$ADD_RECON13_LOCAL_NONLINEAR" == "1" ]]; then
     mkdir -p "$LOCAL_LOG_ROOT"
