@@ -28,13 +28,21 @@ from analysis.shift_visualization import (
     update_class_residual_outputs,
     update_local_nonlinear_outputs,
     update_multi_event_outputs,
+    write_structure_segment_outputs,
     validate_existing_task_outputs,
+    visualization_meta_dir,
+    task_visualization_config_dir,
+    migrate_visualization_layout,
     write_task_outputs,
 )
 from analysis.recon_event_diagnostic import (
     detect_circular_events,
     evaluate_source_event_stability,
     greedy_match_events,
+)
+from analysis.recon_structure_segments import (
+    detect_structure_segments,
+    evaluate_source_segment_stability,
 )
 from analysis.recon_anchor_diagnostic import (
     Extremum,
@@ -677,6 +685,336 @@ def _boundary_view(curve):
     return np.arange(300.0, 425.0), np.concatenate((values[300:365], values[:60]))
 
 
+def _segment_row(task, class_id, class_name, segment, sample_id=None):
+    first, center, last = segment.events
+    row = {
+        "task": task,
+        "class_id" if sample_id is None else "true_class": class_id,
+        "class_name": class_name,
+        "segment_id": segment.segment_id,
+        "pattern": segment.pattern,
+        "start_event_day" if sample_id is None else "start_day": first.day % 365,
+        "center_event_day" if sample_id is None else "center_day": center.day % 365,
+        "end_event_day" if sample_id is None else "end_day": last.day % 365,
+        "span_days": segment.span_days,
+        "curve_normalized_variation": segment.curve_normalized_variation,
+        "domain_normalized_variation": segment.domain_normalized_variation,
+        "amplitude_range": segment.amplitude_range,
+        "accepted": segment.accepted,
+        "rejection_reason": segment.rejection_reason,
+        "crosses_year_boundary": segment.crosses_year_boundary,
+    }
+    if sample_id is None:
+        row.update(
+            start_event_type=first.kind,
+            center_event_type=center.kind,
+            end_event_type=last.kind,
+            total_variation=segment.total_variation,
+            source_occurrence_rate=segment.source_occurrence_rate,
+            source_center_timing_mad_days=segment.source_center_timing_mad_days,
+            source_span_ratio_median=segment.source_span_ratio_median,
+        )
+    else:
+        row["sample_id"] = sample_id
+    return row
+
+
+def _periodic_segment_intervals(segment, low=0.0, high=365.0):
+    start, _, end = segment.unwrapped_days
+    intervals = []
+    for offset in (-365.0, 0.0, 365.0):
+        left, right = start + offset, end + offset
+        clipped = (max(low, left), min(high, right))
+        if clipped[1] > clipped[0]:
+            intervals.append(clipped)
+    return intervals
+
+
+def _plot_structure_segment_class(
+    output_path,
+    detail_path,
+    class_name,
+    source_curve,
+    target_curves,
+    source_core_events,
+    source_candidates,
+    source_segments,
+    target_core_events,
+    target_candidates,
+    target_median_segments,
+):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    days = np.arange(365.0)
+    target_median = np.median(np.asarray(target_curves), axis=0)
+    figure, axes = plt.subplots(
+        3, 1, figsize=(13, 10), gridspec_kw={"height_ratios": [3.0, 1.0, 2.0]}
+    )
+    source_color, target_color = "#1F4E79", "#B85C00"
+    core_source = {(event.kind, round(event.day, 6)) for event in source_core_events if event.accepted}
+    core_target = {(event.kind, round(event.day, 6)) for event in target_core_events if event.accepted}
+    auxiliary_source = {
+        (event.kind, round(event.day % 365, 6))
+        for segment in source_segments if segment.accepted for event in segment.events
+    }
+    auxiliary_target = {
+        (event.kind, round(event.day % 365, 6))
+        for segment in target_median_segments if segment.accepted for event in segment.events
+    }
+
+    def draw_curve(axis, curve, events, core, auxiliary, color, label):
+        axis.plot(days, curve, color=color, lw=2.2, label=label)
+        for event in events:
+            key = (event.kind, round(event.day % 365, 6))
+            if key in core:
+                marker, size, alpha = ("^" if event.kind == "peak" else "v"), 58, 1.0
+            elif key in auxiliary:
+                marker, size, alpha = "o", 35, 0.9
+            else:
+                marker, size, alpha = "x", 25, 0.45
+            axis.scatter(event.day % 365, event.value, marker=marker, s=size, color=color, alpha=alpha)
+
+    for segment in source_segments:
+        if segment.accepted:
+            for left, right in _periodic_segment_intervals(segment):
+                axes[0].axvspan(left, right, color=source_color, alpha=0.07)
+                axes[0].text((left + right) / 2, 0.98, segment.segment_id, transform=axes[0].get_xaxis_transform(), ha="center", va="top", fontsize=7, color=source_color)
+    for segment in target_median_segments:
+        if segment.accepted:
+            for left, right in _periodic_segment_intervals(segment):
+                axes[0].axvspan(left, right, color=target_color, alpha=0.06)
+    draw_curve(axes[0], source_curve, source_candidates, core_source, auxiliary_source, source_color, "source prototype")
+    draw_curve(axes[0], target_median, target_candidates, core_target, auxiliary_target, target_color, "target oracle median")
+    axes[0].set_title("Full-year global-aligned Recon13: ▲/▼ core, ○ auxiliary member, × rejected")
+    axes[0].set_ylabel("Source-class PC1 score")
+    axes[0].legend(frameon=False)
+    axes[0].grid(alpha=0.2)
+
+    axes[1].hlines([1, 0], 0, 365, colors=[source_color, target_color], alpha=0.25)
+    for y, segments, color, prefix in (
+        (1, source_segments, source_color, "S"),
+        (0, target_median_segments, target_color, "T"),
+    ):
+        for segment in segments:
+            if not segment.accepted:
+                continue
+            for left, right in _periodic_segment_intervals(segment):
+                axes[1].plot([left, right], [y, y], color=color, lw=9, alpha=0.55, solid_capstyle="butt")
+                axes[1].text((left + right) / 2, y + 0.12, f"{prefix}{segment.segment_id}", ha="center", fontsize=7)
+    axes[1].scatter(
+        [event.day % 365 for event in source_core_events if event.accepted],
+        [1] * sum(event.accepted for event in source_core_events),
+        marker="|", s=180, color=source_color,
+    )
+    axes[1].scatter(
+        [event.day % 365 for event in target_core_events if event.accepted],
+        [0] * sum(event.accepted for event in target_core_events),
+        marker="|", s=180, color=target_color,
+    )
+    axes[1].set_yticks([0, 1], ["target median", "source"])
+    axes[1].set_ylim(-0.45, 1.45)
+    axes[1].set_title("Accepted structural-segment timeline (no cross-domain matching)")
+    axes[1].grid(axis="x", alpha=0.2)
+
+    boundary_days, source_boundary = _boundary_view(source_curve)
+    _, target_boundary = _boundary_view(target_median)
+    axes[2].plot(boundary_days, source_boundary, color=source_color, lw=2.2)
+    axes[2].plot(boundary_days, target_boundary, color=target_color, lw=2.0)
+    axes[2].axvline(365, color="#555555", ls=":", lw=1.1)
+    for segments, color in ((source_segments, source_color), (target_median_segments, target_color)):
+        for segment in segments:
+            if segment.accepted:
+                for left, right in _periodic_segment_intervals(segment, 300, 425):
+                    axes[2].axvspan(left, right, color=color, alpha=0.08)
+    for curve, events, core, auxiliary, color in (
+        (source_curve, source_candidates, core_source, auxiliary_source, source_color),
+        (target_median, target_candidates, core_target, auxiliary_target, target_color),
+    ):
+        for event in events:
+            shown_day = event.day + 365 if event.day < 60 else event.day
+            if 300 <= shown_day <= 425:
+                key = (event.kind, round(event.day % 365, 6))
+                if key in core:
+                    marker, size, alpha = ("^" if event.kind == "peak" else "v"), 50, 1.0
+                elif key in auxiliary:
+                    marker, size, alpha = "o", 30, 0.9
+                else:
+                    marker, size, alpha = "x", 24, 0.45
+                axes[2].scatter(
+                    shown_day,
+                    np.interp(event.day % 365, days, curve),
+                    marker=marker,
+                    s=size,
+                    color=color,
+                    alpha=alpha,
+                )
+    axes[2].set_xlim(300, 425)
+    axes[2].set_title("Circular year-boundary view")
+    axes[2].set_xlabel("Unwrapped calendar day")
+    axes[2].set_ylabel("Source-class PC1 score")
+    axes[2].grid(alpha=0.2)
+    for axis in (axes[0], axes[1]):
+        axis.set_xlim(0, 364)
+    figure.suptitle(f"{class_name} | Mode13 core events + local structure segments")
+    figure.tight_layout(rect=(0, 0, 1, 0.96))
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+    detail, axis = plt.subplots(figsize=(14, max(4.5, 1.0 + 0.55 * len(source_segments))))
+    axis.axis("off")
+    lines = ["segment | pattern | start-center-end | span | curve-var | domain-var | occurrence | MAD | width-ratio | decision"]
+    for item in source_segments:
+        lines.append(
+            f"{item.segment_id} | {item.pattern} | "
+            f"{item.unwrapped_days[0]:.1f}-{item.unwrapped_days[1]:.1f}-{item.unwrapped_days[2]:.1f} | "
+            f"{item.span_days:.1f} | {item.curve_normalized_variation:.3f} | "
+            f"{item.domain_normalized_variation:.3f} | {item.source_occurrence_rate:.3f} | "
+            f"{item.source_center_timing_mad_days:.1f} | {item.source_span_ratio_median:.3f} | "
+            f"{'ACCEPT' if item.accepted else 'REJECT ' + item.rejection_reason}"
+        )
+    axis.text(0.01, 0.98, "\n".join(lines), va="top", family="monospace", fontsize=8)
+    axis.set_title(f"{class_name} | source structural-segment threshold audit")
+    detail_path = Path(detail_path)
+    detail_path.parent.mkdir(parents=True, exist_ok=True)
+    detail.savefig(detail_path, dpi=180, bbox_inches="tight")
+    plt.close(detail)
+
+
+def run_structure_segment_extension(
+    args, output_dir, task_name, classes, projections, source_coefficients,
+    target_coefficients, target_records, source_baselines, target_baselines,
+    source_prototypes, recon_shift_days, expected_filenames,
+):
+    daily = np.arange(365.0)
+    folder = task_visualization_config_dir(output_dir, "05_reconshift13_structure_segments")
+    segment_kwargs = {
+        "min_distance_days": args.event_min_distance_days,
+        "member_min_width_days": args.segment_event_min_width_days,
+        "member_min_relative_prominence": args.segment_event_min_relative_prominence,
+        "member_min_domain_prominence": args.segment_event_min_domain_prominence,
+        "min_span_days": args.segment_min_span_days,
+        "max_span_days": args.segment_max_span_days,
+        "min_domain_variation": args.segment_min_domain_variation,
+        "min_curve_variation": args.segment_min_curve_variation,
+    }
+    core_rows, source_rows, target_rows, class_rows = [], [], [], []
+    for class_id, class_name in enumerate(classes):
+        matching = sorted(name for name in expected_filenames if name.startswith(f"{class_id:02d}_"))
+        if not matching:
+            continue
+        projection = projections[class_id]
+        source_curve = projection.transform(source_prototypes[class_id][None])[0]
+        source_samples = reconstruct_projected_coefficients(source_coefficients[class_id], projection, daily)
+        source_candidates, _, source_segments = detect_structure_segments(
+            source_curve, daily, source_baselines[class_id], event_prefix="S", segment_prefix="SSEG", **segment_kwargs
+        )
+        sample_segments = [
+            detect_structure_segments(curve, daily, source_baselines[class_id], event_prefix="I", segment_prefix="ISEG", **segment_kwargs)[2]
+            for curve in source_samples
+        ]
+        source_segments = tuple(
+            evaluate_source_segment_stability(
+                item, sample_segments,
+                args.segment_occurrence_radius_days,
+                args.segment_min_source_occurrence,
+                args.segment_max_source_timing_mad_days,
+                args.segment_max_width_ratio,
+            ) for item in source_segments
+        )
+        core_candidates = detect_circular_events(
+            source_curve, daily, source_baselines[class_id], event_prefix="CORE",
+            **_event_detection_kwargs(_event_detector_config(args)),
+        )
+        source_core = tuple(
+            evaluate_source_event_stability(
+                item, source_samples, daily, source_baselines[class_id],
+                occurrence_radius_days=args.event_source_occurrence_radius_days,
+                min_occurrence=args.event_min_source_occurrence,
+                max_timing_mad_days=args.event_max_source_timing_mad_days,
+                **_event_detection_kwargs(_event_detector_config(args)),
+            ) for item in core_candidates
+        )
+        core_rows.extend(_event_row(task_name, class_id, class_name, item) for item in source_core if item.accepted)
+        source_rows.extend(_segment_row(task_name, class_id, class_name, item) for item in source_segments)
+
+        target_curves = reconstruct_projected_coefficients(
+            target_coefficients[class_id], projection, daily - float(recon_shift_days)
+        )
+        target_segments_per_sample = []
+        for record, curve in zip(target_records[class_id], target_curves):
+            _, _, segments = detect_structure_segments(
+                curve, daily, target_baselines[class_id], event_prefix="T", segment_prefix="TSEG", **segment_kwargs
+            )
+            target_segments_per_sample.append(segments)
+            target_rows.extend(
+                _segment_row(task_name, class_id, class_name, item, record["sample_id"])
+                for item in segments
+            )
+        target_median = np.median(target_curves, axis=0)
+        target_candidates, _, target_median_segments = detect_structure_segments(
+            target_median, daily, target_baselines[class_id], event_prefix="TM", segment_prefix="TMSEG", **segment_kwargs
+        )
+        target_core = detect_circular_events(
+            target_median, daily, target_baselines[class_id], event_prefix="TCORE",
+            **_event_detection_kwargs(_event_detector_config(args)),
+        )
+        safe_name = matching[0]
+        _plot_structure_segment_class(
+            folder / safe_name,
+            folder / "diagnostics" / safe_name.replace(".png", "_segment_detail.png"),
+            class_name, source_curve, target_curves, source_core, source_candidates,
+            source_segments, target_core, target_candidates, target_median_segments,
+        )
+        accepted_source = [item for item in source_segments if item.accepted]
+        target_counts = [sum(item.accepted for item in items) for items in target_segments_per_sample]
+        class_rows.append({
+            "class_id": class_id, "class_name": class_name,
+            "num_core_events": sum(item.accepted for item in source_core),
+            "num_source_segment_candidates": len(source_segments),
+            "num_source_auxiliary_segments": len(accepted_source),
+            "num_source_vpv_segments": sum(item.pattern == "valley_peak_valley" for item in accepted_source),
+            "num_source_pvp_segments": sum(item.pattern == "peak_valley_peak" for item in accepted_source),
+            "mean_target_segments_per_sample": float(np.mean(target_counts)) if target_counts else float("nan"),
+            "median_target_segments_per_sample": float(np.median(target_counts)) if target_counts else float("nan"),
+            "source_segment_center_days": ";".join(f"{item.center_day:.1f}" for item in accepted_source),
+            "source_segment_patterns": ";".join(item.pattern for item in accepted_source),
+            "num_boundary_segments": sum(item.crosses_year_boundary for item in accepted_source),
+        })
+    generated = {path.name for path in folder.glob("*.png")}
+    if generated != expected_filenames:
+        raise RuntimeError(f"structure-segment class files differ from existing views: expected={sorted(expected_filenames)}, generated={sorted(generated)}")
+    manifest = {
+        "audit_type": "offline_recon13_structure_segment_diagnostic",
+        "task": task_name, "mode": 13,
+        "global_shift_days": float(recon_shift_days),
+        "structure_capture": {
+            "core_event": _event_detector_config(args),
+            "segment_member": {
+                "min_relative_prominence": args.segment_event_min_relative_prominence,
+                "min_domain_prominence": args.segment_event_min_domain_prominence,
+                "min_width_days": args.segment_event_min_width_days,
+            },
+            "segment": {"chain_length": 3, "patterns": ["valley_peak_valley", "peak_valley_peak"], **segment_kwargs},
+            "source_stability": {
+                "occurrence_radius_days": args.segment_occurrence_radius_days,
+                "min_occurrence": args.segment_min_source_occurrence,
+                "max_timing_mad_days": args.segment_max_source_timing_mad_days,
+                "max_width_ratio": args.segment_max_width_ratio,
+            },
+        },
+        "circular_calendar": True,
+        "nonlinear_registration": False,
+        "raw_timestamp_modified": False,
+        "source_target_segment_matching": False,
+        "target_label_usage": "offline oracle grouping only",
+    }
+    write_structure_segment_outputs(output_dir, manifest, core_rows, source_rows, target_rows, class_rows)
+
+
 def _plot_multi_event_class(
     output_path,
     detail_path,
@@ -866,8 +1204,18 @@ def run_multi_event_extension(
     detection_kwargs = _event_detection_kwargs(config)
     daily = np.arange(365.0)
     source_rows, target_rows, match_rows, class_rows, metadata = [], [], [], [], {}
-    folder = Path(output_dir) / "04_reconshift13_multi_event"
+    folder = task_visualization_config_dir(
+        output_dir, "04_reconshift13_multi_event"
+    )
     for class_id, class_name in enumerate(classes):
+        matching = [
+            name
+            for name in expected_filenames
+            if name.startswith(f"{class_id:02d}_")
+        ]
+        if not matching:
+            continue
+        safe_name = matching[0]
         projection = projections[class_id]
         source_pc1 = projection.transform(source_prototypes[class_id][None])[0]
         source_sample_curves = reconstruct_projected_coefficients(
@@ -937,9 +1285,6 @@ def run_multi_event_extension(
                 )
                 for match in matches
             )
-        safe_name = next(
-            name for name in expected_filenames if name.startswith(f"{class_id:02d}_")
-        )
         output_path = folder / safe_name
         detail_path = folder / "diagnostics" / safe_name.replace(".png", "_event_detail.png")
         _plot_multi_event_class(
@@ -1357,8 +1702,9 @@ def run_local_nonlinear_extension(
         if anchor is not None and before_segments:
             filename = Path(metadata["path"]).name
             _plot_local_nonlinear_diagnostic(
-                Path(output_dir)
-                / "04_reconshift13_local_nonlinear"
+                task_visualization_config_dir(
+                    output_dir, "04_reconshift13_local_nonlinear"
+                )
                 / "diagnostics"
                 / filename,
                 class_name,
@@ -1402,7 +1748,9 @@ def run_local_nonlinear_extension(
 
     generated = {
         path.name
-        for path in (Path(output_dir) / "04_reconshift13_local_nonlinear").glob("*.png")
+        for path in task_visualization_config_dir(
+            output_dir, "04_reconshift13_local_nonlinear"
+        ).glob("*.png")
     }
     if generated != expected_filenames:
         raise RuntimeError(
@@ -1441,18 +1789,21 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
         spatial_encoder, source_dataset, len(classes), grid, args.batch_size, device, bool(config.get("with_extra", False))
     )
     task_name = f"{source_alias}_{target_alias}"
-    output_dir = Path(args.output_root) / task_name
+    output_dir = visualization_meta_dir(args.output_root, task_name)
     existing_manifest = None
     expected_filenames = None
     extension_count = (
         int(args.add_class_residual_shift)
         + int(args.add_recon13_local_nonlinear)
         + int(args.add_recon13_multi_event)
+        + int(args.add_recon13_structure_segments)
     )
     if extension_count > 1:
         raise ValueError("select only one visualization extension per invocation")
     if extension_count:
-        existing_manifest, expected_filenames = validate_existing_task_outputs(output_dir)
+        existing_manifest, expected_filenames = validate_existing_task_outputs(
+            args.output_root, task_name
+        )
 
     fourier_analyzer = None
     fourier_synthesizer = None
@@ -1474,6 +1825,7 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
         fourier_analyzer,
         collect_samplewise=(
             args.add_recon13_local_nonlinear or args.add_recon13_multi_event
+            or args.add_recon13_structure_segments
         ),
     )
     source_prototypes = None
@@ -1486,7 +1838,10 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
             for class_id, values in source_coefficients.items()
         }
         del source_coefficients
-    elif args.add_recon13_local_nonlinear or args.add_recon13_multi_event:
+    elif (
+        args.add_recon13_local_nonlinear or args.add_recon13_multi_event
+        or args.add_recon13_structure_segments
+    ):
         (
             source_curves,
             source_coefficients,
@@ -1510,6 +1865,7 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
         fourier_analyzer,
         collect_samplewise=(
             args.add_recon13_local_nonlinear or args.add_recon13_multi_event
+            or args.add_recon13_structure_segments
         ),
     )
     if args.add_class_residual_shift:
@@ -1521,7 +1877,10 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
             for class_id, values in target_coefficients.items()
         }
         del target_coefficients
-    elif args.add_recon13_local_nonlinear or args.add_recon13_multi_event:
+    elif (
+        args.add_recon13_local_nonlinear or args.add_recon13_multi_event
+        or args.add_recon13_structure_segments
+    ):
         (
             target_curves,
             target_coefficients,
@@ -1610,7 +1969,10 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
             )
         generated = {
             path.name
-            for path in (output_dir / "04_reconshift13_class_shift20").glob("*.png")
+            for path in task_visualization_config_dir(
+                output_dir, "04_reconshift13_class_shift20"
+            ).glob("*.png")
+            if path.name in expected_filenames
         }
         if generated != expected_filenames:
             raise RuntimeError(
@@ -1626,6 +1988,16 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
             args.class_residual_max_days,
         )
         print(f"[FINISHED] {task_name} class residual extension: {output_dir}")
+        return
+
+    if args.add_recon13_structure_segments:
+        run_structure_segment_extension(
+            args, output_dir, task_name, classes, projections,
+            source_coefficients, target_coefficients, target_records,
+            source_baselines, target_baselines, source_prototypes,
+            recon_shift.shift_days, expected_filenames,
+        )
+        print(f"[FINISHED] {task_name} structure-segment extension: {output_dir}")
         return
 
     if args.add_recon13_multi_event:
@@ -1743,12 +2115,12 @@ def run_task(args, source_alias, target_alias, checkpoint_overrides, tm_log_over
 
 def build_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", required=True, type=Path)
-    parser.add_argument("--source-checkpoint-root", required=True, type=Path)
-    parser.add_argument("--timematch-output-root", required=True, type=Path)
-    parser.add_argument("--timematch-log-root", required=True, type=Path)
-    parser.add_argument("--reconshift-output-root", required=True, type=Path)
-    parser.add_argument("--reconshift-log-root", required=True, type=Path)
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--source-checkpoint-root", type=Path)
+    parser.add_argument("--timematch-output-root", type=Path)
+    parser.add_argument("--timematch-log-root", type=Path)
+    parser.add_argument("--reconshift-output-root", type=Path)
+    parser.add_argument("--reconshift-log-root", type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--source-domain", choices=DOMAINS)
     parser.add_argument("--target-domain", choices=DOMAINS)
@@ -1764,6 +2136,9 @@ def build_parser():
     parser.add_argument("--add-class-residual-shift", action="store_true")
     parser.add_argument("--add-recon13-local-nonlinear", action="store_true")
     parser.add_argument("--add-recon13-multi-event", action="store_true")
+    parser.add_argument("--add-recon13-structure-segments", action="store_true")
+    parser.add_argument("--migrate-output-layout", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--class-residual-max-days", type=int, default=20)
     parser.add_argument("--event-min-distance-days", type=float, default=15)
     parser.add_argument("--event-min-width-days", type=float, default=5)
@@ -1774,12 +2149,29 @@ def build_parser():
     parser.add_argument("--event-min-source-occurrence", type=float, default=0.60)
     parser.add_argument("--event-max-source-timing-mad-days", type=float, default=20)
     parser.add_argument("--event-match-radius-days", type=float, default=25)
+    parser.add_argument("--segment-event-min-relative-prominence", type=float, default=0.05)
+    parser.add_argument("--segment-event-min-domain-prominence", type=float, default=0.05)
+    parser.add_argument("--segment-event-min-width-days", type=float, default=3)
+    parser.add_argument("--segment-min-span-days", type=float, default=15)
+    parser.add_argument("--segment-max-span-days", type=float, default=100)
+    parser.add_argument("--segment-min-domain-variation", type=float, default=0.50)
+    parser.add_argument("--segment-min-curve-variation", type=float, default=0.25)
+    parser.add_argument("--segment-occurrence-radius-days", type=float, default=30)
+    parser.add_argument("--segment-min-source-occurrence", type=float, default=0.50)
+    parser.add_argument("--segment-max-source-timing-mad-days", type=float, default=25)
+    parser.add_argument("--segment-max-width-ratio", type=float, default=2.0)
     parser.add_argument("--device", default="cuda")
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.migrate_output_layout:
+        summary = migrate_visualization_layout(args.output_root, dry_run=args.dry_run)
+        print("VISUALIZATION_LAYOUT_MIGRATION|" + "|".join(
+            f"{key}={value}" for key, value in summary.items()
+        ))
+        return
     if args.fold != 0:
         raise SystemExit("ERROR: this audit reproduces fold 0 only")
     if (args.source_domain is None) != (args.target_domain is None):
@@ -1792,7 +2184,7 @@ def main(argv=None):
         (args.reconshift_output_root, "ReconShift13 output root"),
         (args.reconshift_log_root, "ReconShift13 log root"),
     ):
-        if not path.is_dir():
+        if path is None or not path.is_dir():
             raise SystemExit(f"ERROR: {label} not found: {path}")
     random.seed(args.seed)
     np.random.seed(args.seed)

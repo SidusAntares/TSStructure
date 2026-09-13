@@ -396,15 +396,15 @@ def test_incremental_fourth_render_preserves_old_images_and_updates_manifest():
         assert (tmp_path / "04_reconshift13_class_shift20" / filename).is_file()
         for path, content in old_bytes.items():
             assert path.read_bytes() == content
-        assert {
-            path.name for path in (tmp_path / "04_reconshift13_class_shift20").glob("*.png")
-        } == expected
+        config_dir = tmp_path / "04_reconshift13_class_shift20"
+        assert {path.name for path in config_dir.glob("*.png") if path.name in expected} == expected
+        assert (config_dir / "class_shift20_overview.png").is_file()
         updated = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
         assert updated["untouched"] == {"keep": True}
         assert updated["class_residual_shift"]["target_grouping"] == (
             "oracle_true_labels_offline_only"
         )
-        score_rows = (tmp_path / "class_shift20_scores" / filename.replace(".png", ".csv")).read_text(
+        score_rows = (config_dir / "class_shift20_scores" / filename.replace(".png", ".csv")).read_text(
             encoding="utf-8"
         ).strip().splitlines()
         assert len(score_rows) == 42
@@ -609,8 +609,9 @@ def test_local_nonlinear_output_is_parallel_04_and_old_folders_untouched(tmp_pat
     )
 
     assert (tmp_path / "04_reconshift13_local_nonlinear" / "00_crop.png").is_file()
-    assert (tmp_path / "local_nonlinear_sample_summary.csv").is_file()
-    assert (tmp_path / "local_nonlinear_class_summary.csv").is_file()
+    folder = tmp_path / "04_reconshift13_local_nonlinear"
+    assert (folder / "local_nonlinear_sample_summary.csv").is_file()
+    assert (folder / "local_nonlinear_class_summary.csv").is_file()
     for path, content in old_bytes.items():
         assert path.read_bytes() == content
     updated = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
@@ -721,3 +722,204 @@ def test_multi_event_two_panel_and_acceptance_detail_figures_render(tmp_path):
     assert main.is_file() and main.stat().st_size > 0
     assert detail.is_file() and detail.stat().st_size > 0
     assert len([event for event in source_events if event.accepted]) >= 3
+
+
+def test_multi_event_extension_skips_classes_absent_from_baseline_views(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from analysis.recon_anchor_diagnostic import DomainProjectionBaseline
+    from scripts.visualize_shift_configs_4tasks import (
+        SourceClassPC1,
+        run_multi_event_extension,
+    )
+
+    args = SimpleNamespace(
+        event_min_distance_days=15,
+        event_min_width_days=5,
+        event_min_relative_prominence=0.15,
+        event_min_domain_prominence=0.20,
+        event_min_domain_elevation=0.50,
+        event_source_occurrence_radius_days=20,
+        event_min_source_occurrence=0.60,
+        event_max_source_timing_mad_days=20,
+        event_match_radius_days=25,
+    )
+    projection = SourceClassPC1(np.zeros(1), np.ones(1))
+    coefficients = np.zeros((1, 13, 1), dtype=np.complex128)
+    prototype = np.zeros((365, 1), dtype=np.float64)
+    baseline = DomainProjectionBaseline(0.0, 1.0)
+
+    def render(output_path, detail_path, *_args):
+        for path in (Path(output_path), Path(detail_path)):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"figure")
+
+    monkeypatch.setattr(
+        "scripts.visualize_shift_configs_4tasks._plot_multi_event_class", render
+    )
+    run_multi_event_extension(
+        args=args,
+        output_dir=tmp_path,
+        task_name="FR2_AT1",
+        classes=("present", "missing_target"),
+        projections={0: projection, 1: projection},
+        source_coefficients={0: coefficients, 1: coefficients},
+        target_coefficients={0: coefficients},
+        source_records={0: [], 1: []},
+        target_records={0: [{"sample_id": 1}]},
+        source_baselines={0: baseline, 1: baseline},
+        target_baselines={0: baseline},
+        source_prototypes={0: prototype, 1: prototype},
+        recon_shift_days=0,
+        existing_manifest={"class_outputs": {"0": {}}},
+        expected_filenames={"00_present.png"},
+    )
+
+    assert (tmp_path / "04_reconshift13_multi_event" / "00_present.png").is_file()
+    summary = (tmp_path / "04_reconshift13_multi_event" / "class_summary.csv").read_text(
+        encoding="utf-8"
+    )
+    assert "present" in summary
+    assert "missing_target" not in summary
+
+
+def test_visualization_layout_migration_is_safe_complete_and_idempotent(tmp_path):
+    from analysis.shift_visualization import (
+        migrate_visualization_layout,
+        visualization_config_dir,
+        visualization_meta_dir,
+    )
+
+    task = tmp_path / "AT1_DK1"
+    (task / "03_reconshift13_shift").mkdir(parents=True)
+    (task / "03_reconshift13_shift" / "00_crop.png").write_bytes(b"recon")
+    (task / "04_oracle_samplewise_anchor_nonlinear").mkdir()
+    (task / "04_oracle_samplewise_anchor_nonlinear" / "obsolete.png").write_bytes(b"old")
+    (task / "class_shift20_scores").mkdir()
+    (task / "class_shift20_scores" / "00_crop.csv").write_text("score", encoding="utf-8")
+    (task / "class_shift20_summary.csv").write_text("summary", encoding="utf-8")
+    (task / "local_nonlinear_class_summary.csv").write_text("local", encoding="utf-8")
+    (task / "manifest.json").write_text('{"task":"AT1_DK1"}', encoding="utf-8")
+    (task / "shifts_summary.csv").write_text("shift", encoding="utf-8")
+
+    first = migrate_visualization_layout(tmp_path)
+    assert first["moved"] >= 6
+    assert first["deleted_obsolete"] == 1
+    assert (visualization_config_dir(tmp_path, "03_reconshift13_shift", "AT1_DK1") / "00_crop.png").is_file()
+    assert (visualization_config_dir(tmp_path, "04_reconshift13_class_shift20", "AT1_DK1") / "class_shift20_scores" / "00_crop.csv").is_file()
+    assert (visualization_config_dir(tmp_path, "04_reconshift13_local_nonlinear", "AT1_DK1") / "local_nonlinear_class_summary.csv").is_file()
+    assert (visualization_meta_dir(tmp_path, "AT1_DK1") / "manifest.json").is_file()
+    assert not task.exists()
+    second = migrate_visualization_layout(tmp_path)
+    assert second["moved"] == 0
+    assert second["deleted_obsolete"] == 0
+
+
+def test_visualization_layout_migration_refuses_conflicting_destination(tmp_path):
+    import pytest
+    from analysis.shift_visualization import migrate_visualization_layout
+
+    source = tmp_path / "AT1_DK1" / "03_reconshift13_shift"
+    destination = tmp_path / "03_reconshift13_shift" / "AT1_DK1"
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    (source / "00_crop.png").write_bytes(b"source")
+    (destination / "00_crop.png").write_bytes(b"different")
+    with pytest.raises(FileExistsError, match="conflict"):
+        migrate_visualization_layout(tmp_path)
+    assert (source / "00_crop.png").read_bytes() == b"source"
+    assert (destination / "00_crop.png").read_bytes() == b"different"
+
+
+def test_visualization_reader_prefers_new_layout_then_falls_back_to_legacy(tmp_path):
+    from analysis.shift_visualization import resolve_visualization_config_dir
+
+    legacy = tmp_path / "AT1_DK1" / "01_raw_pse"
+    legacy.mkdir(parents=True)
+    assert resolve_visualization_config_dir(tmp_path, "01_raw_pse", "AT1_DK1") == legacy
+    modern = tmp_path / "01_raw_pse" / "AT1_DK1"
+    modern.mkdir(parents=True)
+    assert resolve_visualization_config_dir(tmp_path, "01_raw_pse", "AT1_DK1") == modern
+
+
+def test_structure_segment_outputs_are_self_cont_and_use_new_layout(tmp_path):
+    from analysis.shift_visualization import (
+        visualization_meta_dir,
+        write_structure_segment_outputs,
+    )
+
+    meta = visualization_meta_dir(tmp_path, "AT1_DK1")
+    write_structure_segment_outputs(
+        meta,
+        {"mode": 13, "nonlinear_registration": False},
+        [{"event_id": "P0", "class_id": 0}],
+        [{"segment_id": "SSEG0", "class_id": 0}],
+        [{"segment_id": "TSEG0", "true_class": 0}],
+        [{"class_id": 0, "num_core_events": 1}],
+    )
+    folder = tmp_path / "05_reconshift13_structure_segments" / "AT1_DK1"
+    assert {path.name for path in folder.iterdir()} == {
+        "source_core_events.csv", "source_segments.csv", "target_segments.csv",
+        "class_summary.csv", "manifest.json",
+    }
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["mode"] == 13
+    assert manifest["nonlinear_registration"] is False
+    assert not (tmp_path / "AT1_DK1" / "05_reconshift13_structure_segments").exists()
+
+
+def test_structure_segment_runner_exposes_all_thresholds_and_no_registration():
+    runner = Path("scripts/visualize_shift_configs_4tasks.py").read_text(encoding="utf-8")
+    launcher = Path("scripts/run_shift_visualization_4tasks_seed1.sh").read_text(encoding="utf-8")
+    for option in (
+        "--add-recon13-structure-segments",
+        "--segment-event-min-relative-prominence",
+        "--segment-event-min-domain-prominence",
+        "--segment-event-min-width-days",
+        "--segment-min-span-days", "--segment-max-span-days",
+        "--segment-min-domain-variation", "--segment-min-curve-variation",
+        "--segment-occurrence-radius-days", "--segment-min-source-occurrence",
+        "--segment-max-source-timing-mad-days", "--segment-max-width-ratio",
+    ):
+        assert option in runner
+    active = runner[runner.index("def run_structure_segment_extension(") : runner.index("def run_multi_event_extension(")]
+    assert "estimate_nonlinear_phase" not in active
+    assert "greedy_match_events" not in active
+    assert 'ADD_RECON13_STRUCTURE_SEGMENTS="${ADD_RECON13_STRUCTURE_SEGMENTS:-0}"' in launcher
+
+
+def test_structure_segment_three_panel_and_detail_figures_render(tmp_path):
+    from analysis.recon_anchor_diagnostic import DomainProjectionBaseline
+    from analysis.recon_event_diagnostic import detect_circular_events
+    from analysis.recon_structure_segments import detect_structure_segments
+    from scripts.visualize_shift_configs_4tasks import _plot_structure_segment_class
+
+    days = np.arange(365.0)
+    source = (
+        -2.0 * np.exp(-0.5 * ((days - 100) / 9) ** 2)
+        + 3.0 * np.exp(-0.5 * ((days - 130) / 10) ** 2)
+        - 2.2 * np.exp(-0.5 * ((days - 165) / 9) ** 2)
+    )
+    targets = np.stack((np.roll(source, 3), np.roll(source, 5)))
+    baseline = DomainProjectionBaseline(0.0, 1.0)
+    source_candidates, _, source_segments = detect_structure_segments(
+        source, days, baseline, min_span_days=15, max_span_days=100,
+        min_domain_variation=0.2, min_curve_variation=0.2,
+    )
+    target_median = np.median(targets, axis=0)
+    target_candidates, _, target_segments = detect_structure_segments(
+        target_median, days, baseline, min_span_days=15, max_span_days=100,
+        min_domain_variation=0.2, min_curve_variation=0.2,
+    )
+    source_core = detect_circular_events(source, days, baseline)
+    target_core = detect_circular_events(target_median, days, baseline)
+    main = tmp_path / "05_reconshift13_structure_segments" / "AT1_DK1" / "00_crop.png"
+    detail = main.parent / "diagnostics" / "00_crop_segment_detail.png"
+    _plot_structure_segment_class(
+        main, detail, "crop", source, targets, source_core, source_candidates,
+        source_segments, target_core, target_candidates, target_segments,
+    )
+    assert main.is_file() and main.stat().st_size > 0
+    assert detail.is_file() and detail.stat().st_size > 0

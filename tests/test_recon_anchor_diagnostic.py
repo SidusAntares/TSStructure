@@ -1051,3 +1051,159 @@ def test_greedy_event_matching_prefers_nearest_same_type_deterministically():
     assert len(matched) == 1
     assert (matched[0].source_event_id, matched[0].target_event_id) == ("S1", "T0")
     assert all(item.source_event_id != "S2" for item in matched)
+
+
+def _structure_event(day, kind, value, prominence=1.0, accepted=True):
+    from analysis.recon_event_diagnostic import StructuralEvent
+
+    return StructuralEvent(
+        "", kind, float(day), float(value), float(prominence), float(prominence),
+        float(prominence), float(abs(value)), 5.0, float(day) - 2,
+        float(day) + 2, accepted, "" if accepted else "weak", False,
+    )
+
+
+def test_structure_chain_compresses_same_type_and_builds_vpv_and_pvp():
+    from analysis.recon_structure_segments import build_alternating_chain, build_segments
+
+    events = (
+        _structure_event(20, "valley", -1),
+        _structure_event(35, "peak", 1),
+        _structure_event(40, "peak", 2),
+        _structure_event(55, "valley", -2),
+        _structure_event(75, "peak", 1.5),
+    )
+    chain = build_alternating_chain(events)
+    assert [(item.day % 365, item.kind) for item in chain] == [
+        (20, "valley"), (40, "peak"), (55, "valley"), (75, "peak")
+    ]
+    segments = build_segments(
+        chain, np.sin(np.linspace(0, 4 * np.pi, 365)), 1.0,
+        15, 100, 0.5, 0.25,
+    )
+    assert [item.pattern for item in segments] == [
+        "valley_peak_valley", "peak_valley_peak"
+    ]
+
+
+def test_structure_segment_accepts_weak_member_from_strong_total_variation():
+    from analysis.recon_structure_segments import build_segments
+
+    chain = (
+        _structure_event(100, "valley", 0.0),
+        _structure_event(125, "peak", 1.2, prominence=0.05, accepted=False),
+        _structure_event(150, "valley", -0.2),
+    )
+    curve = np.linspace(-0.2, 1.2, 365)
+    segment = build_segments(chain, curve, 1.0, 15, 100, 1.0, 0.5)[0]
+    assert segment.accepted
+    assert not segment.events[1].accepted
+
+
+def test_structure_segment_gates_span_and_variation_without_upgrading_members():
+    from analysis.recon_structure_segments import build_segments
+
+    chain = (
+        _structure_event(10, "valley", 0.0, accepted=False),
+        _structure_event(14, "peak", 0.1, accepted=False),
+        _structure_event(18, "valley", 0.0, accepted=False),
+    )
+    segment = build_segments(chain, np.zeros(365), 10.0, 15, 100, 0.5, 0.25)[0]
+    assert not segment.accepted
+    assert "span_too_short" in segment.rejection_reason
+    assert "low_domain_variation" in segment.rejection_reason
+    assert all(not event.accepted for event in segment.events)
+
+
+def test_structure_segment_unwraps_circular_340_5_35():
+    from analysis.recon_structure_segments import build_alternating_chain, build_segments
+
+    events = (
+        _structure_event(5, "peak", 2),
+        _structure_event(35, "valley", -1),
+        _structure_event(340, "valley", -2),
+    )
+    chain = build_alternating_chain(events)
+    segment = build_segments(
+        chain, np.sin(np.arange(365) * 2 * np.pi / 365), 1.0,
+        15, 100, 0.1, 0.1,
+    )[0]
+    assert segment.unwrapped_days == (340.0, 370.0, 400.0)
+    assert segment.span_days == 60.0
+    assert segment.crosses_year_boundary
+
+
+def test_source_segment_stability_uses_pattern_center_mad_and_width_ratio():
+    from analysis.recon_structure_segments import (
+        build_segments, evaluate_source_segment_stability,
+    )
+
+    curve = np.sin(np.arange(365) * 2 * np.pi / 365)
+    base = build_segments(
+        (_structure_event(100, "valley", -1), _structure_event(130, "peak", 2), _structure_event(160, "valley", -1)),
+        curve, 1.0, 15, 100, 0.1, 0.1,
+    )[0]
+    samples = []
+    for center, span in ((128, 60), (132, 66), (129, 58), (200, 180)):
+        half = span / 2
+        samples.append(build_segments(
+            (_structure_event(center-half, "valley", -1), _structure_event(center, "peak", 2), _structure_event(center+half, "valley", -1)),
+            curve, 1.0, 1, 300, 0.1, 0.1,
+        )[0])
+    stable = evaluate_source_segment_stability(
+        base, samples, 30, 0.5, 25, 2.0,
+    )
+    assert stable.accepted
+    assert stable.source_occurrence_rate == 0.75
+    assert stable.source_center_timing_mad_days <= 2
+    assert 0.9 < stable.source_span_ratio_median < 1.1
+    width_rejected = evaluate_source_segment_stability(
+        base, [samples[-1]], 100, 1.0, 25, 2.0,
+    )
+    assert not width_rejected.accepted
+    assert width_rejected.source_occurrence_rate == 0.0
+
+
+def test_isolated_extremum_cannot_form_structure_segment():
+    from analysis.recon_structure_segments import build_alternating_chain, build_segments
+
+    chain = build_alternating_chain((_structure_event(120, "peak", 2),))
+    assert build_segments(chain, np.zeros(365), 1.0, 15, 100, 0.5, 0.25) == ()
+
+
+def test_structure_segment_reports_long_span_and_curve_variation_gates():
+    from analysis.recon_structure_segments import build_segments
+
+    segment = build_segments(
+        (
+            _structure_event(10, "peak", 1),
+            _structure_event(100, "valley", 0),
+            _structure_event(210, "peak", 1),
+        ),
+        np.linspace(-100, 100, 365),
+        1.0, 15, 100, 0.1, 0.25,
+    )[0]
+    assert not segment.accepted
+    assert "span_too_long" in segment.rejection_reason
+    assert "low_curve_variation" in segment.rejection_reason
+
+
+def test_meadow_like_small_oscillation_has_no_accepted_segments():
+    from analysis.recon_anchor_diagnostic import DomainProjectionBaseline
+    from analysis.recon_structure_segments import detect_structure_segments
+
+    days = np.arange(365.0)
+    curve = 0.02 * np.sin(2 * np.pi * days / 30.0)
+    _, _, segments = detect_structure_segments(
+        curve, days, DomainProjectionBaseline(0.0, 2.0),
+        min_distance_days=7,
+        member_min_width_days=2,
+        member_min_relative_prominence=0.01,
+        member_min_domain_prominence=0.001,
+        min_span_days=10,
+        max_span_days=100,
+        min_domain_variation=0.50,
+        min_curve_variation=0.25,
+    )
+    assert segments
+    assert not any(item.accepted for item in segments)

@@ -21,6 +21,49 @@ ADD_RECON13_LOCAL_NONLINEAR="${ADD_RECON13_LOCAL_NONLINEAR:-0}"
 LOCAL_LOG_ROOT="${LOCAL_LOG_ROOT:-logs/reconshift13_local_nonlinear_visualization_seed1}"
 ADD_RECON13_MULTI_EVENT="${ADD_RECON13_MULTI_EVENT:-0}"
 MULTI_EVENT_LOG_ROOT="${MULTI_EVENT_LOG_ROOT:-logs/reconshift13_multi_event_visualization_seed1}"
+ADD_RECON13_STRUCTURE_SEGMENTS="${ADD_RECON13_STRUCTURE_SEGMENTS:-0}"
+STRUCTURE_SEGMENT_LOG_ROOT="${STRUCTURE_SEGMENT_LOG_ROOT:-logs/reconshift13_structure_segment_visualization_seed1}"
+MIGRATE_OUTPUT_LAYOUT="${MIGRATE_OUTPUT_LAYOUT:-0}"
+MIGRATION_DRY_RUN="${MIGRATION_DRY_RUN:-0}"
+
+run_structure_segment_task() {
+    local gpu="$1"
+    local source="$2"
+    local target="$3"
+    local source_weights
+    case "$source" in
+        AT1) source_weights="$AT1_WEIGHTS" ;;
+        DK1) source_weights="$DK1_WEIGHTS" ;;
+        FR1) source_weights="$FR1_WEIGHTS" ;;
+        FR2) source_weights="$FR2_WEIGHTS" ;;
+        *) echo "ERROR: unknown source alias: $source" >&2; return 2 ;;
+    esac
+    echo "[START] GPU${gpu} ${source} -> ${target} structure segments"
+    CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u scripts/visualize_shift_configs_4tasks.py \
+        --data-root "$DATA_ROOT" \
+        --source-checkpoint-root "$SOURCE_CHECKPOINT_ROOT" \
+        --source-checkpoint "${source}=${source_weights}" \
+        --timematch-output-root "$TIMEMATCH_OUTPUT_ROOT" \
+        --timematch-log-root "$TIMEMATCH_LOG_ROOT" \
+        --reconshift-output-root "$RECONSHIFT_OUTPUT_ROOT" \
+        --reconshift-log-root "$RECONSHIFT_LOG_ROOT" \
+        --output-root "$OUTPUT_ROOT" \
+        --source-domain "$source" --target-domain "$target" \
+        --seed "$SEED" --fold "$FOLD" --grid-size "$GRID_SIZE" \
+        --add-recon13-structure-segments \
+        --segment-event-min-relative-prominence "${SEGMENT_EVENT_MIN_RELATIVE_PROMINENCE:-0.05}" \
+        --segment-event-min-domain-prominence "${SEGMENT_EVENT_MIN_DOMAIN_PROMINENCE:-0.05}" \
+        --segment-event-min-width-days "${SEGMENT_EVENT_MIN_WIDTH_DAYS:-3}" \
+        --segment-min-span-days "${SEGMENT_MIN_SPAN_DAYS:-15}" \
+        --segment-max-span-days "${SEGMENT_MAX_SPAN_DAYS:-100}" \
+        --segment-min-domain-variation "${SEGMENT_MIN_DOMAIN_VARIATION:-0.50}" \
+        --segment-min-curve-variation "${SEGMENT_MIN_CURVE_VARIATION:-0.25}" \
+        --segment-occurrence-radius-days "${SEGMENT_OCCURRENCE_RADIUS_DAYS:-30}" \
+        --segment-min-source-occurrence "${SEGMENT_MIN_SOURCE_OCCURRENCE:-0.50}" \
+        --segment-max-source-timing-mad-days "${SEGMENT_MAX_SOURCE_TIMING_MAD_DAYS:-25}" \
+        --segment-max-width-ratio "${SEGMENT_MAX_WIDTH_RATIO:-2.0}" \
+        --device "$DEVICE"
+}
 
 run_multi_event_task() {
     local gpu="$1"
@@ -101,6 +144,17 @@ FR2_WEIGHTS="${FR2_WEIGHTS:-outputs/pseltae_FR2_source_seed1}"
 
 [[ "$FOLD" == "0" ]] || { echo "ERROR: this audit supports fold 0 only" >&2; exit 2; }
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || { echo "ERROR: Python not found: $PYTHON_BIN" >&2; exit 1; }
+
+mkdir -p "$OUTPUT_ROOT"
+export PYTHONUNBUFFERED=1
+
+if [[ "$MIGRATE_OUTPUT_LAYOUT" == "1" ]]; then
+    migration_args=(--output-root "$OUTPUT_ROOT" --migrate-output-layout)
+    [[ "$MIGRATION_DRY_RUN" == "1" ]] && migration_args+=(--dry-run)
+    "$PYTHON_BIN" -u scripts/visualize_shift_configs_4tasks.py "${migration_args[@]}"
+    exit 0
+fi
+
 for directory in \
     "$DATA_ROOT" "$SOURCE_CHECKPOINT_ROOT" \
     "$TIMEMATCH_OUTPUT_ROOT" "$TIMEMATCH_LOG_ROOT" \
@@ -112,8 +166,26 @@ for checkpoint_root in "$AT1_WEIGHTS" "$DK1_WEIGHTS" "$FR1_WEIGHTS" "$FR2_WEIGHT
     [[ -f "$checkpoint_root/train_config.json" ]] || { echo "ERROR: source config not found: $checkpoint_root/train_config.json" >&2; exit 1; }
 done
 
-mkdir -p "$OUTPUT_ROOT"
-export PYTHONUNBUFFERED=1
+if [[ "$ADD_RECON13_STRUCTURE_SEGMENTS" == "1" ]]; then
+    "$PYTHON_BIN" -u scripts/visualize_shift_configs_4tasks.py \
+        --output-root "$OUTPUT_ROOT" \
+        --migrate-output-layout
+    mkdir -p "$STRUCTURE_SEGMENT_LOG_ROOT"
+    run_structure_segment_task 0 AT1 DK1 > "$STRUCTURE_SEGMENT_LOG_ROOT/AT1_DK1.log" 2>&1 & pid0=$!
+    run_structure_segment_task 1 DK1 FR1 > "$STRUCTURE_SEGMENT_LOG_ROOT/DK1_FR1.log" 2>&1 & pid1=$!
+    run_structure_segment_task 2 FR1 FR2 > "$STRUCTURE_SEGMENT_LOG_ROOT/FR1_FR2.log" 2>&1 & pid2=$!
+    run_structure_segment_task 3 FR2 AT1 > "$STRUCTURE_SEGMENT_LOG_ROOT/FR2_AT1.log" 2>&1 & pid3=$!
+    status=0
+    for pid in "$pid0" "$pid1" "$pid2" "$pid3"; do
+        if ! wait "$pid"; then status=1; fi
+    done
+    if [[ "$status" -ne 0 ]]; then
+        echo "ERROR: one or more structure-segment visualizations failed; inspect $STRUCTURE_SEGMENT_LOG_ROOT" >&2
+        exit 1
+    fi
+    echo "[ALL FINISHED] Recon13 structure-segment visualizations written to $OUTPUT_ROOT"
+    exit 0
+fi
 
 if [[ "$ADD_RECON13_MULTI_EVENT" == "1" ]]; then
     mkdir -p "$MULTI_EVENT_LOG_ROOT"

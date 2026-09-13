@@ -11,6 +11,7 @@ import csv
 import json
 import random
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
@@ -31,7 +32,141 @@ CONFIG_FOLDERS = {
     "reconshift13_class_shift20": "04_reconshift13_class_shift20",
     "reconshift13_local_nonlinear": "04_reconshift13_local_nonlinear",
     "reconshift13_multi_event": "04_reconshift13_multi_event",
+    "reconshift13_structure_segments": "05_reconshift13_structure_segments",
 }
+
+OBSOLETE_VISUALIZATION_CONFIG = "04_oracle_samplewise_anchor_nonlinear"
+
+
+def visualization_meta_dir(root: Path, task_name: str) -> Path:
+    return Path(root) / "00_meta" / str(task_name)
+
+
+def visualization_config_dir(root: Path, config_name: str, task_name: str) -> Path:
+    return Path(root) / str(config_name) / str(task_name)
+
+
+def resolve_visualization_config_dir(root: Path, config_name: str, task_name: str) -> Path:
+    modern = visualization_config_dir(root, config_name, task_name)
+    legacy = Path(root) / str(task_name) / str(config_name)
+    return modern if modern.exists() or not legacy.exists() else legacy
+
+
+def resolve_visualization_meta_dir(root: Path, task_name: str) -> Path:
+    modern = visualization_meta_dir(root, task_name)
+    legacy = Path(root) / str(task_name)
+    return modern if modern.exists() or not legacy.exists() else legacy
+
+
+def task_visualization_config_dir(task_meta_dir: Path, config_name: str) -> Path:
+    """Resolve a config directory from a task metadata directory.
+
+    Production passes ``root/00_meta/task``.  The legacy form remains accepted
+    only for historical readers and focused unit fixtures.
+    """
+    task_meta_dir = Path(task_meta_dir)
+    if task_meta_dir.parent.name == "00_meta":
+        return visualization_config_dir(
+            task_meta_dir.parent.parent, config_name, task_meta_dir.name
+        )
+    return task_meta_dir / config_name
+
+
+def _same_tree(left: Path, right: Path) -> bool:
+    if left.is_file() != right.is_file() or left.is_dir() != right.is_dir():
+        return False
+    if left.is_file():
+        return left.stat().st_size == right.stat().st_size and left.read_bytes() == right.read_bytes()
+    left_files = {item.relative_to(left) for item in left.rglob("*") if item.is_file()}
+    right_files = {item.relative_to(right) for item in right.rglob("*") if item.is_file()}
+    return left_files == right_files and all(
+        _same_tree(left / name, right / name) for name in left_files
+    )
+
+
+def _standalone_config(item: Path, task_dir: Path):
+    name = item.name
+    if name.startswith("class_shift20_") or name == "class_shift20_scores":
+        return "04_reconshift13_class_shift20"
+    if name.startswith("local_nonlinear_"):
+        return "04_reconshift13_local_nonlinear"
+    if name in {"manifest.json", "shifts_summary.csv"}:
+        return None
+    config_dirs = [
+        child for child in task_dir.iterdir()
+        if child.is_dir() and re.match(r"^\d{2}_", child.name)
+        and child.name != OBSOLETE_VISUALIZATION_CONFIG
+    ]
+    if not config_dirs:
+        return None
+    nearest = sorted(
+        (abs(item.stat().st_ctime - child.stat().st_ctime), child.name)
+        for child in config_dirs
+    )
+    return nearest[0][1] if nearest[0][0] <= 300 else None
+
+
+def migrate_visualization_layout(root: Path, dry_run: bool = False):
+    """Move legacy root/task/config outputs to root/config/task without overwrite."""
+    root = Path(root)
+    task_dirs = [
+        item for item in root.iterdir() if item.is_dir()
+        and item.name != "00_meta" and not re.match(r"^\d{2}_", item.name)
+        and re.match(r"^[A-Za-z0-9]+_[A-Za-z0-9]+$", item.name)
+    ] if root.is_dir() else []
+    actions, obsolete = [], []
+    migrated_obsolete_root = root / OBSOLETE_VISUALIZATION_CONFIG
+    if migrated_obsolete_root.is_dir():
+        obsolete.append(migrated_obsolete_root)
+    for task_dir in task_dirs:
+        items = sorted(
+            task_dir.iterdir(),
+            key=lambda item: (
+                not (item.is_dir() and re.match(r"^\d{2}_", item.name)),
+                item.name,
+            ),
+        )
+        for item in items:
+            if item.is_dir() and item.name == OBSOLETE_VISUALIZATION_CONFIG:
+                obsolete.append(item)
+                continue
+            if item.is_dir() and re.match(r"^\d{2}_", item.name):
+                config = item.name
+            else:
+                config = _standalone_config(item, task_dir)
+            destination_dir = (
+                visualization_meta_dir(root, task_dir.name)
+                if config is None
+                else visualization_config_dir(root, config, task_dir.name)
+            )
+            destination = destination_dir if item.is_dir() and item.name == config else destination_dir / item.name
+            actions.append((item, destination))
+    for source, destination in actions:
+        if destination.exists() and not _same_tree(source, destination):
+            raise FileExistsError(f"visualization migration conflict: {source} -> {destination}")
+    preexisting = sum(destination.exists() for _, destination in actions)
+    if not dry_run:
+        for path in obsolete:
+            shutil.rmtree(path)
+        for source, destination in actions:
+            if destination.exists():
+                if source.is_dir():
+                    shutil.rmtree(source)
+                else:
+                    source.unlink()
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source.rename(destination)
+        for task_dir in task_dirs:
+            if task_dir.exists() and not any(task_dir.iterdir()):
+                task_dir.rmdir()
+    return {
+        "moved": len(actions) - preexisting,
+        "already_present": preexisting,
+        "deleted_obsolete": len(obsolete),
+        "tasks": len(task_dirs),
+        "dry_run": bool(dry_run),
+    }
 
 
 @dataclass(frozen=True)
@@ -448,7 +583,9 @@ def render_task_class_figures(
     shifts = {"raw": 0.0, "timematch": timematch_shift, "reconshift13": reconshift_shift}
     metadata = {}
     for key, view in views.items():
-        output_path = Path(output_dir) / CONFIG_FOLDERS[key] / filename
+        output_path = task_visualization_config_dir(
+            output_dir, CONFIG_FOLDERS[key]
+        ) / filename
         _plot_view(
             output_path,
             task_name,
@@ -498,8 +635,9 @@ def render_class_residual_figure(
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", class_name).strip("_")
     filename = f"{int(class_id):02d}_{safe_name}.png"
     output_path = (
-        Path(output_dir)
-        / CONFIG_FOLDERS["reconshift13_class_shift20"]
+        task_visualization_config_dir(
+            output_dir, CONFIG_FOLDERS["reconshift13_class_shift20"]
+        )
         / filename
     )
     final_shift = float(global_shift_days) + int(class_residual_shift_days)
@@ -543,8 +681,9 @@ def render_local_nonlinear_figure(
     """Render sample-wise Raw-PSE time maps with the established two-panel style."""
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", class_name).strip("_")
     output_path = (
-        Path(output_dir)
-        / CONFIG_FOLDERS["reconshift13_local_nonlinear"]
+        task_visualization_config_dir(
+            output_dir, CONFIG_FOLDERS["reconshift13_local_nonlinear"]
+        )
         / f"{int(class_id):02d}_{safe_name}.png"
     )
     if global_only_reason:
@@ -606,8 +745,12 @@ def update_local_nonlinear_outputs(
 ):
     """Persist only the new local-nonlinear extension and preserve prior views."""
     output_dir = Path(output_dir)
-    _write_mapping_rows(output_dir / "local_nonlinear_sample_summary.csv", sample_rows)
-    _write_mapping_rows(output_dir / "local_nonlinear_class_summary.csv", class_rows)
+    folder = task_visualization_config_dir(
+        output_dir, CONFIG_FOLDERS["reconshift13_local_nonlinear"]
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+    _write_mapping_rows(folder / "local_nonlinear_sample_summary.csv", sample_rows)
+    _write_mapping_rows(folder / "local_nonlinear_class_summary.csv", class_rows)
     updated = dict(manifest)
     updated["reconshift13_local_nonlinear"] = {
         "enabled": True,
@@ -659,7 +802,9 @@ def update_multi_event_outputs(
 ):
     """Persist the parallel Mode13 event audit without touching prior views."""
     output_dir = Path(output_dir)
-    folder = output_dir / CONFIG_FOLDERS["reconshift13_multi_event"]
+    folder = task_visualization_config_dir(
+        output_dir, CONFIG_FOLDERS["reconshift13_multi_event"]
+    )
     folder.mkdir(parents=True, exist_ok=True)
     for filename, rows in (
         ("source_events.csv", source_rows),
@@ -691,16 +836,55 @@ def update_multi_event_outputs(
     )
 
 
-def validate_existing_task_outputs(output_dir: Path):
+def write_structure_segment_outputs(
+    output_dir,
+    manifest,
+    source_core_rows,
+    source_segment_rows,
+    target_segment_rows,
+    class_rows,
+):
+    """Write a self-contained configuration-05 audit in the modern layout."""
+    folder = task_visualization_config_dir(
+        output_dir, CONFIG_FOLDERS["reconshift13_structure_segments"]
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+    for filename, rows in (
+        ("source_core_events.csv", source_core_rows),
+        ("source_segments.csv", source_segment_rows),
+        ("target_segments.csv", target_segment_rows),
+        ("class_summary.csv", class_rows),
+    ):
+        _write_mapping_rows(folder / filename, rows)
+    (folder / "manifest.json").write_text(
+        json.dumps(dict(manifest), indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def validate_existing_task_outputs(output_dir: Path, task_name: Optional[str] = None):
     """Fail fast unless the complete, mutually consistent baseline views exist."""
     output_dir = Path(output_dir)
-    manifest_path = output_dir / "manifest.json"
+    if task_name is None:
+        meta_dir = output_dir
+        config_dirs = {
+            key: task_visualization_config_dir(output_dir, CONFIG_FOLDERS[key])
+            for key in ("raw", "timematch", "reconshift13")
+        }
+    else:
+        meta_dir = resolve_visualization_meta_dir(output_dir, task_name)
+        config_dirs = {
+            key: resolve_visualization_config_dir(
+                output_dir, CONFIG_FOLDERS[key], task_name
+            )
+            for key in ("raw", "timematch", "reconshift13")
+        }
+    manifest_path = meta_dir / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"existing manifest not found: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     file_sets = []
     for key in ("raw", "timematch", "reconshift13"):
-        folder = output_dir / CONFIG_FOLDERS[key]
+        folder = config_dirs[key]
         if not folder.is_dir():
             raise FileNotFoundError(f"existing visualization folder not found: {folder}")
         file_sets.append({path.name for path in folder.glob("*.png")})
@@ -760,6 +944,10 @@ def update_class_residual_outputs(
 ) -> None:
     """Add configuration 04 artifacts while preserving baseline manifest fields."""
     output_dir = Path(output_dir)
+    folder = task_visualization_config_dir(
+        output_dir, CONFIG_FOLDERS["reconshift13_class_shift20"]
+    )
+    folder.mkdir(parents=True, exist_ok=True)
     summary_fields = [
         "class_id",
         "class_name",
@@ -775,13 +963,13 @@ def update_class_residual_outputs(
         "num_valid_channels",
         "common_support_days",
     ]
-    with (output_dir / "class_shift20_summary.csv").open(
+    with (folder / "class_shift20_summary.csv").open(
         "w", newline="", encoding="utf-8"
     ) as stream:
         writer = csv.DictWriter(stream, fieldnames=summary_fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(summary_rows)
-    score_dir = output_dir / "class_shift20_scores"
+    score_dir = folder / "class_shift20_scores"
     score_dir.mkdir(parents=True, exist_ok=True)
     for row in summary_rows:
         class_id = int(row["class_id"])
@@ -795,7 +983,7 @@ def update_class_residual_outputs(
             writer.writerows(_candidate_values(candidate) for candidate in candidates)
     if summary_rows:
         _plot_class_shift_overview(
-            output_dir / "class_shift20_overview.png",
+            folder / "class_shift20_overview.png",
             summary_rows,
             max_residual_days,
         )
