@@ -1053,18 +1053,18 @@ def test_greedy_event_matching_prefers_nearest_same_type_deterministically():
     assert all(item.source_event_id != "S2" for item in matched)
 
 
-def _structure_event(day, kind, value, prominence=1.0, accepted=True):
+def _structure_event(day, kind, value, prominence=1.0, accepted=True, event_id=""):
     from analysis.recon_event_diagnostic import StructuralEvent
 
     return StructuralEvent(
-        "", kind, float(day), float(value), float(prominence), float(prominence),
+        event_id, kind, float(day), float(value), float(prominence), float(prominence),
         float(prominence), float(abs(value)), 5.0, float(day) - 2,
         float(day) + 2, accepted, "" if accepted else "weak", False,
     )
 
 
-def test_structure_chain_compresses_same_type_and_builds_vpv_and_pvp():
-    from analysis.recon_structure_segments import build_alternating_chain, build_segments
+def test_structure_chain_compresses_same_type_including_circular_endpoints():
+    from analysis.recon_structure_segments import build_alternating_chain
 
     events = (
         _structure_event(20, "valley", -1),
@@ -1077,115 +1077,167 @@ def test_structure_chain_compresses_same_type_and_builds_vpv_and_pvp():
     assert [(item.day % 365, item.kind) for item in chain] == [
         (20, "valley"), (40, "peak"), (55, "valley"), (75, "peak")
     ]
-    segments = build_segments(
-        chain, np.sin(np.linspace(0, 4 * np.pi, 365)), 1.0,
-        15, 100, 0.5, 0.25,
+    circular = build_alternating_chain(
+        (
+            _structure_event(20, "peak", 1, prominence=0.5),
+            _structure_event(120, "valley", -2),
+            _structure_event(240, "peak", 3),
+            _structure_event(355, "peak", 2, prominence=0.4),
+        )
     )
-    assert [item.pattern for item in segments] == [
-        "valley_peak_valley", "peak_valley_peak"
+    assert [(item.day % 365, item.kind) for item in circular] == [
+        (120, "valley"), (240, "peak")
     ]
 
 
-def test_structure_segment_accepts_weak_member_from_strong_total_variation():
-    from analysis.recon_structure_segments import build_segments
-
-    chain = (
-        _structure_event(100, "valley", 0.0),
-        _structure_event(125, "peak", 1.2, prominence=0.05, accepted=False),
-        _structure_event(150, "valley", -0.2),
+def test_directed_segments_include_circular_last_to_first_fall():
+    from analysis.recon_structure_segments import (
+        build_alternating_chain,
+        build_directed_segments,
     )
-    curve = np.linspace(-0.2, 1.2, 365)
-    segment = build_segments(chain, curve, 1.0, 15, 100, 1.0, 0.5)[0]
-    assert segment.accepted
-    assert not segment.events[1].accepted
-
-
-def test_structure_segment_gates_span_and_variation_without_upgrading_members():
-    from analysis.recon_structure_segments import build_segments
-
-    chain = (
-        _structure_event(10, "valley", 0.0, accepted=False),
-        _structure_event(14, "peak", 0.1, accepted=False),
-        _structure_event(18, "valley", 0.0, accepted=False),
-    )
-    segment = build_segments(chain, np.zeros(365), 10.0, 15, 100, 0.5, 0.25)[0]
-    assert not segment.accepted
-    assert "span_too_short" in segment.rejection_reason
-    assert "low_domain_variation" in segment.rejection_reason
-    assert all(not event.accepted for event in segment.events)
-
-
-def test_structure_segment_unwraps_circular_340_5_35():
-    from analysis.recon_structure_segments import build_alternating_chain, build_segments
 
     events = (
-        _structure_event(5, "peak", 2),
-        _structure_event(35, "valley", -1),
-        _structure_event(340, "valley", -2),
+        _structure_event(20, "valley", -1),
+        _structure_event(180, "peak", 2),
+        _structure_event(355, "peak", 3),
     )
     chain = build_alternating_chain(events)
-    segment = build_segments(
-        chain, np.sin(np.arange(365) * 2 * np.pi / 365), 1.0,
-        15, 100, 0.1, 0.1,
-    )[0]
-    assert segment.unwrapped_days == (340.0, 370.0, 400.0)
-    assert segment.span_days == 60.0
-    assert segment.crosses_year_boundary
+    segments = build_directed_segments(
+        chain,
+        np.linspace(-1, 3, 365),
+        domain_scale=1.0,
+        min_duration_days=10,
+        max_duration_days=200,
+        min_domain_change=0.1,
+        min_curve_change=0.1,
+    )
+    boundary = next(item for item in segments if item.crosses_year_boundary)
+    assert boundary.direction == "FALL"
+    assert boundary.start_day == 355
+    assert boundary.end_day == 20
+    assert boundary.unwrapped_start_day == 355
+    assert boundary.unwrapped_end_day == 385
+    assert boundary.duration_days == 30
 
 
-def test_source_segment_stability_uses_pattern_center_mad_and_width_ratio():
+def test_directed_segment_uses_loose_members_and_records_core_aux_roles():
+    from analysis.recon_structure_segments import build_directed_segments
+
+    chain = (
+        _structure_event(100, "valley", 0.0, accepted=True),
+        _structure_event(125, "peak", 1.2, prominence=0.05, accepted=True),
+    )
+    core = (_structure_event(100, "valley", 0.0),)
+    segments = build_directed_segments(
+        chain,
+        np.linspace(0, 1.2, 365),
+        domain_scale=1.0,
+        core_events=core,
+        min_duration_days=10,
+        max_duration_days=120,
+        min_domain_change=0.3,
+        min_curve_change=0.15,
+    )
+    rise = next(item for item in segments if item.direction == "RISE")
+    assert rise.accepted
+    assert (rise.start_role, rise.end_role) == ("CORE", "AUX")
+    assert rise.signed_change > 0
+
+
+def test_directed_segment_gates_duration_and_change():
+    from analysis.recon_structure_segments import build_directed_segments
+
+    segments = build_directed_segments(
+        (
+            _structure_event(10, "valley", 0.0),
+            _structure_event(14, "peak", 0.1),
+        ),
+        np.linspace(-50.0, 50.0, 365),
+        domain_scale=10.0,
+        min_duration_days=10,
+        max_duration_days=120,
+        min_domain_change=0.3,
+        min_curve_change=0.15,
+    )
+    first = segments[0]
+    assert not first.accepted
+    assert "duration_too_short" in first.rejection_reason
+    assert "low_domain_change" in first.rejection_reason
+    assert "low_curve_change" in first.rejection_reason
+
+
+def test_directed_segment_matching_is_one_to_one_and_deterministic():
     from analysis.recon_structure_segments import (
-        build_segments, evaluate_source_segment_stability,
+        build_directed_segments,
+        match_directed_segments_one_to_one,
+    )
+
+    def segments(events, prefix):
+        from analysis.recon_structure_segments import build_alternating_chain
+
+        return build_directed_segments(
+            build_alternating_chain(events),
+            np.sin(np.arange(365) * 2 * np.pi / 365), 1.0,
+            min_duration_days=1, max_duration_days=180,
+            min_domain_change=0.01, min_curve_change=0.01,
+            segment_prefix=prefix,
+        )
+
+    prototypes = segments(
+        (_structure_event(90, "valley", -1), _structure_event(120, "peak", 2),
+         _structure_event(150, "valley", -1)), "P",
+    )
+    candidates = segments(
+        (_structure_event(92, "valley", -1), _structure_event(121, "peak", 2),
+         _structure_event(149, "valley", -1)), "C",
+    )
+    first = match_directed_segments_one_to_one(prototypes, candidates, 30, 2.0)
+    second = match_directed_segments_one_to_one(prototypes, candidates, 30, 2.0)
+    assert [(a.segment_id, b.segment_id) for a, b in first] == [
+        (a.segment_id, b.segment_id) for a, b in second
+    ]
+    assert len({candidate.segment_id for _, candidate in first}) == len(first)
+
+
+def test_source_directed_segment_stability_uses_one_to_one_matches():
+    from analysis.recon_structure_segments import (
+        build_directed_segments,
+        evaluate_source_segments_stability,
     )
 
     curve = np.sin(np.arange(365) * 2 * np.pi / 365)
-    base = build_segments(
-        (_structure_event(100, "valley", -1), _structure_event(130, "peak", 2), _structure_event(160, "valley", -1)),
-        curve, 1.0, 15, 100, 0.1, 0.1,
-    )[0]
-    samples = []
-    for center, span in ((128, 60), (132, 66), (129, 58), (200, 180)):
-        half = span / 2
-        samples.append(build_segments(
-            (_structure_event(center-half, "valley", -1), _structure_event(center, "peak", 2), _structure_event(center+half, "valley", -1)),
-            curve, 1.0, 1, 300, 0.1, 0.1,
-        )[0])
-    stable = evaluate_source_segment_stability(
+    kwargs = dict(
+        min_duration_days=1, max_duration_days=180,
+        min_domain_change=0.01, min_curve_change=0.01,
+    )
+    base = build_directed_segments(
+        (_structure_event(100, "valley", -1), _structure_event(130, "peak", 2)),
+        curve, 1.0, **kwargs,
+    )
+    samples = [
+        build_directed_segments(
+            (_structure_event(100 + shift, "valley", -1),
+             _structure_event(130 + shift, "peak", 2)),
+            curve, 1.0, **kwargs,
+        )
+        for shift in (0, 2, -1)
+    ] + [()]
+    stable = evaluate_source_segments_stability(
         base, samples, 30, 0.5, 25, 2.0,
     )
-    assert stable.accepted
-    assert stable.source_occurrence_rate == 0.75
-    assert stable.source_center_timing_mad_days <= 2
-    assert 0.9 < stable.source_span_ratio_median < 1.1
-    width_rejected = evaluate_source_segment_stability(
-        base, [samples[-1]], 100, 1.0, 25, 2.0,
-    )
-    assert not width_rejected.accepted
-    assert width_rejected.source_occurrence_rate == 0.0
+    rise = next(item for item in stable if item.direction == "RISE")
+    assert rise.accepted
+    assert rise.source_occurrence_rate == 0.75
+    assert rise.source_center_timing_mad_days <= 2
+    assert 0.9 < rise.source_duration_ratio_median < 1.1
+    assert rise.source_duration_ratio_error_p90 < 0.1
 
 
-def test_isolated_extremum_cannot_form_structure_segment():
-    from analysis.recon_structure_segments import build_alternating_chain, build_segments
+def test_isolated_extremum_cannot_form_directed_segment():
+    from analysis.recon_structure_segments import build_alternating_chain, build_directed_segments
 
     chain = build_alternating_chain((_structure_event(120, "peak", 2),))
-    assert build_segments(chain, np.zeros(365), 1.0, 15, 100, 0.5, 0.25) == ()
-
-
-def test_structure_segment_reports_long_span_and_curve_variation_gates():
-    from analysis.recon_structure_segments import build_segments
-
-    segment = build_segments(
-        (
-            _structure_event(10, "peak", 1),
-            _structure_event(100, "valley", 0),
-            _structure_event(210, "peak", 1),
-        ),
-        np.linspace(-100, 100, 365),
-        1.0, 15, 100, 0.1, 0.25,
-    )[0]
-    assert not segment.accepted
-    assert "span_too_long" in segment.rejection_reason
-    assert "low_curve_variation" in segment.rejection_reason
+    assert build_directed_segments(chain, np.zeros(365), 1.0) == ()
 
 
 def test_meadow_like_small_oscillation_has_no_accepted_segments():
@@ -1200,10 +1252,186 @@ def test_meadow_like_small_oscillation_has_no_accepted_segments():
         member_min_width_days=2,
         member_min_relative_prominence=0.01,
         member_min_domain_prominence=0.001,
-        min_span_days=10,
-        max_span_days=100,
-        min_domain_variation=0.50,
-        min_curve_variation=0.25,
+        min_duration_days=10,
+        max_duration_days=120,
+        min_domain_change=0.30,
+        min_curve_change=0.15,
     )
     assert segments
     assert not any(item.accepted for item in segments)
+
+
+def _coarse_result(events, domain_scale=10.0, **overrides):
+    from analysis.recon_structure_segments import (
+        build_alternating_chain,
+        build_coarse_structure,
+        build_directed_segments,
+    )
+
+    chain = build_alternating_chain(events)
+    curve = np.linspace(-10.0, 30.0, 365)
+    fine = build_directed_segments(
+        chain, curve, domain_scale,
+        min_duration_days=1, max_duration_days=365,
+        min_domain_change=0.0, min_curve_change=0.0,
+        segment_prefix="F",
+    )
+    options = dict(
+        max_reversal_ratio=0.50,
+        max_reversal_domain_change=0.35,
+        max_reversal_duration_days=45,
+        max_merge_depth=5,
+        min_duration_days=1,
+        max_duration_days=240,
+        min_curve_change=0.0,
+        min_domain_change=0.0,
+        min_monotonicity=0.0,
+    )
+    options.update(overrides)
+    return build_coarse_structure(chain, fine, curve, domain_scale, **options)
+
+
+def test_coarse_structure_removes_weak_fall_inside_overall_rise():
+    result = _coarse_result((
+        _structure_event(0, "valley", 0, event_id="V0"),
+        _structure_event(30, "peak", 10, event_id="P0"),
+        _structure_event(45, "valley", 8, event_id="V1"),
+        _structure_event(80, "peak", 20, event_id="P1"),
+    ))
+    rise = next(item for item in result.segments if item.direction == "RISE")
+    assert (rise.start_event_id, rise.end_event_id) == ("V0", "P1")
+    assert rise.num_fine_segments_covered == 3
+    assert rise.num_removed_reversals == 1
+    assert rise.fine_segment_ids == ("F0", "F1", "F2")
+    assert rise.total_path_variation == 24
+    assert rise.net_change == 20
+    assert np.isclose(rise.monotonicity_ratio, 20 / 24)
+
+
+def test_coarse_structure_removes_weak_rise_inside_overall_fall():
+    result = _coarse_result((
+        _structure_event(0, "peak", 20, event_id="P0"),
+        _structure_event(30, "valley", 0, event_id="V0"),
+        _structure_event(45, "peak", 2, event_id="P1"),
+        _structure_event(80, "valley", -10, event_id="V1"),
+    ))
+    fall = next(item for item in result.segments if item.direction == "FALL")
+    assert (fall.start_event_id, fall.end_event_id) == ("P0", "V1")
+    assert fall.signed_change == -30
+    assert fall.num_removed_reversals == 1
+
+
+def test_coarse_structure_keeps_strong_or_long_or_domain_large_reversal():
+    strong = _coarse_result((
+        _structure_event(0, "valley", 0), _structure_event(30, "peak", 10),
+        _structure_event(45, "valley", 2), _structure_event(80, "peak", 20),
+    ))
+    domain_large = _coarse_result((
+        _structure_event(0, "valley", 0), _structure_event(30, "peak", 100),
+        _structure_event(45, "valley", 96), _structure_event(80, "peak", 200),
+    ))
+    long = _coarse_result((
+        _structure_event(0, "valley", 0), _structure_event(30, "peak", 10),
+        _structure_event(90, "valley", 9), _structure_event(120, "peak", 20),
+    ))
+    assert not strong.removed_reversals
+    assert not domain_large.removed_reversals
+    assert not long.removed_reversals
+
+
+def test_coarse_structure_selects_weakest_then_rebuilds_deterministically():
+    events = (
+        _structure_event(0, "valley", 0, event_id="V0"),
+        _structure_event(30, "peak", 10, event_id="P0"),
+        _structure_event(40, "valley", 9, event_id="V1"),
+        _structure_event(70, "peak", 20, event_id="P1"),
+        _structure_event(80, "valley", 19.5, event_id="V2"),
+        _structure_event(110, "peak", 30, event_id="P2"),
+    )
+    first = _coarse_result(events)
+    second = _coarse_result(events)
+    assert [item.removed_event_ids for item in first.removed_reversals] == [
+        ("P1", "V2"), ("P0", "V1")
+    ]
+    assert repr(first) == repr(second)
+    rise = next(item for item in first.segments if item.start_event_id == "V0")
+    assert rise.num_fine_segments_covered == 5
+    assert rise.num_removed_reversals == 2
+
+
+def test_coarse_structure_merge_depth_blocks_over_simplification():
+    result = _coarse_result((
+        _structure_event(0, "valley", 0), _structure_event(30, "peak", 10),
+        _structure_event(45, "valley", 9), _structure_event(80, "peak", 20),
+    ), max_merge_depth=2)
+    assert not result.removed_reversals
+    assert result.stop_reason == "merge_depth_limit"
+
+
+def test_coarse_structure_handles_circular_weak_reversal_and_duration():
+    result = _coarse_result((
+        _structure_event(10, "valley", 9, event_id="V1"),
+        _structure_event(40, "peak", 20, event_id="P1"),
+        _structure_event(300, "valley", 0, event_id="V0"),
+        _structure_event(350, "peak", 10, event_id="P0"),
+    ))
+    rise = next(item for item in result.segments if item.start_event_id == "V0")
+    assert rise.end_event_id == "P1"
+    assert rise.crosses_year_boundary
+    assert rise.start_day == 300
+    assert rise.end_day == 40
+    assert rise.unwrapped_end_day == 405
+    assert rise.duration_days == 105
+
+
+def test_source_coarse_stability_matches_coarse_to_coarse_one_to_one():
+    from analysis.recon_structure_segments import evaluate_source_coarse_stability
+
+    prototype = _coarse_result((
+        _structure_event(0, "valley", 0), _structure_event(30, "peak", 10),
+        _structure_event(45, "valley", 9), _structure_event(80, "peak", 20),
+    )).segments
+    samples = [
+        _coarse_result((
+            _structure_event(shift, "valley", 0),
+            _structure_event(30 + shift, "peak", 10),
+            _structure_event(45 + shift, "valley", 9),
+            _structure_event(80 + shift, "peak", 20),
+        )).segments
+        for shift in (0, 2, -1)
+    ] + [()]
+    stable = evaluate_source_coarse_stability(
+        prototype, samples, occurrence_radius_days=40,
+        min_occurrence=0.40, max_center_mad_days=35,
+        max_duration_ratio=2.5,
+    )
+    rise = next(item for item in stable if item.direction == "RISE")
+    assert rise.source_occurrence_rate == 0.75
+    assert rise.accepted
+
+
+def test_coarse_derivation_does_not_mutate_fine_segments_or_chain():
+    from analysis.recon_structure_segments import (
+        build_alternating_chain,
+        build_coarse_structure,
+        build_directed_segments,
+    )
+
+    chain = build_alternating_chain((
+        _structure_event(0, "valley", 0, event_id="V0"),
+        _structure_event(30, "peak", 10, event_id="P0"),
+        _structure_event(45, "valley", 9, event_id="V1"),
+        _structure_event(80, "peak", 20, event_id="P1"),
+    ))
+    curve = np.linspace(-10.0, 30.0, 365)
+    fine = build_directed_segments(
+        chain, curve, 10.0, min_duration_days=1, max_duration_days=365,
+        min_domain_change=0.0, min_curve_change=0.0,
+    )
+    before = (repr(chain), repr(fine))
+    build_coarse_structure(
+        chain, fine, curve, 10.0, min_duration_days=1,
+        min_curve_change=0.0, min_domain_change=0.0,
+        min_monotonicity=0.0,
+    )
+    assert (repr(chain), repr(fine)) == before

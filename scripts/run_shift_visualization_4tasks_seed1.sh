@@ -54,14 +54,27 @@ run_structure_segment_task() {
         --segment-event-min-relative-prominence "${SEGMENT_EVENT_MIN_RELATIVE_PROMINENCE:-0.05}" \
         --segment-event-min-domain-prominence "${SEGMENT_EVENT_MIN_DOMAIN_PROMINENCE:-0.05}" \
         --segment-event-min-width-days "${SEGMENT_EVENT_MIN_WIDTH_DAYS:-3}" \
-        --segment-min-span-days "${SEGMENT_MIN_SPAN_DAYS:-15}" \
-        --segment-max-span-days "${SEGMENT_MAX_SPAN_DAYS:-100}" \
-        --segment-min-domain-variation "${SEGMENT_MIN_DOMAIN_VARIATION:-0.50}" \
-        --segment-min-curve-variation "${SEGMENT_MIN_CURVE_VARIATION:-0.25}" \
-        --segment-occurrence-radius-days "${SEGMENT_OCCURRENCE_RADIUS_DAYS:-30}" \
+        --segment-min-duration-days "${SEGMENT_MIN_DURATION_DAYS:-10}" \
+        --segment-max-duration-days "${SEGMENT_MAX_DURATION_DAYS:-120}" \
+        --segment-min-domain-change "${SEGMENT_MIN_DOMAIN_CHANGE:-0.30}" \
+        --segment-min-curve-change "${SEGMENT_MIN_CURVE_CHANGE:-0.15}" \
+        --segment-stability-radius-days "${SEGMENT_STABILITY_RADIUS_DAYS:-30}" \
         --segment-min-source-occurrence "${SEGMENT_MIN_SOURCE_OCCURRENCE:-0.50}" \
-        --segment-max-source-timing-mad-days "${SEGMENT_MAX_SOURCE_TIMING_MAD_DAYS:-25}" \
-        --segment-max-width-ratio "${SEGMENT_MAX_WIDTH_RATIO:-2.0}" \
+        --segment-max-source-center-mad-days "${SEGMENT_MAX_SOURCE_CENTER_MAD_DAYS:-25}" \
+        --segment-max-duration-ratio "${SEGMENT_MAX_DURATION_RATIO:-2.0}" \
+        --coarse-max-reversal-ratio "${COARSE_MAX_REVERSAL_RATIO:-0.50}" \
+        --coarse-max-reversal-domain-change "${COARSE_MAX_REVERSAL_DOMAIN_CHANGE:-0.35}" \
+        --coarse-max-reversal-duration-days "${COARSE_MAX_REVERSAL_DURATION_DAYS:-45}" \
+        --coarse-max-merge-depth "${COARSE_MAX_MERGE_DEPTH:-5}" \
+        --coarse-min-duration-days "${COARSE_MIN_DURATION_DAYS:-20}" \
+        --coarse-max-duration-days "${COARSE_MAX_DURATION_DAYS:-240}" \
+        --coarse-min-curve-change "${COARSE_MIN_CURVE_CHANGE:-0.20}" \
+        --coarse-min-domain-change "${COARSE_MIN_DOMAIN_CHANGE:-0.40}" \
+        --coarse-min-monotonicity "${COARSE_MIN_MONOTONICITY:-0.60}" \
+        --coarse-occurrence-radius-days "${COARSE_OCCURRENCE_RADIUS_DAYS:-40}" \
+        --coarse-min-source-occurrence "${COARSE_MIN_SOURCE_OCCURRENCE:-0.40}" \
+        --coarse-max-center-mad-days "${COARSE_MAX_CENTER_MAD_DAYS:-35}" \
+        --coarse-max-duration-ratio "${COARSE_MAX_DURATION_RATIO:-2.5}" \
         --device "$DEVICE"
 }
 

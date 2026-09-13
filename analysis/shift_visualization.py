@@ -12,6 +12,7 @@ import json
 import random
 import re
 import shutil
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
@@ -840,25 +841,75 @@ def write_structure_segment_outputs(
     output_dir,
     manifest,
     source_core_rows,
-    source_segment_rows,
-    target_segment_rows,
+    source_fine_rows,
+    source_coarse_rows,
+    target_fine_rows,
+    target_coarse_rows,
     class_rows,
+    coverage_rows,
+    folder=None,
 ):
     """Write a self-contained configuration-05 audit in the modern layout."""
-    folder = task_visualization_config_dir(
+    folder = Path(folder) if folder is not None else task_visualization_config_dir(
         output_dir, CONFIG_FOLDERS["reconshift13_structure_segments"]
     )
     folder.mkdir(parents=True, exist_ok=True)
     for filename, rows in (
         ("source_core_events.csv", source_core_rows),
-        ("source_segments.csv", source_segment_rows),
-        ("target_segments.csv", target_segment_rows),
+        ("source_fine_segments.csv", source_fine_rows),
+        ("source_coarse_segments.csv", source_coarse_rows),
+        ("target_fine_segments.csv", target_fine_rows),
+        ("target_coarse_segments.csv", target_coarse_rows),
         ("class_summary.csv", class_rows),
+        ("coverage_summary.csv", coverage_rows),
     ):
         _write_mapping_rows(folder / filename, rows)
     (folder / "manifest.json").write_text(
         json.dumps(dict(manifest), indent=2, ensure_ascii=False), encoding="utf-8"
     )
+
+
+@contextmanager
+def staged_structure_segment_output(output_dir):
+    """Build configuration 05 beside the final tree and publish it as a unit."""
+    final = task_visualization_config_dir(
+        output_dir, CONFIG_FOLDERS["reconshift13_structure_segments"]
+    )
+    staging = final.with_name(f".tmp_{final.name}")
+    backup = final.with_name(f".old_{final.name}")
+
+    def move_complete_tree(source, destination):
+        try:
+            source.replace(destination)
+        except PermissionError:
+            shutil.copytree(source, destination)
+            shutil.rmtree(source)
+
+    if backup.exists():
+        if final.exists():
+            shutil.rmtree(backup)
+        else:
+            move_complete_tree(backup, final)
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    try:
+        yield staging
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
+    try:
+        if final.exists():
+            move_complete_tree(final, backup)
+        move_complete_tree(staging, final)
+    except BaseException:
+        if not final.exists() and backup.exists():
+            move_complete_tree(backup, final)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    shutil.rmtree(backup, ignore_errors=True)
 
 
 def validate_existing_task_outputs(output_dir: Path, task_name: Optional[str] = None):

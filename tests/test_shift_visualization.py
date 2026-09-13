@@ -853,21 +853,96 @@ def test_structure_segment_outputs_are_self_cont_and_use_new_layout(tmp_path):
     meta = visualization_meta_dir(tmp_path, "AT1_DK1")
     write_structure_segment_outputs(
         meta,
-        {"mode": 13, "nonlinear_registration": False},
+        {
+            "mode": 13,
+            "nonlinear_registration": False,
+            "representation": "directed_two_extrema_segments",
+        },
         [{"event_id": "P0", "class_id": 0}],
-        [{"segment_id": "SSEG0", "class_id": 0}],
-        [{"segment_id": "TSEG0", "true_class": 0}],
-        [{"class_id": 0, "num_core_events": 1}],
+        [{
+            "segment_id": "SSEG0", "class_id": 0, "direction": "RISE",
+            "start_day": 100, "end_day": 130, "duration_days": 30,
+        }],
+        [{
+            "coarse_segment_id": "C0", "class_id": 0, "direction": "RISE",
+            "start_day": 80, "end_day": 190, "duration_days": 110,
+        }],
+        [{
+            "segment_id": "TSEG0", "true_class": 0, "direction": "FALL",
+            "start_day": 355, "end_day": 20, "duration_days": 30,
+        }],
+        [{
+            "coarse_segment_id": "TC0", "true_class": 0, "direction": "FALL",
+            "start_day": 350, "end_day": 40, "duration_days": 55,
+        }],
+        [{"class_id": 0, "num_core_events": 1, "num_source_rise_segments": 1}],
+        [{
+            "scope": "CLASS", "class_id": 0, "class_name": "crop",
+            "num_fine_accepted": 0, "num_coarse_accepted": 1,
+            "coarse_rescued_class": True,
+        }],
     )
     folder = tmp_path / "05_reconshift13_structure_segments" / "AT1_DK1"
     assert {path.name for path in folder.iterdir()} == {
-        "source_core_events.csv", "source_segments.csv", "target_segments.csv",
-        "class_summary.csv", "manifest.json",
+        "source_core_events.csv", "source_fine_segments.csv",
+        "source_coarse_segments.csv", "target_fine_segments.csv",
+        "target_coarse_segments.csv", "class_summary.csv",
+        "coverage_summary.csv", "manifest.json",
     }
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["mode"] == 13
+    assert manifest["representation"] == "directed_two_extrema_segments"
     assert manifest["nonlinear_registration"] is False
+    source_header = set(
+        (folder / "source_fine_segments.csv").read_text(encoding="utf-8")
+        .splitlines()[0]
+        .split(",")
+    )
+    assert {"direction", "duration_days"} <= source_header
+    assert {"center_event_day", "pattern", "span_days"}.isdisjoint(source_header)
+    assert not (folder / "source_segments.csv").exists()
+    assert not (folder / "target_segments.csv").exists()
     assert not (tmp_path / "AT1_DK1" / "05_reconshift13_structure_segments").exists()
+
+
+def test_structure_segment_staging_preserves_old_output_on_failure_and_replaces_on_success(tmp_path):
+    import pytest
+
+    from analysis.shift_visualization import staged_structure_segment_output
+
+    meta = tmp_path / "00_meta" / "AT1_DK1"
+    final = tmp_path / "05_reconshift13_structure_segments" / "AT1_DK1"
+    final.mkdir(parents=True)
+    (final / "old_three_point.csv").write_text("old", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        with staged_structure_segment_output(meta) as staging:
+            (staging / "new.csv").write_text("incomplete", encoding="utf-8")
+            raise RuntimeError("render failed")
+    assert (final / "old_three_point.csv").read_text(encoding="utf-8") == "old"
+    assert not final.with_name(f".tmp_{final.name}").exists()
+
+    with staged_structure_segment_output(meta) as staging:
+        (staging / "new.csv").write_text("complete", encoding="utf-8")
+    assert not (final / "old_three_point.csv").exists()
+    assert (final / "new.csv").read_text(encoding="utf-8") == "complete"
+
+
+def test_structure_segment_staging_recovers_interrupted_backup_before_render(tmp_path):
+    import pytest
+
+    from analysis.shift_visualization import staged_structure_segment_output
+
+    meta = tmp_path / "00_meta" / "FR2_AT1"
+    final = tmp_path / "05_reconshift13_structure_segments" / "FR2_AT1"
+    backup = final.with_name(f".old_{final.name}")
+    backup.mkdir(parents=True)
+    (backup / "last_complete.csv").write_text("complete", encoding="utf-8")
+
+    with pytest.raises(RuntimeError):
+        with staged_structure_segment_output(meta):
+            raise RuntimeError("new render failed")
+    assert (final / "last_complete.csv").read_text(encoding="utf-8") == "complete"
 
 
 def test_structure_segment_runner_exposes_all_thresholds_and_no_registration():
@@ -878,10 +953,21 @@ def test_structure_segment_runner_exposes_all_thresholds_and_no_registration():
         "--segment-event-min-relative-prominence",
         "--segment-event-min-domain-prominence",
         "--segment-event-min-width-days",
-        "--segment-min-span-days", "--segment-max-span-days",
-        "--segment-min-domain-variation", "--segment-min-curve-variation",
-        "--segment-occurrence-radius-days", "--segment-min-source-occurrence",
-        "--segment-max-source-timing-mad-days", "--segment-max-width-ratio",
+        "--segment-min-duration-days", "--segment-max-duration-days",
+        "--segment-min-domain-change", "--segment-min-curve-change",
+        "--segment-stability-radius-days", "--segment-min-source-occurrence",
+        "--segment-max-source-center-mad-days", "--segment-max-duration-ratio",
+        "--coarse-max-reversal-ratio",
+        "--coarse-max-reversal-domain-change",
+        "--coarse-max-reversal-duration-days",
+        "--coarse-max-merge-depth",
+        "--coarse-min-duration-days", "--coarse-max-duration-days",
+        "--coarse-min-curve-change", "--coarse-min-domain-change",
+        "--coarse-min-monotonicity",
+        "--coarse-occurrence-radius-days",
+        "--coarse-min-source-occurrence",
+        "--coarse-max-center-mad-days",
+        "--coarse-max-duration-ratio",
     ):
         assert option in runner
     active = runner[runner.index("def run_structure_segment_extension(") : runner.index("def run_multi_event_extension(")]
@@ -890,10 +976,35 @@ def test_structure_segment_runner_exposes_all_thresholds_and_no_registration():
     assert 'ADD_RECON13_STRUCTURE_SEGMENTS="${ADD_RECON13_STRUCTURE_SEGMENTS:-0}"' in launcher
 
 
-def test_structure_segment_three_panel_and_detail_figures_render(tmp_path):
+def test_structure_coverage_summary_uses_strict_rescue_definition_and_total_row():
+    from scripts.visualize_shift_configs_4tasks import build_structure_coverage_rows
+
+    rows = build_structure_coverage_rows("AT1_DK1", [
+        {"class_id": 0, "class_name": "none_then_coarse", "num_fine_accepted": 0, "num_coarse_accepted": 1},
+        {"class_id": 1, "class_name": "one_then_coarse", "num_fine_accepted": 1, "num_coarse_accepted": 2},
+        {"class_id": 2, "class_name": "none", "num_fine_accepted": 0, "num_coarse_accepted": 0},
+    ])
+    assert rows[0]["coarse_rescued_class"] is True
+    assert rows[1]["coarse_rescued_class"] is False
+    assert rows[2]["has_coarse_structure"] is False
+    total = rows[-1]
+    assert total["scope"] == "TOTAL"
+    assert total["num_class_task_units"] == 3
+    assert total["num_with_fine_structure"] == 1
+    assert total["num_with_coarse_structure"] == 2
+    assert total["num_with_either_structure"] == 2
+    assert total["num_with_no_structure"] == 1
+    assert np.isclose(total["coverage_fine"], 1 / 3)
+    assert np.isclose(total["coverage_coarse"], 2 / 3)
+
+
+def test_directed_structure_segment_three_panel_and_detail_figures_render(tmp_path):
     from analysis.recon_anchor_diagnostic import DomainProjectionBaseline
     from analysis.recon_event_diagnostic import detect_circular_events
-    from analysis.recon_structure_segments import detect_structure_segments
+    from analysis.recon_structure_segments import (
+        build_coarse_structure,
+        detect_structure_segments,
+    )
     from scripts.visualize_shift_configs_4tasks import _plot_structure_segment_class
 
     days = np.arange(365.0)
@@ -904,22 +1015,36 @@ def test_structure_segment_three_panel_and_detail_figures_render(tmp_path):
     )
     targets = np.stack((np.roll(source, 3), np.roll(source, 5)))
     baseline = DomainProjectionBaseline(0.0, 1.0)
-    source_candidates, _, source_segments = detect_structure_segments(
-        source, days, baseline, min_span_days=15, max_span_days=100,
-        min_domain_variation=0.2, min_curve_variation=0.2,
+    source_candidates, source_chain, source_segments = detect_structure_segments(
+        source, days, baseline, min_duration_days=10, max_duration_days=120,
+        min_domain_change=0.2, min_curve_change=0.2,
     )
     target_median = np.median(targets, axis=0)
-    target_candidates, _, target_segments = detect_structure_segments(
-        target_median, days, baseline, min_span_days=15, max_span_days=100,
-        min_domain_variation=0.2, min_curve_variation=0.2,
+    target_candidates, target_chain, target_segments = detect_structure_segments(
+        target_median, days, baseline, min_duration_days=10, max_duration_days=120,
+        min_domain_change=0.2, min_curve_change=0.2,
     )
     source_core = detect_circular_events(source, days, baseline)
     target_core = detect_circular_events(target_median, days, baseline)
+    coarse_kwargs = dict(
+        max_reversal_ratio=0.5, max_reversal_domain_change=0.35,
+        max_reversal_duration_days=45, max_merge_depth=5,
+        min_duration_days=20, max_duration_days=240,
+        min_curve_change=0.0, min_domain_change=0.0,
+        min_monotonicity=0.0,
+    )
+    source_coarse = build_coarse_structure(
+        source_chain, source_segments, source, baseline.iqr, **coarse_kwargs
+    )
+    target_coarse = build_coarse_structure(
+        target_chain, target_segments, target_median, baseline.iqr, **coarse_kwargs
+    )
     main = tmp_path / "05_reconshift13_structure_segments" / "AT1_DK1" / "00_crop.png"
     detail = main.parent / "diagnostics" / "00_crop_segment_detail.png"
     _plot_structure_segment_class(
         main, detail, "crop", source, targets, source_core, source_candidates,
-        source_segments, target_core, target_candidates, target_segments,
+        source_segments, source_coarse, target_core, target_candidates,
+        target_segments, target_coarse,
     )
     assert main.is_file() and main.stat().st_size > 0
     assert detail.is_file() and detail.stat().st_size > 0

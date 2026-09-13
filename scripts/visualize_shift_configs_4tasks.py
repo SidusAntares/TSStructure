@@ -6,6 +6,7 @@ import json
 import random
 import sys
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,7 @@ from analysis.shift_visualization import (
     update_local_nonlinear_outputs,
     update_multi_event_outputs,
     write_structure_segment_outputs,
+    staged_structure_segment_output,
     validate_existing_task_outputs,
     visualization_meta_dir,
     task_visualization_config_dir,
@@ -41,8 +43,10 @@ from analysis.recon_event_diagnostic import (
     greedy_match_events,
 )
 from analysis.recon_structure_segments import (
+    build_coarse_structure,
     detect_structure_segments,
-    evaluate_source_segment_stability,
+    evaluate_source_coarse_stability,
+    evaluate_source_segments_stability,
 )
 from analysis.recon_anchor_diagnostic import (
     Extremum,
@@ -686,41 +690,135 @@ def _boundary_view(curve):
 
 
 def _segment_row(task, class_id, class_name, segment, sample_id=None):
-    first, center, last = segment.events
     row = {
         "task": task,
         "class_id" if sample_id is None else "true_class": class_id,
         "class_name": class_name,
         "segment_id": segment.segment_id,
-        "pattern": segment.pattern,
-        "start_event_day" if sample_id is None else "start_day": first.day % 365,
-        "center_event_day" if sample_id is None else "center_day": center.day % 365,
-        "end_event_day" if sample_id is None else "end_day": last.day % 365,
-        "span_days": segment.span_days,
-        "curve_normalized_variation": segment.curve_normalized_variation,
-        "domain_normalized_variation": segment.domain_normalized_variation,
-        "amplitude_range": segment.amplitude_range,
+        "direction": segment.direction,
+        "start_event_type": segment.start_event.kind,
+        "end_event_type": segment.end_event.kind,
+        "start_day": segment.start_day,
+        "end_day": segment.end_day,
+        "center_day": segment.center_day,
+        "duration_days": segment.duration_days,
+        "signed_change": segment.signed_change,
+        "absolute_change": segment.absolute_change,
+        "slope": segment.slope,
+        "curve_normalized_change": segment.curve_normalized_change,
+        "domain_normalized_change": segment.domain_normalized_change,
+        "start_role": segment.start_role,
+        "end_role": segment.end_role,
+        "left_context_pattern": segment.left_context_pattern,
+        "right_context_pattern": segment.right_context_pattern,
         "accepted": segment.accepted,
         "rejection_reason": segment.rejection_reason,
         "crosses_year_boundary": segment.crosses_year_boundary,
     }
     if sample_id is None:
         row.update(
-            start_event_type=first.kind,
-            center_event_type=center.kind,
-            end_event_type=last.kind,
-            total_variation=segment.total_variation,
             source_occurrence_rate=segment.source_occurrence_rate,
             source_center_timing_mad_days=segment.source_center_timing_mad_days,
-            source_span_ratio_median=segment.source_span_ratio_median,
+            source_duration_ratio_median=segment.source_duration_ratio_median,
+            source_duration_ratio_error_p90=segment.source_duration_ratio_error_p90,
+            source_domain_change_median=segment.source_domain_change_median,
+            source_domain_change_iqr=segment.source_domain_change_iqr,
         )
     else:
         row["sample_id"] = sample_id
     return row
 
 
+def _coarse_segment_row(task, class_id, class_name, segment, sample_id=None):
+    row = {
+        "task": task,
+        "class_id" if sample_id is None else "true_class": class_id,
+        "class_name": class_name,
+        "coarse_segment_id": segment.coarse_segment_id,
+        "direction": segment.direction,
+        "start_event_id": segment.start_event_id,
+        "end_event_id": segment.end_event_id,
+        "start_day": segment.start_day,
+        "end_day": segment.end_day,
+        "center_day": segment.center_day,
+        "unwrapped_end_day": segment.unwrapped_end_day,
+        "duration_days": segment.duration_days,
+        "start_value": segment.start_value,
+        "end_value": segment.end_value,
+        "signed_change": segment.signed_change,
+        "absolute_change": segment.absolute_change,
+        "curve_normalized_change": segment.curve_normalized_change,
+        "domain_normalized_change": segment.domain_normalized_change,
+        "fine_segment_ids": ";".join(segment.fine_segment_ids),
+        "removed_reversal_ids": ";".join(segment.removed_reversal_ids),
+        "num_fine_segments_covered": segment.num_fine_segments_covered,
+        "num_removed_reversals": segment.num_removed_reversals,
+        "total_path_variation": segment.total_path_variation,
+        "net_change": segment.net_change,
+        "monotonicity_ratio": segment.monotonicity_ratio,
+        "max_removed_reversal_ratio": segment.max_removed_reversal_ratio,
+        "max_removed_reversal_domain_change": segment.max_removed_reversal_domain_change,
+        "max_removed_reversal_duration_days": segment.max_removed_reversal_duration_days,
+        "accepted": segment.accepted,
+        "rejection_reason": segment.rejection_reason,
+        "crosses_year_boundary": segment.crosses_year_boundary,
+    }
+    if sample_id is None:
+        row.update(
+            source_occurrence_rate=segment.source_occurrence_rate,
+            source_center_timing_mad_days=segment.source_center_timing_mad_days,
+            source_duration_ratio_median=segment.source_duration_ratio_median,
+        )
+    else:
+        row["sample_id"] = sample_id
+    return row
+
+
+def build_structure_coverage_rows(task, class_rows):
+    rows = []
+    for item in class_rows:
+        fine = int(item["num_fine_accepted"])
+        coarse = int(item["num_coarse_accepted"])
+        rows.append({
+            "scope": "CLASS",
+            "task": task,
+            "class_id": item["class_id"],
+            "class_name": item["class_name"],
+            "num_fine_accepted": fine,
+            "num_coarse_accepted": coarse,
+            "has_fine_structure": fine > 0,
+            "has_coarse_structure": coarse > 0,
+            "coarse_rescued_class": fine == 0 and coarse > 0,
+        })
+    total = len(rows)
+    fine_count = sum(row["has_fine_structure"] for row in rows)
+    coarse_count = sum(row["has_coarse_structure"] for row in rows)
+    rescued_count = sum(row["coarse_rescued_class"] for row in rows)
+    union_count = sum(
+        row["has_fine_structure"] or row["has_coarse_structure"] for row in rows
+    )
+    rows.append({
+        "scope": "TOTAL",
+        "task": task,
+        "class_id": "",
+        "class_name": "ALL",
+        "num_class_task_units": total,
+        "num_with_fine_structure": fine_count,
+        "num_with_coarse_structure": coarse_count,
+        "num_coarse_rescued_classes": rescued_count,
+        "num_with_either_structure": union_count,
+        "num_with_no_structure": total - union_count,
+        "coverage_fine": fine_count / total if total else float("nan"),
+        "coverage_coarse": coarse_count / total if total else float("nan"),
+        "coverage_coarse_rescued": rescued_count / total if total else float("nan"),
+        "coverage_union": union_count / total if total else float("nan"),
+    })
+    return rows
+
+
 def _periodic_segment_intervals(segment, low=0.0, high=365.0):
-    start, _, end = segment.unwrapped_days
+    start = getattr(segment, "unwrapped_start_day", segment.start_day)
+    end = segment.unwrapped_end_day
     intervals = []
     for offset in (-365.0, 0.0, 365.0):
         left, right = start + offset, end + offset
@@ -739,9 +837,11 @@ def _plot_structure_segment_class(
     source_core_events,
     source_candidates,
     source_segments,
+    source_coarse,
     target_core_events,
     target_candidates,
     target_median_segments,
+    target_coarse,
 ):
     import matplotlib
     matplotlib.use("Agg")
@@ -757,65 +857,98 @@ def _plot_structure_segment_class(
     core_target = {(event.kind, round(event.day, 6)) for event in target_core_events if event.accepted}
     auxiliary_source = {
         (event.kind, round(event.day % 365, 6))
-        for segment in source_segments if segment.accepted for event in segment.events
+        for segment in source_segments if segment.accepted
+        for event in (segment.start_event, segment.end_event)
     }
     auxiliary_target = {
         (event.kind, round(event.day % 365, 6))
-        for segment in target_median_segments if segment.accepted for event in segment.events
+        for segment in target_median_segments if segment.accepted
+        for event in (segment.start_event, segment.end_event)
+    }
+    removed_source = {
+        event_id for reversal in source_coarse.removed_reversals
+        for event_id in reversal.removed_event_ids
+    }
+    removed_target = {
+        event_id for reversal in target_coarse.removed_reversals
+        for event_id in reversal.removed_event_ids
     }
 
-    def draw_curve(axis, curve, events, core, auxiliary, color, label):
+    def draw_curve(axis, curve, events, core, auxiliary, removed, color, label):
         axis.plot(days, curve, color=color, lw=2.2, label=label)
         for event in events:
             key = (event.kind, round(event.day % 365, 6))
-            if key in core:
+            if event.event_id in removed:
+                marker, size, alpha, event_color = "x", 48, 0.9, "#777777"
+            elif key in core:
                 marker, size, alpha = ("^" if event.kind == "peak" else "v"), 58, 1.0
+                event_color = color
             elif key in auxiliary:
                 marker, size, alpha = "o", 35, 0.9
+                event_color = color
             else:
                 marker, size, alpha = "x", 25, 0.45
-            axis.scatter(event.day % 365, event.value, marker=marker, s=size, color=color, alpha=alpha)
+                event_color = color
+            axis.scatter(event.day % 365, event.value, marker=marker, s=size, color=event_color, alpha=alpha)
 
-    for segment in source_segments:
-        if segment.accepted:
-            for left, right in _periodic_segment_intervals(segment):
-                axes[0].axvspan(left, right, color=source_color, alpha=0.07)
-                axes[0].text((left + right) / 2, 0.98, segment.segment_id, transform=axes[0].get_xaxis_transform(), ha="center", va="top", fontsize=7, color=source_color)
-    for segment in target_median_segments:
-        if segment.accepted:
-            for left, right in _periodic_segment_intervals(segment):
-                axes[0].axvspan(left, right, color=target_color, alpha=0.06)
-    draw_curve(axes[0], source_curve, source_candidates, core_source, auxiliary_source, source_color, "source prototype")
-    draw_curve(axes[0], target_median, target_candidates, core_target, auxiliary_target, target_color, "target oracle median")
-    axes[0].set_title("Full-year global-aligned Recon13: ▲/▼ core, ○ auxiliary member, × rejected")
+    def draw_segments(axis, curve, segments, color, low=0.0, high=365.0, coarse=False):
+        for segment in segments:
+            if not segment.accepted:
+                continue
+            for left, right in _periodic_segment_intervals(segment, low, high):
+                start_y = np.interp(left % 365.0, days, curve)
+                end_y = np.interp(right % 365.0, days, curve)
+                axis.annotate(
+                    "", xy=(right, end_y), xytext=(left, start_y),
+                    arrowprops={
+                        "arrowstyle": "-|>", "color": color,
+                        "lw": 3.2 if coarse else 0.9,
+                        "alpha": 0.95 if coarse else 0.28,
+                    },
+                )
+
+    draw_segments(axes[0], source_curve, source_segments, source_color)
+    draw_segments(axes[0], target_median, target_median_segments, target_color)
+    draw_segments(axes[0], source_curve, source_coarse.segments, source_color, coarse=True)
+    draw_segments(axes[0], target_median, target_coarse.segments, target_color, coarse=True)
+    draw_curve(axes[0], source_curve, source_candidates, core_source, auxiliary_source, removed_source, source_color, "source prototype")
+    draw_curve(axes[0], target_median, target_candidates, core_target, auxiliary_target, removed_target, target_color, "target oracle median")
+    axes[0].set_title("Full-year Recon13: thin=fine, thick=coarse; gray ×=removed weak reversal")
     axes[0].set_ylabel("Source-class PC1 score")
     axes[0].legend(frameon=False)
     axes[0].grid(alpha=0.2)
 
-    axes[1].hlines([1, 0], 0, 365, colors=[source_color, target_color], alpha=0.25)
-    for y, segments, color, prefix in (
-        (1, source_segments, source_color, "S"),
-        (0, target_median_segments, target_color, "T"),
+    axes[1].hlines([3, 2, 1, 0], 0, 365, colors="#BBBBBB", alpha=0.35)
+    for y, segments, color, prefix, coarse in (
+        (3, source_segments, source_color, "SF", False),
+        (2, source_coarse.segments, source_color, "SC", True),
+        (1, target_median_segments, target_color, "TF", False),
+        (0, target_coarse.segments, target_color, "TC", True),
     ):
         for segment in segments:
             if not segment.accepted:
                 continue
             for left, right in _periodic_segment_intervals(segment):
-                axes[1].plot([left, right], [y, y], color=color, lw=9, alpha=0.55, solid_capstyle="butt")
-                axes[1].text((left + right) / 2, y + 0.12, f"{prefix}{segment.segment_id}", ha="center", fontsize=7)
-    axes[1].scatter(
-        [event.day % 365 for event in source_core_events if event.accepted],
-        [1] * sum(event.accepted for event in source_core_events),
-        marker="|", s=180, color=source_color,
+                axes[1].annotate(
+                    "", xy=(right, y), xytext=(left, y),
+                    arrowprops={
+                        "arrowstyle": "-|>", "color": color,
+                        "lw": 5 if coarse else 2,
+                        "alpha": 0.8 if coarse else 0.35,
+                    },
+                )
+                segment_id = getattr(segment, "coarse_segment_id", getattr(segment, "segment_id", ""))
+                axes[1].text(
+                    (left + right) / 2, y + 0.12,
+                    f"{prefix}:{segment_id}:{segment.direction}",
+                    ha="center", fontsize=7,
+                )
+    axes[1].set_yticks(
+        [0, 1, 2, 3],
+        ["target coarse", "target fine", "source coarse", "source fine"],
     )
-    axes[1].scatter(
-        [event.day % 365 for event in target_core_events if event.accepted],
-        [0] * sum(event.accepted for event in target_core_events),
-        marker="|", s=180, color=target_color,
-    )
-    axes[1].set_yticks([0, 1], ["target median", "source"])
-    axes[1].set_ylim(-0.45, 1.45)
-    axes[1].set_title("Accepted structural-segment timeline (no cross-domain matching)")
+    axes[1].set_ylim(-0.45, 3.45)
+    axes[1].set_title("Independent fine/coarse timelines (no cross-domain matching)")
     axes[1].grid(axis="x", alpha=0.2)
 
     boundary_days, source_boundary = _boundary_view(source_curve)
@@ -823,31 +956,35 @@ def _plot_structure_segment_class(
     axes[2].plot(boundary_days, source_boundary, color=source_color, lw=2.2)
     axes[2].plot(boundary_days, target_boundary, color=target_color, lw=2.0)
     axes[2].axvline(365, color="#555555", ls=":", lw=1.1)
-    for segments, color in ((source_segments, source_color), (target_median_segments, target_color)):
-        for segment in segments:
-            if segment.accepted:
-                for left, right in _periodic_segment_intervals(segment, 300, 425):
-                    axes[2].axvspan(left, right, color=color, alpha=0.08)
-    for curve, events, core, auxiliary, color in (
-        (source_curve, source_candidates, core_source, auxiliary_source, source_color),
-        (target_median, target_candidates, core_target, auxiliary_target, target_color),
+    draw_segments(axes[2], source_curve, source_segments, source_color, 300, 425)
+    draw_segments(axes[2], target_median, target_median_segments, target_color, 300, 425)
+    draw_segments(axes[2], source_curve, source_coarse.segments, source_color, 300, 425, coarse=True)
+    draw_segments(axes[2], target_median, target_coarse.segments, target_color, 300, 425, coarse=True)
+    for curve, events, core, auxiliary, removed, color in (
+        (source_curve, source_candidates, core_source, auxiliary_source, removed_source, source_color),
+        (target_median, target_candidates, core_target, auxiliary_target, removed_target, target_color),
     ):
         for event in events:
             shown_day = event.day + 365 if event.day < 60 else event.day
             if 300 <= shown_day <= 425:
                 key = (event.kind, round(event.day % 365, 6))
-                if key in core:
+                if event.event_id in removed:
+                    marker, size, alpha, event_color = "x", 42, 0.9, "#777777"
+                elif key in core:
                     marker, size, alpha = ("^" if event.kind == "peak" else "v"), 50, 1.0
+                    event_color = color
                 elif key in auxiliary:
                     marker, size, alpha = "o", 30, 0.9
+                    event_color = color
                 else:
                     marker, size, alpha = "x", 24, 0.45
+                    event_color = color
                 axes[2].scatter(
                     shown_day,
                     np.interp(event.day % 365, days, curve),
                     marker=marker,
                     s=size,
-                    color=color,
+                    color=event_color,
                     alpha=alpha,
                 )
     axes[2].set_xlim(300, 425)
@@ -857,51 +994,88 @@ def _plot_structure_segment_class(
     axes[2].grid(alpha=0.2)
     for axis in (axes[0], axes[1]):
         axis.set_xlim(0, 364)
-    figure.suptitle(f"{class_name} | Mode13 core events + local structure segments")
+    figure.suptitle(f"{class_name} | Mode13 fine segments + weak-reversal coarse segments")
     figure.tight_layout(rect=(0, 0, 1, 0.96))
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(figure)
 
-    detail, axis = plt.subplots(figsize=(14, max(4.5, 1.0 + 0.55 * len(source_segments))))
+    detail, axis = plt.subplots(
+        figsize=(15, max(6.0, 2.5 + 0.45 * (len(source_segments) + len(source_coarse.segments))))
+    )
     axis.axis("off")
-    lines = ["segment | pattern | start-center-end | span | curve-var | domain-var | occurrence | MAD | width-ratio | decision"]
+    lines = ["FINE", "segment | dir | start-end | days | abs-change | slope | roles | occurrence | MAD | duration-ratio | context | decision"]
     for item in source_segments:
         lines.append(
-            f"{item.segment_id} | {item.pattern} | "
-            f"{item.unwrapped_days[0]:.1f}-{item.unwrapped_days[1]:.1f}-{item.unwrapped_days[2]:.1f} | "
-            f"{item.span_days:.1f} | {item.curve_normalized_variation:.3f} | "
-            f"{item.domain_normalized_variation:.3f} | {item.source_occurrence_rate:.3f} | "
-            f"{item.source_center_timing_mad_days:.1f} | {item.source_span_ratio_median:.3f} | "
+            f"{item.segment_id} | {item.direction} | "
+            f"{item.unwrapped_start_day:.1f}-{item.unwrapped_end_day:.1f} | "
+            f"{item.duration_days:.1f} | {item.absolute_change:.3f} | {item.slope:.4f} | "
+            f"{item.start_role}/{item.end_role} | {item.source_occurrence_rate:.3f} | "
+            f"{item.source_center_timing_mad_days:.1f} | {item.source_duration_ratio_median:.3f} | "
+            f"{item.left_context_pattern}/{item.right_context_pattern} | "
             f"{'ACCEPT' if item.accepted else 'REJECT ' + item.rejection_reason}"
         )
-    axis.text(0.01, 0.98, "\n".join(lines), va="top", family="monospace", fontsize=8)
-    axis.set_title(f"{class_name} | source structural-segment threshold audit")
+    lines.extend([
+        "",
+        f"COARSE | stop_reason={source_coarse.stop_reason} | removed={len(source_coarse.removed_reversals)}",
+        "segment | dir | start-end | days | fine-ids | removed-ids | path-var | net | monotonicity | occurrence | MAD | duration-ratio | decision",
+    ])
+    for item in source_coarse.segments:
+        lines.append(
+            f"{item.coarse_segment_id} | {item.direction} | {item.start_day:.1f}-{item.unwrapped_end_day:.1f} | "
+            f"{item.duration_days:.1f} | {','.join(item.fine_segment_ids)} | "
+            f"{','.join(item.removed_reversal_ids) or '-'} | {item.total_path_variation:.3f} | "
+            f"{item.net_change:.3f} | {item.monotonicity_ratio:.3f} | "
+            f"{item.source_occurrence_rate:.3f} | {item.source_center_timing_mad_days:.1f} | "
+            f"{item.source_duration_ratio_median:.3f} | "
+            f"{'ACCEPT' if item.accepted else 'REJECT ' + item.rejection_reason}"
+        )
+    if source_coarse.removed_reversals:
+        lines.extend(["", "REMOVED REVERSALS | events | ratio | domain | days"])
+        for item in source_coarse.removed_reversals:
+            lines.append(
+                f"{item.removal_id} | {','.join(item.removed_event_ids)} | "
+                f"{item.reversal_ratio:.3f} | {item.domain_normalized_reversal:.3f} | "
+                f"{item.reversal_duration_days:.1f}"
+            )
+    axis.text(0.01, 0.98, "\n".join(lines), va="top", family="monospace", fontsize=7)
+    axis.set_title(f"{class_name} | source fine/coarse threshold, provenance, and stability audit")
     detail_path = Path(detail_path)
     detail_path.parent.mkdir(parents=True, exist_ok=True)
     detail.savefig(detail_path, dpi=180, bbox_inches="tight")
     plt.close(detail)
 
 
-def run_structure_segment_extension(
+def _run_structure_segment_extension_into(
     args, output_dir, task_name, classes, projections, source_coefficients,
     target_coefficients, target_records, source_baselines, target_baselines,
-    source_prototypes, recon_shift_days, expected_filenames,
+    source_prototypes, recon_shift_days, expected_filenames, folder,
 ):
     daily = np.arange(365.0)
-    folder = task_visualization_config_dir(output_dir, "05_reconshift13_structure_segments")
     segment_kwargs = {
         "min_distance_days": args.event_min_distance_days,
         "member_min_width_days": args.segment_event_min_width_days,
         "member_min_relative_prominence": args.segment_event_min_relative_prominence,
         "member_min_domain_prominence": args.segment_event_min_domain_prominence,
-        "min_span_days": args.segment_min_span_days,
-        "max_span_days": args.segment_max_span_days,
-        "min_domain_variation": args.segment_min_domain_variation,
-        "min_curve_variation": args.segment_min_curve_variation,
+        "min_duration_days": args.segment_min_duration_days,
+        "max_duration_days": args.segment_max_duration_days,
+        "min_domain_change": args.segment_min_domain_change,
+        "min_curve_change": args.segment_min_curve_change,
     }
-    core_rows, source_rows, target_rows, class_rows = [], [], [], []
+    coarse_kwargs = {
+        "max_reversal_ratio": args.coarse_max_reversal_ratio,
+        "max_reversal_domain_change": args.coarse_max_reversal_domain_change,
+        "max_reversal_duration_days": args.coarse_max_reversal_duration_days,
+        "max_merge_depth": args.coarse_max_merge_depth,
+        "min_duration_days": args.coarse_min_duration_days,
+        "max_duration_days": args.coarse_max_duration_days,
+        "min_curve_change": args.coarse_min_curve_change,
+        "min_domain_change": args.coarse_min_domain_change,
+        "min_monotonicity": args.coarse_min_monotonicity,
+    }
+    core_rows, source_fine_rows, source_coarse_rows = [], [], []
+    target_fine_rows, target_coarse_rows, class_rows = [], [], []
     for class_id, class_name in enumerate(classes):
         matching = sorted(name for name in expected_filenames if name.startswith(f"{class_id:02d}_"))
         if not matching:
@@ -909,22 +1083,6 @@ def run_structure_segment_extension(
         projection = projections[class_id]
         source_curve = projection.transform(source_prototypes[class_id][None])[0]
         source_samples = reconstruct_projected_coefficients(source_coefficients[class_id], projection, daily)
-        source_candidates, _, source_segments = detect_structure_segments(
-            source_curve, daily, source_baselines[class_id], event_prefix="S", segment_prefix="SSEG", **segment_kwargs
-        )
-        sample_segments = [
-            detect_structure_segments(curve, daily, source_baselines[class_id], event_prefix="I", segment_prefix="ISEG", **segment_kwargs)[2]
-            for curve in source_samples
-        ]
-        source_segments = tuple(
-            evaluate_source_segment_stability(
-                item, sample_segments,
-                args.segment_occurrence_radius_days,
-                args.segment_min_source_occurrence,
-                args.segment_max_source_timing_mad_days,
-                args.segment_max_width_ratio,
-            ) for item in source_segments
-        )
         core_candidates = detect_circular_events(
             source_curve, daily, source_baselines[class_id], event_prefix="CORE",
             **_event_detection_kwargs(_event_detector_config(args)),
@@ -938,51 +1096,135 @@ def run_structure_segment_extension(
                 **_event_detection_kwargs(_event_detector_config(args)),
             ) for item in core_candidates
         )
+        source_candidates, source_chain, source_raw_segments = detect_structure_segments(
+            source_curve, daily, source_baselines[class_id], core_events=source_core,
+            event_prefix="S", segment_prefix="SSEG", **segment_kwargs
+        )
+        sample_detections = [
+            detect_structure_segments(
+                curve, daily, source_baselines[class_id], event_prefix=f"I{sample_id}_",
+                segment_prefix=f"ISEG{sample_id}_", **segment_kwargs
+            )
+            for sample_id, curve in enumerate(source_samples)
+        ]
+        sample_segments = [item[2] for item in sample_detections]
+        source_segments = evaluate_source_segments_stability(
+                source_raw_segments, sample_segments,
+                args.segment_stability_radius_days,
+                args.segment_min_source_occurrence,
+                args.segment_max_source_center_mad_days,
+                args.segment_max_duration_ratio,
+        )
+        source_coarse_raw = build_coarse_structure(
+            source_chain, source_raw_segments, source_curve,
+            source_baselines[class_id].iqr, segment_prefix="SC", **coarse_kwargs,
+        )
+        sample_coarse_results = [
+            build_coarse_structure(
+                chain, segments, curve, source_baselines[class_id].iqr,
+                segment_prefix=f"IC{sample_id}_", **coarse_kwargs,
+            )
+            for sample_id, (curve, (_, chain, segments)) in enumerate(
+                zip(source_samples, sample_detections)
+            )
+        ]
+        stable_source_coarse = evaluate_source_coarse_stability(
+            source_coarse_raw.segments,
+            [item.segments for item in sample_coarse_results],
+            args.coarse_occurrence_radius_days,
+            args.coarse_min_source_occurrence,
+            args.coarse_max_center_mad_days,
+            args.coarse_max_duration_ratio,
+        )
+        source_coarse = replace(source_coarse_raw, segments=stable_source_coarse)
         core_rows.extend(_event_row(task_name, class_id, class_name, item) for item in source_core if item.accepted)
-        source_rows.extend(_segment_row(task_name, class_id, class_name, item) for item in source_segments)
+        source_fine_rows.extend(_segment_row(task_name, class_id, class_name, item) for item in source_segments)
+        source_coarse_rows.extend(
+            _coarse_segment_row(task_name, class_id, class_name, item)
+            for item in source_coarse.segments
+        )
 
         target_curves = reconstruct_projected_coefficients(
             target_coefficients[class_id], projection, daily - float(recon_shift_days)
         )
-        target_segments_per_sample = []
-        for record, curve in zip(target_records[class_id], target_curves):
-            _, _, segments = detect_structure_segments(
-                curve, daily, target_baselines[class_id], event_prefix="T", segment_prefix="TSEG", **segment_kwargs
+        target_segments_per_sample, target_coarse_per_sample = [], []
+        for sample_index, (record, curve) in enumerate(zip(target_records[class_id], target_curves)):
+            _, chain, segments = detect_structure_segments(
+                curve, daily, target_baselines[class_id], event_prefix=f"T{sample_index}_",
+                segment_prefix=f"TSEG{sample_index}_", **segment_kwargs
+            )
+            coarse = build_coarse_structure(
+                chain, segments, curve, target_baselines[class_id].iqr,
+                segment_prefix=f"TC{sample_index}_", **coarse_kwargs,
             )
             target_segments_per_sample.append(segments)
-            target_rows.extend(
+            target_coarse_per_sample.append(coarse)
+            target_fine_rows.extend(
                 _segment_row(task_name, class_id, class_name, item, record["sample_id"])
                 for item in segments
             )
+            target_coarse_rows.extend(
+                _coarse_segment_row(task_name, class_id, class_name, item, record["sample_id"])
+                for item in coarse.segments
+            )
         target_median = np.median(target_curves, axis=0)
-        target_candidates, _, target_median_segments = detect_structure_segments(
-            target_median, daily, target_baselines[class_id], event_prefix="TM", segment_prefix="TMSEG", **segment_kwargs
-        )
         target_core = detect_circular_events(
             target_median, daily, target_baselines[class_id], event_prefix="TCORE",
             **_event_detection_kwargs(_event_detector_config(args)),
+        )
+        target_candidates, target_median_chain, target_median_segments = detect_structure_segments(
+            target_median, daily, target_baselines[class_id], core_events=target_core,
+            event_prefix="TM", segment_prefix="TMSEG", **segment_kwargs
+        )
+        target_median_coarse = build_coarse_structure(
+            target_median_chain, target_median_segments, target_median,
+            target_baselines[class_id].iqr, segment_prefix="TMC", **coarse_kwargs,
+        )
+        target_fine_rows.extend(
+            _segment_row(task_name, class_id, class_name, item, "TARGET_MEDIAN")
+            for item in target_median_segments
+        )
+        target_coarse_rows.extend(
+            _coarse_segment_row(task_name, class_id, class_name, item, "TARGET_MEDIAN")
+            for item in target_median_coarse.segments
         )
         safe_name = matching[0]
         _plot_structure_segment_class(
             folder / safe_name,
             folder / "diagnostics" / safe_name.replace(".png", "_segment_detail.png"),
             class_name, source_curve, target_curves, source_core, source_candidates,
-            source_segments, target_core, target_candidates, target_median_segments,
+            source_segments, source_coarse, target_core, target_candidates,
+            target_median_segments, target_median_coarse,
         )
         accepted_source = [item for item in source_segments if item.accepted]
+        accepted_source_coarse = [item for item in source_coarse.segments if item.accepted]
         target_counts = [sum(item.accepted for item in items) for items in target_segments_per_sample]
+        target_coarse_counts = [
+            sum(item.accepted for item in result.segments)
+            for result in target_coarse_per_sample
+        ]
         class_rows.append({
             "class_id": class_id, "class_name": class_name,
             "num_core_events": sum(item.accepted for item in source_core),
-            "num_source_segment_candidates": len(source_segments),
-            "num_source_auxiliary_segments": len(accepted_source),
-            "num_source_vpv_segments": sum(item.pattern == "valley_peak_valley" for item in accepted_source),
-            "num_source_pvp_segments": sum(item.pattern == "peak_valley_peak" for item in accepted_source),
-            "mean_target_segments_per_sample": float(np.mean(target_counts)) if target_counts else float("nan"),
-            "median_target_segments_per_sample": float(np.median(target_counts)) if target_counts else float("nan"),
-            "source_segment_center_days": ";".join(f"{item.center_day:.1f}" for item in accepted_source),
-            "source_segment_patterns": ";".join(item.pattern for item in accepted_source),
-            "num_boundary_segments": sum(item.crosses_year_boundary for item in accepted_source),
+            "num_fine_candidates": len(source_segments),
+            "num_fine_accepted": len(accepted_source),
+            "num_coarse_candidates": len(source_coarse.segments),
+            "num_coarse_accepted": len(accepted_source_coarse),
+            "coarse_rescued_class": len(accepted_source) == 0 and len(accepted_source_coarse) > 0,
+            "num_fine_rise": sum(item.direction == "RISE" for item in accepted_source),
+            "num_fine_fall": sum(item.direction == "FALL" for item in accepted_source),
+            "num_coarse_rise": sum(item.direction == "RISE" for item in accepted_source_coarse),
+            "num_coarse_fall": sum(item.direction == "FALL" for item in accepted_source_coarse),
+            "mean_target_fine_per_sample": float(np.mean(target_counts)) if target_counts else float("nan"),
+            "median_target_fine_per_sample": float(np.median(target_counts)) if target_counts else float("nan"),
+            "mean_target_coarse_per_sample": float(np.mean(target_coarse_counts)) if target_coarse_counts else float("nan"),
+            "median_target_coarse_per_sample": float(np.median(target_coarse_counts)) if target_coarse_counts else float("nan"),
+            "source_fine_center_days": ";".join(f"{item.center_day:.1f}" for item in accepted_source),
+            "source_coarse_center_days": ";".join(f"{item.center_day:.1f}" for item in accepted_source_coarse),
+            "num_fine_boundary_segments": sum(item.crosses_year_boundary for item in accepted_source),
+            "num_coarse_boundary_segments": sum(item.crosses_year_boundary for item in accepted_source_coarse),
+            "num_removed_reversals": len(source_coarse.removed_reversals),
+            "coarse_stop_reason": source_coarse.stop_reason,
         })
     generated = {path.name for path in folder.glob("*.png")}
     if generated != expected_filenames:
@@ -998,21 +1240,79 @@ def run_structure_segment_extension(
                 "min_domain_prominence": args.segment_event_min_domain_prominence,
                 "min_width_days": args.segment_event_min_width_days,
             },
-            "segment": {"chain_length": 3, "patterns": ["valley_peak_valley", "peak_valley_peak"], **segment_kwargs},
+            "segment": {
+                "unit": "adjacent_two_extrema",
+                "directions": {"valley_to_peak": "RISE", "peak_to_valley": "FALL"},
+                "circular_closing_pair": True,
+                **segment_kwargs,
+            },
             "source_stability": {
-                "occurrence_radius_days": args.segment_occurrence_radius_days,
+                "matching": "one_to_one_greedy_same_direction",
+                "occurrence_radius_days": args.segment_stability_radius_days,
                 "min_occurrence": args.segment_min_source_occurrence,
-                "max_timing_mad_days": args.segment_max_source_timing_mad_days,
-                "max_width_ratio": args.segment_max_width_ratio,
+                "max_center_mad_days": args.segment_max_source_center_mad_days,
+                "max_duration_ratio": args.segment_max_duration_ratio,
+            },
+            "coarse": {
+                "derivation": "iterative_weak_reversal_elimination_on_fine_extrema_chain",
+                "redetect_extrema": False,
+                "selection": "one_unique_weakest_then_reenumerate",
+                "tie_break": ["reversal_ratio", "domain_change", "duration", "circular_start_day", "event_id"],
+                "max_reversal_ratio": args.coarse_max_reversal_ratio,
+                "max_reversal_domain_change": args.coarse_max_reversal_domain_change,
+                "max_reversal_duration_days": args.coarse_max_reversal_duration_days,
+                "max_merge_depth": args.coarse_max_merge_depth,
+                "min_duration_days": args.coarse_min_duration_days,
+                "max_duration_days": args.coarse_max_duration_days,
+                "min_curve_change": args.coarse_min_curve_change,
+                "min_domain_change": args.coarse_min_domain_change,
+                "min_monotonicity": args.coarse_min_monotonicity,
+                "source_stability": {
+                    "matching": "one_to_one_greedy_same_direction",
+                    "occurrence_radius_days": args.coarse_occurrence_radius_days,
+                    "min_occurrence": args.coarse_min_source_occurrence,
+                    "max_center_mad_days": args.coarse_max_center_mad_days,
+                    "max_duration_ratio": args.coarse_max_duration_ratio,
+                },
             },
         },
+        "representation": "fine_directed_segments_plus_coarse_weak_reversal_elimination",
+        "three_extrema_context_only": True,
         "circular_calendar": True,
         "nonlinear_registration": False,
         "raw_timestamp_modified": False,
         "source_target_segment_matching": False,
         "target_label_usage": "offline oracle grouping only",
     }
-    write_structure_segment_outputs(output_dir, manifest, core_rows, source_rows, target_rows, class_rows)
+    coverage_rows = build_structure_coverage_rows(task_name, class_rows)
+    write_structure_segment_outputs(
+        output_dir, manifest, core_rows, source_fine_rows, source_coarse_rows,
+        target_fine_rows, target_coarse_rows, class_rows, coverage_rows,
+        folder=folder,
+    )
+    required_outputs = {
+        "source_core_events.csv", "source_fine_segments.csv",
+        "source_coarse_segments.csv", "target_fine_segments.csv",
+        "target_coarse_segments.csv", "class_summary.csv",
+        "coverage_summary.csv", "manifest.json",
+    }
+    missing = sorted(name for name in required_outputs if not (folder / name).is_file())
+    if missing:
+        raise RuntimeError(f"incomplete staged structure-segment audit: missing={missing}")
+    json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+
+
+def run_structure_segment_extension(
+    args, output_dir, task_name, classes, projections, source_coefficients,
+    target_coefficients, target_records, source_baselines, target_baselines,
+    source_prototypes, recon_shift_days, expected_filenames,
+):
+    with staged_structure_segment_output(output_dir) as folder:
+        _run_structure_segment_extension_into(
+            args, output_dir, task_name, classes, projections, source_coefficients,
+            target_coefficients, target_records, source_baselines, target_baselines,
+            source_prototypes, recon_shift_days, expected_filenames, folder,
+        )
 
 
 def _plot_multi_event_class(
@@ -2152,14 +2452,27 @@ def build_parser():
     parser.add_argument("--segment-event-min-relative-prominence", type=float, default=0.05)
     parser.add_argument("--segment-event-min-domain-prominence", type=float, default=0.05)
     parser.add_argument("--segment-event-min-width-days", type=float, default=3)
-    parser.add_argument("--segment-min-span-days", type=float, default=15)
-    parser.add_argument("--segment-max-span-days", type=float, default=100)
-    parser.add_argument("--segment-min-domain-variation", type=float, default=0.50)
-    parser.add_argument("--segment-min-curve-variation", type=float, default=0.25)
-    parser.add_argument("--segment-occurrence-radius-days", type=float, default=30)
+    parser.add_argument("--segment-min-duration-days", type=float, default=10)
+    parser.add_argument("--segment-max-duration-days", type=float, default=120)
+    parser.add_argument("--segment-min-domain-change", type=float, default=0.30)
+    parser.add_argument("--segment-min-curve-change", type=float, default=0.15)
+    parser.add_argument("--segment-stability-radius-days", type=float, default=30)
     parser.add_argument("--segment-min-source-occurrence", type=float, default=0.50)
-    parser.add_argument("--segment-max-source-timing-mad-days", type=float, default=25)
-    parser.add_argument("--segment-max-width-ratio", type=float, default=2.0)
+    parser.add_argument("--segment-max-source-center-mad-days", type=float, default=25)
+    parser.add_argument("--segment-max-duration-ratio", type=float, default=2.0)
+    parser.add_argument("--coarse-max-reversal-ratio", type=float, default=0.50)
+    parser.add_argument("--coarse-max-reversal-domain-change", type=float, default=0.35)
+    parser.add_argument("--coarse-max-reversal-duration-days", type=float, default=45)
+    parser.add_argument("--coarse-max-merge-depth", type=int, default=5)
+    parser.add_argument("--coarse-min-duration-days", type=float, default=20)
+    parser.add_argument("--coarse-max-duration-days", type=float, default=240)
+    parser.add_argument("--coarse-min-curve-change", type=float, default=0.20)
+    parser.add_argument("--coarse-min-domain-change", type=float, default=0.40)
+    parser.add_argument("--coarse-min-monotonicity", type=float, default=0.60)
+    parser.add_argument("--coarse-occurrence-radius-days", type=float, default=40)
+    parser.add_argument("--coarse-min-source-occurrence", type=float, default=0.40)
+    parser.add_argument("--coarse-max-center-mad-days", type=float, default=35)
+    parser.add_argument("--coarse-max-duration-ratio", type=float, default=2.5)
     parser.add_argument("--device", default="cuda")
     return parser
 
