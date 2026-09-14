@@ -227,3 +227,20 @@ def test_runner_fits_raw_pse_pc1_once_and_reuses_it_for_all_mode13_structures():
         "prototype_multi[None]",
         "medoid.curve[None]",
     }
+
+
+def test_configuration05_class_scope_excludes_source_only_classes_absent_from_05():
+    from analysis.structure_reference_validity_diagnostic import (
+        configuration05_class_scope,
+    )
+
+    classes = ["corn", "winter_barley", "winter_oat", "winter_rye"]
+    configuration05_rows = [
+        {"class_id": "0", "class_name": "corn"},
+        {"class_id": "1", "class_name": "winter_barley"},
+    ]
+
+    included, excluded = configuration05_class_scope(classes, configuration05_rows)
+
+    assert included == {0, 1}
+    assert excluded == {2: "winter_oat", 3: "winter_rye"}

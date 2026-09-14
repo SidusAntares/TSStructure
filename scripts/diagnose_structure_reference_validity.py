@@ -25,6 +25,7 @@ from analysis.structure_reference_validity_diagnostic import (
     bootstrap_subsample_indices,
     build_class_summary,
     build_total_summary,
+    configuration05_class_scope,
     plot_bootstrap_stability,
     plot_median_vs_medoid,
     select_multivariate_medoid,
@@ -147,11 +148,22 @@ def _load_reference_rows(view_root, reference_task):
     )
     manifest_path = folder / "manifest.json"
     rows_path = folder / "source_coarse_segments.csv"
-    if not manifest_path.is_file() or not rows_path.is_file():
+    classes_path = folder / "class_summary.csv"
+    if (
+        not manifest_path.is_file()
+        or not rows_path.is_file()
+        or not classes_path.is_file()
+    ):
         raise FileNotFoundError(
-            f"configuration-05 inputs missing: {manifest_path}, {rows_path}"
+            "configuration-05 inputs missing: "
+            f"{manifest_path}, {rows_path}, {classes_path}"
         )
-    return folder, _read_json(manifest_path), _read_csv(rows_path)
+    return (
+        folder,
+        _read_json(manifest_path),
+        _read_csv(rows_path),
+        _read_csv(classes_path),
+    )
 
 
 def _attach_configuration05_reference(computed, rows, class_id):
@@ -220,8 +232,11 @@ def run_source(args):
         bool(config.get("with_extra", False)), analyzer,
         collect_samplewise=True,
     )
-    view_folder, view_manifest, saved_rows = _load_reference_rows(
+    view_folder, view_manifest, saved_rows, saved_class_rows = _load_reference_rows(
         args.structure_view_root, args.reference_task
+    )
+    audited_class_ids, excluded_classes = configuration05_class_scope(
+        classes, saved_class_rows
     )
     fine_settings, coarse_settings = _detector_settings(view_manifest)
     output = Path(args.output_root) / alias
@@ -229,6 +244,12 @@ def run_source(args):
     days = np.arange(365.0)
 
     for class_id, class_name in enumerate(classes):
+        if class_id not in audited_class_ids:
+            print(
+                f"PROGRESS|source={alias}|class={class_name}|stage=skip_not_in_configuration05",
+                flush=True,
+            )
+            continue
         values = coefficients.get(class_id)
         if values is None or len(values) == 0 or class_id not in projections:
             continue
@@ -311,6 +332,8 @@ def run_source(args):
     class_rows = build_class_summary(structure_rows, medoid_counts)
     represented = {(row["source_domain"], row["class_id"]) for row in class_rows}
     for class_id, class_name in enumerate(classes):
+        if class_id not in audited_class_ids:
+            continue
         if (alias, class_id) not in represented:
             class_rows.append({
                 "source_domain": alias, "class_id": class_id,
@@ -332,7 +355,10 @@ def run_source(args):
         "source_checkpoint": str(checkpoint),
         "source_split": "fold0 first source shuffle",
         "source_sample_count": len(source_set),
-        "class_count": len(classes),
+        "class_count": len(audited_class_ids),
+        "full_source_class_count": len(classes),
+        "configuration05_class_ids": sorted(audited_class_ids),
+        "excluded_source_classes": excluded_classes,
         "latent_dim": latent_dim,
         "mode": 13,
         "pc1_fit": "full-source Raw-PSE interpolation; one fixed axis per class",

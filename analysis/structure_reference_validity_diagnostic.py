@@ -43,6 +43,31 @@ class MedoidSelection:
     total_distance: float
 
 
+def configuration05_class_scope(
+    classes: Sequence[str], class_rows: Sequence[Mapping]
+) -> tuple[set[int], dict[int, str]]:
+    """Return exactly the class scope materialized by configuration 05."""
+    included = set()
+    for row in class_rows:
+        class_id = int(row["class_id"])
+        if class_id < 0 or class_id >= len(classes):
+            raise ValueError(f"configuration-05 class id out of range: {class_id}")
+        expected = str(classes[class_id])
+        observed = str(row["class_name"])
+        if observed != expected:
+            raise ValueError(
+                f"configuration-05 class mismatch for id {class_id}: "
+                f"expected {expected}, found {observed}"
+            )
+        included.add(class_id)
+    excluded = {
+        class_id: str(class_name)
+        for class_id, class_name in enumerate(classes)
+        if class_id not in included
+    }
+    return included, excluded
+
+
 def bootstrap_subsample_indices(
     sample_count: int,
     repeats: int = 100,
