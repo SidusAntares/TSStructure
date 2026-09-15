@@ -15,6 +15,11 @@ def segment(sid, direction="RISE", start=10., end=40., accepted=True):
                 end_day=end, accepted=accepted)
 
 
+def event(eid, kind, day, prominence):
+    return dict(event_id=eid, kind=kind, day=day,
+                relative_prominence=prominence)
+
+
 def test_relative_queries_include_endpoints_and_unwrap_cross_year():
     m = api()
     np.testing.assert_allclose(m.relative_queries(segment("S", start=10, end=40), 4), [10, 20, 30, 40])
@@ -30,6 +35,13 @@ def test_endpoint_relative_ned_is_offset_invariant_but_not_amplitude_normalized(
     assert m.endpoint_relative_ned(q, 3 * q) > .1
 
 
+def test_slope_ned_compares_window_internal_first_differences_without_offset_removal():
+    m = api()
+    reference = np.array([0., 1., 3., 6.])
+    assert m.slope_ned(reference, reference + 10) == pytest.approx(0)
+    assert m.slope_ned(reference, np.array([0., 3., 4., 6.])) > 0
+
+
 def test_cosine_handles_degenerate_waveform_without_nan():
     m = api()
     score, q_energy, w_energy, degenerate = m.endpoint_relative_cosine(np.ones((4, 2)), np.ones((4, 2)))
@@ -43,6 +55,48 @@ def test_candidate_pool_is_accepted_same_direction_and_requires_baseline():
     assert [row["coarse_segment_id"] for row in m.candidate_pool(candidates, "RISE", "A")] == ["A"]
     with pytest.raises(ValueError, match="baseline"):
         m.candidate_pool(candidates, "RISE", "B")
+
+
+def test_extract_extrema_tokens_uses_complete_window_and_unwraps_year_boundary():
+    m = api()
+    events = [event("P", "peak", 355, .8), event("V", "valley", 5, .4),
+              event("OUT", "peak", 100, .7)]
+    tokens = m.extract_extrema_tokens(events, segment("S", start=350, end=10))
+    assert [item.event_type for item in tokens] == ["P", "V"]
+    np.testing.assert_allclose([item.relative_location for item in tokens], [.2, .8])
+    np.testing.assert_allclose([item.normalized_prominence for item in tokens], [.8, .4])
+
+
+def test_cue_audit_type_sequence_is_strict_and_mismatches_have_nan_errors():
+    m = api()
+    reference = [m.ExtremaToken("P", 0., .8), m.ExtremaToken("V", 1., .5)]
+    positive = [m.ExtremaToken("P", .1, .7), m.ExtremaToken("V", .9, .6)]
+    negative = [m.ExtremaToken("P", 0., .8), m.ExtremaToken("V", .5, .5),
+                m.ExtremaToken("P", 1., .4)]
+    audit = m.audit_structural_cues(reference, positive, negative)
+    assert audit["cue_status"] == "CUE_HELPFUL"
+    assert audit["cue_help_source"] == "TYPE_SEQUENCE"
+    assert audit["positive_type_exact"] and not audit["negative_type_exact"]
+    assert np.isfinite(audit["positive_location_error"])
+    assert np.isnan(audit["negative_location_error"])
+
+    positive_mismatch = m.audit_structural_cues(reference, negative, positive)
+    assert positive_mismatch["cue_status"] == "WAVEFORM_AND_CUE_AMBIGUOUS"
+    assert np.isnan(positive_mismatch["positive_location_error"])
+
+
+def test_cue_audit_requires_location_prominence_pareto_dominance():
+    m = api()
+    reference = [m.ExtremaToken("P", 0., .8), m.ExtremaToken("V", 1., .4)]
+    positive = [m.ExtremaToken("P", .05, .75), m.ExtremaToken("V", .95, .45)]
+    negative = [m.ExtremaToken("P", .20, .60), m.ExtremaToken("V", .80, .60)]
+    helpful = m.audit_structural_cues(reference, positive, negative)
+    assert helpful["cue_status"] == "CUE_HELPFUL"
+    assert helpful["cue_help_source"] == "LOCATION_PROMINENCE_PARETO"
+
+    tradeoff = [m.ExtremaToken("P", .01, .30), m.ExtremaToken("V", .99, .90)]
+    ambiguous = m.audit_structural_cues(reference, tradeoff, negative)
+    assert ambiguous["cue_status"] == "WAVEFORM_AND_CUE_AMBIGUOUS"
 
 
 def test_ranking_top1_rank_margin_pairwise_and_tie_confidence():
@@ -166,6 +220,35 @@ def test_transitions_are_posthoc_only():
         "HANDCRAFTED_WRONG_TO_MULTI_CORRECT", "HANDCRAFTED_CORRECT_TO_MULTI_WRONG"}
 
 
+def test_cue_summary_is_stratified_and_transitions_only_use_multi_wrong_cases():
+    m = api()
+    rows = [
+        dict(task="T", class_id=1, class_name="corn", reference_structure_id="R",
+             cue_status="CUE_HELPFUL", cue_help_source="TYPE_SEQUENCE",
+             positive_type_exact=True, negative_type_exact=False),
+        dict(task="T", class_id=1, class_name="corn", reference_structure_id="R",
+             cue_status="WAVEFORM_AND_CUE_AMBIGUOUS", cue_help_source="AMBIGUOUS",
+             positive_type_exact=True, negative_type_exact=True),
+    ]
+    summary = m.cue_summary(rows)
+    total = next(row for row in summary if row["reference_structure_id"] == "TOTAL")
+    assert total["num_multi_ned_wrong"] == 2
+    assert total["cue_helpful_rate"] == pytest.approx(.5)
+    assert total["type_sequence_helpful_count"] == 1
+    assert total["ambiguous_count"] == 1
+
+    transitions = m.transition_summary([
+        dict(task="T", **{"06c_final_exact": False, "handcrafted_local_exact": False,
+                          "multi_ned_exact": False, "cue_status": "CUE_HELPFUL"}),
+        dict(task="T", **{"06c_final_exact": False, "handcrafted_local_exact": False,
+                          "multi_ned_exact": False,
+                          "cue_status": "WAVEFORM_AND_CUE_AMBIGUOUS"}),
+    ], "T")
+    counts = {row["transition"]: row["count"] for row in transitions}
+    assert counts["WAVEFORM_HARD_CUE_HELPFUL"] == 1
+    assert counts["WAVEFORM_AND_CUE_AMBIGUOUS"] == 1
+
+
 def test_cluster_bootstrap_resamples_sample_clusters_and_is_reproducible():
     m = api()
     rows = [dict(sample_id=1, multi_candidate=True, multi_ned_exact=True, handcrafted_local_exact=False, pc1_ned_exact=False),
@@ -202,6 +285,13 @@ def test_atomic_revision_publish_requires_all_tasks_and_preserves_old(tmp_path):
     (staging / "AT1_DK1" / "manifest.json").write_text("{}")
     m.publish_revision(staging, final)
     assert not (final / "old.csv").exists()
+
+
+def test_required_outputs_include_cue_audit_and_summary():
+    m = api()
+    assert "cue_pair_audit.csv" in m.REQUIRED_TASK_FILES
+    assert "cue_summary.csv" in m.REQUIRED_TASK_FILES
+    assert "cue_summary.csv" in m.REQUIRED_ROOT_FILES
 
 
 def test_source_only_static_boundary_and_launcher_contract():

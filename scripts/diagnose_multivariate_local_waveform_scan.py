@@ -18,11 +18,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from analysis.multivariate_local_waveform_scan_diagnostic import (
-    REQUIRED_TASK_FILES, candidate_pool, cluster_bootstrap,
+    CUE_PAIR_FIELDS, CUE_SUMMARY_FIELDS, REQUIRED_TASK_FILES,
+    audit_structural_cues, candidate_pool, cluster_bootstrap,
     compare_candidate_waveforms, endpoint_relative, endpoint_relative_ned,
-    evaluate_mode13, metric_summary,
+    cue_summary, evaluate_mode13, extract_extrema_tokens, metric_summary,
     publish_revision, relative_queries, sample_periodic_curve, structure_summary,
-    template_pc1_consistency_error, transition_summary,
+    serialize_event_tokens, slope_ned, template_pc1_consistency_error, transition_summary,
 )
 from analysis.structure_identity_phase_diagnostic import descriptor, structural_cost
 from analysis.structure_observation_support_diagnostic import staged_output, write_csv, write_json
@@ -118,6 +119,42 @@ def _plot_case(path, prototype_pc1, sample_pc1, reference, baseline, chosen, wro
     fig.tight_layout(rect=(0, 0, 1, .96)); fig.savefig(path, dpi=140); plt.close(fig)
 
 
+def _plot_cue_case(path, reference_pc1, positive_pc1, negative_pc1,
+                   reference_tokens, positive_tokens, negative_tokens, row):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    u = np.linspace(0, 1, len(reference_pc1))
+    fig, axes = plt.subplots(2, 1, figsize=(13, 8), gridspec_kw={"height_ratios": [2.2, 1]})
+    axes[0].plot(u, reference_pc1, color="#245580", lw=2.2, label="reference")
+    axes[0].plot(u, positive_pc1, color="#2ca02c", lw=1.8, label="06B positive")
+    axes[0].plot(u, negative_pc1, color="#d62728", lw=1.8, label="Multi hard-negative")
+    axes[0].set(ylabel="Fixed source-class PC1", title="Relative-time waveforms; cue does not alter ranking")
+    axes[0].legend(); axes[0].grid(alpha=.2)
+
+    chains = ((reference_tokens, 2, "reference", "#245580"),
+              (positive_tokens, 1, "positive", "#2ca02c"),
+              (negative_tokens, 0, "hard-negative", "#d62728"))
+    for tokens, level, label, color in chains:
+        axes[1].hlines(level, 0, 1, color=color, alpha=.35)
+        for token in tokens:
+            marker = "^" if token.event_type == "P" else "v"
+            axes[1].scatter(token.relative_location, level, marker=marker,
+                            s=45 + 90 * max(0., token.normalized_prominence), color=color)
+            axes[1].annotate(
+                f"{token.event_type}\nu={token.relative_location:.2f}\np={token.normalized_prominence:.2f}",
+                (token.relative_location, level), xytext=(0, 9), textcoords="offset points",
+                ha="center", va="bottom", fontsize=7,
+            )
+    axes[1].set(xlim=(-.02, 1.02), ylim=(-.45, 2.65), yticks=[0, 1, 2],
+                yticklabels=["hard-negative", "positive", "reference"], xlabel="Relative phase u",
+                title=f"{row['cue_status']} | source={row['cue_help_source']}")
+    axes[1].grid(axis="x", alpha=.2)
+    fig.suptitle(f"{row['task']} | {row['class_name']} | {row['reference_structure_id']} | sample {row['sample_id']}")
+    fig.tight_layout(rect=(0, 0, 1, .95)); fig.savefig(path, dpi=140); plt.close(fig)
+
+
 def _select_examples(rows, predicate, limit=20):
     pool = sorted((row for row in rows if predicate(row)),
                   key=lambda row: (int(row["class_id"]), str(row["reference_structure_id"]), int(row["sample_id"])))
@@ -172,13 +209,15 @@ def run_task(args):
         references_by_class = defaultdict(list)
         for row in reliable:
             references_by_class[int(row["class_id"])].append(row)
-        all_rows, templates, contexts = [], [], {}
+        all_rows, templates, contexts, cue_rows, cue_contexts = [], [], {}, [], {}
         for class_id, saved_refs in sorted(references_by_class.items()):
             prototype_multi = reconstruct_class_prototype(coefficients[class_id], synthesizer, device,
                                                            sample_batch_size=args.reconstruction_batch_size)
             projection = projections[class_id]
             prototype_pc1 = projection.transform(prototype_multi[None])[0]
-            _, computed = _detect(prototype_pc1, baselines[class_id], fine_settings, coarse_settings, "S")
+            reference_chain, computed = _detect(
+                prototype_pc1, baselines[class_id], fine_settings, coarse_settings, "S"
+            )
             _validate_computed_references(computed, saved05, class_id)
             geometry = {row.coarse_segment_id: asdict(row) for row in computed}
             sample_pc1_curves = reconstruct_projected_coefficients(coefficients[class_id], projection, np.arange(365.))
@@ -186,6 +225,7 @@ def run_task(args):
             for saved in saved_refs:
                 reference_id = str(saved["coarse_segment_id"])
                 reference = geometry[reference_id]
+                reference_tokens = extract_extrema_tokens(reference_chain, reference)
                 queries = relative_queries(reference, args.local_waveform_points)
                 reference_multi = sample_periodic_curve(prototype_multi, queries)
                 reference_pc1 = reference_multi @ projection.axis - float(projection.center @ projection.axis)
@@ -208,7 +248,10 @@ def run_task(args):
                     if sample_id not in record_by_id:
                         raise ValueError(f"06B G+ sample missing from source replay: {sample_id}")
                     sample_index, record = record_by_id[sample_id]
-                    _, detected = _detect(sample_pc1_curves[sample_index], baselines[class_id], fine_settings, coarse_settings, f"I{sample_index}_")
+                    sample_chain, detected = _detect(
+                        sample_pc1_curves[sample_index], baselines[class_id],
+                        fine_settings, coarse_settings, f"I{sample_index}_"
+                    )
                     segments = [asdict(item) for item in detected]
                     baseline_id = str(baseline_row["matched_sample_segment_id"])
                     pool = candidate_pool(segments, reference["direction"], baseline_id)
@@ -230,6 +273,53 @@ def run_task(args):
                         degenerate_waveform=bool(any(np.linalg.norm(endpoint_relative(value)) < 1e-12 for value in waveforms.values())))
                     for method, result in ranked.items():
                         row.update(flatten_ranking(method, result))
+                    row.update(cue_status="", cue_help_source="")
+                    if not row["multi_ned_exact"]:
+                        negative_id = str(row["multi_ned_best_id"])
+                        positive_segment = next(
+                            item for item in pool if item["coarse_segment_id"] == baseline_id
+                        )
+                        negative_segment = next(
+                            item for item in pool if item["coarse_segment_id"] == negative_id
+                        )
+                        positive_tokens = extract_extrema_tokens(sample_chain, positive_segment)
+                        negative_tokens = extract_extrema_tokens(sample_chain, negative_segment)
+                        cue = audit_structural_cues(reference_tokens, positive_tokens, negative_tokens)
+                        reference_descriptor = descriptor(saved)
+                        positive_descriptor = descriptor(positive_segment)
+                        negative_descriptor = descriptor(negative_segment)
+                        cue_row = dict(
+                            task=args.task, source_domain=source, class_id=class_id,
+                            class_name=classes[class_id], reference_structure_id=reference_id,
+                            sample_id=sample_id, positive_segment_id=baseline_id,
+                            hard_negative_segment_id=negative_id,
+                            reference_event_tokens=serialize_event_tokens(reference_tokens),
+                            positive_event_tokens=serialize_event_tokens(positive_tokens),
+                            negative_event_tokens=serialize_event_tokens(negative_tokens),
+                            positive_pc1_slope_ned=slope_ned(reference_pc1, pc1_waveforms[baseline_id]),
+                            negative_pc1_slope_ned=slope_ned(reference_pc1, pc1_waveforms[negative_id]),
+                            positive_multi_slope_ned=slope_ned(reference_multi, waveforms[baseline_id]),
+                            negative_multi_slope_ned=slope_ned(reference_multi, waveforms[negative_id]),
+                            reference_curve_change=reference_descriptor.curve_change,
+                            positive_curve_change=positive_descriptor.curve_change,
+                            negative_curve_change=negative_descriptor.curve_change,
+                            reference_domain_change=reference_descriptor.domain_change,
+                            positive_domain_change=positive_descriptor.domain_change,
+                            negative_domain_change=negative_descriptor.domain_change,
+                            reference_monotonicity=reference_descriptor.monotonicity,
+                            positive_monotonicity=positive_descriptor.monotonicity,
+                            negative_monotonicity=negative_descriptor.monotonicity,
+                            reference_fine_count=reference_descriptor.fine_count,
+                            positive_fine_count=positive_descriptor.fine_count,
+                            negative_fine_count=negative_descriptor.fine_count,
+                            **cue,
+                        )
+                        cue_rows.append(cue_row)
+                        row.update(cue_status=cue["cue_status"], cue_help_source=cue["cue_help_source"])
+                        cue_contexts[(class_id, reference_id, sample_id)] = (
+                            reference_pc1, pc1_waveforms[baseline_id], pc1_waveforms[negative_id],
+                            reference_tokens, positive_tokens, negative_tokens,
+                        )
                     all_rows.append(row)
                     contexts[(class_id, reference_id, sample_id)] = (prototype_pc1, sample_pc1_curves[sample_index], reference,
                         {item["coarse_segment_id"]: item for item in pool}, reference_pc1, pc1_waveforms, reference_multi, waveforms)
@@ -243,6 +333,8 @@ def run_task(args):
         write_csv(staging / "transition_summary.csv", transition_summary(all_rows, args.task))
         write_csv(staging / "template_summary.csv", templates)
         write_csv(staging / "bootstrap_summary.csv", [dict(task=args.task, **cluster_bootstrap(all_rows, args.bootstrap_repeats, args.seed))])
+        write_csv(staging / "cue_pair_audit.csv", cue_rows, CUE_PAIR_FIELDS)
+        write_csv(staging / "cue_summary.csv", cue_summary(cue_rows), CUE_SUMMARY_FIELDS)
         diagnostic_specs = (
             ("diagnostics/06c_wrong_07a_correct", lambda r: not r["06c_final_exact"] and r["multi_ned_exact"]),
             ("diagnostics/both_wrong", lambda r: not r["06c_final_exact"] and not r["multi_ned_exact"]),
@@ -259,6 +351,17 @@ def run_task(args):
                            segments[row["baseline_segment_id"]], segments.get(row["multi_ned_best_id"]),
                            segments.get(row["06c_final_segment_id"]), ref_pc1, pc1s, ref_multi, multis, row)
                 plots.append(path)
+        cue_specs = (
+            ("diagnostics/waveform_hard_cue_helpful", "CUE_HELPFUL"),
+            ("diagnostics/waveform_and_cue_ambiguous", "WAVEFORM_AND_CUE_AMBIGUOUS"),
+        )
+        for folder, status in cue_specs:
+            (staging / folder).mkdir(parents=True)
+            for index, row in enumerate(_select_examples(cue_rows, lambda item: item["cue_status"] == status, args.max_examples)):
+                context = cue_contexts[(row["class_id"], row["reference_structure_id"], row["sample_id"])]
+                path = f"{folder}/{index:02d}_class{row['class_id']}_{row['reference_structure_id']}_sample{row['sample_id']}.png"
+                _plot_cue_case(staging / path, *context, row)
+                plots.append(path)
         write_json(staging / "manifest.json", dict(experiment="07A_multivariate_local_waveform_scan", task=args.task,
             source_domain=source, target_used=False, training=False, parameter_updates=False, local_waveform_points=args.local_waveform_points,
             mode=13, candidate_pool="accepted=true and same direction", evaluation_positive="06B G+ baseline matched segment",
@@ -268,15 +371,18 @@ def run_task(args):
             num_references=len(templates), num_Gplus=len(all_rows), num_multi_candidate=sum(r["multi_candidate"] for r in all_rows),
             average_candidate_count=float(np.mean([r["num_same_direction_candidates"] for r in all_rows])),
             baseline_join_failures=0, degenerate_waveform_count=sum(r["degenerate_waveform"] for r in all_rows), plots=plots,
+            cue_audit_scope="MULTI_NED wrong only", cue_enters_primary_ranking=False,
+            num_multi_ned_wrong=len(cue_rows), num_cue_helpful=sum(r["cue_status"] == "CUE_HELPFUL" for r in cue_rows),
             inputs={"checkpoint": file_hash(checkpoint), "05_manifest": file_hash(folder05 / "manifest.json"),
                     "06B": file_hash(baseline_path), "06C": file_hash(args.identity_root / args.task / "sample_structure_identity.csv")}))
     print(f"[FINISHED] 07A {args.task}: G+={len(all_rows)}, multi={sum(r['multi_candidate'] for r in all_rows)}", flush=True)
 
 
 def run_aggregate(args):
-    rows = []
+    rows, cue_rows = [], []
     for task in TASKS:
         rows.extend(read_csv(args.output_root / task / "gplus_local_ranking.csv"))
+        cue_rows.extend(read_csv(args.output_root / task / "cue_pair_audit.csv"))
     typed = []
     bool_fields = ("multi_candidate", "handcrafted_local_exact", "pc1_ned_exact", "multi_ned_exact", "multi_cosine_exact", "06c_final_exact")
     int_fields = ("sample_id", "num_same_direction_candidates", "handcrafted_positive_rank", "pc1_ned_positive_rank", "multi_ned_positive_rank",
@@ -288,8 +394,24 @@ def run_aggregate(args):
     write_csv(args.output_root / "metric_comparison.csv", metric_summary(typed, "TOTAL"))
     write_csv(args.output_root / "transition_summary.csv", transition_summary(typed, "TOTAL"))
     write_csv(args.output_root / "bootstrap_summary.csv", [dict(task="TOTAL", **cluster_bootstrap(typed, args.bootstrap_repeats, args.seed))])
+    typed_cues = [dict(
+        row,
+        class_id=int(row["class_id"]), sample_id=int(row["sample_id"]),
+        positive_type_exact=truth(row["positive_type_exact"]),
+        negative_type_exact=truth(row["negative_type_exact"]),
+    ) for row in cue_rows]
+    cue_records = cue_summary(typed_cues)
+    if typed_cues:
+        overall_rows = [dict(
+            row, task="TOTAL", class_id="TOTAL", class_name="TOTAL",
+            reference_structure_id="TOTAL",
+        ) for row in typed_cues]
+        cue_records.extend(cue_summary(overall_rows))
+    write_csv(args.output_root / "cue_summary.csv", cue_records, CUE_SUMMARY_FIELDS)
     write_json(args.output_root / "manifest.json", dict(experiment="07A_multivariate_local_waveform_scan", completed=True,
-        tasks=list(TASKS), target_used=False, training=False))
+        tasks=list(TASKS), target_used=False, training=False,
+        cue_audit_scope="MULTI_NED wrong only", cue_enters_primary_ranking=False,
+        num_multi_ned_wrong=len(typed_cues)))
 
 
 def build_parser():

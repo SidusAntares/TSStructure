@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import uuid
@@ -13,9 +14,131 @@ TASKS = ("AT1_DK1", "DK1_FR1", "FR1_FR2", "FR2_AT1")
 REQUIRED_TASK_FILES = (
     "gplus_local_ranking.csv", "gplus_structure_summary.csv",
     "metric_comparison.csv", "transition_summary.csv", "template_summary.csv",
-    "bootstrap_summary.csv", "manifest.json",
+    "bootstrap_summary.csv", "cue_pair_audit.csv", "cue_summary.csv", "manifest.json",
 )
-REQUIRED_ROOT_FILES = ("metric_comparison.csv", "transition_summary.csv", "bootstrap_summary.csv", "manifest.json")
+REQUIRED_ROOT_FILES = (
+    "metric_comparison.csv", "transition_summary.csv", "bootstrap_summary.csv",
+    "cue_summary.csv", "manifest.json",
+)
+CUE_PAIR_FIELDS = (
+    "task", "source_domain", "class_id", "class_name", "reference_structure_id", "sample_id",
+    "positive_segment_id", "hard_negative_segment_id", "reference_event_sequence",
+    "positive_event_sequence", "negative_event_sequence", "reference_event_tokens",
+    "positive_event_tokens", "negative_event_tokens", "positive_type_exact", "negative_type_exact",
+    "positive_location_error", "negative_location_error", "positive_prominence_error",
+    "negative_prominence_error", "positive_pc1_slope_ned", "negative_pc1_slope_ned",
+    "positive_multi_slope_ned", "negative_multi_slope_ned",
+    "reference_curve_change", "positive_curve_change", "negative_curve_change",
+    "reference_domain_change", "positive_domain_change", "negative_domain_change",
+    "reference_monotonicity", "positive_monotonicity", "negative_monotonicity",
+    "reference_fine_count", "positive_fine_count", "negative_fine_count",
+    "cue_status", "cue_help_source",
+)
+CUE_SUMMARY_FIELDS = (
+    "task", "class_id", "class_name", "reference_structure_id", "scope", "num_multi_ned_wrong",
+    "cue_helpful_count", "cue_helpful_rate", "type_sequence_helpful_count",
+    "type_sequence_helpful_rate", "pareto_helpful_count", "pareto_helpful_rate",
+    "ambiguous_count", "ambiguous_rate", "positive_type_exact_count", "positive_type_exact_rate",
+    "negative_type_exact_count", "negative_type_exact_rate", "positive_exact_negative_not_count",
+    "positive_exact_negative_not_rate",
+)
+
+
+@dataclass(frozen=True)
+class ExtremaToken:
+    event_type: str
+    relative_location: float
+    normalized_prominence: float
+
+
+def _value(item, name):
+    return item[name] if isinstance(item, dict) else getattr(item, name)
+
+
+def extract_extrema_tokens(events, segment, period_days=365.0):
+    """Extract the complete, ordered extrema chain inside one coarse window."""
+    start = float(_value(segment, "start_day"))
+    end = float(_value(segment, "end_day"))
+    if end <= start:
+        end += float(period_days)
+    duration = end - start
+    if duration <= 0:
+        raise ValueError("invalid coarse segment duration")
+    selected = []
+    for item in events:
+        day = float(_value(item, "day")) % float(period_days)
+        if day < start - EPS:
+            day += float(period_days)
+        if start - EPS <= day <= end + EPS:
+            kind = str(_value(item, "kind")).lower()
+            event_type = "P" if kind == "peak" else "V" if kind == "valley" else kind.upper()
+            try:
+                prominence = float(_value(item, "relative_prominence"))
+            except (AttributeError, KeyError):
+                prominence = float(_value(item, "normalized_prominence"))
+            selected.append((day, str(_value(item, "event_id")), ExtremaToken(
+                event_type=event_type,
+                relative_location=float(np.clip((day - start) / duration, 0.0, 1.0)),
+                normalized_prominence=prominence,
+            )))
+    return tuple(item[2] for item in sorted(selected, key=lambda value: (value[0], value[1])))
+
+
+def event_sequence(tokens):
+    return "-".join(item.event_type for item in tokens)
+
+
+def serialize_event_tokens(tokens):
+    return ";".join(
+        f"{item.event_type}@{item.relative_location:.8f}:{item.normalized_prominence:.8f}"
+        for item in tokens
+    )
+
+
+def _aligned_cue_errors(reference, candidate):
+    exact = (
+        len(reference) == len(candidate)
+        and all(left.event_type == right.event_type for left, right in zip(reference, candidate))
+    )
+    if not exact:
+        return False, float("nan"), float("nan")
+    if not reference:
+        return True, 0.0, 0.0
+    location = float(np.mean([
+        abs(left.relative_location - right.relative_location)
+        for left, right in zip(reference, candidate)
+    ]))
+    prominence = float(np.mean([
+        abs(left.normalized_prominence - right.normalized_prominence)
+        for left, right in zip(reference, candidate)
+    ]))
+    return True, location, prominence
+
+
+def audit_structural_cues(reference, positive, negative):
+    positive_exact, positive_location, positive_prominence = _aligned_cue_errors(reference, positive)
+    negative_exact, negative_location, negative_prominence = _aligned_cue_errors(reference, negative)
+    status, source = "WAVEFORM_AND_CUE_AMBIGUOUS", "AMBIGUOUS"
+    if positive_exact and not negative_exact:
+        status, source = "CUE_HELPFUL", "TYPE_SEQUENCE"
+    elif positive_exact and negative_exact:
+        no_worse = positive_location <= negative_location and positive_prominence <= negative_prominence
+        strictly_better = positive_location < negative_location or positive_prominence < negative_prominence
+        if no_worse and strictly_better:
+            status, source = "CUE_HELPFUL", "LOCATION_PROMINENCE_PARETO"
+    return {
+        "reference_event_sequence": event_sequence(reference),
+        "positive_event_sequence": event_sequence(positive),
+        "negative_event_sequence": event_sequence(negative),
+        "positive_type_exact": positive_exact,
+        "negative_type_exact": negative_exact,
+        "positive_location_error": positive_location,
+        "negative_location_error": negative_location,
+        "positive_prominence_error": positive_prominence,
+        "negative_prominence_error": negative_prominence,
+        "cue_status": status,
+        "cue_help_source": source,
+    }
 
 
 def relative_queries(segment, points=32, period_days=365.0):
@@ -60,6 +183,13 @@ def endpoint_relative(values):
 
 def endpoint_relative_ned(reference, sample, eps=EPS):
     q, w = endpoint_relative(reference), endpoint_relative(sample)
+    if q.shape != w.shape:
+        raise ValueError("waveform shapes must match")
+    return float(np.sum((q - w) ** 2) / (np.sum(q ** 2) + np.sum(w ** 2) + eps))
+
+
+def slope_ned(reference, sample, eps=EPS):
+    q, w = np.diff(np.asarray(reference, dtype=float), axis=0), np.diff(np.asarray(sample, dtype=float), axis=0)
     if q.shape != w.shape:
         raise ValueError("waveform shapes must match")
     return float(np.sum((q - w) ** 2) / (np.sum(q ** 2) + np.sum(w ** 2) + eps))
@@ -195,6 +325,44 @@ def structure_summary(rows):
     return output
 
 
+def cue_summary(rows):
+    groups = defaultdict(list)
+    for row in rows:
+        groups[(row["task"], row["class_id"], row["class_name"], row["reference_structure_id"])].append(row)
+    for task in sorted({row["task"] for row in rows}):
+        groups[(task, "TOTAL", "TOTAL", "TOTAL")] = [row for row in rows if row["task"] == task]
+    output = []
+    for key, group in sorted(groups.items(), key=lambda item: tuple(map(str, item[0]))):
+        total = len(group)
+        helpful = sum(row["cue_status"] == "CUE_HELPFUL" for row in group)
+        type_helpful = sum(row["cue_help_source"] == "TYPE_SEQUENCE" for row in group)
+        pareto_helpful = sum(row["cue_help_source"] == "LOCATION_PROMINENCE_PARETO" for row in group)
+        ambiguous = sum(row["cue_status"] == "WAVEFORM_AND_CUE_AMBIGUOUS" for row in group)
+        positive_exact = sum(bool(row["positive_type_exact"]) for row in group)
+        negative_exact = sum(bool(row["negative_type_exact"]) for row in group)
+        positive_only = sum(bool(row["positive_type_exact"]) and not bool(row["negative_type_exact"]) for row in group)
+        output.append({
+            "task": key[0], "class_id": key[1], "class_name": key[2],
+            "reference_structure_id": key[3], "scope": "MULTI_NED_WRONG",
+            "num_multi_ned_wrong": total,
+            "cue_helpful_count": helpful,
+            "cue_helpful_rate": helpful / total if total else float("nan"),
+            "type_sequence_helpful_count": type_helpful,
+            "type_sequence_helpful_rate": type_helpful / total if total else float("nan"),
+            "pareto_helpful_count": pareto_helpful,
+            "pareto_helpful_rate": pareto_helpful / total if total else float("nan"),
+            "ambiguous_count": ambiguous,
+            "ambiguous_rate": ambiguous / total if total else float("nan"),
+            "positive_type_exact_count": positive_exact,
+            "positive_type_exact_rate": positive_exact / total if total else float("nan"),
+            "negative_type_exact_count": negative_exact,
+            "negative_type_exact_rate": negative_exact / total if total else float("nan"),
+            "positive_exact_negative_not_count": positive_only,
+            "positive_exact_negative_not_rate": positive_only / total if total else float("nan"),
+        })
+    return output
+
+
 def transition_summary(rows, task):
     predicates = (
         ("06C_WRONG_TO_MULTI_CORRECT", lambda r: not r["06c_final_exact"] and r["multi_ned_exact"]),
@@ -203,6 +371,8 @@ def transition_summary(rows, task):
         ("HANDCRAFTED_CORRECT_TO_MULTI_WRONG", lambda r: r["handcrafted_local_exact"] and not r["multi_ned_exact"]),
         ("BOTH_06C_AND_MULTI_CORRECT", lambda r: r["06c_final_exact"] and r["multi_ned_exact"]),
         ("BOTH_06C_AND_MULTI_WRONG", lambda r: not r["06c_final_exact"] and not r["multi_ned_exact"]),
+        ("WAVEFORM_HARD_CUE_HELPFUL", lambda r: not r["multi_ned_exact"] and r.get("cue_status") == "CUE_HELPFUL"),
+        ("WAVEFORM_AND_CUE_AMBIGUOUS", lambda r: not r["multi_ned_exact"] and r.get("cue_status") == "WAVEFORM_AND_CUE_AMBIGUOUS"),
     )
     return [dict(task=task, transition=name, count=sum(predicate(row) for row in rows))
             for name, predicate in predicates if any(predicate(row) for row in rows)]
