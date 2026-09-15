@@ -134,6 +134,28 @@ def test_structure_summary_includes_reference_and_task_total_rows():
     assert ("MULTI_CANDIDATE_ONLY", "TOTAL") in keys
 
 
+def test_handcrafted_ranking_flattens_to_structure_summary_contract():
+    m = api()
+    from scripts.diagnose_multivariate_local_waveform_scan import flatten_ranking
+
+    ranking = m.rank_scores({"S0": .1, "S1": .2}, "S0")
+    flattened = flatten_ranking("handcrafted", ranking)
+    assert flattened["handcrafted_local_exact"] is True
+    assert flattened["handcrafted_positive_rank"] == 1
+
+    row = dict(
+        task="AT1_DK1", class_id=0, class_name="corn",
+        reference_structure_id="R0", multi_candidate=True,
+        pc1_ned_exact=True, pc1_ned_positive_rank=1,
+        pc1_ned_pairwise_wins=1, pc1_ned_pairwise_total=1,
+        multi_ned_exact=True, multi_ned_positive_rank=1,
+        multi_ned_pairwise_wins=1, multi_ned_pairwise_total=1,
+        multi_ned_unique_best=True, multi_ned_margin=.25,
+        **flattened,
+    )
+    assert m.structure_summary([row])
+
+
 def test_transitions_are_posthoc_only():
     m = api()
     rows = [dict(task="T", **{"06c_final_exact": False, "handcrafted_local_exact": False, "multi_ned_exact": True}),

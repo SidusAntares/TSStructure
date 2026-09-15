@@ -63,15 +63,17 @@ def _unique_index(rows, fields, name):
 
 
 def flatten_ranking(prefix, ranking):
-    if prefix == "handcrafted_local":
+    if prefix in ("handcrafted", "handcrafted_local"):
+        canonical_prefix = "handcrafted_local"
         names = dict(best_id="handcrafted_local_best_id", exact="handcrafted_local_exact",
                      unique_best="handcrafted_local_unique_best", positive_rank="handcrafted_positive_rank",
                      positive_distance="handcrafted_positive_distance", best_negative_distance="handcrafted_best_negative_distance",
                      margin="handcrafted_margin", pairwise_wins="handcrafted_pairwise_wins",
                      pairwise_total="handcrafted_pairwise_total")
     else:
+        canonical_prefix = prefix
         names = {key: f"{prefix}_{key}" for key in ranking}
-    return {names.get(key, f"{prefix}_{key}"): value for key, value in ranking.items()}
+    return {names.get(key, f"{canonical_prefix}_{key}"): value for key, value in ranking.items()}
 
 
 def _plot_case(path, prototype_pc1, sample_pc1, reference, baseline, chosen, wrong,
