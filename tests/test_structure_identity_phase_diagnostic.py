@@ -26,7 +26,9 @@ def segment(sid="S0", direction="RISE", amplitude=1., start=10., duration=30., *
 
 
 def calibration(threshold=1.):
-    return dict(scales=[1., 1., 1., 1.], threshold=threshold, calibration_level="source_direction")
+    return dict(scales=[1., 1., 1., 1.], active=[True] * 4,
+                positive_pairs=[20] * 4, num_active_components=4,
+                threshold=threshold, calibration_level="source_direction")
 
 
 def test_descriptor_excludes_all_time_and_acceptance_fields():
@@ -44,11 +46,11 @@ def test_calibration_quantiles_and_all_fallback_levels():
                for domain in ("AT1", "DK1", "FR1", "FR2")
                for direction, count in (("RISE", 4 if domain == "AT1" else 1), ("FALL", 1))
                for i in range(count)]
-    result = m.calibrate(records, min_pairs=4)
+    result = m.calibrate(records, min_pairs=4, min_positive_pairs=1)
     assert result["AT1:RISE"]["calibration_level"] == "source_direction"
     assert result["AT1:FALL"]["calibration_level"] == "source_pooled"
     assert result["DK1:RISE"]["calibration_level"] == "all_source_pooled"
-    expected = np.quantile(np.array([[i + 1., 2, .1, .3] for i in range(4)]), .9, axis=0) + m.EPS
+    expected = np.quantile(np.array([[i + 1., 2, .1, .3] for i in range(4)]), .9, axis=0)
     np.testing.assert_allclose(result["AT1:RISE"]["scales"], expected)
     costs = (np.array([[i + 1., 2, .1, .3] for i in range(4)]) / expected).mean(axis=1)
     assert result["AT1:RISE"]["threshold"] == pytest.approx(np.quantile(costs, .95))
@@ -78,18 +80,31 @@ def test_alignment_maximizes_count_before_cost_and_preserves_order():
     assert result.pairs == ((0, 0), (1, 1))
 
 
-def test_identity_ignores_large_phase_duration_and_rejected_flag():
+def test_rejected_candidate_is_secondary_plausible_despite_large_phase_duration():
     m = api()
     refs = [segment("R0")]
-    candidates = [segment("S0", amplitude=1.1, start=170, duration=160, accepted=False), segment("S1", amplitude=2, start=12)]
+    candidates = [segment("S0", amplitude=1.1, start=170, duration=160, accepted=False),
+                  segment("S1", amplitude=100, start=12)]
     rows, alignment = m.identify(refs, candidates, {"RISE": calibration()})
-    assert alignment.pairs == ((0, 0),)
-    assert rows[0]["identity_status"] == "LIKELY_SAME_STRUCTURE"
-    assert rows[0]["mutual_best"]
-    assert rows[0]["num_identity_candidates"] == 2
-    assert rows[0]["cost_margin"] > 0
+    assert alignment.pairs == ()
+    assert rows[0]["identity_status"] == "STRUCTURALLY_PLAUSIBLE"
+    assert rows[0]["candidate_source"] == "SECONDARY_REJECTED"
+    assert rows[0]["sample_segment_accepted"] is False
+    assert not rows[0]["unique_mutual_best"]
     assert rows[0]["duration_ratio"] > 2.5
     assert abs(rows[0]["center_displacement_days"]) > 40
+
+
+def test_accepted_unique_mutual_best_is_likely_and_rejected_never_likely():
+    m = api()
+    rows, _ = m.identify([segment("R")], [segment("P", amplitude=1.1)], {"RISE": calibration()})
+    assert rows[0]["identity_status"] == "LIKELY_SAME_STRUCTURE"
+    assert rows[0]["candidate_source"] == "PRIMARY_ACCEPTED"
+    assert rows[0]["reference_unique_best"] and rows[0]["sample_unique_best"]
+    assert rows[0]["unique_mutual_best"]
+    rows, _ = m.identify([segment("R")], [segment("S", amplitude=1.1, accepted=False)], {"RISE": calibration()})
+    assert rows[0]["identity_status"] == "STRUCTURALLY_PLAUSIBLE"
+    assert rows[0]["candidate_source"] == "SECONDARY_REJECTED"
 
 
 @pytest.mark.parametrize("costs,expected", [
@@ -103,7 +118,7 @@ def test_confidence_ties_and_labels(costs, expected):
     alignment = m.circular_alignment(a, np.ones(a.shape[0]))
     result = m.classify_alignment(a, np.ones(a.shape[0]), alignment)
     assert result[0]["identity_status"] == expected
-    assert not result[0]["mutual_best"]
+    assert not result[0]["unique_mutual_best"]
     if a.shape == (2, 1):
         assert result[1]["identity_status"] == "AMBIGUOUS"
         assert result[1]["assignment_conflict"]
@@ -114,8 +129,57 @@ def test_neighbors_give_context_but_not_mutual_best_on_cost_ties():
     costs = np.zeros((4, 4))
     result = m.classify_alignment(costs, np.ones(4), m.circular_alignment(costs, np.ones(4)))
     assert all(row["neighbor_support"] == 2 for row in result)
-    assert all(not row["mutual_best"] for row in result)
-    assert all(row["identity_status"] == "LIKELY_SAME_STRUCTURE" for row in result)
+    assert all(not row["unique_mutual_best"] for row in result)
+    assert all(row["identity_status"] == "AMBIGUOUS" for row in result)
+
+
+def test_zero_heavy_calibration_disables_component_instead_of_epsilon_scale():
+    m = api()
+    records = [dict(source_domain=source, direction="RISE",
+                    differences=[0. if i < 23 else .2, .1 + i/100, .2 + i/100, 0.])
+               for source in m.SOURCES for i in range(25)]
+    row = m.calibrate(records, min_pairs=20, min_positive_pairs=20,
+                      min_active_components=2)["AT1:RISE"]
+    assert row["active"] == [False, True, True, False]
+    assert np.isnan(row["scales"][0]) and np.isnan(row["scales"][3])
+    assert row["positive_pairs"] == [2, 25, 25, 0]
+    assert row["num_active_components"] == 2
+    assert np.isfinite(row["threshold"]) and row["threshold"] < 1e4
+    assert m.structural_cost(m.Descriptor("RISE", 1, 1, .8, 1),
+                             m.Descriptor("RISE", 100, 1.2, .9, 99), row) < 10
+
+
+def test_positive_only_quantile_and_active_denominator():
+    m = api()
+    records = [dict(source_domain=s, direction="RISE", differences=[0, 0, .1, .2])
+               for s in m.SOURCES for _ in range(20)]
+    for row, value in zip(records[:20], np.linspace(.1, 2, 20)):
+        row["differences"][0] = value
+    row = m.calibrate(records, min_pairs=20, min_positive_pairs=20,
+                      min_active_components=2)["AT1:RISE"]
+    assert row["scales"][0] == pytest.approx(np.quantile(np.linspace(.1, 2, 20), .9))
+    assert row["active"] == [True, False, True, True]
+    reference = m.Descriptor("RISE", 1, 1, .8, 1)
+    sample = m.Descriptor("RISE", np.exp(row["scales"][0]), 1000,
+                          .8 + row["scales"][2], 2)
+    _, contribution = m.cost_components(reference, sample, row)
+    assert np.isnan(contribution[1])
+    assert m.structural_cost(reference, sample, row) == pytest.approx(np.nanmean(contribution))
+
+
+def test_insufficient_active_components_falls_back_then_hard_fails():
+    m = api()
+    records = [dict(source_domain=source, direction=direction,
+                    differences=[i/20 if direction == "RISE" else 0,
+                                 i/20 if direction == "FALL" else 0, 0, 0])
+               for source in m.SOURCES for direction in ("RISE", "FALL")
+               for i in range(1, 21)]
+    result = m.calibrate(records, min_pairs=20, min_positive_pairs=20,
+                         min_active_components=2)
+    assert result["AT1:RISE"]["calibration_level"] == "source_pooled"
+    with pytest.raises(ValueError, match="active components"):
+        m.calibrate(records, min_pairs=20, min_positive_pairs=20,
+                    min_active_components=3)
 
 
 def test_direction_mismatch_and_ambiguous_timing_are_nan():
@@ -159,19 +223,24 @@ def test_summary_rescue_consistency_grouped_and_failure_transitions():
                 reference_structure_id="SC0", reference_cross_boundary=True,
                 bootstrap_occurrence=.9, baseline_individual_occurrence=.5,
                 center_displacement_days=70., duration_ratio=3., stretch_difference_days=60.,
-                has_grouped_candidate=False, identity_sample_segment_id="S0", baseline_matched_segment_id="S0")
-    rows = [dict(base, baseline_06B_status="G+", baseline_failure_reason="", identity_status="LIKELY_SAME_STRUCTURE"),
+                has_grouped_candidate=False, identity_sample_segment_id="S0", baseline_matched_segment_id="S0",
+                candidate_source="PRIMARY_ACCEPTED", gplus_exact_segment_recovered=False)
+    rows = [dict(base, baseline_06B_status="G+", baseline_failure_reason="", identity_status="LIKELY_SAME_STRUCTURE", gplus_exact_segment_recovered=True),
             dict(base, baseline_06B_status="G-", baseline_failure_reason="CENTER_DISTANCE_FAIL", identity_status="LIKELY_SAME_STRUCTURE"),
-            dict(base, baseline_06B_status="G-", baseline_failure_reason="DURATION_RATIO_FAIL", identity_status="AMBIGUOUS", has_grouped_candidate=True)]
+            dict(base, baseline_06B_status="G-", baseline_failure_reason="DURATION_RATIO_FAIL", identity_status="STRUCTURALLY_PLAUSIBLE",
+                 candidate_source="SECONDARY_REJECTED", has_grouped_candidate=True)]
     summary = m.summarize_structures(rows)[0]
-    assert summary["Gminus_identity_rescue_rate"] == .5
-    assert summary["gplus_identity_consistency_rate"] == 1
+    assert summary["Gminus_high_confidence_rescue_rate"] == .5
+    assert summary["Gminus_plausible_or_better_rate"] == 1
+    assert summary["gplus_exact_segment_rate"] == 1
     assert summary["num_grouped_candidates"] == 1
-    assert summary["num_Gminus_likely_same"] == 1
+    assert summary["Gminus_primary_likely"] == 1
+    assert summary["Gminus_secondary_plausible"] == 1
     transitions = m.summarize_transitions(rows)
-    assert any(r["scope"] == "TOTAL" and r["count"] == 1 and r["fraction"] == 1 for r in transitions)
+    assert any(r["scope"] == "TOTAL" and r["candidate_source"] == "SECONDARY_REJECTED"
+               and r["count"] == 1 for r in transitions)
     boundaries = m.summarize_boundaries(rows)
-    assert boundaries[0]["identity_rescue_rate"] == .5
+    assert boundaries[0]["high_confidence_rescue_rate"] == .5
 
 
 def test_baseline_exact_join_rejects_duplicate_missing_and_stale_segment():
@@ -201,8 +270,13 @@ def test_output_transaction_and_runner_contract(tmp_path):
     assert args.identity_component_scale_quantile == .9
     assert args.identity_cost_quantile == .95
     assert args.identity_calibration_min_pairs == 50
+    assert args.identity_component_min_positive_pairs == 20
+    assert args.identity_calibration_min_active_components == 2
     script = (Path(__file__).parents[1] / "scripts/run_structure_identity_phase_4tasks.sh").read_text()
     assert "--stage prepare" in script and "--stage calibrate" in script and "--stage audit" in script
+    assert "--stage publish" in script
+    assert ".tmp_06C_structure_identity_phase_revision_" in script
+    assert "gplus_consistency_summary.csv" in runner.REQUIRED_OUTPUTS
 
 
 def test_runner_audits_historical_labels_and_stale_gplus_fails():
@@ -232,13 +306,14 @@ def test_synthetic_four_source_calibrate_audit_and_pngs(tmp_path):
         folder.mkdir()
         payload = dict(class_id=0, class_name="corn", references=[dict(segment("SC0"), bootstrap_occurrence=.9, baseline_individual_occurrence=.5)], samples=[])
         for i, reason in enumerate(("", "CENTER_DISTANCE_FAIL", "DURATION_RATIO_FAIL")):
-            payload["samples"].append(dict(sample_id=i, segments=[segment(f"I{i}_C0", start=10 if not reason else 150, duration=30 if not reason else 120)],
+            payload["samples"].append(dict(sample_id=i, segments=[segment(f"I{i}_C0", amplitude=1.1 + .01 * len(source), start=10 if not reason else 150, duration=30 if not reason else 120)],
                 baseline=[dict(reference_structure_id="SC0", matched=str(not bool(reason)), matched_sample_segment_id="I0_C0" if not reason else "", failure_reason=reason)]))
         m.write_json(folder / "class_0.json", payload)
         np.savez_compressed(folder / "class_0.npz", prototype=np.sin(grid/40), curves=np.tile(np.sin(grid/40), (3, 1)))
         m.write_json(folder / "manifest.json", dict(task=task, source_domain=source, class_ids=[0], coarse_min_monotonicity=.6,
             gplus=runner.collect_gplus(source, payload), completed=True))
-    args = runner.build_parser().parse_args(["--stage", "calibrate", "--work-root", str(work), "--output-root", str(tmp_path / "out"), "--identity-calibration-min-pairs", "1"])
+    args = runner.build_parser().parse_args(["--stage", "calibrate", "--work-root", str(work), "--output-root", str(tmp_path / "out"),
+                                             "--identity-calibration-min-pairs", "1", "--identity-component-min-positive-pairs", "1"])
     runner.run_calibration(args)
     args.task = "AT1_DK1"
     runner.run_audit(args)
@@ -290,7 +365,7 @@ def test_time_fields_perturbation_cannot_change_assignment():
     samples = [segment("S0", "FALL", 2), segment("S1", amplitude=1)]
     calibrations = {d: calibration() for d in ("RISE", "FALL")}
     before, a = m.identify(refs, samples, calibrations)
-    changed = [dict(s, start_day=300., end_day=3., center_day=-9999, duration_days=9000., accepted=False) for s in samples]
+    changed = [dict(s, start_day=300., end_day=3., center_day=-9999, duration_days=9000.) for s in samples]
     after, b = m.identify(refs, changed, calibrations)
     assert a == b
     assert [r["identity_status"] for r in before] == [r["identity_status"] for r in after]
@@ -300,10 +375,42 @@ def test_gplus_consistency_requires_original_candidate_id():
     m = api()
     row = dict(task="AT1_DK1", source_domain="AT1", class_id=0, class_name="corn", reference_structure_id="R0",
                bootstrap_occurrence=1., baseline_individual_occurrence=1., baseline_06B_status="G+",
-               identity_status="LIKELY_SAME_STRUCTURE", identity_sample_segment_id="S1", baseline_matched_segment_id="S0")
+               identity_status="LIKELY_SAME_STRUCTURE", identity_sample_segment_id="S1", baseline_matched_segment_id="S0",
+               candidate_source="PRIMARY_ACCEPTED", gplus_exact_segment_recovered=False)
     summary = m.summarize_structures([row])[0]
-    assert summary["gplus_identity_consistency_rate"] == 0
-    assert np.isnan(summary["Gminus_identity_rescue_rate"])
+    assert summary["gplus_exact_segment_rate"] == 0
+    assert summary["wrong_segment_likely_rate"] == 1
+    assert np.isnan(summary["Gminus_high_confidence_rescue_rate"])
+
+
+def test_gplus_any_exact_exact_likely_and_wrong_likely_are_distinct():
+    m = api()
+    base = dict(task="AT1_DK1", source_domain="AT1", class_id=0, class_name="corn",
+                reference_structure_id="R0", baseline_06B_status="G+", baseline_failure_reason="",
+                candidate_source="PRIMARY_ACCEPTED", has_grouped_candidate=False)
+    rows = [dict(base, identity_status="LIKELY_SAME_STRUCTURE", identity_sample_segment_id="S0", baseline_matched_segment_id="S0", gplus_exact_segment_recovered=True),
+            dict(base, identity_status="STRUCTURALLY_PLAUSIBLE", identity_sample_segment_id="S0", baseline_matched_segment_id="S0", gplus_exact_segment_recovered=True),
+            dict(base, identity_status="LIKELY_SAME_STRUCTURE", identity_sample_segment_id="S1", baseline_matched_segment_id="S0", gplus_exact_segment_recovered=False),
+            dict(base, identity_status="AMBIGUOUS", identity_sample_segment_id="", baseline_matched_segment_id="S0", gplus_exact_segment_recovered=False)]
+    total = next(row for row in m.summarize_gplus(rows) if row["scope"] == "TOTAL")
+    assert total["gplus_any_identity_rate"] == .75
+    assert total["gplus_exact_segment_rate"] == .5
+    assert total["gplus_exact_likely_rate"] == .25
+    assert total["wrong_segment_likely_rate"] == .25
+
+
+def test_secondary_timing_is_excluded_from_formal_phase_summary():
+    m = api()
+    base = dict(task="AT1_DK1", source_domain="AT1", class_id=0, class_name="corn", reference_structure_id="R",
+                reference_cross_boundary=False, bootstrap_occurrence=.9, baseline_individual_occurrence=.5,
+                baseline_06B_status="G-", baseline_failure_reason="CENTER_DISTANCE_FAIL", identity_status="STRUCTURALLY_PLAUSIBLE",
+                has_grouped_candidate=False, identity_sample_segment_id="S", baseline_matched_segment_id="",
+                gplus_exact_segment_recovered=False, duration_ratio=9., center_displacement_days=100., stretch_difference_days=80.)
+    secondary = dict(base, candidate_source="SECONDARY_REJECTED")
+    primary = dict(base, candidate_source="PRIMARY_ACCEPTED", duration_ratio=2., center_displacement_days=30., stretch_difference_days=10.)
+    summary = m.summarize_structures([secondary, primary])[0]
+    assert summary["median_center_displacement"] == 30
+    assert summary["median_duration_ratio"] == 2
 
 
 def test_nonadjacent_assignments_do_not_count_as_neighbors():
@@ -356,6 +463,46 @@ def test_transaction_requires_complete_files_and_can_publish(tmp_path):
         (staging / "manifest.json").write_text("{}")
     assert not (final / "old").exists()
     assert (final / "manifest.json").exists()
+
+
+def test_whole_revision_publish_requires_four_tasks_and_replaces_without_stale_files(tmp_path):
+    runner = importlib.import_module("scripts.diagnose_structure_identity_phase")
+    revision, final = tmp_path / "revision", tmp_path / "06C"
+    revision.mkdir()
+    final.mkdir()
+    (final / "stale.csv").write_text("old")
+    runner.write_json(revision / "calibration.json", {"source_domains": list(runner.SOURCES)})
+    for task in runner.TASKS:
+        folder = revision / task
+        folder.mkdir()
+        for name in runner.REQUIRED_OUTPUTS:
+            if name == "manifest.json":
+                runner.write_json(folder / name, {"task": task, "completed": True, "plots": []})
+            else:
+                (folder / name).write_text("header\n")
+    missing = revision / "FR2_AT1" / "gplus_consistency_summary.csv"
+    missing.unlink()
+    with pytest.raises(RuntimeError, match="incomplete"):
+        runner.publish_revision(revision, final)
+    assert (final / "stale.csv").exists()
+    missing.write_text("header\n")
+    runner.publish_revision(revision, final)
+    assert not (final / "stale.csv").exists()
+    assert (final / "AT1_DK1" / "manifest.json").exists()
+
+
+def test_gplus_misassignment_selection_is_bounded_and_prioritizes_wrong_likely_with_class_coverage():
+    m = api()
+    rows = []
+    for index in range(30):
+        rows.append(dict(baseline_06B_status="G+", gplus_exact_segment_recovered=False,
+                         identity_status="LIKELY_SAME_STRUCTURE" if index in (5, 7) else "AMBIGUOUS",
+                         cost_margin=float(index), class_id=index % 3,
+                         reference_structure_id=f"R{index}", sample_id=index))
+    selected = m.select_gplus_misassignments(rows, 20)
+    assert len(selected) == 20
+    assert {row["class_id"] for row in selected} == {0, 1, 2}
+    assert {5, 7}.issubset({row["sample_id"] for row in selected})
 
 
 def test_calibration_refuses_missing_source_or_stale_packet(tmp_path):

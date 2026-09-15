@@ -15,6 +15,7 @@ TIMING_LABELS = LABELS[:2]
 TIMING_FIELDS = ("center_displacement_days", "start_displacement_days", "end_displacement_days",
                  "reference_duration_days", "sample_duration_days", "duration_ratio",
                  "duration_difference_days", "stretch_difference_days")
+COMPONENT_NAMES = ("curve_change", "domain_change", "monotonicity", "fine_count")
 
 
 @dataclass(frozen=True)
@@ -45,16 +46,59 @@ def differences(reference, sample):
     ])
 
 
+def cost_components(reference, sample, calibration):
+    raw = differences(reference, sample)
+    active = np.asarray(calibration.get("active", [True] * len(raw)), dtype=bool)
+    scales = np.asarray(calibration["scales"], dtype=float)
+    if raw.shape != active.shape or scales.shape != raw.shape:
+        raise ValueError("invalid calibration component shape")
+    contribution = np.full(raw.shape, np.nan, dtype=float)
+    if np.any(active & (~np.isfinite(scales) | (scales <= 0))):
+        raise ValueError("active calibration scales must be finite and positive")
+    contribution[active] = raw[active] / scales[active]
+    return raw, contribution
+
+
 def structural_cost(reference, sample, calibration):
     if reference.direction != sample.direction:
         return float("inf")
-    return float(np.mean(differences(reference, sample) / np.asarray(calibration["scales"])))
+    _, contribution = cost_components(reference, sample, calibration)
+    if not np.isfinite(contribution).any():
+        raise ValueError("calibration has no active components")
+    return float(np.nanmean(contribution))
 
 
-def calibrate(records, min_pairs=50, scale_quantile=.90, cost_quantile=.95, source_domains=SOURCES):
+def _fit_calibration_pool(pool, min_pairs, scale_quantile, cost_quantile,
+                          min_positive_pairs, min_active_components):
+    if len(pool) < min_pairs:
+        return None
+    ds = np.asarray([r["differences"] for r in pool], dtype=float)
+    if ds.shape != (len(pool), 4) or not np.isfinite(ds).all() or np.any(ds < 0):
+        raise ValueError("invalid G+ differences")
+    positive_pairs = np.sum(ds > 1e-12, axis=0)
+    active = positive_pairs >= min_positive_pairs
+    if int(active.sum()) < min_active_components:
+        return None
+    scales = np.full(4, np.nan, dtype=float)
+    for index in np.flatnonzero(active):
+        scales[index] = np.quantile(ds[ds[:, index] > 1e-12, index], scale_quantile)
+    if np.any(~np.isfinite(scales[active]) | (scales[active] <= 0)):
+        return None
+    costs = np.mean(ds[:, active] / scales[active], axis=1)
+    threshold = float(np.quantile(costs, cost_quantile))
+    if not np.isfinite(threshold) or threshold >= 1e4:
+        return None
+    return dict(scales=scales.tolist(), active=active.tolist(),
+                positive_pairs=positive_pairs.astype(int).tolist(),
+                num_active_components=int(active.sum()), threshold=threshold)
+
+
+def calibrate(records, min_pairs=50, scale_quantile=.90, cost_quantile=.95,
+              source_domains=SOURCES, min_positive_pairs=20, min_active_components=2):
     if set(source_domains) != set(SOURCES) or {row["source_domain"] for row in records} != set(SOURCES):
         raise ValueError("calibration requires G+ contributions from all four sources")
-    if min_pairs < 1 or not (0 < scale_quantile <= 1 and 0 < cost_quantile <= 1):
+    if (min_pairs < 1 or min_positive_pairs < 1 or not 1 <= min_active_components <= 4
+            or not (0 < scale_quantile <= 1 and 0 < cost_quantile <= 1)):
         raise ValueError("invalid calibration settings")
     if len(records) < min_pairs:
         raise ValueError("insufficient all-source pooled calibration pairs")
@@ -64,15 +108,19 @@ def calibrate(records, min_pairs=50, scale_quantile=.90, cost_quantile=.95, sour
             pools = [("source_direction", [r for r in records if r["source_domain"] == source and r["direction"] == direction]),
                      ("source_pooled", [r for r in records if r["source_domain"] == source]),
                      ("all_source_pooled", records)]
-            level, pool = next((level, pool) for level, pool in pools if len(pool) >= min_pairs)
-            ds = np.asarray([r["differences"] for r in pool], dtype=float)
-            if ds.shape != (len(pool), 4) or not np.isfinite(ds).all() or np.any(ds < 0):
-                raise ValueError("invalid G+ differences")
-            scales = np.quantile(ds, scale_quantile, axis=0) + EPS
-            threshold = float(np.quantile((ds / scales).mean(axis=1), cost_quantile))
+            selected = None
+            for level, pool in pools:
+                fitted = _fit_calibration_pool(pool, min_pairs, scale_quantile, cost_quantile,
+                                               min_positive_pairs, min_active_components)
+                if fitted is not None:
+                    selected = level, pool, fitted
+                    break
+            if selected is None:
+                raise ValueError(f"insufficient active components for all-source calibration: {source}:{direction}")
+            level, pool, fitted = selected
             output[source + ":" + direction] = dict(source_domain=source, direction=direction,
-                calibration_level=level, num_Gplus_pairs=len(pool), scales=scales.tolist(), threshold=threshold,
-                contributing_sources=sorted({r["source_domain"] for r in pool}))
+                calibration_level=level, num_Gplus_pairs=len(pool),
+                contributing_sources=sorted({r["source_domain"] for r in pool}), **fitted)
     return output
 
 
@@ -126,26 +174,28 @@ def classify_alignment(costs, thresholds, alignment):
         eligible = np.flatnonzero(np.isfinite(costs[i]) & (costs[i] <= thresholds[i]))
         ordered = sorted(float(value) for value in costs[i] if np.isfinite(value))
         j = pairs.get(i)
-        mutual, neighbors = False, 0
+        ref_unique, sample_unique, mutual, neighbors = False, False, False, 0
         if j is not None:
             row_best, col_best = costs[i].min(), costs[:, j].min()
-            mutual = bool(costs[i, j] == row_best == col_best
-                          and np.count_nonzero(costs[i] == row_best) == 1
-                          and np.count_nonzero(costs[:, j] == col_best) == 1)
+            ref_unique = bool(costs[i, j] == row_best and np.count_nonzero(costs[i] == row_best) == 1)
+            sample_unique = bool(costs[i, j] == col_best and np.count_nonzero(costs[:, j] == col_best) == 1)
+            mutual = ref_unique and sample_unique
             if n > 1 and m > 1:
                 neighbors = sum(pairs.get((i + step) % n) == (j + step) % m for step in (-1, 1))
         if not len(eligible):
             label = "NO_STRUCTURAL_COUNTERPART"
         elif j is None:
             label = "AMBIGUOUS"
-        elif mutual or neighbors >= 1:
+        elif mutual:
             label = "LIKELY_SAME_STRUCTURE"
         elif len(eligible) > 1:
             label = "AMBIGUOUS"
         else:
             label = "STRUCTURALLY_PLAUSIBLE"
         result.append(dict(identity_status=label, candidate_index=j, assignment_conflict=bool(len(eligible) and j is None),
-            mutual_best=mutual, neighbor_support=int(neighbors), num_identity_candidates=len(eligible),
+            reference_unique_best=ref_unique, sample_unique_best=sample_unique,
+            unique_mutual_best=mutual, mutual_best=mutual,
+            neighbor_support=int(neighbors), num_identity_candidates=len(eligible),
             best_structural_cost=ordered[0] if ordered else float("nan"),
             second_best_structural_cost=ordered[1] if len(ordered) > 1 else float("nan"),
             cost_margin=ordered[1]-ordered[0] if len(ordered) > 1 else float("nan"),
@@ -168,21 +218,55 @@ def measure_timing(reference, sample):
 
 
 def identify(references, candidates, calibrations):
-    refs, samples = [descriptor(r) for r in references], [descriptor(s) for s in candidates]
-    costs = np.array([[structural_cost(r, s, calibrations[r.direction]) for s in samples] for r in refs]).reshape(len(refs), len(samples))
+    primary = [item for item in candidates if bool(item.get("accepted", False))]
+    secondary = [item for item in candidates if not bool(item.get("accepted", False))]
+    refs, samples = [descriptor(r) for r in references], [descriptor(s) for s in primary]
+    costs = np.array([[structural_cost(r, s, calibrations[r.direction]) for s in samples]
+                      for r in refs]).reshape(len(refs), len(samples))
     thresholds = np.array([calibrations[r.direction]["threshold"] for r in refs])
     alignment = circular_alignment(costs, thresholds)
     rows = classify_alignment(costs, thresholds, alignment)
     for i, row in enumerate(rows):
         j = row["candidate_index"]
+        chosen = primary[j] if j is not None else None
+        row.update(candidate_source="PRIMARY_ACCEPTED" if chosen is not None else "NONE",
+                   num_secondary_candidates=0)
+        if row["identity_status"] in ("NO_STRUCTURAL_COUNTERPART", "AMBIGUOUS") and secondary:
+            secondary_costs = np.asarray([structural_cost(refs[i], descriptor(item), calibrations[refs[i].direction])
+                                          for item in secondary])
+            eligible = np.flatnonzero(np.isfinite(secondary_costs) & (secondary_costs <= thresholds[i]))
+            row["num_secondary_candidates"] = int(len(eligible))
+            if len(eligible) == 1:
+                chosen = secondary[int(eligible[0])]
+                row.update(identity_status="STRUCTURALLY_PLAUSIBLE", candidate_source="SECONDARY_REJECTED",
+                           structural_cost=float(secondary_costs[eligible[0]]),
+                           best_structural_cost=float(np.min(secondary_costs)),
+                           second_best_structural_cost=float("nan"), cost_margin=float("nan"),
+                           reference_unique_best=False, sample_unique_best=False,
+                           unique_mutual_best=False, mutual_best=False, assignment_conflict=False)
         row.update(reference_structure_id=references[i]["coarse_segment_id"], reference_direction=refs[i].direction,
-            identity_sample_segment_id=candidates[j]["coarse_segment_id"] if j is not None else "",
+            identity_sample_segment_id=chosen["coarse_segment_id"] if chosen is not None else "",
+            primary_sample_segment_id=primary[j]["coarse_segment_id"] if j is not None else "",
+            sample_segment_accepted=bool(chosen["accepted"]) if chosen is not None else None,
             identity_threshold=float(thresholds[i]), calibration_level=calibrations[refs[i].direction]["calibration_level"],
             reference_cross_boundary=bool(references[i]["crosses_year_boundary"]),
-            sample_cross_boundary=bool(candidates[j]["crosses_year_boundary"]) if j is not None else None)
+            sample_cross_boundary=bool(chosen["crosses_year_boundary"]) if chosen is not None else None)
+        if chosen is not None:
+            raw, contribution = cost_components(refs[i], descriptor(chosen), calibrations[refs[i].direction])
+        else:
+            raw, contribution = np.full(4, np.nan), np.full(4, np.nan)
+        for name, value, contribution_value in zip(COMPONENT_NAMES, raw, contribution):
+            row[f"{name}_difference"] = float(value)
+            row[f"{name}_cost_contribution"] = float(contribution_value)
+        active = calibrations[refs[i].direction]["active"]
+        row.update(active_component_count=int(sum(active)),
+                   curve_component_active=bool(active[0]), curve_component_contribution=float(contribution[0]),
+                   domain_component_active=bool(active[1]), domain_component_contribution=float(contribution[1]),
+                   monotonicity_component_active=bool(active[2]), monotonicity_component_contribution=float(contribution[2]),
+                   fine_count_component_active=bool(active[3]), fine_count_component_contribution=float(contribution[3]))
         row.update({field: float("nan") for field in TIMING_FIELDS})
-        if row["identity_status"] in TIMING_LABELS:
-            row.update(measure_timing(references[i], candidates[j]))
+        if row["identity_status"] in TIMING_LABELS and chosen is not None:
+            row.update(measure_timing(references[i], chosen))
     return rows, alignment
 
 
@@ -269,17 +353,34 @@ def summarize_structures(rows):
         first = group[0]
         minus = [r for r in group if r["baseline_06B_status"] == "G-"]
         plus = [r for r in group if r["baseline_06B_status"] == "G+"]
-        rescued = [r for r in minus if r["identity_status"] in TIMING_LABELS]
-        measured = [dict(r, abs_center=abs(r["center_displacement_days"]), abs_stretch=abs(r["stretch_difference_days"])) for r in rescued]
-        consistent = sum(r["identity_sample_segment_id"] == r["baseline_matched_segment_id"] for r in plus)
+        high = [r for r in minus if r["candidate_source"] == "PRIMARY_ACCEPTED"
+                and r["identity_status"] == "LIKELY_SAME_STRUCTURE"]
+        loose = [r for r in minus if r["identity_status"] in TIMING_LABELS]
+        measured = [dict(r, abs_center=abs(r["center_displacement_days"]), abs_stretch=abs(r["stretch_difference_days"]))
+                    for r in minus if r["candidate_source"] == "PRIMARY_ACCEPTED"
+                    and r["identity_status"] in TIMING_LABELS]
+        exact = sum(bool(r.get("gplus_exact_segment_recovered")) for r in plus)
+        any_identity = sum(r["identity_status"] in TIMING_LABELS for r in plus)
+        exact_likely = sum(bool(r.get("gplus_exact_segment_recovered"))
+                           and r["identity_status"] == "LIKELY_SAME_STRUCTURE" for r in plus)
         row = {k: first[k] for k in ("task", "source_domain", "class_id", "class_name", "reference_structure_id", "bootstrap_occurrence", "baseline_individual_occurrence")}
         row.update(num_samples=len(group), num_Gplus=len(plus), num_Gminus=len(minus),
             num_Gminus_likely_same=sum(r["identity_status"] == LABELS[0] for r in minus),
             num_Gminus_plausible=sum(r["identity_status"] == LABELS[1] for r in minus),
             num_Gminus_ambiguous=sum(r["identity_status"] == LABELS[2] for r in minus),
             num_Gminus_no_counterpart=sum(r["identity_status"] == LABELS[3] for r in minus),
-            Gminus_identity_rescue_rate=_rate(len(rescued), len(minus)),
-            gplus_identity_consistency_count=consistent, gplus_identity_consistency_rate=_rate(consistent, len(plus)),
+            Gminus_high_confidence_rescue_rate=_rate(len(high), len(minus)),
+            Gminus_plausible_or_better_rate=_rate(len(loose), len(minus)),
+            Gminus_primary_likely=len(high),
+            Gminus_primary_plausible=sum(r["candidate_source"] == "PRIMARY_ACCEPTED"
+                                         and r["identity_status"] == "STRUCTURALLY_PLAUSIBLE" for r in minus),
+            Gminus_secondary_plausible=sum(r["candidate_source"] == "SECONDARY_REJECTED"
+                                           and r["identity_status"] == "STRUCTURALLY_PLAUSIBLE" for r in minus),
+            gplus_exact_segment_count=exact, gplus_exact_segment_rate=_rate(exact, len(plus)),
+            gplus_any_identity_rate=_rate(any_identity, len(plus)),
+            gplus_exact_likely_rate=_rate(exact_likely, len(plus)),
+            wrong_segment_likely_rate=_rate(sum(r["identity_status"] == "LIKELY_SAME_STRUCTURE"
+                                                and not r.get("gplus_exact_segment_recovered", False) for r in plus), len(plus)),
             median_center_displacement=_quantile(measured, "center_displacement_days", .5),
             p90_abs_center_displacement=_quantile(measured, "abs_center", .9),
             max_abs_center_displacement=_quantile(measured, "abs_center", 1),
@@ -291,15 +392,41 @@ def summarize_structures(rows):
     return result
 
 
+def summarize_gplus(rows):
+    groups = defaultdict(list)
+    plus = [row for row in rows if row["baseline_06B_status"] == "G+"]
+    for row in plus:
+        groups[("STRUCTURE", row["source_domain"], row["class_id"], row["reference_structure_id"])].append(row)
+        groups[("TOTAL", "", "", "")].append(row)
+    result = []
+    for key, group in sorted(groups.items()):
+        total = len(group)
+        any_identity = sum(r["identity_status"] in TIMING_LABELS for r in group)
+        exact = sum(bool(r.get("gplus_exact_segment_recovered")) for r in group)
+        exact_likely = sum(bool(r.get("gplus_exact_segment_recovered"))
+                           and r["identity_status"] == "LIKELY_SAME_STRUCTURE" for r in group)
+        wrong_likely = sum(not bool(r.get("gplus_exact_segment_recovered"))
+                           and r["identity_status"] == "LIKELY_SAME_STRUCTURE" for r in group)
+        result.append(dict(scope=key[0], source_domain=key[1], class_id=key[2], reference_structure_id=key[3],
+                           num_Gplus=total, num_any_identity=any_identity,
+                           gplus_any_identity_rate=_rate(any_identity, total),
+                           num_exact_segment=exact, gplus_exact_segment_rate=_rate(exact, total),
+                           num_exact_likely=exact_likely, gplus_exact_likely_rate=_rate(exact_likely, total),
+                           num_wrong_segment_likely=wrong_likely,
+                           wrong_segment_likely_rate=_rate(wrong_likely, total)))
+    return result
+
+
 def summarize_transitions(rows):
     groups = defaultdict(list)
     for row in rows:
         if row["baseline_06B_status"] != "G-":
             continue
-        key = (row["class_id"], row["reference_structure_id"], row["baseline_failure_reason"])
+        key = (row["class_id"], row["reference_structure_id"], row["baseline_failure_reason"], row["candidate_source"])
         groups[("STRUCTURE",) + key].append(row)
-        groups[("TOTAL", "", "", row["baseline_failure_reason"])].append(row)
+        groups[("TOTAL", "", "", row["baseline_failure_reason"], row["candidate_source"])].append(row)
     return [dict(scope=key[0], class_id=key[1], reference_structure_id=key[2], baseline_failure_reason=key[3],
+                 candidate_source=key[4],
                  identity_status=label, count=sum(r["identity_status"] == label for r in group),
                  fraction=sum(r["identity_status"] == label for r in group)/len(group))
             for key, group in sorted(groups.items()) for label in LABELS]
@@ -309,8 +436,12 @@ def summarize_boundaries(rows):
     result = []
     for boundary in (True, False):
         minus = [r for r in rows if r["baseline_06B_status"] == "G-" and r["reference_cross_boundary"] == boundary]
-        rescued = [dict(r, abs_center=abs(r["center_displacement_days"])) for r in minus if r["identity_status"] in TIMING_LABELS]
-        result.append(dict(cross_boundary=boundary, num_Gminus=len(minus), identity_rescue_rate=_rate(len(rescued), len(minus)),
+        rescued = [dict(r, abs_center=abs(r["center_displacement_days"])) for r in minus
+                   if r["candidate_source"] == "PRIMARY_ACCEPTED" and r["identity_status"] == "LIKELY_SAME_STRUCTURE"]
+        loose = [r for r in minus if r["identity_status"] in TIMING_LABELS]
+        result.append(dict(cross_boundary=boundary, num_Gminus=len(minus),
+            high_confidence_rescue_rate=_rate(len(rescued), len(minus)),
+            plausible_or_better_rate=_rate(len(loose), len(minus)),
             median_abs_center_displacement=_quantile(rescued, "abs_center", .5),
             p90_abs_center_displacement=_quantile(rescued, "abs_center", .9), median_duration_ratio=_quantile(rescued, "duration_ratio", .5),
             grouped_candidate_rate=_rate(sum(bool(r["has_grouped_candidate"]) for r in minus), len(minus))))
@@ -341,26 +472,34 @@ def plot_identity(path, prototype, curve, references, candidates, alignment, row
     axes[0].set(xlabel="Source calendar day", ylabel="Fixed source-class PC1", xlim=(0, 365))
     axes[0].legend()
     axes[0].grid(alpha=.2)
-    for objects, height, prefix in ((references, 1, "reference"), (candidates, 0, "sample")):
+    primary = [item for item in candidates if bool(item.get("accepted", False))]
+    ordered_primary = primary[alignment.rotation:] + primary[:alignment.rotation]
+    for objects, height, prefix in ((references, 1, "reference"), (ordered_primary, 0, "sample")):
         for i, item in enumerate(objects):
             x = i / max(len(objects)-1, 1)
-            axes[1].text(x, height, item["coarse_segment_id"] + (" ↑" if item["direction"] == "RISE" else " ↓"), ha="center", fontsize=8)
+            axes[1].text(x, height, f"{item['coarse_segment_id']}\n{item['direction']}\naccepted={item.get('accepted', False)}", ha="center", fontsize=7)
     for i, j in alignment.pairs:
-        axes[1].add_artist(ConnectionPatch((i/max(len(references)-1, 1), .9), (j/max(len(candidates)-1, 1), .15),
+        adjusted = (j - alignment.rotation) % max(len(primary), 1)
+        axes[1].add_artist(ConnectionPatch((i/max(len(references)-1, 1), .9), (adjusted/max(len(primary)-1, 1), .15),
             "data", "data", axesA=axes[1], axesB=axes[1], color="gray", alpha=.6))
-    axes[1].set(xlim=(-.08, 1.08), ylim=(-.2, 1.2), title="Circular sequence order / time-free primary assignment")
+    axes[1].set(xlim=(-.08, 1.08), ylim=(-.2, 1.2),
+                title="Sequence order only — x-axis is NOT calendar time")
     axes[1].axis("off")
     if grouped:
         text = ("grouped diagnostic only — not primary correspondence\n"
                 f"segments: {' + '.join(ids)}\ncost={row['grouped_structural_cost']:.4f}; "
                 f"threshold={row['identity_threshold']:.4f}; monotonicity={row['grouped_monotonicity']:.4f}")
     else:
-        ds = differences(descriptor(ref), descriptor(chosen[0]))
+        ds, contributions = cost_components(descriptor(ref), descriptor(chosen[0]), calibration)
+        component_lines = []
+        for name, raw, scale, active, contribution in zip(
+                COMPONENT_NAMES, ds, calibration["scales"], calibration["active"], contributions):
+            component_lines.append(f"{name}: raw={raw:.4f}, scale={scale:.4f}, contribution={contribution:.4f}"
+                                   if active else f"{name}: DISABLED (raw={raw:.4f})")
         text = (f"cost={row['structural_cost']:.4f}; threshold={row['identity_threshold']:.4f}; "
-                f"unique mutual best={row['mutual_best']}; neighbor support={row['neighbor_support']}\n"
-                f"curve difference={ds[0]:.4f}; domain difference={ds[1]:.4f}; "
-                f"monotonicity difference={ds[2]:.4f}; fine-count difference={ds[3]:.4f}\n"
-                f"scales={np.round(calibration['scales'], 4).tolist()}\n"
+                f"source={row['candidate_source']}; accepted={row['sample_segment_accepted']}\n"
+                f"unique mutual best={row['unique_mutual_best']}; neighbor support={row['neighbor_support']}\n"
+                + "\n".join(component_lines) + "\n"
                 f"center displacement={row['center_displacement_days']:+.1f} days; duration ratio={row['duration_ratio']:.3f}")
     axes[2].text(.01, .95, text, transform=axes[2].transAxes, va="top", fontsize=10)
     axes[2].axis("off")
@@ -375,7 +514,9 @@ def plot_phase_distribution(path, rows):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    selected = [r for r in rows if r["baseline_06B_status"] == "G-" and r["identity_status"] in TIMING_LABELS]
+    selected = [r for r in rows if r["baseline_06B_status"] == "G-"
+                and r["candidate_source"] == "PRIMARY_ACCEPTED"
+                and r["identity_status"] == "LIKELY_SAME_STRUCTURE"]
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     if not selected:
         for axis in axes:
@@ -395,5 +536,62 @@ def plot_phase_distribution(path, rows):
     first = rows[0]
     fig.suptitle(f"{first['task']} | {first['class_name']} | {first['reference_structure_id']} | identity then timing")
     fig.tight_layout()
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+
+
+def select_gplus_misassignments(rows, limit=20):
+    """Deterministically prioritize wrong-likely cases, class coverage, then margin extremes."""
+    pool = [row for row in rows if row["baseline_06B_status"] == "G+"
+            and not row.get("gplus_exact_segment_recovered", False)]
+    def stable_key(row):
+        return int(row["class_id"]), str(row["reference_structure_id"]), int(row["sample_id"])
+    def margin(row):
+        value = float(row.get("cost_margin", float("nan")))
+        return value if np.isfinite(value) else -float("inf")
+    wrong_likely = sorted((row for row in pool if row["identity_status"] == "LIKELY_SAME_STRUCTURE"),
+                          key=stable_key)
+    selected = wrong_likely[:limit]
+    remaining = [row for row in pool if row not in selected]
+    for class_id in sorted({int(row["class_id"]) for row in pool}):
+        item = next((row for row in sorted(remaining, key=stable_key) if int(row["class_id"]) == class_id), None)
+        if item is not None and len(selected) < limit:
+            selected.append(item)
+    remaining = [row for row in remaining if row not in selected]
+    extremes = []
+    ordered = sorted(remaining, key=lambda row: (margin(row), stable_key(row)))
+    while ordered:
+        extremes.append(ordered.pop(0))
+        if ordered:
+            extremes.append(ordered.pop())
+    selected.extend(row for row in extremes if len(selected) < limit)
+    return selected[:limit]
+
+
+def plot_gplus_misassignment(path, prototype, curve, reference, baseline_segment, chosen_segment, row):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 1, figsize=(13, 7), gridspec_kw={"height_ratios": [2.5, 1]})
+    axes[0].plot(np.arange(len(prototype)), prototype, color="#245580", lw=2, label="reference prototype")
+    axes[0].plot(np.arange(len(curve)), curve, color="#be6900", lw=1.5, label=f"source sample {row['sample_id']}")
+    _shade(axes[0], reference, "#245580")
+    _shade(axes[0], baseline_segment, "#2ca02c")
+    if chosen_segment is not None:
+        _shade(axes[0], chosen_segment, "#d62728")
+    axes[0].set(xlim=(0, 365), xlabel="Source calendar day", ylabel="Fixed source-class PC1")
+    axes[0].legend()
+    axes[0].grid(alpha=.2)
+    chosen_id = chosen_segment["coarse_segment_id"] if chosen_segment is not None else "NONE"
+    axes[1].text(.02, .92,
+        f"reference: {reference['coarse_segment_id']} ({reference['direction']})\n"
+        f"06B baseline matched: {baseline_segment['coarse_segment_id']} (green)\n"
+        f"06C chosen: {chosen_id} (red)\n"
+        f"status={row['identity_status']}; candidate_source={row['candidate_source']}; "
+        f"accepted={row['sample_segment_accepted']}; margin={row['cost_margin']}",
+        transform=axes[1].transAxes, va="top")
+    axes[1].axis("off")
+    fig.suptitle(f"G+ exact-segment mismatch | {row['task']} | {row['class_name']}")
+    fig.tight_layout(rect=(0, 0, 1, .94))
     fig.savefig(path, dpi=140)
     plt.close(fig)

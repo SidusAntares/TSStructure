@@ -7,6 +7,8 @@ import csv
 import hashlib
 import json
 import re
+import shutil
+import uuid
 import sys
 from collections import defaultdict
 from dataclasses import asdict
@@ -20,19 +22,27 @@ if str(ROOT) not in sys.path:
 
 from analysis.structure_identity_phase_diagnostic import (
     SOURCES, TIMING_FIELDS, TIMING_LABELS, audit_group, calibrate, descriptor, differences,
-    grouped_candidates, identify, index_baseline, plot_identity, plot_phase_distribution,
-    staged_output, summarize_boundaries, summarize_structures, summarize_transitions, write_csv, write_json,
+    grouped_candidates, identify, index_baseline, plot_gplus_misassignment, plot_identity, plot_phase_distribution,
+    select_gplus_misassignments,
+    staged_output, summarize_boundaries, summarize_gplus, summarize_structures, summarize_transitions, write_csv, write_json,
 )
 
 TASKS = {"AT1_DK1": ("AT1", "austria/33UVP/2017"), "DK1_FR1": ("DK1", "denmark/32VNH/2017"),
          "FR1_FR2": ("FR1", "france/30TXT/2017"), "FR2_AT1": ("FR2", "france/31TCJ/2017")}
 REQUIRED_OUTPUTS = ("identity_calibration.csv", "sample_structure_identity.csv", "structure_identity_summary.csv",
-                    "failure_transition_summary.csv", "boundary_summary.csv", "manifest.json")
+                    "gplus_consistency_summary.csv", "failure_transition_summary.csv", "boundary_summary.csv", "manifest.json")
 SAMPLE_FIELDS = ("task", "source_domain", "class_id", "class_name", "reference_structure_id", "reference_direction",
     "sample_id", "baseline_06B_status", "baseline_failure_reason", "baseline_matched_segment_id", "identity_status",
-    "identity_sample_segment_id", "structural_cost", "identity_threshold", "calibration_level", "mutual_best",
-    "neighbor_support", "assignment_conflict", "num_identity_candidates", "best_structural_cost", "second_best_structural_cost",
-    "cost_margin") + TIMING_FIELDS + ("reference_cross_boundary", "sample_cross_boundary", "has_grouped_candidate",
+    "identity_sample_segment_id", "primary_sample_segment_id", "candidate_source", "sample_segment_accepted",
+    "structural_cost", "identity_threshold", "calibration_level", "reference_unique_best", "sample_unique_best",
+    "unique_mutual_best", "neighbor_support", "assignment_conflict", "num_identity_candidates", "num_secondary_candidates",
+    "best_structural_cost", "second_best_structural_cost", "cost_margin",
+    "curve_change_difference", "domain_change_difference", "monotonicity_difference", "fine_count_difference",
+    "curve_change_cost_contribution", "domain_change_cost_contribution", "monotonicity_cost_contribution", "fine_count_cost_contribution",
+    "active_component_count", "curve_component_active", "curve_component_contribution",
+    "domain_component_active", "domain_component_contribution", "monotonicity_component_active",
+    "monotonicity_component_contribution", "fine_count_component_active", "fine_count_component_contribution",
+    "gplus_exact_segment_recovered") + TIMING_FIELDS + ("reference_cross_boundary", "sample_cross_boundary", "has_grouped_candidate",
     "grouped_status", "grouped_candidate_ids", "grouped_structural_cost", "grouped_monotonicity", "group_start_segment",
     "group_end_segment", "baseline_individual_occurrence", "bootstrap_occurrence")
 
@@ -70,7 +80,7 @@ def validate_args(args):
         raise ValueError("06C fixes --min-bootstrap-occurrence at 0.8")
     if args.max_examples_per_structure < 0:
         raise ValueError("max examples must be nonnegative")
-    if args.stage != "calibrate" and args.task is None:
+    if args.stage in ("prepare", "audit") and args.task is None:
         raise ValueError("--task required for prepare/audit")
 
 
@@ -80,6 +90,48 @@ def file_hash(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def validate_revision_root(root):
+    root = Path(root)
+    calibration_path = root / "calibration.json"
+    if not calibration_path.is_file() or not calibration_path.stat().st_size:
+        raise RuntimeError("incomplete 06C revision: missing global calibration")
+    packet = read_json(calibration_path)
+    if set(packet.get("source_domains", ())) != set(SOURCES):
+        raise RuntimeError("incomplete 06C revision: invalid global calibration")
+    for task in TASKS:
+        folder = root / task
+        for name in REQUIRED_OUTPUTS:
+            path = folder / name
+            if not path.is_file() or not path.stat().st_size:
+                raise RuntimeError(f"incomplete 06C revision: {task}/{name}")
+        manifest = read_json(folder / "manifest.json")
+        if manifest.get("completed") is not True or manifest.get("task") != task:
+            raise RuntimeError(f"incomplete 06C revision manifest: {task}")
+        for relative in manifest.get("plots", ()):
+            if not (folder / relative).is_file():
+                raise RuntimeError(f"incomplete 06C revision plot: {task}/{relative}")
+
+
+def publish_revision(revision_root, final_root):
+    """Validate the entire four-task revision before replacing the prior root."""
+    revision_root, final_root = Path(revision_root), Path(final_root)
+    validate_revision_root(revision_root)
+    final_root.parent.mkdir(parents=True, exist_ok=True)
+    backup = final_root.parent / f".old_{final_root.name}_{uuid.uuid4().hex}"
+    moved_old = False
+    try:
+        if final_root.exists():
+            final_root.replace(backup)
+            moved_old = True
+        revision_root.replace(final_root)
+    except Exception:
+        if moved_old and backup.exists() and not final_root.exists():
+            backup.replace(final_root)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
 
 
 def id_order(value):
@@ -125,6 +177,9 @@ def audit_prepared_class(task, payload, calibration, min_monotonicity):
                 sample_id=sample["sample_id"], baseline_06B_status="G+" if plus else "G-",
                 baseline_failure_reason=baseline["failure_reason"], baseline_matched_segment_id=baseline["matched_sample_segment_id"],
                 bootstrap_occurrence=ref["bootstrap_occurrence"], baseline_individual_occurrence=ref["baseline_individual_occurrence"])
+            row["gplus_exact_segment_recovered"] = bool(
+                plus and row["candidate_source"] == "PRIMARY_ACCEPTED"
+                and row["identity_sample_segment_id"] == row["baseline_matched_segment_id"])
             row.update(audit_group(ref, [], calibration[ref["direction"]]))
             row["grouped_status"] = "NOT_AUDITED"
             if not plus and row["identity_status"] in ("AMBIGUOUS", "NO_STRUCTURAL_COUNTERPART"):
@@ -250,19 +305,30 @@ def run_calibration(args):
         hashes[task] = file_hash(path)
         records.extend(packet["gplus"])
     result = calibrate(records, args.identity_calibration_min_pairs,
-                       args.identity_component_scale_quantile, args.identity_cost_quantile)
+                       args.identity_component_scale_quantile, args.identity_cost_quantile,
+                       min_positive_pairs=args.identity_component_min_positive_pairs,
+                       min_active_components=args.identity_calibration_min_active_components)
     write_json(args.work_root / "calibration.json", dict(calibrations=result, prepared_manifest_hashes=hashes,
         source_domains=list(SOURCES), min_pairs=args.identity_calibration_min_pairs,
-        component_scale_quantile=args.identity_component_scale_quantile, cost_quantile=args.identity_cost_quantile))
+        component_scale_quantile=args.identity_component_scale_quantile, cost_quantile=args.identity_cost_quantile,
+        component_min_positive_pairs=args.identity_component_min_positive_pairs,
+        min_active_components=args.identity_calibration_min_active_components,
+        revision="robust-active-components-primary-secondary-v2"))
     for key, row in result.items():
         print(f"CALIBRATION|{key}|level={row['calibration_level']}|n={row['num_Gplus_pairs']}|threshold={row['threshold']:.6g}", flush=True)
 
 
 def calibration_csv(calibrations):
-    names = ("curve_change_scale", "domain_change_scale", "monotonicity_scale", "fine_count_scale")
-    return [dict(source_domain=row["source_domain"], direction=row["direction"], calibration_level=row["calibration_level"],
-                 num_Gplus_pairs=row["num_Gplus_pairs"], identity_cost_threshold=row["threshold"],
-                 **dict(zip(names, row["scales"]))) for row in calibrations.values()]
+    rows = []
+    for row in calibrations.values():
+        result = dict(source_domain=row["source_domain"], direction=row["direction"], calibration_level=row["calibration_level"],
+                      num_Gplus_pairs=row["num_Gplus_pairs"], num_active_components=row["num_active_components"],
+                      identity_cost_threshold=row["threshold"])
+        for name, scale, active, count in zip(("curve_change", "domain_change", "monotonicity", "fine_count"),
+                                              row["scales"], row["active"], row["positive_pairs"]):
+            result.update({f"{name}_active": active, f"{name}_positive_pairs": count, f"{name}_scale": scale})
+        rows.append(result)
+    return rows
 
 
 def _plot_class(staging, payload, rows, alignments, curves, prototype, calibration, max_examples):
@@ -292,7 +358,10 @@ def _plot_class(staging, payload, rows, alignments, curves, prototype, calibrati
                 plot_identity(staging / path, prototype, curves[idx], payload["references"], sample["segments"],
                     alignments[row["sample_id"]], row, calibration[ref["direction"]], grouped=is_group)
                 required.append(path)
-    return required
+    contexts = {int(row["sample_id"]): (payload, by_sample[int(row["sample_id"])][1],
+                                        curves[by_sample[int(row["sample_id"])][0]], prototype)
+                for row in rows}
+    return required, contexts
 
 
 def run_audit(args):
@@ -307,40 +376,66 @@ def run_audit(args):
         if calibration_packet["prepared_manifest_hashes"][task] != file_hash(args.work_root / task / "manifest.json"):
             raise ValueError(f"prepared packet changed after calibration: {task}")
     calibration = {direction: calibration_packet["calibrations"][source + ":" + direction] for direction in ("RISE", "FALL")}
-    all_rows, required_plots = [], []
+    all_rows, required_plots, visual_contexts = [], [], {}
     with staged_output(args.output_root / args.task, REQUIRED_OUTPUTS) as staging:
         (staging / "diagnostics").mkdir()
         (staging / "fragmentation_diagnostics").mkdir()
+        (staging / "gplus_misassignment_diagnostics").mkdir()
         for cid in prepared["class_ids"]:
             payload = read_json(work / f"class_{cid}.json")
             rows, alignments = audit_prepared_class(args.task, payload, calibration, prepared["coarse_min_monotonicity"])
             all_rows.extend(rows)
             with np.load(work / f"class_{cid}.npz", allow_pickle=False) as arrays:
-                required_plots.extend(_plot_class(staging, payload, rows, alignments, arrays["curves"], arrays["prototype"], calibration, args.max_examples_per_structure))
+                plots, contexts = _plot_class(staging, payload, rows, alignments, arrays["curves"], arrays["prototype"], calibration, args.max_examples_per_structure)
+                required_plots.extend(plots)
+                visual_contexts.update({(cid, sid): context for sid, context in contexts.items()})
             print(f"AUDITED|task={args.task}|class={cid}|rows={len(rows)}", flush=True)
         if not all_rows:
             raise ValueError("empty identity audit")
+        for index, row in enumerate(select_gplus_misassignments(all_rows, 20)):
+            payload, sample, curve, prototype = visual_contexts[(int(row["class_id"]), int(row["sample_id"]))]
+            refs = {item["coarse_segment_id"]: item for item in payload["references"]}
+            segments = {item["coarse_segment_id"]: item for item in sample["segments"]}
+            baseline = segments.get(row["baseline_matched_segment_id"])
+            if baseline is None:
+                raise ValueError("G+ baseline segment missing during misassignment visualization")
+            chosen = segments.get(row["identity_sample_segment_id"])
+            name = f"gplus_misassignment_diagnostics/{index:02d}_class{row['class_id']}_{row['reference_structure_id']}_sample{row['sample_id']}.png"
+            plot_gplus_misassignment(staging / name, prototype, curve, refs[row["reference_structure_id"]], baseline, chosen, row)
+            required_plots.append(name)
         summary = summarize_structures(all_rows)
         plus_total = sum(r["num_Gplus"] for r in summary)
-        consistency = sum(r["gplus_identity_consistency_count"] for r in summary) / plus_total if plus_total else None
+        exact_total = sum(r["gplus_exact_segment_count"] for r in summary)
+        consistency = exact_total / plus_total if plus_total else None
         csv_rows = [dict(r, grouped_candidate_ids=json.dumps(r["grouped_candidate_ids"])) for r in all_rows]
         write_csv(staging / "sample_structure_identity.csv", csv_rows, SAMPLE_FIELDS)
         write_csv(staging / "structure_identity_summary.csv", summary)
+        write_csv(staging / "gplus_consistency_summary.csv", summarize_gplus(all_rows))
         write_csv(staging / "identity_calibration.csv", calibration_csv(calibration))
         write_csv(staging / "failure_transition_summary.csv", summarize_transitions(all_rows),
-                  ("scope", "class_id", "reference_structure_id", "baseline_failure_reason", "identity_status", "count", "fraction"))
+                  ("scope", "class_id", "reference_structure_id", "baseline_failure_reason", "candidate_source", "identity_status", "count", "fraction"))
         write_csv(staging / "boundary_summary.csv", summarize_boundaries(all_rows))
         write_json(staging / "manifest.json", dict(task=args.task, source_domain=source, completed=True,
+            experiment=dict(name="structure_identity_phase_06C", revision="robust_calibration_v2"),
             preparation={k: v for k, v in prepared.items() if k != "gplus"}, calibration=calibration_packet,
             gplus_identity_consistency_rate=consistency, num_rows=len(all_rows), plots=required_plots,
             target_used=False, training=False, timing_used_in_identity=False, duration_used_in_identity=False,
-            sample_sequence="all coarse segments including accepted=false; existing detector ID order",
+            revision="robust-active-components-primary-secondary-v2",
+            calibration_policy=dict(zero_scale_policy="disable_component",
+                scale_source="positive_gplus_differences_only",
+                component_scale_quantile=args.identity_component_scale_quantile,
+                min_positive_pairs=args.identity_component_min_positive_pairs,
+                min_active_components=args.identity_calibration_min_active_components),
+            candidate_pool=dict(primary="accepted_coarse_segments", secondary="rejected_coarse_segments",
+                                secondary_can_be_likely=False),
+            likely_requires_unique_mutual_best=True, neighbor_support_high_confidence=False,
+            sample_sequence="primary accepted coarse segments; rejected segments are secondary fallback only",
             reference_sequence="05 accepted, 06A bootstrap>=0.8, numeric structure ID order",
             descriptor=["direction", "A_curve", "A_domain", "monotonicity", "num_fine_segments_covered"],
-            identity_policy="no candidate -> no counterpart; unassigned -> ambiguous/conflict; unique mutual or neighbor -> likely; multiple unsupported -> ambiguous; single unsupported -> plausible",
+            identity_policy="primary accepted unique mutual-best -> likely; primary single unsupported or unique rejected fallback -> plausible; neighbor support diagnostic only",
             gap_definition="unmatched sequence elements", mutual_best="unique exact minimum on both sides; ties are not mutual-best",
-            rescue_definition="G- classified LIKELY_SAME_STRUCTURE or STRUCTURALLY_PLAUSIBLE; grouped excluded",
-            timing_scope="identity-rescued G- in summary; all assigned confident pairs in sample CSV",
+            rescue_definition="high-confidence = primary accepted likely; loose = likely or plausible; grouped excluded",
+            timing_scope="formal summaries use primary accepted identities only; secondary timing remains row-level",
             grouped_scope="G- ambiguous/no counterpart only; consecutive 3 on full sample circle; diagnostic only"))
         for name in REQUIRED_OUTPUTS + tuple(required_plots):
             if not (staging / name).is_file() or (staging / name).stat().st_size == 0:
@@ -350,9 +445,16 @@ def run_audit(args):
     print(f"[FINISHED] 06C {args.task}: rows={len(all_rows)}, G+ consistency={consistency}", flush=True)
 
 
+def run_publish(args):
+    if args.revision_root is None:
+        raise ValueError("--revision-root is required for publish")
+    publish_revision(args.revision_root, args.output_root)
+    print(f"[PUBLISHED] complete 06C revision: {args.output_root}", flush=True)
+
+
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--stage", choices=("prepare", "calibrate", "audit"), required=True)
+    p.add_argument("--stage", choices=("prepare", "calibrate", "audit", "publish"), required=True)
     p.add_argument("--task", choices=tuple(TASKS))
     p.add_argument("--data-root", type=Path)
     p.add_argument("--source-checkpoint")
@@ -361,10 +463,13 @@ def build_parser():
     p.add_argument("--observation-root", type=Path, default=Path("outputs/shift_visualizations_seed1/06B_structure_observation_support"))
     p.add_argument("--output-root", type=Path, default=Path("outputs/shift_visualizations_seed1/06C_structure_identity_phase"))
     p.add_argument("--work-root", type=Path, default=Path("outputs/shift_visualizations_seed1/.06C_work"))
+    p.add_argument("--revision-root", type=Path)
     p.add_argument("--min-bootstrap-occurrence", type=float, default=.8)
     p.add_argument("--identity-component-scale-quantile", type=float, default=.90)
     p.add_argument("--identity-cost-quantile", type=float, default=.95)
     p.add_argument("--identity-calibration-min-pairs", type=int, default=50)
+    p.add_argument("--identity-component-min-positive-pairs", type=int, default=20)
+    p.add_argument("--identity-calibration-min-active-components", type=int, default=2)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--grid-size", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=128)
@@ -377,7 +482,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     validate_args(args)
-    {"prepare": run_prepare, "calibrate": run_calibration, "audit": run_audit}[args.stage](args)
+    {"prepare": run_prepare, "calibrate": run_calibration, "audit": run_audit, "publish": run_publish}[args.stage](args)
 
 
 if __name__ == "__main__":

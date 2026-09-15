@@ -17,6 +17,8 @@ FR2_WEIGHTS="${FR2_WEIGHTS:-outputs/pseltae_FR2_source_seed1}"
 IDENTITY_COMPONENT_SCALE_QUANTILE="${IDENTITY_COMPONENT_SCALE_QUANTILE:-0.90}"
 IDENTITY_COST_QUANTILE="${IDENTITY_COST_QUANTILE:-0.95}"
 IDENTITY_CALIBRATION_MIN_PAIRS="${IDENTITY_CALIBRATION_MIN_PAIRS:-50}"
+IDENTITY_COMPONENT_MIN_POSITIVE_PAIRS="${IDENTITY_COMPONENT_MIN_POSITIVE_PAIRS:-20}"
+IDENTITY_CALIBRATION_MIN_ACTIVE_COMPONENTS="${IDENTITY_CALIBRATION_MIN_ACTIVE_COMPONENTS:-2}"
 export PYTHONUNBUFFERED=1
 
 [[ -d "$DATA_ROOT" ]] || { echo "ERROR: missing source data: $DATA_ROOT" >&2; exit 1; }
@@ -36,9 +38,12 @@ for source_alias in AT1 DK1 FR1 FR2; do
         echo "ERROR: missing 06A input: $VALIDITY_ROOT/$source_alias/structure_stability.csv" >&2; exit 1;
     }
 done
-mkdir -p "$OUTPUT_ROOT" "$LOG_ROOT"
-WORK_ROOT="$(mktemp -d "$OUTPUT_ROOT/.work_06C_XXXXXXXX")"
-common=(--work-root "$WORK_ROOT" --output-root "$OUTPUT_ROOT")
+OUTPUT_PARENT="$(dirname "$OUTPUT_ROOT")"
+mkdir -p "$OUTPUT_PARENT" "$LOG_ROOT"
+REVISION_ROOT="$(mktemp -d "$OUTPUT_PARENT/.tmp_06C_structure_identity_phase_revision_XXXXXXXX")"
+WORK_ROOT="$REVISION_ROOT/.work"
+mkdir -p "$WORK_ROOT"
+common=(--work-root "$WORK_ROOT" --output-root "$REVISION_ROOT")
 
 prepare_one() {
     local gpu="$1"
@@ -76,6 +81,8 @@ echo "[STAGE 2] Shared calibration from all four sources"
     --identity-component-scale-quantile "$IDENTITY_COMPONENT_SCALE_QUANTILE" \
     --identity-cost-quantile "$IDENTITY_COST_QUANTILE" \
     --identity-calibration-min-pairs "$IDENTITY_CALIBRATION_MIN_PAIRS" \
+    --identity-component-min-positive-pairs "$IDENTITY_COMPONENT_MIN_POSITIVE_PAIRS" \
+    --identity-calibration-min-active-components "$IDENTITY_CALIBRATION_MIN_ACTIVE_COMPONENTS" \
     2>&1 | tee "$LOG_ROOT/calibration.log"
 
 echo "[STAGE 3] Time-free identity audit; preparation reused without feature extraction"
@@ -86,8 +93,11 @@ for task in AT1_DK1 DK1_FR1 FR1_FR2 FR2_AT1; do
     pids+=("$!")
 done
 wait_wave "${pids[@]}"
-# Only remove this invocation's mktemp directory, after every output is published.
-if [[ "$WORK_ROOT" == "$OUTPUT_ROOT"/.work_06C_* && -d "$WORK_ROOT" ]]; then
-    rm -r -- "$WORK_ROOT"
-fi
+
+echo "[STAGE 4] Validate complete revision before atomic root replacement"
+[[ -s "$WORK_ROOT/calibration.json" ]] || { echo "ERROR: missing global calibration; old root preserved" >&2; exit 1; }
+cp "$WORK_ROOT/calibration.json" "$REVISION_ROOT/calibration.json"
+rm -r -- "$WORK_ROOT"
+"$PYTHON_BIN" -u scripts/diagnose_structure_identity_phase.py \
+    --stage publish --revision-root "$REVISION_ROOT" --output-root "$OUTPUT_ROOT"
 echo "[ALL FINISHED] 06C: $OUTPUT_ROOT"
