@@ -22,6 +22,7 @@ from utils.focal_loss import FocalLoss
 from utils.train_utils import AverageMeter, bool_flag, cycle, progress_bar_disabled, to_cuda
 from methods.structure_da.prototype_losses import (
     compose_da_loss,
+    prototype_ramp,
     select_top_shape_tokens,
     two_level_prototype_losses,
     update_source_banks,
@@ -313,6 +314,11 @@ def _classify_prepared(model, prepared, positions, temporal_shift=0):
 def _train_structure_proto_timematch(
     student, config, writer, val_loader, device, best_model_path, fold_num, splits,
 ):
+    if config.with_shift_aug:
+        raise ValueError(
+            "structure prototype TimeMatch requires identical canonical window indexing; "
+            "set --with_shift_aug false"
+        )
     source_loader, target_loader_no_aug, target_loader = get_data_loaders(
         splits, config, config.balance_source
     )
@@ -342,6 +348,9 @@ def _train_structure_proto_timematch(
     best_f1 = 0
     global_step = 0
     for epoch in range(config.epochs):
+        target_ramp = prototype_ramp(
+            epoch, config.proto_ramp_epochs, config.proto_ramp_start,
+        )
         target_to_source_shift = _reestimate_timematch_shift(
             teacher, target_loader_no_aug, device, config,
             initial_shift, class_distribution, initial_diagnostics, epoch,
@@ -378,10 +387,14 @@ def _train_structure_proto_timematch(
                 return_dict=True,
             )
             loss_cls_source = criterion(source_output["logits"], source_labels)
-            source_ins, source_shape, source_proto, source_selected = two_level_prototype_losses(
+            source_ins, source_shape, source_selected = two_level_prototype_losses(
                 source_output, source_labels,
                 student.shape_prototype_bank, student.instance_prototype_bank,
-                config.shape_ratio, config.proto_temperature, config.proto_shape_mix,
+                config.shape_ratio, config.proto_temperature,
+            )
+            source_proto = (
+                config.proto_instance_weight * source_ins
+                + config.proto_shape_weight * source_shape
             )
 
             target_count = int(pseudo_mask.sum())
@@ -398,11 +411,15 @@ def _train_structure_proto_timematch(
                     teacher_output["shape_mask"][pseudo_mask],
                     config.shape_ratio,
                 )
-                target_ins, target_shape, target_proto, _ = two_level_prototype_losses(
+                target_ins, target_shape, _ = two_level_prototype_losses(
                     target_output, target_labels,
                     student.shape_prototype_bank, student.instance_prototype_bank,
-                    config.shape_ratio, config.proto_temperature, config.proto_shape_mix,
+                    config.shape_ratio, config.proto_temperature,
                     selected_tokens=teacher_selected,
+                )
+                target_proto = (
+                    config.proto_instance_weight * target_ins
+                    + config.proto_shape_weight * target_shape
                 )
                 _collect_epoch_structure_stats(
                     target_epoch_stats,
@@ -418,8 +435,9 @@ def _train_structure_proto_timematch(
 
             loss = compose_da_loss(
                 loss_cls_source, loss_pseudo_target, config.trade_off,
-                source_proto, target_proto,
-                config.source_proto_weight, config.target_proto_weight,
+                source_ins, source_shape, target_ins, target_shape,
+                target_ramp,
+                config.proto_instance_weight, config.proto_shape_weight,
             )
             optimizer.zero_grad()
             loss.backward()
@@ -449,6 +467,8 @@ def _train_structure_proto_timematch(
                     "loss_proto_shape_target": target_shape,
                     "loss_proto_source_total": source_proto,
                     "loss_proto_target_total": target_proto,
+                    "proto_ramp_source": source_ins.new_tensor(1.),
+                    "proto_ramp_target": source_ins.new_tensor(target_ramp),
                     "loss_total": loss,
                 }
                 for name, value in metrics.items():

@@ -32,12 +32,14 @@ CUDA_VISIBLE_DEVICES="$GPU_ID" python -u train.py \
   --shape-window-stride 8 \
   --proto-momentum 0.9 \
   --proto-temperature 0.1 \
-  --proto-shape-mix 0.01 \
-  --source-proto-weight 1.0 \
-  --target-proto-weight 1.0 \
-  --proto-warmup-epochs 1 \
+  --proto-instance-weight 1.0 \
+  --proto-shape-weight 1.0 \
+  --proto-init-epoch 1 \
+  --proto-ramp-start 0.1 \
+  --proto-ramp-epochs 5 \
   --seed 1 --num_folds 1 --batch_size 128 \
   --seq_length 30 --num_pixels 64 --closed_set true \
+  --with_shift_aug false \
   --progress_bar off \
   --output_dir "$OUTPUT_ROOT" \
   --tensorboard_log_dir "$RUN_ROOT" \

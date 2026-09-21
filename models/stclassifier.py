@@ -62,7 +62,7 @@ class PseStructureProtoLTae(nn.Module):
 
     def classify_prepared(self, prepared, positions, temporal_shift=0, return_feats=False):
         shifted_positions = positions + temporal_shift
-        structure = self.structure_branch(prepared, shifted_positions)
+        structure = self.structure_branch(prepared, positions)
         instance = self.temporal_encoder(
             prepared, shifted_positions,
             external_query=structure["shape_class_token"],
@@ -79,7 +79,7 @@ class PseStructureProtoLTae(nn.Module):
         del collect_diagnostics
         spatial = self.spatial_encoder(pixels, mask, extra)
         shifted_positions = positions + temporal_shift
-        structure = self.structure_branch(spatial, shifted_positions)
+        structure = self.structure_branch(spatial, positions)
         instance = self.temporal_encoder(
             spatial, shifted_positions,
             external_query=structure["shape_class_token"],

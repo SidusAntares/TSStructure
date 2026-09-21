@@ -54,19 +54,36 @@ def sample_shape_centers(tokens, selected):
     return torch.stack(centers)
 
 
-def compose_source_loss(classification, instance, shape, shape_mix=.01, weight=1.):
-    prototype = (1 - shape_mix) * instance + shape_mix * shape
-    return SourceLosses(classification + weight * prototype, prototype)
+def prototype_ramp(step, ramp_epochs, start=.1):
+    if not 0 <= start <= 1:
+        raise ValueError("prototype ramp start must be in [0, 1]")
+    if ramp_epochs < 0:
+        raise ValueError("prototype ramp epochs must be non-negative")
+    if ramp_epochs == 0 or step >= ramp_epochs:
+        return 1.
+    if step <= 0:
+        return float(start)
+    return float(start + (1. - start) * step / ramp_epochs)
 
 
-def compose_da_loss(cls_source, pseudo_target, trade_off, proto_source, proto_target,
-                    source_weight=1., target_weight=1.):
-    return cls_source + trade_off * pseudo_target + source_weight * proto_source + target_weight * proto_target
+def compose_source_loss(classification, instance, shape, ramp=1., instance_weight=1., shape_weight=1.):
+    prototype = instance_weight * instance + shape_weight * shape
+    return SourceLosses(classification + ramp * prototype, prototype)
+
+
+def compose_da_loss(
+    cls_source, pseudo_target, trade_off,
+    source_instance, source_shape, target_instance, target_shape,
+    target_ramp=1., instance_weight=1., shape_weight=1.,
+):
+    source = instance_weight * source_instance + shape_weight * source_shape
+    target = instance_weight * target_instance + shape_weight * target_shape
+    return cls_source + trade_off * pseudo_target + source + target_ramp * target
 
 
 def two_level_prototype_losses(
     outputs, labels, shape_bank, instance_bank, ratio=.6, temperature=.1,
-    shape_mix=.01, selected_tokens=None,
+    selected_tokens=None,
 ):
     if selected_tokens is None:
         selected_tokens = select_top_shape_tokens(
@@ -79,7 +96,7 @@ def two_level_prototype_losses(
         outputs["shape_tokens"], selected_tokens, labels,
         shape_bank.prototypes, temperature,
     )
-    return instance, shape, (1 - shape_mix) * instance + shape_mix * shape, selected_tokens
+    return instance, shape, selected_tokens
 
 
 @torch.no_grad()

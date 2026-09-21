@@ -11,6 +11,7 @@ from methods.structure_da.prototype_losses import (
 from models.structure_da.prototype_bank import ClassPrototypeBank
 from timematch import update_ema_variables
 from models.stclassifier import PseStructureProtoLTae
+import methods.structure_da.prototype_losses as prototype_losses
 
 
 def test_bank_updates_source_classes_by_ema_and_leaves_absent_class():
@@ -67,10 +68,26 @@ def test_prototype_loss_and_composition_formulas_are_exact():
     prototypes = torch.eye(2)
     labels = torch.tensor([0, 1])
     assert prototype_contrastive_loss(features, labels, prototypes, .1) < .001
-    source = compose_source_loss(torch.tensor(2.), torch.tensor(3.), torch.tensor(5.), .01, 1.)
-    assert torch.allclose(source.total, torch.tensor(2.) + .99 * 3 + .01 * 5)
-    da = compose_da_loss(torch.tensor(2.), torch.tensor(4.), 2., torch.tensor(3.), torch.tensor(5.), 1., 1.)
-    assert torch.allclose(da, torch.tensor(18.))
+    source = compose_source_loss(
+        torch.tensor(2.), torch.tensor(3.), torch.tensor(5.), .4, 2., 3.,
+    )
+    assert torch.allclose(source.total, torch.tensor(2.) + .4 * (2 * 3 + 3 * 5))
+    da = compose_da_loss(
+        torch.tensor(2.), torch.tensor(4.), 2.,
+        torch.tensor(3.), torch.tensor(5.),
+        torch.tensor(7.), torch.tensor(11.),
+        .25, 2., 3.,
+    )
+    expected = 2 + 2 * 4 + 2 * 3 + 3 * 5 + .25 * (2 * 7 + 3 * 11)
+    assert torch.allclose(da, torch.tensor(expected))
+
+
+def test_prototype_ramp_starts_then_increases_linearly_to_one():
+    ramp = prototype_losses.prototype_ramp
+    assert ramp(0, 5, .1) == pytest.approx(.1)
+    assert ramp(2, 5, .1) == pytest.approx(.46)
+    assert ramp(5, 5, .1) == pytest.approx(1.)
+    assert ramp(9, 5, .1) == pytest.approx(1.)
 
 
 def test_teacher_ema_updates_parameters_but_not_prototype_banks():

@@ -1,7 +1,5 @@
 """Differentiable discriminative structure representation for irregular SITS."""
 
-import math
-
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -48,46 +46,68 @@ class MultiScaleWindowExtractor(nn.Module):
     def forward(self, curve):
         if curve.ndim != 3:
             raise ValueError("curve must be [B,G,D]")
-        batch, points, channels = curve.shape
-        max_scale = max(self.scales)
-        windows, masks, scale_ids = [], [], []
+        _, points, _ = curve.shape
+        windows, scale_ids = [], []
         for scale in self.scales:
             if scale > points:
-                continue
-            for start in range(0, points - scale + 1, self.stride):
-                window = curve[:, start:start + scale]
-                padded = curve.new_zeros(batch, max_scale, channels)
-                padded[:, :scale] = window
-                valid = torch.zeros(batch, max_scale, dtype=torch.bool, device=curve.device)
-                valid[:, :scale] = True
-                windows.append(padded)
-                masks.append(valid)
-                scale_ids.append(scale)
+                raise ValueError("window scales cannot exceed the exposed curve length")
+            starts = range(0, points, self.stride)
+            indices = torch.stack([
+                (torch.arange(scale, device=curve.device) + start) % points
+                for start in starts
+            ])
+            windows.append(curve[:, indices])
+            scale_ids.extend([scale] * indices.shape[0])
         if not windows:
             raise ValueError("no window scale fits the exposed curve")
-        return (
-            torch.stack(windows, dim=1),
-            torch.stack(masks, dim=1),
-            torch.tensor(scale_ids, device=curve.device),
-        )
+        return windows, torch.tensor(scale_ids, device=curve.device)
 
 
-class _TemporalBranch(nn.Module):
-    def __init__(self, channels, hidden):
+class _ResidualTemporalBlock(nn.Module):
+    def __init__(self, hidden, dilation, dropout=.1):
         super().__init__()
         self.network = nn.Sequential(
-            nn.Conv1d(channels, hidden, 3, padding=1),
+            nn.Conv1d(hidden, hidden, 3, padding=dilation, dilation=dilation),
             nn.GELU(),
-            nn.Conv1d(hidden, hidden, 3, padding=1),
-            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(hidden, hidden, 3, padding=dilation, dilation=dilation),
+            nn.Dropout(dropout),
         )
+        self.norm = nn.LayerNorm(hidden)
 
-    def forward(self, values, mask):
+    def forward(self, values):
+        return self.norm((values + self.network(values)).transpose(1, 2)).transpose(1, 2)
+
+
+class _VariableLengthTemporalEncoder(nn.Module):
+    def __init__(self, channels, hidden):
+        super().__init__()
+        self.input_projection = nn.Conv1d(channels, hidden, 1)
+        self.multiscale = nn.ModuleList(
+            nn.Conv1d(hidden, hidden, kernel, padding=kernel // 2)
+            for kernel in (3, 5, 7)
+        )
+        self.multiscale_projection = nn.Conv1d(3 * hidden, hidden, 1)
+        self.blocks = nn.ModuleList(
+            _ResidualTemporalBlock(hidden, dilation) for dilation in (1, 2, 4)
+        )
+        self.temporal_score = nn.Conv1d(hidden, 1, 1)
+
+    def forward(self, values, mask=None):
         batch, tokens, points, channels = values.shape
         flat = values.reshape(batch * tokens, points, channels).transpose(1, 2)
-        encoded = self.network(flat).transpose(1, 2)
-        flat_mask = mask.reshape(batch * tokens, points).unsqueeze(-1)
-        pooled = (encoded * flat_mask).sum(1) / flat_mask.sum(1).clamp_min(1)
+        encoded = self.input_projection(flat)
+        encoded = self.multiscale_projection(torch.cat([
+            F.gelu(layer(encoded)) for layer in self.multiscale
+        ], dim=1))
+        for block in self.blocks:
+            encoded = block(encoded)
+        scores = self.temporal_score(encoded).squeeze(1)
+        if mask is not None:
+            flat_mask = mask.reshape(batch * tokens, points)
+            scores = scores.masked_fill(~flat_mask, -torch.inf)
+        attention = torch.softmax(scores, dim=-1)
+        pooled = (encoded * attention.unsqueeze(1)).sum(-1)
         return pooled.reshape(batch, tokens, -1)
 
 
@@ -97,8 +117,8 @@ class ShapeTokenGenerator(nn.Module):
     def __init__(self, channels, shape_dim=128, branch_dim=32, eps=1e-6):
         super().__init__()
         self.eps = eps
-        self.raw_encoder = _TemporalBranch(channels, branch_dim)
-        self.diff_encoder = _TemporalBranch(channels, branch_dim)
+        self.raw_encoder = _VariableLengthTemporalEncoder(channels, branch_dim)
+        self.diff_encoder = _VariableLengthTemporalEncoder(channels, branch_dim)
         self.mean_encoder = nn.Sequential(nn.Linear(channels, branch_dim), nn.GELU(), nn.Linear(branch_dim, branch_dim))
         self.std_encoder = nn.Sequential(nn.Linear(channels, branch_dim), nn.GELU(), nn.Linear(branch_dim, branch_dim))
         self.fusion = nn.Sequential(
@@ -107,7 +127,11 @@ class ShapeTokenGenerator(nn.Module):
             nn.GELU(),
         )
 
-    def components(self, windows, mask):
+    def components(self, windows, mask=None):
+        if mask is None:
+            mask = torch.ones(
+                windows.shape[:3], dtype=torch.bool, device=windows.device,
+            )
         weights = mask.to(windows.dtype).unsqueeze(-1)
         count = weights.sum(2).clamp_min(1)
         mean = (windows * weights).sum(2) / count
@@ -121,7 +145,7 @@ class ShapeTokenGenerator(nn.Module):
         difference = difference * weights
         return {"normalized": normalized, "difference": difference, "mean": mean, "std": std}
 
-    def forward(self, windows, mask):
+    def forward(self, windows, mask=None):
         parts = self.components(windows, mask)
         raw = self.raw_encoder(parts["normalized"], mask)
         difference = self.diff_encoder(parts["difference"], mask)
@@ -133,7 +157,11 @@ class ShapeTokenGenerator(nn.Module):
 class ShapeAttentionPool(nn.Module):
     def __init__(self, shape_dim):
         super().__init__()
-        self.score = nn.Linear(shape_dim, 1)
+        self.score = nn.Sequential(
+            nn.Linear(shape_dim, 8),
+            nn.Tanh(),
+            nn.Linear(8, 1),
+        )
 
     def forward(self, tokens, valid_token_mask):
         scores = self.score(tokens).squeeze(-1)
@@ -157,9 +185,13 @@ class DiscriminativeStructureBranch(nn.Module):
 
     def forward(self, features, positions):
         exposed, grid = self.exposer(features, positions)
-        windows, window_mask, scales = self.window_extractor(exposed)
-        tokens = self.token_generator(windows, window_mask)
-        token_mask = window_mask.any(-1)
+        window_groups, scales = self.window_extractor(exposed)
+        tokens = torch.cat([
+            self.token_generator(windows) for windows in window_groups
+        ], dim=1)
+        token_mask = torch.ones(
+            tokens.shape[:2], dtype=torch.bool, device=tokens.device,
+        )
         class_token, attention, token_mask = self.attention_pool(tokens, token_mask)
         return {
             "shape_tokens": tokens,

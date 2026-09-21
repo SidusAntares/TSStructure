@@ -32,6 +32,7 @@ tensorboard_stub.SummaryWriter = object
 sys.modules.setdefault("torch.utils.tensorboard", tensorboard_stub)
 
 import timematch
+from models.stclassifier import PseStructureProtoLTae
 
 
 def test_shift_selector_can_run_without_target_true_labels(capsys):
@@ -523,3 +524,17 @@ def test_training_reestimates_with_recon_but_semantic_forwards_stay_raw(
     assert 4 in scalar_shifts  # current teacher target-to-source shift
     assert 0 in scalar_shifts  # target student remains on raw, unshifted positions
     assert -4 in scalar_shifts  # source follows current source-to-target shift
+
+
+def test_structure_proto_timematch_rejects_temporal_shift_augmentation():
+    model = PseStructureProtoLTae(
+        input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
+        n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6],
+        num_classes=3, shape_dim=10, shape_window_scales=(8, 16),
+        shape_window_stride=8, fourier_num_modes=5,
+    )
+    config = types.SimpleNamespace(with_shift_aug=True)
+    with pytest.raises(ValueError, match="identical canonical window indexing"):
+        timematch._train_structure_proto_timematch(
+            model, config, None, None, "cpu", "unused.pt", 0, {},
+        )

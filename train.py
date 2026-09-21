@@ -32,6 +32,7 @@ from models.stclassifier import (
 from methods.structure_da.prototype_losses import (
     compose_source_loss,
     initialize_source_banks,
+    prototype_ramp,
     select_top_shape_tokens,
     two_level_prototype_losses,
     update_source_banks,
@@ -73,10 +74,11 @@ def add_model_arguments(parser):
     parser.add_argument('--shape-window-stride', dest='shape_window_stride', default=8, type=int)
     parser.add_argument('--proto-momentum', dest='proto_momentum', default=.9, type=float)
     parser.add_argument('--proto-temperature', dest='proto_temperature', default=.1, type=float)
-    parser.add_argument('--proto-shape-mix', dest='proto_shape_mix', default=.01, type=float)
-    parser.add_argument('--source-proto-weight', dest='source_proto_weight', default=1., type=float)
-    parser.add_argument('--target-proto-weight', dest='target_proto_weight', default=1., type=float)
-    parser.add_argument('--proto-warmup-epochs', dest='proto_warmup_epochs', default=1, type=int)
+    parser.add_argument('--proto-instance-weight', dest='proto_instance_weight', default=1., type=float)
+    parser.add_argument('--proto-shape-weight', dest='proto_shape_weight', default=1., type=float)
+    parser.add_argument('--proto-init-epoch', dest='proto_init_epoch', default=1, type=int)
+    parser.add_argument('--proto-ramp-start', dest='proto_ramp_start', default=.1, type=float)
+    parser.add_argument('--proto-ramp-epochs', dest='proto_ramp_epochs', default=5, type=int)
     return parser
 
 
@@ -163,9 +165,11 @@ def main(config):
                         'shape_window_stride': config.shape_window_stride,
                         'proto_momentum': config.proto_momentum,
                         'proto_temperature': config.proto_temperature,
-                        'proto_shape_mix': config.proto_shape_mix,
-                        'source_proto_weight': config.source_proto_weight,
-                        'target_proto_weight': config.target_proto_weight,
+                        'proto_instance_weight': config.proto_instance_weight,
+                        'proto_shape_weight': config.proto_shape_weight,
+                        'proto_init_epoch': config.proto_init_epoch,
+                        'proto_ramp_start': config.proto_ramp_start,
+                        'proto_ramp_epochs': config.proto_ramp_epochs,
                         'prototype_update_domain': 'source_ground_truth_only',
                     },
                     stream,
@@ -422,8 +426,8 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
 
     best_f1 = 0
     structure_proto = isinstance(model, PseStructureProtoLTae)
-    if structure_proto and config.epochs <= config.proto_warmup_epochs:
-        raise ValueError("structure prototype source training requires at least one epoch after warm-up")
+    if structure_proto and config.epochs <= config.proto_init_epoch:
+        raise ValueError("structure prototype source training requires at least one epoch after initialization")
 
     train_transform = transforms.Compose([
         RandomSamplePixels(config.num_pixels),
@@ -454,7 +458,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
 
     best_f1 = 0
     for epoch in range(config.epochs):
-        if structure_proto and epoch == config.proto_warmup_epochs:
+        if structure_proto and epoch == config.proto_init_epoch:
             model.eval()
             def initialization_batches():
                 for initialization_sample in data_loader:
@@ -497,24 +501,30 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 structured = model(pixels, mask, positions, extra, return_dict=True)
                 outputs = structured["logits"]
                 loss_cls = criterion(outputs, targets)
-                if epoch < config.proto_warmup_epochs:
+                if epoch < config.proto_init_epoch:
                     loss_instance = outputs.sum() * 0
                     loss_shape = outputs.sum() * 0
                     loss_proto = outputs.sum() * 0
+                    source_ramp = 0.
                     loss = loss_cls
                     selected_for_stats = select_top_shape_tokens(
                         structured['shape_attention'], structured['shape_mask'], config.shape_ratio,
                     )
                 else:
-                    loss_instance, loss_shape, _, selected_for_stats = two_level_prototype_losses(
+                    loss_instance, loss_shape, selected_for_stats = two_level_prototype_losses(
                         structured, targets,
                         model.shape_prototype_bank, model.instance_prototype_bank,
                         config.shape_ratio, config.proto_temperature,
-                        config.proto_shape_mix,
+                    )
+                    source_ramp = prototype_ramp(
+                        epoch - config.proto_init_epoch,
+                        config.proto_ramp_epochs,
+                        config.proto_ramp_start,
                     )
                     composed = compose_source_loss(
                         loss_cls, loss_instance, loss_shape,
-                        config.proto_shape_mix, config.source_proto_weight,
+                        source_ramp,
+                        config.proto_instance_weight, config.proto_shape_weight,
                     )
                     loss, loss_proto = composed.total, composed.prototype_total
             else:
@@ -524,7 +534,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            if structure_proto and epoch >= config.proto_warmup_epochs:
+            if structure_proto and epoch >= config.proto_init_epoch:
                 update_source_banks(
                     structured, targets,
                     model.shape_prototype_bank, model.instance_prototype_bank,
@@ -553,6 +563,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     writer.add_scalar("train/loss_proto_instance_source", loss_instance.detach(), global_step + step)
                     writer.add_scalar("train/loss_proto_shape_source", loss_shape.detach(), global_step + step)
                     writer.add_scalar("train/loss_proto_source_total", loss_proto.detach(), global_step + step)
+                    writer.add_scalar("train/proto_ramp_source", source_ramp, global_step + step)
                     entropy = -(structured["shape_attention"].clamp_min(1e-12).log()
                                 * structured["shape_attention"]).sum(-1).mean()
                     writer.add_scalar("structure/attention_entropy_mean", entropy.detach(), global_step + step)
