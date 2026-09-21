@@ -163,7 +163,6 @@ run_worker() {
         --shift_estimator AM \
         --run_validation \
         --output_student true \
-        --shape_align false \
         --class_residual_phase false \
         --shift-estimation-view fourier_recon \
         --shift-fourier-num-modes 13 \

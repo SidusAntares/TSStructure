@@ -420,7 +420,7 @@ def build_parser():
     parser.add_argument("--source-checkpoint")
     parser.add_argument("--reference-task")
     parser.add_argument("--structure-view-root", type=Path, default=Path("outputs/shift_visualizations_seed1"))
-    parser.add_argument("--output-root", type=Path, default=Path("outputs/structure_reference_validity"))
+    parser.add_argument("--output-root", type=Path, default=Path("outputs/06A_structure_reference_validity"))
     parser.add_argument("--summarize-root", type=Path)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--grid-size", type=int, default=128)

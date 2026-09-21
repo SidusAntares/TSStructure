@@ -64,6 +64,10 @@ TASKS = {
     "DK1_FR1": ("DK1", "denmark/32VNH/2017"),
     "FR1_FR2": ("FR1", "france/30TXT/2017"),
     "FR2_AT1": ("FR2", "france/31TCJ/2017"),
+    "AT1_SOURCE": ("AT1", "austria/33UVP/2017"),
+    "DK1_SOURCE": ("DK1", "denmark/32VNH/2017"),
+    "FR1_SOURCE": ("FR1", "france/30TXT/2017"),
+    "FR2_SOURCE": ("FR2", "france/31TCJ/2017"),
 }
 
 SAMPLE_FIELDS = (
@@ -677,7 +681,7 @@ def build_parser():
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--source-checkpoint")
     parser.add_argument("--structure-view-root", type=Path, default=Path("outputs/shift_visualizations_seed1"))
-    parser.add_argument("--validity-root", type=Path, default=Path("outputs/structure_reference_validity"))
+    parser.add_argument("--validity-root", type=Path, default=Path("outputs/06A_structure_reference_validity"))
     parser.add_argument("--output-root", type=Path, default=Path("outputs/shift_visualizations_seed1/06B_structure_observation_support"))
     parser.add_argument("--min-bootstrap-occurrence", type=float, default=0.8)
     parser.add_argument("--observation-support-radius-days", type=float, default=15)

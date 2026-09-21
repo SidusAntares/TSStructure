@@ -12,6 +12,90 @@ from models.fourier_reconstruction import (
 from models.ltae import LTAE
 from models.pse import PixelSetEncoder
 from models.tae import TemporalAttentionEncoder
+from models.structure_da.discriminative_structure import DiscriminativeStructureBranch
+from models.structure_da.prototype_bank import ClassPrototypeBank
+
+
+class PseStructureProtoLTae(nn.Module):
+    """PSE classifier with discriminative Fourier structure as the LTAE query."""
+
+    def __init__(
+        self, input_dim=10, mlp1=[10, 32, 64], pooling="mean_std",
+        mlp2=[128, 128], with_extra=True, extra_size=4,
+        n_head=16, d_k=8, d_model=256, mlp3=[256, 128], dropout=.2,
+        T=1000, mlp4=[128, 64, 32], num_classes=20,
+        max_temporal_shift=100, shape_dim=128,
+        shape_window_scales=(16, 32), shape_window_stride=8,
+        fourier_num_modes=13, fourier_reg=1e-3, fourier_period_days=365.,
+    ):
+        super().__init__()
+        spatial_mlp2 = deepcopy(mlp2)
+        if with_extra:
+            spatial_mlp2[0] += extra_size
+        self.spatial_encoder = PixelSetEncoder(
+            input_dim, mlp1=mlp1, pooling=pooling, mlp2=spatial_mlp2,
+            with_extra=with_extra, extra_size=extra_size,
+        )
+        channels = spatial_mlp2[-1]
+        self.structure_branch = DiscriminativeStructureBranch(
+            channels, shape_dim=shape_dim, num_modes=fourier_num_modes,
+            period_days=fourier_period_days, reg=fourier_reg,
+            window_scales=tuple(shape_window_scales), window_stride=shape_window_stride,
+        )
+        self.temporal_encoder = LTAE(
+            in_channels=channels, n_head=n_head, d_k=d_k, d_model=d_model,
+            n_neurons=mlp3, dropout=dropout, T=T,
+            max_temporal_shift=max_temporal_shift,
+            external_query_dim=shape_dim,
+        )
+        self.decoder = get_decoder(mlp4, num_classes)
+        self.shape_dim = shape_dim
+        self.instance_dim = mlp3[-1]
+        self.shape_prototype_bank = ClassPrototypeBank(num_classes, shape_dim)
+        self.instance_prototype_bank = ClassPrototypeBank(num_classes, self.instance_dim)
+
+    def get_temporal_encoders(self):
+        return (self.temporal_encoder,)
+
+    def prepare_temporal_features(self, spatial_feats, positions):
+        return spatial_feats
+
+    def classify_prepared(self, prepared, positions, temporal_shift=0, return_feats=False):
+        shifted_positions = positions + temporal_shift
+        structure = self.structure_branch(prepared, shifted_positions)
+        instance = self.temporal_encoder(
+            prepared, shifted_positions,
+            external_query=structure["shape_class_token"],
+        )
+        logits = self.decoder(instance)
+        if return_feats:
+            return logits, instance
+        return logits
+
+    def forward_with_temporal_shift(
+        self, pixels, mask, positions, extra, temporal_shift=0,
+        return_feats=False, return_dict=False, collect_diagnostics=False,
+    ):
+        del collect_diagnostics
+        spatial = self.spatial_encoder(pixels, mask, extra)
+        shifted_positions = positions + temporal_shift
+        structure = self.structure_branch(spatial, shifted_positions)
+        instance = self.temporal_encoder(
+            spatial, shifted_positions,
+            external_query=structure["shape_class_token"],
+        )
+        logits = self.decoder(instance)
+        if return_dict:
+            return {"logits": logits, "instance_feature": instance, **structure}
+        if return_feats:
+            return logits, instance
+        return logits
+
+    def forward(self, pixels, mask, positions, extra, return_feats=False, return_dict=False):
+        return self.forward_with_temporal_shift(
+            pixels, mask, positions, extra,
+            return_feats=return_feats, return_dict=return_dict,
+        )
 
 
 class PseFourierReconLTae(nn.Module):

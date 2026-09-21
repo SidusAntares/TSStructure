@@ -1,304 +1,117 @@
-from torch.utils.data.sampler import WeightedRandomSampler
-import sklearn.metrics
 from collections import Counter
 from copy import deepcopy
 import csv
-import json
+from collections import defaultdict
 import os
-import random
 
 import numpy as np
+import sklearn.metrics
 import torch
 import torch.nn.functional as F
 from torch.utils import data
+from torch.utils.data.sampler import WeightedRandomSampler
 from torchvision import transforms
 from tqdm import tqdm
 
 from dataset import PixelSetData
 from evaluation import validation
-from models.fourier_reconstruction import (
-    BatchedDirectFourierAnalyzer,
-    BatchedDirectFourierSynthesizer,
-)
-from models.shape_alignment import (
-    ClassPhaseRecord,
-    ClassResidualPhaseEstimator,
-    ClassResidualPhaseResult,
-    ShapeAlignment,
-    SourceShapeReferenceBank,
-    preserve_rng_state,
-)
-from transforms import (
-    Normalize,
-    RandomSamplePixels,
-    RandomSampleTimeSteps,
-    ToTensor,
-    RandomTemporalShift,
-    Identity,
-)
+from models.fourier_reconstruction import BatchedDirectFourierAnalyzer, BatchedDirectFourierSynthesizer
+from models.stclassifier import PseStructureProtoLTae
+from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
 from utils.focal_loss import FocalLoss
-from utils.train_utils import (
-    AverageMeter,
-    bool_flag,
-    cycle,
-    progress_bar_disabled,
-    to_cuda,
+from utils.train_utils import AverageMeter, bool_flag, cycle, progress_bar_disabled, to_cuda
+from methods.structure_da.prototype_losses import (
+    compose_da_loss,
+    select_top_shape_tokens,
+    two_level_prototype_losses,
+    update_source_banks,
+    structure_batch_statistics,
 )
-from class_residual_shift import decide_class_residual_shift, estimate_class_residual_shift
+
+
+def _append_structure_csv(path, row):
+    exists = os.path.isfile(path)
+    with open(path, "a", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(row))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _new_epoch_structure_stats():
+    return {
+        "instance_cos": [], "shape_cos": [], "attention_entropy": [],
+        "top_counts": [], "selected_by_scale": defaultdict(lambda: [0., 0.]),
+    }
+
+
+def _collect_epoch_structure_stats(accumulator, batch):
+    for key in ("instance_cos", "shape_cos", "attention_entropy", "top_counts"):
+        accumulator[key].append(batch[key].detach())
+    for scale, (selected, valid) in batch["selected_by_scale"].items():
+        accumulator["selected_by_scale"][scale][0] += float(selected)
+        accumulator["selected_by_scale"][scale][1] += float(valid)
+
+
+def _summarize_epoch_structure_stats(accumulator, prefix, expected_scales=()):
+    if not accumulator["instance_cos"]:
+        row = {
+            f"{prefix}_instance_cos_to_correct_proto": float("nan"),
+            f"{prefix}_shape_cos_to_correct_proto": float("nan"),
+            f"{prefix}_attention_entropy_mean": float("nan"),
+            f"{prefix}_attention_entropy_p10": float("nan"),
+            f"{prefix}_attention_entropy_p90": float("nan"),
+            f"{prefix}_top_shape_count_mean": 0.,
+            f"{prefix}_top_shape_count_min": 0,
+            f"{prefix}_top_shape_count_max": 0,
+        }
+        for scale in expected_scales:
+            row[f"{prefix}_selected_fraction_scale_{int(scale)}"] = float("nan")
+        return row
+    merged = {key: torch.cat(accumulator[key]) for key in (
+        "instance_cos", "shape_cos", "attention_entropy", "top_counts",
+    )}
+    row = {
+        f"{prefix}_instance_cos_to_correct_proto": float(merged["instance_cos"].mean()),
+        f"{prefix}_shape_cos_to_correct_proto": float(merged["shape_cos"].mean()),
+        f"{prefix}_attention_entropy_mean": float(merged["attention_entropy"].mean()),
+        f"{prefix}_attention_entropy_p10": float(torch.quantile(merged["attention_entropy"], .1)),
+        f"{prefix}_attention_entropy_p90": float(torch.quantile(merged["attention_entropy"], .9)),
+        f"{prefix}_top_shape_count_mean": float(merged["top_counts"].mean()),
+        f"{prefix}_top_shape_count_min": int(merged["top_counts"].min()),
+        f"{prefix}_top_shape_count_max": int(merged["top_counts"].max()),
+    }
+    for scale, (selected, valid) in sorted(accumulator["selected_by_scale"].items()):
+        row[f"{prefix}_selected_fraction_scale_{scale}"] = selected / max(valid, 1.)
+    for scale in expected_scales:
+        row.setdefault(f"{prefix}_selected_fraction_scale_{int(scale)}", float("nan"))
+    return row
+
+
+def _prototype_bank_stats(model):
+    row = {}
+    for prefix, bank in (
+        ("prototype_shape", model.shape_prototype_bank),
+        ("prototype_instance", model.instance_prototype_bank),
+    ):
+        active = bank.prototypes[bank.initialized]
+        similarity = active @ active.T
+        off_diagonal = similarity[
+            ~torch.eye(active.shape[0], dtype=torch.bool, device=active.device)
+        ]
+        row[f"{prefix}_initialized_classes"] = int(bank.initialized.sum())
+        row[f"{prefix}_mean_pairwise_cos"] = float(off_diagonal.mean()) if off_diagonal.numel() else 0.
+        row[f"{prefix}_min_pairwise_cos"] = float(off_diagonal.min()) if off_diagonal.numel() else 0.
+    return row
 
 
 def add_shift_estimation_arguments(parser):
-    parser.add_argument(
-        "--shift-estimation-view",
-        "--shift_estimation_view",
-        dest="shift_estimation_view",
-        default="raw",
-        choices=["raw", "fourier_recon"],
-    )
-    parser.add_argument(
-        "--shift-fourier-num-modes",
-        "--shift_fourier_num_modes",
-        dest="shift_fourier_num_modes",
-        default=13,
-        type=int,
-    )
-    parser.add_argument(
-        "--shift-fourier-reg",
-        "--shift_fourier_reg",
-        dest="shift_fourier_reg",
-        default=1e-3,
-        type=float,
-    )
-    parser.add_argument(
-        "--shift-fourier-period-days",
-        "--shift_fourier_period_days",
-        dest="shift_fourier_period_days",
-        default=365.0,
-        type=float,
-    )
-    parser.add_argument(
-        "--shift-fourier-solver",
-        "--shift_fourier_solver",
-        dest="shift_fourier_solver",
-        default="dense_direct",
-        choices=["dense_direct"],
-    )
-    parser.add_argument(
-        "--source-class-residual-shift", "--source_class_residual_shift",
-        dest="source_class_residual_shift", type=bool_flag, default=False,
-    )
-    parser.add_argument(
-        "--source-class-residual-max-days", "--source_class_residual_max_days",
-        dest="source_class_residual_max_days", type=int, default=20,
-    )
-    parser.add_argument(
-        "--source-class-residual-min-samples", "--source_class_residual_min_samples",
-        dest="source_class_residual_min_samples", type=int, default=32,
-    )
-    parser.add_argument(
-        "--source-class-residual-max-samples", "--source_class_residual_max_samples",
-        dest="source_class_residual_max_samples", type=int, default=128,
-    )
-    parser.add_argument(
-        "--source-class-residual-min-gain", "--source_class_residual_min_gain",
-        dest="source_class_residual_min_gain", type=float, default=0.005,
-    )
+    parser.add_argument("--shift-estimation-view", "--shift_estimation_view", dest="shift_estimation_view", default="raw", choices=["raw", "fourier_recon"])
+    parser.add_argument("--shift-fourier-num-modes", "--shift_fourier_num_modes", dest="shift_fourier_num_modes", default=13, type=int)
+    parser.add_argument("--shift-fourier-reg", "--shift_fourier_reg", dest="shift_fourier_reg", default=1e-3, type=float)
+    parser.add_argument("--shift-fourier-period-days", "--shift_fourier_period_days", dest="shift_fourier_period_days", default=365.0, type=float)
+    parser.add_argument("--shift-fourier-solver", "--shift_fourier_solver", dest="shift_fourier_solver", default="dense_direct", choices=["dense_direct"])
     return parser
-
-
-def _compose_source_class_shifts(global_target_to_source_shift, residuals):
-    return -(torch.as_tensor(residuals) + float(global_target_to_source_shift))
-
-
-def _source_batch_temporal_shift(class_shifts, source_labels, dtype):
-    table = torch.as_tensor(class_shifts, device=source_labels.device, dtype=dtype)
-    return table.index_select(0, source_labels.long()).reshape(-1, 1)
-
-
-def _class_residual_dataset(config, domain, indices):
-    transform = transforms.Compose([
-        RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()
-    ])
-    return PixelSetData(
-        config.data_root, domain, config.classes, transform,
-        indices=indices, closed_set=config.closed_set,
-        combine_spring_and_winter=config.combine_spring_and_winter,
-    )
-
-
-@torch.no_grad()
-def _collect_class_residual_coefficients(
-    model, loader, analyzer, device, global_shift, *, target
-):
-    coefficients, classes, confidences = [], [], []
-    model.eval()
-    for sample in loader:
-        pixels, mask, positions, extra = to_cuda(sample, device)
-        spatial = model.spatial_encoder(pixels, mask, extra)
-        coeffs, _ = analyzer(spatial, positions)
-        coefficients.append(coeffs.detach().cpu())
-        if target:
-            logits = model.classify_prepared(
-                spatial, positions, temporal_shift=global_shift
-            )
-            confidence, predicted = F.softmax(logits, dim=1).max(dim=1)
-            classes.append(predicted.detach().cpu())
-            confidences.append(confidence.detach().cpu())
-        else:
-            # Target labels are deliberately never inspected in the target branch.
-            classes.append(torch.as_tensor(sample["label"]).detach().cpu())
-    return (
-        torch.cat(coefficients), torch.cat(classes),
-        torch.cat(confidences) if confidences else None,
-    )
-
-
-def _write_class_residual_shift_outputs(output_dir, records, score_rows, global_shift):
-    os.makedirs(output_dir, exist_ok=True)
-    payload = {
-        "global_target_to_source_shift": float(global_shift),
-        "classes": records,
-    }
-    with open(os.path.join(output_dir, "class_residual_shifts.json"), "w") as handle:
-        json.dump(payload, handle, indent=2)
-    path = os.path.join(output_dir, "class_residual_shift_scores.csv")
-    with open(path, "w", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=["class_id", "class_name", "residual_shift_days", "score", "common_support_days"],
-        )
-        writer.writeheader()
-        writer.writerows(score_rows)
-
-
-def _bootstrap_source_class_residual_shifts(model, config, splits, device, global_shift):
-    if getattr(config, "model", None) not in ("pse", "pseltae"):
-        raise ValueError("source class residual shift requires the Raw PseLTae model")
-    if getattr(config, "shift_estimation_view", "raw") != "fourier_recon":
-        raise ValueError("source class residual shift requires fourier_recon shift view")
-    if int(config.shift_fourier_num_modes) != 13:
-        raise ValueError("source class residual shift is fixed to Recon13")
-    print(
-        "CLASS_RESIDUAL_SHIFT_CONFIG|enabled=true|view=fourier_recon|modes=13|"
-        f"max_days={config.source_class_residual_max_days}|"
-        f"min_samples={config.source_class_residual_min_samples}|"
-        f"max_samples={config.source_class_residual_max_samples}|"
-        f"min_gain={config.source_class_residual_min_gain}|"
-        "update=bootstrap_once|apply_to=source_only"
-    )
-    analyzer = BatchedDirectFourierAnalyzer(
-        num_modes=13, period_days=365.0, reg=0.001
-    ).to(device)
-    synthesizer = BatchedDirectFourierSynthesizer(
-        num_modes=13, period_days=365.0
-    ).to(device)
-    seed = int(getattr(config, "seed", 1))
-    with preserve_rng_state():
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        source_dataset = _class_residual_dataset(
-            config, config.source, splits[config.source]["train"]
-        )
-        target_dataset = _class_residual_dataset(
-            config, config.target, splits[config.target]["train"]
-        )
-        source_loader = data.DataLoader(
-            source_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0
-        )
-        target_loader = data.DataLoader(
-            target_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0
-        )
-        source_coeffs, source_classes, _ = _collect_class_residual_coefficients(
-            model, source_loader, analyzer, device, global_shift, target=False
-        )
-        target_coeffs, target_classes, target_confidence = _collect_class_residual_coefficients(
-            model, target_loader, analyzer, device, global_shift, target=True
-        )
-
-    grid = torch.arange(365, device=device).reshape(1, -1)
-    residuals = torch.zeros(config.num_classes, dtype=torch.float32)
-    records, score_rows = [], []
-    rng = np.random.default_rng(seed)
-    max_samples = int(config.source_class_residual_max_samples)
-    for class_id, class_name in enumerate(config.classes):
-        source_index = torch.nonzero(source_classes == class_id).flatten().numpy()
-        target_index = torch.nonzero(
-            (target_classes == class_id)
-            & (target_confidence >= float(config.pseudo_threshold))
-        ).flatten().numpy()
-        pseudo_count, source_count = len(target_index), len(source_index)
-        record = {
-            "class_id": class_id, "class_name": class_name,
-            "pseudo_count": pseudo_count, "source_count": source_count,
-            "global_target_to_source_shift": float(global_shift),
-        }
-        try:
-            if pseudo_count == 0:
-                raise RuntimeError("insufficient_samples")
-            if source_count == 0:
-                raise RuntimeError("missing_source_class")
-            if len(source_index) > max_samples:
-                source_index = np.sort(rng.choice(source_index, max_samples, replace=False))
-            if len(target_index) > max_samples:
-                target_index = np.sort(rng.choice(target_index, max_samples, replace=False))
-            source_selected = source_coeffs[source_index].to(device)
-            target_selected = target_coeffs[target_index].to(device)
-            source_grid = grid.expand(len(source_index), -1)
-            target_grid = grid.expand(len(target_index), -1)
-            source_proto = synthesizer(source_selected, source_grid).median(dim=0).values.cpu().numpy()
-            target_proto = synthesizer(target_selected, target_grid).median(dim=0).values.cpu().numpy()
-            result = estimate_class_residual_shift(
-                source_proto, target_proto, float(global_shift),
-                max_residual_days=config.source_class_residual_max_days,
-            )
-            decision = decide_class_residual_shift(
-                result, pseudo_count, config.source_class_residual_min_samples,
-                config.source_class_residual_min_gain,
-            )
-            residuals[class_id] = decision.accepted_residual_shift
-            record.update({
-                "score_at_zero": result.score_at_residual_0,
-                "best_score": result.best_score, "gain": result.score_gain,
-                "raw_best_residual_shift": result.class_residual_shift_days,
-                "accepted_residual_shift": decision.accepted_residual_shift,
-                "final_target_to_source_class_shift": decision.final_target_to_source_shift,
-                "final_source_to_target_class_shift": decision.final_source_to_target_shift,
-                "boundary_hit": decision.boundary_hit,
-                "valid_channels": result.num_valid_channels,
-                "fallback_reason": decision.fallback_reason,
-            })
-            for candidate in result.candidates:
-                score_rows.append({
-                    "class_id": class_id, "class_name": class_name,
-                    "residual_shift_days": candidate.residual_shift_days,
-                    "score": candidate.score,
-                    "common_support_days": candidate.common_support_days,
-                })
-        except Exception as error:
-            reason = str(error) or type(error).__name__
-            record.update({
-                "score_at_zero": None, "best_score": None, "gain": None,
-                "raw_best_residual_shift": 0, "accepted_residual_shift": 0,
-                "final_target_to_source_class_shift": float(global_shift),
-                "final_source_to_target_class_shift": -float(global_shift),
-                "boundary_hit": False, "valid_channels": 0,
-                "fallback_reason": reason,
-            })
-        records.append(record)
-        print(
-            "CLASS_RESIDUAL_SHIFT|"
-            f"class={class_name}|pseudo_count={pseudo_count}|global_t2s={global_shift}|"
-            f"raw_best_residual={record['raw_best_residual_shift']}|gain={record['gain']}|"
-            f"accepted={not bool(record['fallback_reason'])}|"
-            f"residual_t2s={record['accepted_residual_shift']}|"
-            f"final_t2s={record['final_target_to_source_class_shift']}|"
-            f"source_s2t={record['final_source_to_target_class_shift']}|"
-            f"boundary_hit={str(record['boundary_hit']).lower()}|"
-            f"fallback_reason={record['fallback_reason'] or 'none'}"
-        )
-    _write_class_residual_shift_outputs(config.fold_dir, records, score_rows, global_shift)
-    return _compose_source_class_shifts(global_shift, residuals), records
 
 
 def _shift_estimation_kwargs(config):
@@ -312,7 +125,6 @@ def _shift_estimation_kwargs(config):
         "shift_fourier_period_days": config.shift_fourier_period_days,
         "shift_fourier_solver": config.shift_fourier_solver,
     }
-
 
 def _estimate_temporal_shift_for_config(
     model,
@@ -332,7 +144,6 @@ def _estimate_temporal_shift_for_config(
         **_shift_estimation_kwargs(config),
     )
 
-
 def _log_shift_view_config(config):
     view = getattr(config, "shift_estimation_view", "raw")
     print(f"SHIFT_ESTIMATION_VIEW|{view}")
@@ -344,7 +155,6 @@ def _log_shift_view_config(config):
             f"period_days={config.shift_fourier_period_days}|"
             f"solver={config.shift_fourier_solver}"
         )
-
 
 def _log_shift_view_compare(epoch, initial_diagnostics, epoch_diagnostics):
     raw_is = initial_diagnostics["raw_selected_shift"]
@@ -367,6 +177,71 @@ def _log_shift_view_compare(epoch, initial_diagnostics, epoch_diagnostics):
         f"is_score_range={initial_diagnostics['score_range']:.6f}"
     )
 
+
+def _initialize_timematch_shift(model, target_loader, device, config):
+    """Replay the established IS -> pseudo distribution initialization."""
+    if not config.estimate_shift:
+        return 0, None, None
+
+    estimator = "IS" if config.shift_estimator == "AM" else config.shift_estimator
+    initial_shift, diagnostics = _estimate_temporal_shift_for_config(
+        model, target_loader, device, config,
+        min_shift=-config.max_temporal_shift,
+        max_shift=config.max_temporal_shift,
+        sample_size=config.sample_size,
+        shift_estimator=estimator,
+        progress_bar=getattr(config, "progress_bar", "auto"),
+        compare_raw=getattr(config, "shift_estimation_view", "raw") == "fourier_recon",
+        return_diagnostics=True,
+        include_label_diagnostics=False,
+    )
+    print(
+        "INITIAL_SHIFT|"
+        f"source={config.source}|target={config.target}|"
+        f"view={getattr(config, 'shift_estimation_view', 'raw')}|"
+        f"shift_days={initial_shift}"
+    )
+    if config.shift_estimator != "AM":
+        return initial_shift, None, diagnostics
+
+    pseudo = get_pseudo_labels(
+        model, target_loader, device, initial_shift, n=None,
+        progress_bar=getattr(config, "progress_bar", "auto"),
+    )
+    distribution = estimate_class_distribution(
+        torch.argmax(pseudo, dim=1).cpu().numpy(), config.num_classes
+    )
+    return initial_shift, distribution, diagnostics
+
+
+def _reestimate_timematch_shift(
+    model, target_loader, device, config, initial_shift,
+    class_distribution, initial_diagnostics, epoch,
+):
+    """Perform the established epoch-wise AM update without target labels."""
+    if not config.estimate_shift or config.shift_estimator != "AM":
+        return initial_shift
+    min_shift, max_shift = (
+        (0, config.max_temporal_shift)
+        if initial_shift >= 0
+        else (-config.max_temporal_shift, 0)
+    )
+    shift, diagnostics = _estimate_temporal_shift_for_config(
+        model, target_loader, device, config,
+        class_distribution=class_distribution,
+        min_shift=min_shift,
+        max_shift=max_shift,
+        sample_size=config.sample_size,
+        shift_estimator="AM",
+        progress_bar=getattr(config, "progress_bar", "auto"),
+        compare_raw=getattr(config, "shift_estimation_view", "raw") == "fourier_recon",
+        return_diagnostics=True,
+        include_label_diagnostics=False,
+    )
+    if getattr(config, "shift_estimation_view", "raw") == "fourier_recon":
+        _log_shift_view_compare(epoch, initial_diagnostics, diagnostics)
+    print(f"EPOCH_SHIFT|epoch={epoch}|target_to_source_days={shift}")
+    return shift
 
 def _check_temporal_index_range(model, positions, applied_shift, tag):
     if positions.numel() == 0:
@@ -395,7 +270,6 @@ def _check_temporal_index_range(model, positions, applied_shift, tag):
                 "alignment or the positional encoding range is inconsistent with the dataset dates."
             )
 
-
 def _forward_with_temporal_shift(
     model,
     pixels,
@@ -415,78 +289,6 @@ def _forward_with_temporal_shift(
         )
     return model.forward(pixels, mask, positions + temporal_shift, extra)
 
-
-def _forward_with_spatial_capture(
-    model,
-    pixels,
-    mask,
-    positions,
-    extra,
-    temporal_shift=0,
-    collect_diagnostics=False,
-):
-    """Capture the spatial tensor produced by this exact semantic forward."""
-    captured = []
-
-    def capture_spatial(_module, _inputs, output):
-        captured.append(output)
-
-    handle = model.spatial_encoder.register_forward_hook(capture_spatial)
-    try:
-        logits = _forward_with_temporal_shift(
-            model,
-            pixels,
-            mask,
-            positions,
-            extra,
-            temporal_shift=temporal_shift,
-            collect_diagnostics=collect_diagnostics,
-        )
-    finally:
-        handle.remove()
-    if len(captured) != 1:
-        raise RuntimeError(
-            "shape alignment expected exactly one spatial encoder call in the "
-            f"semantic forward, captured {len(captured)}"
-        )
-    return logits, captured[0]
-
-
-def _shape_loss_from_capture(
-    shape_alignment,
-    captured_selected,
-    target_positions,
-    pseudo_targets,
-    pseudo_mask,
-    target_to_source_shift,
-    class_residual_shifts=None,
-):
-    """Apply the sole pseudo gate and express accepted targets in source time."""
-    selected_positions = target_positions[pseudo_mask]
-    selected_classes = pseudo_targets[pseudo_mask]
-    if captured_selected.shape[0] != selected_positions.shape[0]:
-        raise ValueError("captured target features do not match the pseudo mask")
-    kwargs = {}
-    if class_residual_shifts is not None:
-        shifts = class_residual_shifts.to(
-            device=selected_classes.device,
-            dtype=selected_positions.dtype,
-        )
-        kwargs["residual_shifts"] = shifts.index_select(0, selected_classes)
-    return shape_alignment(
-        captured_selected,
-        selected_positions + target_to_source_shift,
-        selected_classes,
-        **kwargs,
-    )
-
-
-def _add_shape_loss(timematch_loss, shape_result, shape_lambda):
-    if shape_result is None:
-        return timematch_loss
-    return timematch_loss + shape_lambda * shape_result.loss
-
-
 def _prepare_temporal_features(
     model,
     spatial_feats,
@@ -496,7 +298,6 @@ def _prepare_temporal_features(
     if hasattr(model, "prepare_temporal_features"):
         return model.prepare_temporal_features(spatial_feats, positions)
     return spatial_feats
-
 
 def _classify_prepared(model, prepared, positions, temporal_shift=0):
     if hasattr(model, "classify_prepared"):
@@ -509,1088 +310,348 @@ def _classify_prepared(model, prepared, positions, temporal_shift=0):
         model.temporal_encoder(prepared, positions + temporal_shift)
     )
 
-
-def _build_source_shape_alignment(student, config, splits, device, checkpoint_path):
-    """Build and persist a frozen source-train-only shape reference."""
-    if getattr(config, "model", "pseltae") != "pseltae":
-        raise ValueError("shape alignment is training-only support for model=pseltae")
-    weak_transform = transforms.Compose(
-        [RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()]
-    )
-    with preserve_rng_state(seed=config.shape_reference_seed):
-        candidates = PixelSetData(
-            config.data_root,
-            config.source,
-            config.classes,
-            transform=None,
-            indices=splits[config.source]["train"],
-            with_extra=config.with_extra,
-            closed_set=config.closed_set,
-            combine_spring_and_winter=config.combine_spring_and_winter,
-        )
-        labels = candidates.get_labels()
-        parcel_indices = candidates.get_parcel_indices()
-        rng = np.random.default_rng(config.shape_reference_seed)
-        selected_parcels = []
-        for class_id in range(config.num_classes):
-            class_parcels = parcel_indices[labels == class_id].copy()
-            if len(class_parcels) == 0:
-                raise ValueError(
-                    f"source train split has no shape reference for class {class_id}"
-                )
-            rng.shuffle(class_parcels)
-            selected_parcels.extend(
-                class_parcels[: config.shape_reference_per_class].tolist()
-            )
-        reference_dataset = PixelSetData(
-            config.data_root,
-            config.source,
-            config.classes,
-            transform=weak_transform,
-            indices=selected_parcels,
-            with_extra=config.with_extra,
-            closed_set=config.closed_set,
-            combine_spring_and_winter=config.combine_spring_and_winter,
-        )
-        reference_loader = data.DataLoader(
-            reference_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            pin_memory=True,
-        )
-        was_training = student.training
-        student.eval()
-        features, positions, reference_labels = [], [], []
-        with torch.no_grad():
-            for sample in reference_loader:
-                pixels, valid, timestamps, extra = to_cuda(sample, device)
-                features.append(student.spatial_encoder(pixels, valid, extra))
-                positions.append(timestamps)
-                reference_labels.append(
-                    sample["label"].to(device, non_blocking=True)
-                )
-        student.train(was_training)
-        reference_modes = set(config.shape_modes)
-        if getattr(config, "class_residual_phase", False):
-            reference_modes.add(config.class_phase_mode)
-        bank = SourceShapeReferenceBank.from_source_features(
-            torch.cat(features),
-            torch.cat(positions),
-            torch.cat(reference_labels),
-            modes=tuple(sorted(reference_modes)),
-            grid_points=config.shape_grid_points,
-            period_days=config.shape_fourier_period_days,
-            reg=config.shape_fourier_reg,
-            prominence_rel=config.shape_prominence_rel,
-            min_distance_days=config.shape_min_distance_days,
-        ).to(device)
-
-    os.makedirs(config.fold_dir, exist_ok=True)
-    torch.save(
-        bank.export_payload(), os.path.join(config.fold_dir, "shape_reference.pt")
-    )
-    shape_alignment = ShapeAlignment(
-        bank,
-        morph_weight=config.shape_morph_weight,
-        event_weight=config.shape_event_weight,
-        loss_modes=config.shape_modes,
-        loss_type=getattr(config, "shape_loss_type", "global_corr"),
-        local_window_points=getattr(config, "shape_local_window_points", 16),
-        local_stride_points=getattr(config, "shape_local_stride_points", 8),
-        local_slope_weight=getattr(config, "shape_local_slope_weight", 0.5),
-        class_balanced=getattr(config, "shape_class_balanced", False),
-    ).to(device)
-    manifest = bank.manifest(
-        config.source,
-        checkpoint_path,
-        config.classes,
-        config.shape_reference_per_class,
-    )
-    shape_metadata = shape_alignment.manifest_metadata(config.classes)
-    per_class_metadata = shape_metadata.pop("per_class")
-    manifest.update(shape_metadata)
-    for class_name, values in per_class_metadata.items():
-        manifest["per_class"][class_name].update(values)
-    with open(
-        os.path.join(config.fold_dir, "shape_reference_manifest.json"),
-        "w",
-        encoding="utf-8",
-    ) as handle:
-        json.dump(manifest, handle, indent=2)
-    return shape_alignment
-
-
-def _build_class_phase_loader(splits, config):
-    """Build an isolated target-train loader without temporal augmentation."""
-    phase_transform = transforms.Compose(
-        [RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()]
-    )
-    phase_dataset = PixelSetData(
-        config.data_root,
-        config.target,
-        config.classes,
-        transform=phase_transform,
-        indices=splits[config.target]["train"],
-        with_extra=config.with_extra,
-        closed_set=config.closed_set,
-        combine_spring_and_winter=config.combine_spring_and_winter,
-    )
-    return data.DataLoader(
-        phase_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-    )
-
-
-def _maybe_build_class_phase(shape_alignment, _teacher, config, splits, device):
-    if not getattr(config, "class_residual_phase", False):
-        return None, None
-    if shape_alignment is None:
-        raise ValueError("class residual phase requires shape_align=true")
-    phase_loader = _build_class_phase_loader(splits, config)
-    estimator = ClassResidualPhaseEstimator(
-        shape_alignment.reference,
-        mode=config.class_phase_mode,
-        radius_days=config.class_phase_radius_days,
-        step_days=config.class_phase_step_days,
-        min_samples=config.class_phase_min_samples,
-        max_samples_per_class=config.class_phase_max_samples_per_class,
-        min_corr_gain=config.class_phase_min_corr_gain,
-    ).to(device)
-    return phase_loader, estimator
-
-
-def _zero_class_phase_result(num_classes, device, dtype, reason):
-    return ClassResidualPhaseResult(
-        accepted_shifts=torch.zeros(num_classes, device=device, dtype=dtype),
-        records=[
-            ClassPhaseRecord(
-                class_index=class_index,
-                pseudo_count=0,
-                corr_zero=float("nan"),
-                best_corr=float("nan"),
-                corr_gain=float("nan"),
-                raw_delta=0.0,
-                accepted_delta=0.0,
-                accepted=False,
-                reason=reason,
-            )
-            for class_index in range(num_classes)
-        ],
-    )
-
-
-@torch.no_grad()
-def _estimate_class_residual_phase(
-    teacher,
-    estimator,
-    phase_loader,
-    device,
-    target_to_source_shift,
-    config,
-    epoch,
+def _train_structure_proto_timematch(
+    student, config, writer, val_loader, device, best_model_path, fold_num, splits,
 ):
-    if epoch == 0 or epoch < config.class_phase_start_epoch:
-        return _zero_class_phase_result(
-            config.num_classes, device, torch.float32, "before_start_epoch"
-        )
-
-    feature_batches = []
-    position_batches = []
-    pseudo_batches = []
-    retained_per_class = [0] * config.num_classes
-    max_per_class = getattr(config, "class_phase_max_samples_per_class", 128)
-    with preserve_rng_state(seed=config.class_phase_seed):
-        was_training = teacher.training
-        teacher.eval()
-        try:
-            for sample in phase_loader:
-                pixels, valid, positions, extra = to_cuda(sample, device)
-                logits, spatial = _forward_with_spatial_capture(
-                    teacher,
-                    pixels,
-                    valid,
-                    positions,
-                    extra,
-                    temporal_shift=target_to_source_shift,
-                )
-                probabilities = F.softmax(logits, dim=1)
-                confidence, pseudo_classes = probabilities.max(dim=1)
-                selected = confidence > config.pseudo_threshold
-                for class_index in range(config.num_classes):
-                    remaining = max_per_class - retained_per_class[class_index]
-                    if remaining <= 0:
-                        continue
-                    class_selected = torch.nonzero(
-                        selected & (pseudo_classes == class_index), as_tuple=False
-                    ).flatten()[:remaining]
-                    if class_selected.numel() == 0:
-                        continue
-                    feature_batches.append(
-                        spatial.index_select(0, class_selected).detach()
-                    )
-                    position_batches.append(
-                        (
-                            positions.index_select(0, class_selected)
-                            + target_to_source_shift
-                        ).detach()
-                    )
-                    pseudo_batches.append(
-                        pseudo_classes.index_select(0, class_selected).detach()
-                    )
-                    retained_per_class[class_index] += int(class_selected.numel())
-                if all(count >= max_per_class for count in retained_per_class):
-                    break
-        finally:
-            teacher.train(was_training)
-
-    if not feature_batches:
-        dtype = next(teacher.parameters()).dtype
-        return _zero_class_phase_result(
-            config.num_classes, device, dtype, "insufficient_samples"
-        )
-    return estimator.estimate(
-        torch.cat(feature_batches),
-        torch.cat(position_batches),
-        torch.cat(pseudo_batches),
-        num_classes=config.num_classes,
+    source_loader, target_loader_no_aug, target_loader = get_data_loaders(
+        splits, config, config.balance_source
     )
-
-
-def _append_csv(path, fieldnames, rows):
-    path = os.fspath(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    write_header = not os.path.exists(path)
-    with open(path, "a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerows(rows)
-
-
-def _write_class_phase_csvs(
-    output_dir, *, epoch, global_shift, class_names, result
-):
-    phase_fields = [
-        "epoch",
-        "class_index",
-        "class_name",
-        "class",
-        "global_shift",
-        "pseudo_count",
-        "corr_zero",
-        "best_corr",
-        "corr_gain",
-        "raw_delta",
-        "accepted_delta",
-        "accepted",
-        "reason",
-    ]
-    phase_rows = []
-    for record in result.records:
-        phase_rows.append(
-            {
-                "epoch": epoch,
-                "class_index": record.class_index,
-                "class_name": class_names[record.class_index],
-                "class": class_names[record.class_index],
-                "global_shift": global_shift,
-                "pseudo_count": record.pseudo_count,
-                "corr_zero": record.corr_zero,
-                "best_corr": record.best_corr,
-                "corr_gain": record.corr_gain,
-                "raw_delta": record.raw_delta,
-                "accepted_delta": record.accepted_delta,
-                "accepted": record.accepted,
-                "reason": record.reason,
-            }
-        )
-    _append_csv(
-        os.path.join(output_dir, "class_residual_phase.csv"),
-        phase_fields,
-        phase_rows,
-    )
-
-    finite_gains = np.asarray(
-        [record.corr_gain for record in result.records if np.isfinite(record.corr_gain)]
-    )
-    absolute = np.asarray([abs(record.accepted_delta) for record in result.records])
-    enough = sum(
-        record.reason not in ("insufficient_samples", "before_start_epoch")
-        for record in result.records
-    )
-    summary = {
-        "epoch": epoch,
-        "global_shift": global_shift,
-        "num_classes": len(result.records),
-        "num_classes_enough_samples": enough,
-        "num_classes_nonzero_phase": int(np.count_nonzero(absolute)),
-        "mean_abs_delta": float(absolute.mean()) if absolute.size else 0.0,
-        "max_abs_delta": float(absolute.max()) if absolute.size else 0.0,
-        "mean_corr_gain": float(finite_gains.mean()) if finite_gains.size else float("nan"),
-        "median_corr_gain": float(np.median(finite_gains)) if finite_gains.size else float("nan"),
-    }
-    _append_csv(
-        os.path.join(output_dir, "class_phase_epoch_summary.csv"),
-        list(summary),
-        [summary],
-    )
-
-
-def _append_shape_training_metrics(output_dir, metrics):
-    _append_csv(
-        os.path.join(output_dir, "shape_training_metrics.csv"),
-        [
-            "epoch",
-            "morph_loss",
-            "global_corr_mean",
-            "local_level_corr_mean",
-            "local_slope_corr_mean",
-            "local_shape_loss",
-            "weighted_shape_loss",
-            "shape_loss_ratio",
-            "selected_target_count",
-            "selected_target_rate",
-            "selected_class_count",
-            "morph_corr_mean",
-        ],
-        [metrics],
-    )
-
-
-def _append_shape_class_metrics(output_dir, rows):
-    if not rows:
-        return
-    _append_csv(
-        os.path.join(output_dir, "shape_class_metrics.csv"),
-        [
-            "epoch",
-            "class_index",
-            "class_name",
-            "selected_count",
-            "global_corr_mean",
-            "local_level_corr_mean",
-            "local_slope_corr_mean",
-            "local_shape_loss",
-            "source_activity_weight_min",
-            "source_activity_weight_max",
-        ],
-        rows,
-    )
-
-
-def _new_shape_epoch_metrics():
-    return {
-        "selected": 0,
-        "target": 0,
-        "morph": 0.0,
-        "weighted": 0.0,
-        "ratio": 0.0,
-        "corr": 0.0,
-        "global_corr": 0.0,
-        "local_level_corr": 0.0,
-        "local_slope_corr": 0.0,
-        "local_loss": 0.0,
-        "classes": {},
-    }
-
-
-@torch.no_grad()
-def _observe_shape_training_step(
-    shape_epoch,
-    shape_result,
-    pseudo_mask,
-    timematch_loss,
-    *,
-    shape_lambda,
-):
-    """Accumulate detached shape metrics without changing training semantics."""
-    for key in (
-        "global_corr",
-        "local_level_corr",
-        "local_slope_corr",
-        "local_loss",
-    ):
-        shape_epoch.setdefault(key, 0.0)
-    shape_epoch.setdefault("classes", {})
-    shape_epoch["target"] += int(pseudo_mask.numel())
-    if shape_result is None:
-        return
-    selected_count = int(pseudo_mask.sum().item())
-    weighted_shape = shape_lambda * shape_result.loss.detach()
-    ratio = weighted_shape / timematch_loss.detach().abs().clamp_min(1e-12)
-    shape_epoch["selected"] += selected_count
-    shape_epoch["morph"] += float(shape_result.morph_loss.detach()) * selected_count
-    shape_epoch["weighted"] += float(weighted_shape) * selected_count
-    shape_epoch["ratio"] += float(ratio) * selected_count
-    shape_epoch["corr"] += float(shape_result.morph_corr_mean) * selected_count
-    global_corr = (
-        shape_result.global_corr_mean
-        if shape_result.global_corr_mean is not None
-        else shape_result.morph_corr_mean
-    )
-    local_level = (
-        shape_result.local_level_corr_mean
-        if shape_result.local_level_corr_mean is not None
-        else shape_result.morph_corr_mean
-    )
-    local_slope = (
-        shape_result.local_slope_corr_mean
-        if shape_result.local_slope_corr_mean is not None
-        else shape_result.morph_corr_mean
-    )
-    local_loss = (
-        shape_result.local_shape_loss
-        if shape_result.local_shape_loss is not None
-        else shape_result.morph_loss
-    )
-    shape_epoch["global_corr"] += float(global_corr) * selected_count
-    shape_epoch["local_level_corr"] += float(local_level) * selected_count
-    shape_epoch["local_slope_corr"] += float(local_slope) * selected_count
-    shape_epoch["local_loss"] += float(local_loss) * selected_count
-    for class_index, class_metrics in shape_result.class_metrics.items():
-        count = int(class_metrics["selected_count"])
-        if count == 0:
-            continue
-        accumulator = shape_epoch["classes"].setdefault(
-            int(class_index),
-            {
-                "selected": 0,
-                "global_corr": 0.0,
-                "local_level_corr": 0.0,
-                "local_slope_corr": 0.0,
-                "local_loss": 0.0,
-                "activity_min": float(class_metrics["source_activity_weight_min"]),
-                "activity_max": float(class_metrics["source_activity_weight_max"]),
-            },
-        )
-        accumulator["selected"] += count
-        accumulator["global_corr"] += float(
-            class_metrics["global_corr_mean"]
-        ) * count
-        accumulator["local_level_corr"] += float(
-            class_metrics["local_level_corr_mean"]
-        ) * count
-        accumulator["local_slope_corr"] += float(
-            class_metrics["local_slope_corr_mean"]
-        ) * count
-        accumulator["local_loss"] += float(
-            class_metrics["local_shape_loss"]
-        ) * count
-
-
-def _log_shape_result(writer, result, timematch_loss, config, pseudo_mask, step):
-    weighted = config.shape_lambda * result.loss.detach()
-    denominator = timematch_loss.detach().abs().clamp_min(1e-12)
-    values = {
-        "shape/raw_loss": result.loss.detach(),
-        "shape/weighted_loss": weighted,
-        "shape/morph_loss": result.morph_loss.detach(),
-        "shape/event_loss": result.event_loss.detach(),
-        "shape/selected_target_count": pseudo_mask.sum().detach(),
-        "shape/selected_target_rate": pseudo_mask.float().mean().detach(),
-        "shape/morph_corr_mean": result.morph_corr_mean,
-        "shape/event_amp_abs_gap": result.event_amp_abs_gap,
-        "shape/loss_ratio": weighted / denominator,
-        "shape/no_event_reference_count": result.no_event_reference_count,
-    }
-    if result.global_corr_mean is not None:
-        values["shape/global_corr_mean"] = result.global_corr_mean
-    if result.local_level_corr_mean is not None:
-        values["shape/local_level_corr_mean"] = result.local_level_corr_mean
-    if result.local_slope_corr_mean is not None:
-        values["shape/local_slope_corr_mean"] = result.local_slope_corr_mean
-    if result.local_shape_loss is not None:
-        values["shape/local_shape_loss"] = result.local_shape_loss
-    for mode, loss in result.mode_losses.items():
-        values[f"shape/mode{mode}_loss"] = loss.detach()
-    for name, value in values.items():
-        writer.add_scalar(name, value, step)
-
-
-@torch.no_grad()
-def _collect_shape_epoch_diagnostics(
-    teacher,
-    shape_alignment,
-    target_loader,
-    device,
-    target_to_source_shift,
-    pseudo_threshold,
-    max_batches,
-    class_residual_shifts=None,
-):
-    totals = {}
-    selected_total = 0
-    if max_batches <= 0:
-        return totals
-    with preserve_rng_state():
-        for batch_index, sample in enumerate(target_loader):
-            if batch_index >= max_batches:
-                break
-            pixels, valid, positions, extra = to_cuda(sample, device)
-            logits, spatial = _forward_with_spatial_capture(
-                teacher,
-                pixels,
-                valid,
-                positions,
-                extra,
-                temporal_shift=target_to_source_shift,
-            )
-            probabilities = F.softmax(logits, dim=1)
-            confidence, pseudo_classes = probabilities.max(dim=1)
-            selected = confidence > pseudo_threshold
-            count = int(selected.sum().item())
-            if count == 0:
-                continue
-            selected_classes = pseudo_classes[selected]
-            residual = None
-            if class_residual_shifts is not None:
-                residual = class_residual_shifts.to(
-                    device=selected_classes.device,
-                    dtype=positions.dtype,
-                ).index_select(0, selected_classes)
-            batch_metrics = shape_alignment.diagnostics(
-                spatial[selected],
-                positions[selected] + target_to_source_shift,
-                selected_classes,
-                residual_shifts=residual,
-            )
-            selected_total += count
-            for name, value in batch_metrics.items():
-                totals[name] = totals.get(name, value.new_zeros(())) + value * count
-    if selected_total:
-        totals = {name: value / selected_total for name, value in totals.items()}
-    return totals
-
-
-def train_timematch(student, config, writer, val_loader, device, best_model_path, fold_num, splits):
-    source_loader, target_loader_no_aug, target_loader = get_data_loaders(splits, config, config.balance_source)
-
-    # Setup model
-    pretrained_path = f"{config.weights}/fold_{fold_num}"
-    pretrained_weights = torch.load(f"{pretrained_path}/model.pt", weights_only=False)["state_dict"]
-    student.load_state_dict(pretrained_weights)
-    teacher = deepcopy(student)
+    checkpoint_path = os.path.join(config.weights, f"fold_{fold_num}", "model.pt")
+    packet = torch.load(checkpoint_path, weights_only=False)
+    student.load_state_dict(packet["state_dict"])
+    if not student.shape_prototype_bank.initialized.all():
+        raise RuntimeError("source shape prototype bank is incomplete")
+    if not student.instance_prototype_bank.initialized.all():
+        raise RuntimeError("source instance prototype bank is incomplete")
     student.to(device)
-    teacher.to(device)
-    shape_alignment = None
-    if getattr(config, "shape_align", False):
-        shape_alignment = _build_source_shape_alignment(
-            student,
-            config,
-            splits,
-            device,
-            os.path.join(pretrained_path, "model.pt"),
-        )
-    class_phase_loader, class_phase_estimator = _maybe_build_class_phase(
-        shape_alignment, teacher, config, splits, device
+    teacher = deepcopy(student).to(device)
+    teacher.eval()
+    criterion = (
+        FocalLoss(gamma=config.focal_loss_gamma)
+        if config.use_focal_loss else torch.nn.CrossEntropyLoss()
     )
-
-    # Training setup
-    global_step, best_f1 = 0, 0
-    if config.use_focal_loss:
-        criterion = FocalLoss(gamma=config.focal_loss_gamma)
-    else:
-        criterion = torch.nn.CrossEntropyLoss()
-
-    steps_per_epoch = config.steps_per_epoch
-
     optimizer = torch.optim.Adam(student.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs * steps_per_epoch, eta_min=0)
-
-    source_iter = iter(cycle(source_loader))
-    target_iter = iter(cycle(target_loader))
-    min_shift, max_shift = -config.max_temporal_shift, config.max_temporal_shift
-    target_to_source_shift = 0
-    recon_shift_view = (
-        getattr(config, "shift_estimation_view", "raw") == "fourier_recon"
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.epochs * config.steps_per_epoch, eta_min=0,
     )
-    initial_shift_diagnostics = None
-
-    # To evaluate how well we estimate class distribution
-    target_labels = target_loader_no_aug.dataset.get_labels()
-    actual_class_distr = estimate_class_distribution(target_labels, config.num_classes)
-
-    # estimate an initial guess for shift using Inception Score
-    if config.estimate_shift:
-        if recon_shift_view:
-            _log_shift_view_config(config)
-        shift_estimator = 'IS' if config.shift_estimator == 'AM' else config.shift_estimator
-        initial_shift_result = _estimate_temporal_shift_for_config(
-            teacher,
-            target_loader_no_aug,
-            device,
-            config,
-            min_shift=min_shift,
-            max_shift=max_shift,
-            sample_size=config.sample_size,
-            shift_estimator=shift_estimator,
-            progress_bar=getattr(config, "progress_bar", "auto"),
-            compare_raw=recon_shift_view,
-            return_diagnostics=recon_shift_view,
-        )
-        if recon_shift_view:
-            target_to_source_shift, initial_shift_diagnostics = initial_shift_result
-        else:
-            target_to_source_shift = initial_shift_result
-        if target_to_source_shift >= 0:
-            min_shift = 0
-        else:
-            max_shift = 0
-
-        # Use estimated shift to get initial pseudo labels
-        pseudo_softmaxes = get_pseudo_labels(
-            teacher,
-            target_loader_no_aug,
-            device,
-            target_to_source_shift,
-            n=None,
-            progress_bar=getattr(config, "progress_bar", "auto"),
-        )
-        all_pseudo_labels = torch.max(pseudo_softmaxes, dim=1)[1]
-
-    source_to_target_shift = 0
-    source_class_shifts = None
-    if getattr(config, "source_class_residual_shift", False):
-        if not config.estimate_shift or not config.shift_source:
-            raise ValueError(
-                "source class residual shift requires estimate_shift=true and shift_source=true"
-            )
-        source_class_shifts, _ = _bootstrap_source_class_residual_shifts(
-            teacher, config, splits, device, target_to_source_shift
-        )
+    source_iter, target_iter = iter(cycle(source_loader)), iter(cycle(target_loader))
+    initial_shift, class_distribution, initial_diagnostics = _initialize_timematch_shift(
+        teacher, target_loader_no_aug, device, config
+    )
+    target_to_source_shift = initial_shift
+    best_f1 = 0
+    global_step = 0
     for epoch in range(config.epochs):
-        progress_bar = tqdm(
-            range(steps_per_epoch),
-            desc=f"TimeMatch Epoch {epoch + 1}/{config.epochs}",
-            disable=progress_bar_disabled(
-                getattr(config, "progress_bar", "auto")
-            ),
+        target_to_source_shift = _reestimate_timematch_shift(
+            teacher, target_loader_no_aug, device, config,
+            initial_shift, class_distribution, initial_diagnostics, epoch,
         )
-        loss_meter = AverageMeter()
-        epoch_shift_diagnostics = None
-
-        if config.estimate_shift:
-            estimated_class_distr = estimate_class_distribution(all_pseudo_labels, config.num_classes)
-            writer.add_scalar("train/kl_d", kl_divergence(actual_class_distr, estimated_class_distr), epoch)
-            epoch_shift_result = _estimate_temporal_shift_for_config(
-                teacher,
-                target_loader_no_aug,
-                device,
-                config,
-                estimated_class_distr,
-                min_shift=min_shift,
-                max_shift=max_shift,
-                sample_size=config.sample_size,
-                shift_estimator=config.shift_estimator,
-                progress_bar=getattr(config, "progress_bar", "auto"),
-                compare_raw=(recon_shift_view and epoch == 0),
-                return_diagnostics=(recon_shift_view and epoch == 0),
-            )
-            if recon_shift_view and epoch == 0:
-                target_to_source_shift, epoch_shift_diagnostics = epoch_shift_result
-                _log_shift_view_compare(
-                    epoch,
-                    initial_shift_diagnostics,
-                    epoch_shift_diagnostics,
-                )
-            else:
-                target_to_source_shift = epoch_shift_result
-            if epoch == 0:
-                if getattr(config, "model", None) == "psefourierreconltae":
-                    aliases = {
-                        "austria/33UVP/2017": "AT1",
-                        "denmark/32VNH/2017": "DK1",
-                        "france/30TXT/2017": "FR1",
-                        "france/31TCJ/2017": "FR2",
-                    }
-                    print(
-                        "INITIAL_SHIFT|"
-                        f"source={aliases.get(config.source, config.source)}|"
-                        f"target={aliases.get(config.target, config.target)}|"
-                        f"mode={config.fourier_num_modes}|"
-                        f"shift_days={target_to_source_shift}"
-                    )
-                elif recon_shift_view:
-                    aliases = {
-                        "austria/33UVP/2017": "AT1",
-                        "denmark/32VNH/2017": "DK1",
-                        "france/30TXT/2017": "FR1",
-                        "france/31TCJ/2017": "FR2",
-                    }
-                    print(
-                        "INITIAL_SHIFT|"
-                        f"source={aliases.get(config.source, config.source)}|"
-                        f"target={aliases.get(config.target, config.target)}|"
-                        f"view=fourier_recon|"
-                        f"mode={config.shift_fourier_num_modes}|"
-                        f"shift_days={target_to_source_shift}"
-                    )
-                if config.shift_source and source_class_shifts is None:
-                    source_to_target_shift = -target_to_source_shift
-                elif not config.shift_source:
-                    source_to_target_shift = 0
-                min_shift, max_shift = min(target_to_source_shift, 0), max(0, target_to_source_shift)
-            writer.add_scalar("train/temporal_shift", target_to_source_shift, epoch)
-
-        class_phase_result = None
-        class_residual_shifts = None
-        if class_phase_estimator is not None:
-            class_phase_result = _estimate_class_residual_phase(
-                teacher,
-                class_phase_estimator,
-                class_phase_loader,
-                device,
-                target_to_source_shift,
-                config,
-                epoch,
-            )
-            class_residual_shifts = class_phase_result.accepted_shifts
-            print(f"Global TimeMatch shift = {target_to_source_shift}")
-            for record in class_phase_result.records:
-                class_name = config.classes[record.class_index]
-                if record.reason in ("insufficient_samples", "before_start_epoch"):
-                    print(
-                        f"CLASS_PHASE class={class_name} n={record.pseudo_count} "
-                        f"{record.reason} accepted_delta=0"
-                    )
-                else:
-                    print(
-                        f"CLASS_PHASE class={class_name} n={record.pseudo_count} "
-                        f"corr0={record.corr_zero:.6f} best={record.best_corr:.6f} "
-                        f"gain={record.corr_gain:.6f} raw_delta={record.raw_delta:+g} "
-                        f"accepted_delta={record.accepted_delta:+g} "
-                        f"accepted={record.accepted} reason={record.reason}"
-                    )
-            _write_class_phase_csvs(
-                config.fold_dir,
-                epoch=epoch,
-                global_shift=target_to_source_shift,
-                class_names=config.classes,
-                result=class_phase_result,
-            )
-
+        source_to_target_shift = (
+            -target_to_source_shift if getattr(config, "shift_source", True) else 0
+        )
         student.train()
-        teacher.eval()  # don't update BN or use dropout for teacher
-
-        all_labels, all_pseudo_labels, all_pseudo_mask = [], [], []
-        teacher_confidence_sum = None
-        teacher_confidence_count = 0
-        shape_epoch = None
-        if shape_alignment is not None:
-            shape_epoch = _new_shape_epoch_metrics()
-        for step in progress_bar:
-            collect_diagnostics = global_step % config.log_step == 0
-            sample_source, (sample_target_weak, sample_target_strong) = next(source_iter), next(target_iter)
-
-            # Get pseudo labels from teacher
-            pixels_t_weak, mask_t_weak, position_t_weak, extra_t_weak = to_cuda(sample_target_weak, device)
+        teacher.eval()
+        source_epoch_stats = _new_epoch_structure_stats()
+        target_epoch_stats = _new_epoch_structure_stats()
+        progress = tqdm(
+            range(config.steps_per_epoch),
+            desc=f"StructureProto TimeMatch {epoch + 1}/{config.epochs}",
+            disable=progress_bar_disabled(getattr(config, "progress_bar", "auto")),
+        )
+        for _ in progress:
+            source_sample = next(source_iter)
+            target_weak, target_strong = next(target_iter)
+            pw, mw, tw, ew = to_cuda(target_weak, device)
             with torch.no_grad():
-                teacher_preds = F.softmax(
-                    _forward_with_temporal_shift(
-                        teacher,
-                        pixels_t_weak,
-                        mask_t_weak,
-                        position_t_weak,
-                        extra_t_weak,
-                        temporal_shift=target_to_source_shift,
-                    ),
-                    dim=1,
+                teacher_output = teacher.forward_with_temporal_shift(
+                    pw, mw, tw, ew, temporal_shift=target_to_source_shift,
+                    return_dict=True,
                 )
-            pseudo_conf, pseudo_targets = torch.max(teacher_preds, dim=1)
-            confidence_total = pseudo_conf.detach().sum()
-            teacher_confidence_sum = (
-                confidence_total
-                if teacher_confidence_sum is None
-                else teacher_confidence_sum + confidence_total
-            )
-            teacher_confidence_count += pseudo_conf.numel()
-            pseudo_mask = pseudo_conf > config.pseudo_threshold
-            num_pseudo = int(pseudo_mask.sum().item())
+                probabilities = F.softmax(teacher_output["logits"], dim=1)
+                confidence, pseudo = probabilities.max(1)
+                pseudo_mask = confidence > config.pseudo_threshold
 
-            # Update student on shifted source data and pseudo-labeled target data
-            pixels_s, mask_s, position_s, extra_s = to_cuda(sample_source, device)
-            source_labels = sample_source['label'].cuda(device, non_blocking=True)
-            source_batch_shift = (
-                _source_batch_temporal_shift(
-                    source_class_shifts, source_labels, position_s.dtype
-                )
-                if source_class_shifts is not None
-                else source_to_target_shift
+            ps, ms, ts, es = to_cuda(source_sample, device)
+            source_labels = source_sample["label"].cuda(device=device, non_blocking=True)
+            source_output = student.forward_with_temporal_shift(
+                ps, ms, ts, es, temporal_shift=source_to_target_shift,
+                return_dict=True,
             )
-            pixels_t, mask_t, position_t, extra_t = to_cuda(sample_target_strong, device)
-            logits_target = None
-            captured_target = None
-            loss_target = 0.0
-            if config.domain_specific_bn:
-                _check_temporal_index_range(student, position_s, source_batch_shift, "source")
-                logits_source = _forward_with_temporal_shift(
-                    student,
-                    pixels_s,
-                    mask_s,
-                    position_s,
-                    extra_s,
-                    temporal_shift=source_batch_shift,
-                    collect_diagnostics=(
-                        collect_diagnostics and num_pseudo < 2
+            loss_cls_source = criterion(source_output["logits"], source_labels)
+            source_ins, source_shape, source_proto, source_selected = two_level_prototype_losses(
+                source_output, source_labels,
+                student.shape_prototype_bank, student.instance_prototype_bank,
+                config.shape_ratio, config.proto_temperature, config.proto_shape_mix,
+            )
+
+            target_count = int(pseudo_mask.sum())
+            if target_count >= 2:
+                pt, mt, tt, et = to_cuda(target_strong, device)
+                target_output = student(
+                    pt[pseudo_mask], mt[pseudo_mask], tt[pseudo_mask], et[pseudo_mask],
+                    return_dict=True,
+                )
+                target_labels = pseudo[pseudo_mask]
+                loss_pseudo_target = criterion(target_output["logits"], target_labels)
+                teacher_selected = select_top_shape_tokens(
+                    teacher_output["shape_attention"][pseudo_mask],
+                    teacher_output["shape_mask"][pseudo_mask],
+                    config.shape_ratio,
+                )
+                target_ins, target_shape, target_proto, _ = two_level_prototype_losses(
+                    target_output, target_labels,
+                    student.shape_prototype_bank, student.instance_prototype_bank,
+                    config.shape_ratio, config.proto_temperature, config.proto_shape_mix,
+                    selected_tokens=teacher_selected,
+                )
+                _collect_epoch_structure_stats(
+                    target_epoch_stats,
+                    structure_batch_statistics(
+                        target_output, target_labels,
+                        student.shape_prototype_bank, student.instance_prototype_bank,
+                        teacher_selected,
                     ),
                 )
-                if num_pseudo >= 2:  # at least 2 examples required for BN
-                    _check_temporal_index_range(student, position_t[pseudo_mask], 0, "target")
-                    target_args = (
-                        student,
-                        pixels_t[pseudo_mask],
-                        mask_t[pseudo_mask],
-                        position_t[pseudo_mask],
-                        extra_t[pseudo_mask],
-                    )
-                    if shape_alignment is None:
-                        logits_target = _forward_with_temporal_shift(
-                            *target_args,
-                            collect_diagnostics=collect_diagnostics,
-                        )
-                    else:
-                        logits_target, captured_target = _forward_with_spatial_capture(
-                            *target_args,
-                            collect_diagnostics=collect_diagnostics,
-                        )
             else:
-                _check_temporal_index_range(student, position_s, source_batch_shift, "source")
-                if num_pseudo > 0:
-                    selected_pixels_t = pixels_t[pseudo_mask]
-                    selected_mask_t = mask_t[pseudo_mask]
-                    selected_position_t = position_t[pseudo_mask]
-                    selected_extra_t = extra_t[pseudo_mask]
+                zero = source_output["logits"].sum() * 0
+                loss_pseudo_target = target_ins = target_shape = target_proto = zero
 
-                    _check_temporal_index_range(student, selected_position_t, 0, "target")
-
-                    pixels = torch.cat([pixels_s, selected_pixels_t], dim=0)
-                    mask = torch.cat([mask_s, selected_mask_t], dim=0)
-                    position = torch.cat(
-                        [position_s, selected_position_t],
-                        dim=0,
-                    )
-                    temporal_shift = torch.cat(
-                        [
-                            source_batch_shift if torch.is_tensor(source_batch_shift) else torch.full(
-                                (position_s.shape[0], 1), source_batch_shift,
-                                device=position_s.device, dtype=position_s.dtype,
-                            ),
-                            torch.zeros(
-                                (selected_position_t.shape[0], 1),
-                                device=selected_position_t.device,
-                                dtype=selected_position_t.dtype,
-                            ),
-                        ],
-                        dim=0,
-                    )
-                    extra = torch.cat([extra_s, selected_extra_t], dim=0)
-
-                    concat_args = (student, pixels, mask, position, extra)
-                    if shape_alignment is None:
-                        logits = _forward_with_temporal_shift(
-                            *concat_args,
-                            temporal_shift=temporal_shift,
-                            collect_diagnostics=collect_diagnostics,
-                        )
-                        captured = None
-                    else:
-                        logits, captured = _forward_with_spatial_capture(
-                            *concat_args,
-                            temporal_shift=temporal_shift,
-                            collect_diagnostics=collect_diagnostics,
-                        )
-                    source_batch_size = pixels_s.shape[0]
-                    logits_source = logits[:source_batch_size]
-                    logits_target = logits[source_batch_size:]
-                    if captured is not None:
-                        captured_target = captured[source_batch_size:]
-                else:
-                    logits_source = _forward_with_temporal_shift(
-                        student,
-                        pixels_s,
-                        mask_s,
-                        position_s,
-                        extra_s,
-                        temporal_shift=source_batch_shift,
-                        collect_diagnostics=collect_diagnostics,
-                    )
-                    logits_target = None
-
-            loss_source = criterion(logits_source, source_labels)
-            if logits_target is not None:
-                loss_target = criterion(logits_target, pseudo_targets[pseudo_mask])
-            timematch_loss = loss_source + config.trade_off * loss_target
-            shape_result = None
-            if shape_alignment is not None and captured_target is not None:
-                shape_result = _shape_loss_from_capture(
-                    shape_alignment,
-                    captured_target,
-                    position_t,
-                    pseudo_targets,
-                    pseudo_mask,
-                    target_to_source_shift,
-                    class_residual_shifts=class_residual_shifts,
-                )
-            loss = _add_shape_loss(
-                timematch_loss,
-                shape_result,
-                getattr(config, "shape_lambda", 0.1),
+            loss = compose_da_loss(
+                loss_cls_source, loss_pseudo_target, config.trade_off,
+                source_proto, target_proto,
+                config.source_proto_weight, config.target_proto_weight,
             )
-
-            # compute loss and backprop
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
+            scheduler.step()
+            update_source_banks(
+                source_output, source_labels,
+                student.shape_prototype_bank, student.instance_prototype_bank,
+                config.shape_ratio,
+            )
+            _collect_epoch_structure_stats(
+                source_epoch_stats,
+                structure_batch_statistics(
+                    source_output, source_labels,
+                    student.shape_prototype_bank, student.instance_prototype_bank,
+                    source_selected,
+                ),
+            )
             update_ema_variables(student, teacher, config.ema_decay)
-
-            if shape_epoch is not None:
-                _observe_shape_training_step(
-                    shape_epoch,
-                    shape_result,
-                    pseudo_mask,
-                    timematch_loss,
-                    shape_lambda=config.shape_lambda,
-                )
-
-            # Metrics
-            loss_meter.update(loss.item())
-            progress_bar.set_postfix(loss=f"{loss_meter.avg:.3f}")
-            all_labels.extend(sample_target_weak['label'].tolist())
-            all_pseudo_labels.extend(pseudo_targets.tolist())
-            all_pseudo_mask.extend(pseudo_mask.tolist())
-
             if global_step % config.log_step == 0:
-                writer.add_scalar("train/loss", loss_meter.val, global_step)
-                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
-                writer.add_scalar("train/target_updates", len(torch.nonzero(pseudo_mask)), global_step)
-                if shape_result is not None:
-                    _log_shape_result(
-                        writer,
-                        shape_result,
-                        timematch_loss,
-                        config,
-                        pseudo_mask,
-                        global_step,
-                    )
-
+                metrics = {
+                    "loss_cls_source": loss_cls_source,
+                    "loss_pseudo_target": loss_pseudo_target,
+                    "loss_proto_instance_source": source_ins,
+                    "loss_proto_shape_source": source_shape,
+                    "loss_proto_instance_target": target_ins,
+                    "loss_proto_shape_target": target_shape,
+                    "loss_proto_source_total": source_proto,
+                    "loss_proto_target_total": target_proto,
+                    "loss_total": loss,
+                }
+                for name, value in metrics.items():
+                    writer.add_scalar(f"train/{name}", value.detach(), global_step)
+                print("STRUCTURE_PROTO_DA|" + "|".join(
+                    f"{name}={float(value.detach()):.6f}" for name, value in metrics.items()
+                ))
             global_step += 1
-
-        progress_bar.close()
-
-        # Evaluate pseudo labels
-        all_labels, all_pseudo_labels, all_pseudo_mask = np.array(all_labels), np.array(all_pseudo_labels), np.array(all_pseudo_mask)
-        pseudo_count = all_pseudo_mask.sum()
-        conf_pseudo_f1 = sklearn.metrics.f1_score(all_labels[all_pseudo_mask], all_pseudo_labels[all_pseudo_mask], average='macro', zero_division=0)
-        print(f"Teacher pseudo label F1 {conf_pseudo_f1:.3f} (n={pseudo_count})")
-        writer.add_scalar("train/pseudo_f1", conf_pseudo_f1, epoch)
-        writer.add_scalar("train/pseudo_count", pseudo_count, epoch)
-        if recon_shift_view:
-            raw_is = initial_shift_diagnostics["raw_selected_shift"]
-            recon_is = initial_shift_diagnostics["selected_shift"]
-            raw_am = (
-                epoch_shift_diagnostics["raw_selected_shift"]
-                if epoch_shift_diagnostics is not None
-                else "NA"
+        progress.close()
+        prototype_row = {"epoch": epoch, **_prototype_bank_stats(student)}
+        prototype_row.update(_summarize_epoch_structure_stats(
+            source_epoch_stats, "source", config.shape_window_scales,
+        ))
+        prototype_row.update(_summarize_epoch_structure_stats(
+            target_epoch_stats, "target", config.shape_window_scales,
+        ))
+        _append_structure_csv(
+            os.path.join(config.fold_dir, "prototype_stats.csv"), prototype_row,
+        )
+        attention_row = {"epoch": epoch}
+        for prefix, accumulator in (
+            ("source", source_epoch_stats), ("target", target_epoch_stats),
+        ):
+            summary = _summarize_epoch_structure_stats(
+                accumulator, prefix, config.shape_window_scales,
             )
-            recon_am = (
-                epoch_shift_diagnostics["selected_shift"]
-                if epoch_shift_diagnostics is not None
-                else target_to_source_shift
-            )
-            mean_teacher_confidence = (
-                float(teacher_confidence_sum.cpu()) / teacher_confidence_count
-            )
-            pseudo_coverage = pseudo_count / max(len(all_pseudo_mask), 1)
-            print(
-                "SHIFT_TRAJECTORY|"
-                f"epoch={epoch}|raw_is_shift={raw_is}|raw_am_shift={raw_am}|"
-                f"recon_is_shift={recon_is}|recon_am_shift={recon_am}|"
-                f"actual_training_shift={target_to_source_shift}|"
-                f"pseudo_label_coverage={pseudo_coverage:.6f}|"
-                f"mean_teacher_confidence={mean_teacher_confidence:.6f}"
-            )
-
-        if shape_alignment is not None:
-            if shape_epoch is not None:
-                selected_denominator = max(shape_epoch["selected"], 1)
-                _append_shape_training_metrics(
-                    config.fold_dir,
-                    {
-                        "epoch": epoch,
-                        "morph_loss": shape_epoch["morph"] / selected_denominator,
-                        "global_corr_mean": shape_epoch["global_corr"]
-                        / selected_denominator,
-                        "local_level_corr_mean": shape_epoch["local_level_corr"]
-                        / selected_denominator,
-                        "local_slope_corr_mean": shape_epoch["local_slope_corr"]
-                        / selected_denominator,
-                        "local_shape_loss": shape_epoch["local_loss"]
-                        / selected_denominator,
-                        "weighted_shape_loss": shape_epoch["weighted"] / selected_denominator,
-                        "shape_loss_ratio": shape_epoch["ratio"] / selected_denominator,
-                        "selected_target_count": shape_epoch["selected"],
-                        "selected_target_rate": (
-                            shape_epoch["selected"] / max(shape_epoch["target"], 1)
-                        ),
-                        "selected_class_count": len(shape_epoch["classes"]),
-                        "morph_corr_mean": shape_epoch["corr"] / selected_denominator,
-                    },
-                )
-                class_rows = []
-                for class_index, metrics in sorted(shape_epoch["classes"].items()):
-                    count = max(metrics["selected"], 1)
-                    class_rows.append(
-                        {
-                            "epoch": epoch,
-                            "class_index": class_index,
-                            "class_name": config.classes[class_index],
-                            "selected_count": metrics["selected"],
-                            "global_corr_mean": metrics["global_corr"] / count,
-                            "local_level_corr_mean": metrics["local_level_corr"]
-                            / count,
-                            "local_slope_corr_mean": metrics["local_slope_corr"]
-                            / count,
-                            "local_shape_loss": metrics["local_loss"] / count,
-                            "source_activity_weight_min": metrics["activity_min"],
-                            "source_activity_weight_max": metrics["activity_max"],
-                        }
-                    )
-                _append_shape_class_metrics(config.fold_dir, class_rows)
-            shape_diagnostics = _collect_shape_epoch_diagnostics(
-                teacher,
-                shape_alignment,
-                target_loader_no_aug,
-                device,
-                target_to_source_shift,
-                config.pseudo_threshold,
-                config.shape_diag_batches,
-                class_residual_shifts=class_residual_shifts,
-            )
-            for name, value in shape_diagnostics.items():
-                writer.add_scalar(f"shape_diag/{name}", value, epoch)
-
-        writer.add_scalar("train/pseudo_f1", conf_pseudo_f1, epoch)
-        writer.add_scalar("train/pseudo_count", pseudo_count, epoch)
-
+            attention_row.update({
+                key: value for key, value in summary.items()
+                if "attention_" in key or "top_shape_" in key or "selected_fraction_" in key
+            })
+        _append_structure_csv(
+            os.path.join(config.fold_dir, "attention_stats.csv"), attention_row,
+        )
+        previous_best = best_f1
         if config.run_validation:
-            if config.output_student:
-                student.eval()
-                best_f1 = validation(best_f1, None, config, criterion, device, epoch, student, val_loader, writer)
-            else:
-                teacher.eval()
-                best_f1 = validation(best_f1, None, config, criterion, device, epoch, teacher, val_loader, writer)
+            student.eval()
+            best_f1 = validation(
+                best_f1, None, config, criterion, device, epoch,
+                student if config.output_student else teacher, val_loader, writer,
+            )
+        state_model = student if config.output_student else teacher
+        checkpoint = {
+            "epoch": epoch,
+            "state_dict": state_model.state_dict(),
+            "teacher_state_dict": teacher.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "global_temporal_shift": target_to_source_shift,
+            "config": vars(config),
+            "best_f1": best_f1,
+        }
+        torch.save(checkpoint, os.path.join(config.fold_dir, "checkpoint_last.pt"))
+        if best_f1 > previous_best or not os.path.isfile(best_model_path):
+            torch.save(checkpoint, best_model_path)
+            torch.save(checkpoint, os.path.join(config.fold_dir, "checkpoint_best.pt"))
 
-    # Save model final model 
-    if config.output_student:
-        torch.save({'state_dict': student.state_dict()}, best_model_path)
-    else:
-        torch.save({'state_dict': teacher.state_dict()}, best_model_path)
+
+def train_timematch(student, config, writer, val_loader, device, best_model_path, fold_num, splits):
+    if isinstance(student, PseStructureProtoLTae):
+        return _train_structure_proto_timematch(
+            student, config, writer, val_loader, device,
+            best_model_path, fold_num, splits,
+        )
+
+    source_loader, target_loader_no_aug, target_loader = get_data_loaders(
+        splits, config, config.balance_source
+    )
+    checkpoint_path = os.path.join(config.weights, f"fold_{fold_num}", "model.pt")
+    student.load_state_dict(torch.load(checkpoint_path, weights_only=False)["state_dict"])
+    student.to(device)
+    teacher = deepcopy(student).to(device)
+    teacher.eval()
+    criterion = FocalLoss(gamma=config.focal_loss_gamma) if config.use_focal_loss else torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(student.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.epochs * config.steps_per_epoch, eta_min=0
+    )
+    source_iter, target_iter = iter(cycle(source_loader)), iter(cycle(target_loader))
+    initial_shift, class_distribution, initial_diagnostics = _initialize_timematch_shift(
+        teacher, target_loader_no_aug, device, config
+    )
+    target_to_source_shift = initial_shift
+    best_f1, global_step = 0, 0
+
+    for epoch in range(config.epochs):
+        target_to_source_shift = _reestimate_timematch_shift(
+            teacher, target_loader_no_aug, device, config,
+            initial_shift, class_distribution, initial_diagnostics, epoch,
+        )
+        source_to_target_shift = (
+            -target_to_source_shift if getattr(config, "shift_source", True) else 0
+        )
+        student.train()
+        teacher.eval()
+        progress = tqdm(
+            range(config.steps_per_epoch),
+            desc=f"TimeMatch Epoch {epoch + 1}/{config.epochs}",
+            disable=progress_bar_disabled(getattr(config, "progress_bar", "auto")),
+        )
+        labels_epoch, pseudo_epoch, mask_epoch = [], [], []
+        for _ in progress:
+            source_sample = next(source_iter)
+            target_weak, target_strong = next(target_iter)
+            pw, mw, tw, ew = to_cuda(target_weak, device)
+            with torch.no_grad():
+                teacher_logits = _forward_with_temporal_shift(
+                    teacher, pw, mw, tw, ew,
+                    temporal_shift=target_to_source_shift,
+                )
+                confidence, pseudo = F.softmax(teacher_logits, dim=1).max(1)
+                pseudo_mask = confidence > config.pseudo_threshold
+
+            ps, ms, ts, es = to_cuda(source_sample, device)
+            source_labels = source_sample["label"].cuda(device=device, non_blocking=True)
+            pt, mt, tt, et = to_cuda(target_strong, device)
+            pseudo_count = int(pseudo_mask.sum())
+            if getattr(config, "domain_specific_bn", True):
+                logits_source = _forward_with_temporal_shift(
+                    student, ps, ms, ts, es,
+                    temporal_shift=source_to_target_shift,
+                )
+                logits_target = None
+                if pseudo_count >= 2:
+                    logits_target = _forward_with_temporal_shift(
+                        student, pt[pseudo_mask], mt[pseudo_mask],
+                        tt[pseudo_mask], et[pseudo_mask],
+                    )
+            elif pseudo_count:
+                pixels = torch.cat((ps, pt[pseudo_mask]))
+                masks = torch.cat((ms, mt[pseudo_mask]))
+                positions = torch.cat((ts, tt[pseudo_mask]))
+                extras = torch.cat((es, et[pseudo_mask]))
+                source_shift = (
+                    source_to_target_shift
+                    if torch.is_tensor(source_to_target_shift)
+                    else torch.full((ts.shape[0], 1), source_to_target_shift, device=ts.device, dtype=ts.dtype)
+                )
+                shifts = torch.cat((
+                    source_shift,
+                    torch.zeros((pseudo_count, 1), device=tt.device, dtype=tt.dtype),
+                ))
+                logits = _forward_with_temporal_shift(
+                    student, pixels, masks, positions, extras, temporal_shift=shifts,
+                )
+                logits_source, logits_target = logits[:ps.shape[0]], logits[ps.shape[0]:]
+            else:
+                logits_source = _forward_with_temporal_shift(
+                    student, ps, ms, ts, es,
+                    temporal_shift=source_to_target_shift,
+                )
+                logits_target = None
+            loss_source = criterion(logits_source, source_labels)
+            loss_target = (
+                criterion(logits_target, pseudo[pseudo_mask])
+                if logits_target is not None else logits_source.sum() * 0
+            )
+            loss = loss_source + config.trade_off * loss_target
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            update_ema_variables(student, teacher, config.ema_decay)
+            if global_step % config.log_step == 0:
+                writer.add_scalar("train/loss_cls_source", loss_source.detach(), global_step)
+                writer.add_scalar("train/loss_pseudo_target", loss_target.detach(), global_step)
+                writer.add_scalar("train/loss_total", loss.detach(), global_step)
+            labels_epoch.extend(target_weak["label"].tolist())
+            pseudo_epoch.extend(pseudo.tolist())
+            mask_epoch.extend(pseudo_mask.tolist())
+            global_step += 1
+        progress.close()
+
+        selected = np.asarray(mask_epoch, dtype=bool)
+        if selected.any():
+            pseudo_f1 = sklearn.metrics.f1_score(
+                np.asarray(labels_epoch)[selected],
+                np.asarray(pseudo_epoch)[selected],
+                average="macro", zero_division=0,
+            )
+            writer.add_scalar("train/pseudo_f1", pseudo_f1, epoch)
+        previous_best = best_f1
+        if config.run_validation:
+            selected_model = student if config.output_student else teacher
+            selected_model.eval()
+            best_f1 = validation(
+                best_f1, None, config, criterion, device, epoch,
+                selected_model, val_loader, writer,
+            )
+        selected_model = student if config.output_student else teacher
+        checkpoint = {
+            "epoch": epoch,
+            "state_dict": selected_model.state_dict(),
+            "teacher_state_dict": teacher.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "global_temporal_shift": target_to_source_shift,
+            "config": vars(config),
+            "best_f1": best_f1,
+        }
+        fold_dir = getattr(config, "fold_dir", os.path.dirname(best_model_path) or ".")
+        torch.save(checkpoint, os.path.join(fold_dir, "checkpoint_last.pt"))
+        if best_f1 > previous_best or not os.path.isfile(best_model_path):
+            torch.save(checkpoint, best_model_path)
+            torch.save(checkpoint, os.path.join(fold_dir, "checkpoint_best.pt"))
+
 
 def estimate_class_distribution(labels, num_classes):
     return np.bincount(labels, minlength=num_classes) / len(labels)
@@ -1600,9 +661,13 @@ def kl_divergence(actual, estimated):
 
 @torch.no_grad()
 def update_ema_variables(model, ema, decay=0.99):
-    for ema_v, model_v in zip(ema.state_dict().values(), model.state_dict().values()):
-        ema_v.copy_(decay * ema_v + (1. - decay) * model_v)
-
+    model_parameters = dict(model.named_parameters())
+    for name, ema_value in ema.named_parameters():
+        ema_value.copy_(decay * ema_value + (1. - decay) * model_parameters[name])
+    model_buffers = dict(model.named_buffers())
+    for name, ema_value in ema.named_buffers():
+        if "prototype_bank" not in name:
+            ema_value.copy_(model_buffers[name])
 
 def get_data_loaders(splits, config, balance_source=True):
     weak_aug = transforms.Compose([
@@ -1690,7 +755,6 @@ def get_data_loaders(splits, config, balance_source=True):
 
     return source_loader, target_loader_no_aug, target_loader_weak_strong
 
-
 class TupleDataset(data.Dataset):
     def __init__(self, dataset1, dataset2):
         super().__init__()
@@ -1705,7 +769,6 @@ class TupleDataset(data.Dataset):
     def __getitem__(self, index):
         return (self.weak[index], self.strong[index])
 
-
 def _select_temporal_shift(
     shift_softmaxes,
     labels,
@@ -1715,13 +778,11 @@ def _select_temporal_shift(
     print_summary,
 ):
     shift_predictions = np.argmax(shift_softmaxes, axis=2)
-    shift_acc_scores = np.asarray(
-        [
-            (labels == predictions).mean()
-            for predictions in np.moveaxis(shift_predictions, 0, 1)
-        ]
-    )
-    if print_summary:
+    shift_acc_scores = (None if labels is None else np.asarray([
+        (labels == predictions).mean()
+        for predictions in np.moveaxis(shift_predictions, 0, 1)
+    ]))
+    if print_summary and shift_acc_scores is not None:
         print(
             f"Most accurate shift {shifts[np.argmax(shift_acc_scores)]} "
             f"with {np.max(shift_acc_scores):.3f}"
@@ -1775,6 +836,8 @@ def _select_temporal_shift(
         best_shift_idx = np.argsort(scores)[0]
         summary_name = "AM Score"
     elif shift_estimator == 'ACC':
+        if shift_acc_scores is None:
+            raise ValueError("accuracy shift selection requires labels")
         scores = shift_acc_scores
         best_shift_idx = np.argmax(scores)
         summary_name = "Accuracy"
@@ -1783,10 +846,10 @@ def _select_temporal_shift(
 
     best_shift = shifts[best_shift_idx]
     if print_summary and shift_estimator != 'ACC':
-        print(
-            f"Best {summary_name} shift {best_shift} with accuracy "
-            f"{shift_acc_scores[best_shift_idx]:.3f}"
-        )
+        message = f"Best {summary_name} shift {best_shift}"
+        if shift_acc_scores is not None:
+            message += f" with accuracy {shift_acc_scores[best_shift_idx]:.3f}"
+        print(message)
     selected_probs = p_yx[:, best_shift_idx]
     selected_predictions = shift_predictions[:, best_shift_idx]
     diagnostics = {
@@ -1803,7 +866,6 @@ def _select_temporal_shift(
         "score_range": float(np.max(scores) - np.min(scores)),
     }
     return best_shift, diagnostics
-
 
 @torch.no_grad()
 def estimate_temporal_shift(
@@ -1823,6 +885,7 @@ def estimate_temporal_shift(
     shift_fourier_solver='dense_direct',
     compare_raw=False,
     return_diagnostics=False,
+    include_label_diagnostics=True,
 ):
     shifts = list(range(min_shift, max_shift + 1))
     model.eval()
@@ -1854,7 +917,8 @@ def estimate_temporal_shift(
         disable=progress_bar_disabled(progress_bar),
     ):
         sample = next(target_iter)
-        labels.extend(sample['label'].tolist())
+        if include_label_diagnostics:
+            labels.extend(sample['label'].tolist())
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
         spatial_feats = model.spatial_encoder.forward(pixels, valid_pixels, extra)
         raw_prepared = _prepare_temporal_features(model, spatial_feats, positions)
@@ -1894,7 +958,7 @@ def estimate_temporal_shift(
                 )
                 raw_shift_softmaxes.append(F.softmax(raw_logits, dim=2))
     shift_softmaxes = torch.cat(shift_softmaxes).cpu().numpy()  # (N, n_shifts, n_classes)
-    labels = np.array(labels)
+    labels = np.array(labels) if include_label_diagnostics else None
     best_shift, diagnostics = _select_temporal_shift(
         shift_softmaxes,
         labels,
@@ -1918,9 +982,6 @@ def estimate_temporal_shift(
     if return_diagnostics:
         return best_shift, diagnostics
     return best_shift
-
-
-
 
 @torch.no_grad()
 def get_pseudo_labels(

@@ -29,6 +29,7 @@ class LTAE(nn.Module):
                  T=1000,
                  max_temporal_shift=100,
                  max_position=365,
+                 external_query_dim=None,
                  ):
         """
         Sequence-to-embedding encoder.
@@ -69,7 +70,10 @@ class LTAE(nn.Module):
         # self.inlayernorm = nn.LayerNorm(self.in_channels)
         # self.outlayernorm = nn.LayerNorm(n_neurons[-1])
 
-        self.attention_heads = MultiHeadAttention(n_head=n_head, d_k=d_k, d_in=self.d_model)
+        self.attention_heads = MultiHeadAttention(
+            n_head=n_head, d_k=d_k, d_in=self.d_model,
+            external_query_dim=external_query_dim,
+        )
 
         assert (self.n_neurons[0] == self.d_model)
 
@@ -81,12 +85,12 @@ class LTAE(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, positions, return_att=False):
+    def forward(self, x, positions, return_att=False, external_query=None):
         if self.inconv is not None:
             x = self.inconv(x)
         enc_output = x + self.positional_enc(positions + self.max_temporal_shift)
 
-        enc_output, attn = self.attention_heads(enc_output)
+        enc_output, attn = self.attention_heads(enc_output, external_query=external_query)
 
         enc_output = self.dropout(self.mlp(enc_output))
 
@@ -98,7 +102,7 @@ class LTAE(nn.Module):
 
 class MultiHeadAttention(nn.Module):
     ''' Multi-Head Attention module '''
-    def __init__(self, n_head, d_k, d_in):
+    def __init__(self, n_head, d_k, d_in, external_query_dim=None):
         super().__init__()
         self.n_head = n_head
         self.d_k = d_k
@@ -107,16 +111,26 @@ class MultiHeadAttention(nn.Module):
         self.key = nn.Linear(d_in, n_head * d_k)
         self.query = nn.Parameter(torch.zeros(n_head, d_k)).requires_grad_(True)
         nn.init.normal_(self.query, mean=0, std=np.sqrt(2.0 / (d_k)))
+        self.external_query_projection = (
+            nn.Linear(external_query_dim, n_head * d_k)
+            if external_query_dim is not None else None
+        )
 
         self.temperature = np.power(d_k, 0.5)
         self.dropout = nn.Dropout(0.1)
         self.softmax = nn.Softmax(dim=-1)
 
 
-    def forward(self, x):
+    def forward(self, x, external_query=None):
         # Slightly more efficient re-implementation of LTAE
         B, T, C = x.size()
-        q = self.query.repeat(B, 1, 1, 1).transpose(1, 2)  # (nh, hs) -> (B, nh, 1, d_k)
+        if external_query is None:
+            q = self.query.repeat(B, 1, 1, 1).transpose(1, 2)
+        else:
+            if self.external_query_projection is None:
+                raise ValueError("this LTAE was not configured for an external query")
+            q = self.external_query_projection(external_query)
+            q = q.view(B, self.n_head, 1, self.d_k)
         k = self.key(x).view(B, T, self.n_head, self.d_k).transpose(1, 2)  # (B, nh, T, d_k)
         v = x.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         # self-attend; (B, nh, 1, d_k) x (B, nh, d_k, T) -> (B, nh, 1, T)
