@@ -25,7 +25,8 @@ class PseStructureProtoLTae(nn.Module):
         n_head=16, d_k=8, d_model=256, mlp3=[256, 128], dropout=.2,
         T=1000, mlp4=[128, 64, 32], num_classes=20,
         max_temporal_shift=100, shape_dim=128,
-        shape_window_scales=(16, 32), shape_window_stride=8,
+        shape_window_scales=(8, 16, 24), shape_window_stride=4,
+        shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
         fourier_num_modes=13, fourier_reg=1e-3, fourier_period_days=365.,
     ):
         super().__init__()
@@ -41,6 +42,8 @@ class PseStructureProtoLTae(nn.Module):
             channels, shape_dim=shape_dim, num_modes=fourier_num_modes,
             period_days=fourier_period_days, reg=fourier_reg,
             window_scales=tuple(shape_window_scales), window_stride=shape_window_stride,
+            shapelet_count=shapelet_count, shapelet_beta=shapelet_beta,
+            shape_resample_length=shape_resample_length,
         )
         self.temporal_encoder = LTAE(
             in_channels=channels, n_head=n_head, d_k=d_k, d_model=d_model,
@@ -51,7 +54,6 @@ class PseStructureProtoLTae(nn.Module):
         self.decoder = get_decoder(mlp4, num_classes)
         self.shape_dim = shape_dim
         self.instance_dim = mlp3[-1]
-        self.shape_prototype_bank = ClassPrototypeBank(num_classes, shape_dim)
         self.instance_prototype_bank = ClassPrototypeBank(num_classes, self.instance_dim)
 
     def get_temporal_encoders(self):

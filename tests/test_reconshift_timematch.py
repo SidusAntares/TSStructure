@@ -538,3 +538,53 @@ def test_structure_proto_timematch_rejects_temporal_shift_augmentation():
         timematch._train_structure_proto_timematch(
             model, config, None, None, "cpu", "unused.pt", 0, {},
         )
+
+
+def test_structure_proto_four_task_launcher_has_canonical_domains_and_gpu_mapping():
+    text = Path("scripts/run_structure_proto_4tasks_4gpu_seed1.sh").read_text(
+        encoding="utf-8",
+    )
+    assert 'AT1="austria/33UVP/2017"' in text
+    assert 'DK1="denmark/32VNH/2017"' in text
+    assert 'FR1="france/30TXT/2017"' in text
+    assert 'FR2="france/31TCJ/2017"' in text
+    assert 'GPU0="${GPU0:-0}"' in text
+    assert 'GPU1="${GPU1:-1}"' in text
+    assert 'GPU2="${GPU2:-2}"' in text
+    assert 'GPU3="${GPU3:-3}"' in text
+    expected = (
+        'run_task "$GPU0" AT1 "$AT1" DK1 "$DK1"',
+        'run_task "$GPU1" FR1 "$FR1" FR2 "$FR2"',
+        'run_task "$GPU2" FR2 "$FR2" DK1 "$DK1"',
+        'run_task "$GPU3" DK1 "$DK1" AT1 "$AT1"',
+    )
+    assert all(command in text for command in expected)
+    assert 'EXP_ROOT="${EXP_ROOT:-outputs/structure_proto_4tasks_seed1}"' in text
+    assert 'LOG_ROOT="${LOG_ROOT:-logs/structure_proto_4tasks_seed1}"' in text
+    assert 'local log_file="$LOG_ROOT/${task}.log"' in text
+    assert '"$EXP_ROOT/logs"' not in text
+    assert "--with_shift_aug false" in text
+    assert "--shape-window-scales 8 16 24" in text
+    assert "--shape-window-stride 4" in text
+    assert "--shapelet-count 16" in text
+    assert "--shapelet-beta 5" in text
+    assert "--shape-resample-length 16" in text
+    assert "--shapelet-diversity-weight 0.01" in text
+    assert "--shapelet-shaping-weight 0.01" in text
+    assert "--shapelet-shaping-temperature 0.1" in text
+    assert "--proto-instance-weight 0.1" in text
+    assert "--shape-ratio" not in text
+    assert "--proto-shape-weight" not in text
+
+
+def test_kmeans_structure_launcher_is_isolated_and_explicit():
+    text = Path("scripts/run_structure_proto_kmeans_init_4tasks_seed1.sh").read_text(
+        encoding="utf-8",
+    )
+    assert 'EXP_ROOT="${EXP_ROOT:-outputs/structure_proto_kmeans_init_4tasks_seed1}"' in text
+    assert 'LOG_ROOT="${LOG_ROOT:-logs/structure_proto_kmeans_init_4tasks_seed1}"' in text
+    assert text.count("--shapelet-init kmeans") == 2
+    assert 'run_task "$GPU0" AT1 "$AT1" DK1 "$DK1"' in text
+    assert 'run_task "$GPU1" FR1 "$FR1" FR2 "$FR2"' in text
+    assert 'run_task "$GPU2" FR2 "$FR2" DK1 "$DK1"' in text
+    assert 'run_task "$GPU3" DK1 "$DK1" AT1 "$AT1"' in text

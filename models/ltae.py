@@ -111,10 +111,13 @@ class MultiHeadAttention(nn.Module):
         self.key = nn.Linear(d_in, n_head * d_k)
         self.query = nn.Parameter(torch.zeros(n_head, d_k)).requires_grad_(True)
         nn.init.normal_(self.query, mean=0, std=np.sqrt(2.0 / (d_k)))
-        self.external_query_projection = (
-            nn.Linear(external_query_dim, n_head * d_k)
-            if external_query_dim is not None else None
-        )
+        self.external_query_projection = None
+        if external_query_dim is not None:
+            self.external_query_projection = nn.Linear(
+                external_query_dim, n_head * d_k, bias=False,
+            )
+            nn.init.zeros_(self.external_query_projection.weight)
+            print("QUERY_PROJECTION_INIT|zero=True")
 
         self.temperature = np.power(d_k, 0.5)
         self.dropout = nn.Dropout(0.1)
@@ -124,13 +127,12 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x, external_query=None):
         # Slightly more efficient re-implementation of LTAE
         B, T, C = x.size()
-        if external_query is None:
-            q = self.query.repeat(B, 1, 1, 1).transpose(1, 2)
-        else:
+        q = self.query.repeat(B, 1, 1, 1).transpose(1, 2)
+        if external_query is not None:
             if self.external_query_projection is None:
                 raise ValueError("this LTAE was not configured for an external query")
-            q = self.external_query_projection(external_query)
-            q = q.view(B, self.n_head, 1, self.d_k)
+            q_shape = self.external_query_projection(external_query)
+            q = q + q_shape.view(B, self.n_head, 1, self.d_k)
         k = self.key(x).view(B, T, self.n_head, self.d_k).transpose(1, 2)  # (B, nh, T, d_k)
         v = x.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         # self-attend; (B, nh, 1, d_k) x (B, nh, d_k, T) -> (B, nh, 1, T)

@@ -1,5 +1,4 @@
 import argparse
-import csv
 from collections import defaultdict
 from copy import deepcopy
 from distutils.util import strtobool
@@ -29,14 +28,19 @@ from models.stclassifier import (
     PseTempCNN,
     PseStructureProtoLTae,
 )
+from models.structure_da.discriminative_structure import (
+    initialize_shapelet_dictionary_from_tokens,
+)
 from methods.structure_da.prototype_losses import (
     compose_source_loss,
-    initialize_source_banks,
+    ensure_finite_structure_loss,
+    initialize_instance_bank,
+    instance_batch_statistics,
+    instance_prototype_loss,
     prototype_ramp,
-    select_top_shape_tokens,
-    two_level_prototype_losses,
-    update_source_banks,
-    structure_batch_statistics,
+    shapelet_data_support_loss,
+    shapelet_diversity_loss,
+    update_instance_bank,
 )
 from timematch import add_shift_estimation_arguments, train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
@@ -69,13 +73,22 @@ def add_model_arguments(parser):
     parser.add_argument('--structure-branch', dest='structure_branch', default=False, type=bool_flag)
     parser.add_argument('--structure-exposer', dest='structure_exposer', default='fourier', choices=['fourier'])
     parser.add_argument('--shape-dim', dest='shape_dim', default=128, type=int)
-    parser.add_argument('--shape-ratio', dest='shape_ratio', default=.6, type=float)
-    parser.add_argument('--shape-window-scales', dest='shape_window_scales', nargs='+', default=[16, 32], type=int)
-    parser.add_argument('--shape-window-stride', dest='shape_window_stride', default=8, type=int)
+    parser.add_argument('--shape-window-scales', dest='shape_window_scales', nargs='+', default=[8, 16, 24], type=int)
+    parser.add_argument('--shape-window-stride', dest='shape_window_stride', default=4, type=int)
+    parser.add_argument('--shapelet-count', dest='shapelet_count', default=16, type=int)
+    parser.add_argument(
+        '--shapelet-init', dest='shapelet_init', default='kmeans',
+        choices=['kmeans', 'random'],
+    )
+    parser.add_argument('--shapelet-beta', dest='shapelet_beta', default=5., type=float)
+    parser.add_argument('--shape-resample-length', dest='shape_resample_length', default=16, type=int)
+    parser.add_argument('--shapelet-diversity-margin', dest='shapelet_diversity_margin', default=.5, type=float)
+    parser.add_argument('--shapelet-diversity-weight', dest='shapelet_diversity_weight', default=.01, type=float)
+    parser.add_argument('--shapelet-shaping-weight', dest='shapelet_shaping_weight', default=.01, type=float)
+    parser.add_argument('--shapelet-shaping-temperature', dest='shapelet_shaping_temperature', default=.1, type=float)
     parser.add_argument('--proto-momentum', dest='proto_momentum', default=.9, type=float)
     parser.add_argument('--proto-temperature', dest='proto_temperature', default=.1, type=float)
-    parser.add_argument('--proto-instance-weight', dest='proto_instance_weight', default=1., type=float)
-    parser.add_argument('--proto-shape-weight', dest='proto_shape_weight', default=1., type=float)
+    parser.add_argument('--proto-instance-weight', dest='proto_instance_weight', default=.1, type=float)
     parser.add_argument('--proto-init-epoch', dest='proto_init_epoch', default=1, type=int)
     parser.add_argument('--proto-ramp-start', dest='proto_ramp_start', default=.1, type=float)
     parser.add_argument('--proto-ramp-epochs', dest='proto_ramp_epochs', default=5, type=int)
@@ -110,11 +123,13 @@ def create_model(config):
             shape_dim=config.shape_dim,
             shape_window_scales=config.shape_window_scales,
             shape_window_stride=config.shape_window_stride,
+            shapelet_count=config.shapelet_count,
+            shapelet_beta=config.shapelet_beta,
+            shape_resample_length=config.shape_resample_length,
             fourier_num_modes=config.fourier_num_modes,
             fourier_reg=config.fourier_reg,
             fourier_period_days=config.fourier_period_days,
         )
-        model.shape_prototype_bank.momentum = config.proto_momentum
         model.instance_prototype_bank.momentum = config.proto_momentum
         return model
     raise NotImplementedError(config.model)
@@ -156,17 +171,22 @@ def main(config):
             with open(os.path.join(config.fold_dir, 'manifest.json'), 'w') as stream:
                 json.dump(
                     {
-                        'method': 'discriminative_structure_dual_prototype_v1',
+                        'method': 'discriminative_structure_shapelet_v1',
                         'structure_exposer': config.structure_exposer,
                         'fourier_num_modes': config.fourier_num_modes,
                         'shape_dim': config.shape_dim,
-                        'shape_ratio': config.shape_ratio,
                         'shape_window_scales': config.shape_window_scales,
                         'shape_window_stride': config.shape_window_stride,
+                        'shapelet_count': config.shapelet_count,
+                        'shapelet_beta': config.shapelet_beta,
+                        'shape_resample_length': config.shape_resample_length,
+                        'shapelet_diversity_margin': config.shapelet_diversity_margin,
+                        'shapelet_diversity_weight': config.shapelet_diversity_weight,
+                        'shapelet_shaping_weight': config.shapelet_shaping_weight,
+                        'shapelet_shaping_temperature': config.shapelet_shaping_temperature,
                         'proto_momentum': config.proto_momentum,
                         'proto_temperature': config.proto_temperature,
                         'proto_instance_weight': config.proto_instance_weight,
-                        'proto_shape_weight': config.proto_shape_weight,
                         'proto_init_epoch': config.proto_init_epoch,
                         'proto_ramp_start': config.proto_ramp_start,
                         'proto_ramp_epochs': config.proto_ramp_epochs,
@@ -357,72 +377,98 @@ def get_num_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _append_csv(path, row):
-    exists = os.path.isfile(path)
-    with open(path, 'a', newline='') as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(row))
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-
 def _prototype_diagnostics(model, epoch):
     row = {'epoch': epoch}
-    for name, bank in (
-        ('prototype_shape', model.shape_prototype_bank),
-        ('prototype_instance', model.instance_prototype_bank),
-    ):
-        active = bank.prototypes[bank.initialized]
-        similarities = active @ active.T
-        off_diagonal = similarities[~torch.eye(active.shape[0], dtype=torch.bool, device=active.device)]
-        row[f'{name}_initialized_classes'] = int(bank.initialized.sum())
-        row[f'{name}_mean_pairwise_cos'] = float(off_diagonal.mean()) if off_diagonal.numel() else 0.
-        row[f'{name}_min_pairwise_cos'] = float(off_diagonal.min()) if off_diagonal.numel() else 0.
+    bank = model.instance_prototype_bank
+    active = bank.prototypes[bank.initialized]
+    similarities = active @ active.T
+    off_diagonal = similarities[~torch.eye(active.shape[0], dtype=torch.bool, device=active.device)]
+    row['prototype_instance_initialized_classes'] = int(bank.initialized.sum())
+    row['prototype_instance_mean_pairwise_cos'] = float(off_diagonal.mean()) if off_diagonal.numel() else 0.
+    row['prototype_instance_min_pairwise_cos'] = float(off_diagonal.min()) if off_diagonal.numel() else 0.
     return row
 
 
 def _new_structure_epoch_stats():
-    return {
-        'instance_cos': [], 'shape_cos': [], 'attention_entropy': [],
-        'top_counts': [], 'selected_by_scale': defaultdict(lambda: [0., 0.]),
-    }
+    return {'instance_cos': []}
 
 
 def _collect_structure_epoch_stats(accumulator, batch):
-    for key in ('instance_cos', 'shape_cos', 'attention_entropy', 'top_counts'):
-        accumulator[key].append(batch[key].detach())
-    for scale, (selected, valid) in batch['selected_by_scale'].items():
-        accumulator['selected_by_scale'][scale][0] += float(selected)
-        accumulator['selected_by_scale'][scale][1] += float(valid)
+    accumulator['instance_cos'].append(batch['instance_cos'].detach())
 
 
 def _summarize_structure_epoch_stats(accumulator, epoch, domain):
-    def merged(key):
-        return torch.cat(accumulator[key])
-    entropy = merged('attention_entropy')
-    counts = merged('top_counts')
-    row = {
-        'epoch': epoch,
-        f'{domain}_instance_cos_to_correct_proto': float(merged('instance_cos').mean()),
-        f'{domain}_shape_cos_to_correct_proto': float(merged('shape_cos').mean()),
-        'attention_entropy_mean': float(entropy.mean()),
-        'attention_entropy_p10': float(torch.quantile(entropy, .1)),
-        'attention_entropy_p90': float(torch.quantile(entropy, .9)),
-        'top_shape_count_mean': float(counts.mean()),
-        'top_shape_count_min': int(counts.min()),
-        'top_shape_count_max': int(counts.max()),
-    }
-    for scale, (selected, valid) in sorted(accumulator['selected_by_scale'].items()):
-        row[f'selected_fraction_scale_{scale}'] = selected / max(valid, 1.)
-    return row
+    values = torch.cat(accumulator['instance_cos'])
+    return {'epoch': epoch, f'{domain}_instance_cos_to_correct_proto': float(values.mean())}
 
 def get_dataset_size(data_root, dataset):
     dir = os.path.join(data_root, dataset)
     return len([name for name in os.listdir(os.path.join(dir, 'data')) if name.endswith('.zarr')])
 
+
+def initialize_shapelet_dictionary_from_source(
+    model, source_loader, device, seed, max_tokens=50_000,
+):
+    """Initialize shared shapelets once from unlabeled source-train shape tokens."""
+    if not isinstance(model, PseStructureProtoLTae):
+        raise TypeError("source shapelet initialization requires PseStructureProtoLTae")
+    if max_tokens < model.structure_branch.shapelet_dictionary.anchors.shape[0]:
+        raise ValueError("max_tokens must cover every shapelet anchor")
+    python_rng = random.getstate()
+    numpy_rng = np.random.get_state()
+    torch_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if cuda_rng is not None:
+        torch.cuda.manual_seed_all(seed)
+    was_training = model.training
+    collected = []
+    model.eval()
+    try:
+        with torch.no_grad():
+            for sample in source_loader:
+                pixels = sample['pixels'].to(device)
+                mask = sample['valid_pixels'].to(device)
+                positions = sample['positions'].to(device)
+                extra = sample.get('extra')
+                if extra is not None:
+                    extra = extra.to(device)
+                spatial = model.spatial_encoder(pixels, mask, extra)
+                branch = model.structure_branch
+                exposed, _ = branch.exposer(spatial, positions)
+                window_groups, _ = branch.window_extractor(exposed)
+                tokens = torch.cat([
+                    branch.token_generator(windows) for windows in window_groups
+                ], dim=1).reshape(-1, model.shape_dim)
+                remaining = max_tokens - sum(value.shape[0] for value in collected)
+                collected.append(tokens[:remaining].cpu())
+                if sum(value.shape[0] for value in collected) >= max_tokens:
+                    break
+    finally:
+        model.train(was_training)
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+        torch.set_rng_state(torch_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+    if not collected:
+        raise RuntimeError("source loader produced no shape tokens")
+    tokens = torch.cat(collected, dim=0)
+    diagnostics = initialize_shapelet_dictionary_from_tokens(
+        model.structure_branch.shapelet_dictionary, tokens, seed,
+    )
+    print(
+        "SHAPELET_KMEANS_INIT|"
+        f"tokens={diagnostics['tokens']}|anchors={diagnostics['anchors']}|"
+        f"pairwise_cos_mean={diagnostics['pairwise_cos_mean']:.6f}|"
+        f"pairwise_cos_max={diagnostics['pairwise_cos_max']:.6f}"
+    )
+    return diagnostics
+
 def train_supervised(model, config, writer, splits, val_loader, device, best_model_path):
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
     best_f1 = 0
     structure_proto = isinstance(model, PseStructureProtoLTae)
@@ -452,6 +498,19 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
     data_loader = create_train_loader(dataset, config.batch_size, config.num_workers)
     print(f'training dataset: {dataset_name}, n={len(dataset)}, batches={len(data_loader)}')
 
+    if (
+        structure_proto
+        and not config.train_on_target
+        and getattr(config, 'shapelet_init', 'kmeans') == 'kmeans'
+    ):
+        initialize_shapelet_dictionary_from_source(
+            model, data_loader, device, config.seed,
+        )
+
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay,
+    )
+
     criterion = FocalLoss(gamma=config.focal_loss_gamma)
     steps_per_epoch = len(data_loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs * steps_per_epoch, eta_min=0)
@@ -464,19 +523,11 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 for initialization_sample in data_loader:
                     initialization_labels = initialization_sample['label'].cuda(device=device, non_blocking=True)
                     init_pixels, init_mask, init_positions, init_extra = to_cuda(initialization_sample, device)
-                    yield (
-                        model(init_pixels, init_mask, init_positions, init_extra, return_dict=True),
-                        initialization_labels,
-                    )
-            initialize_source_banks(
-                initialization_batches(),
-                model.shape_prototype_bank,
-                model.instance_prototype_bank,
-                config.shape_ratio,
-            )
+                    output = model(init_pixels, init_mask, init_positions, init_extra, return_dict=True)
+                    yield output['instance_feature'], initialization_labels
+            initialize_instance_bank(initialization_batches(), model.instance_prototype_bank)
             print(
                 "STRUCTURE_PROTO_INITIALIZED|"
-                f"shape_classes={int(model.shape_prototype_bank.initialized.sum())}|"
                 f"instance_classes={int(model.instance_prototype_bank.initialized.sum())}"
             )
             best_f1 = 0
@@ -503,51 +554,54 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 loss_cls = criterion(outputs, targets)
                 if epoch < config.proto_init_epoch:
                     loss_instance = outputs.sum() * 0
-                    loss_shape = outputs.sum() * 0
                     loss_proto = outputs.sum() * 0
                     source_ramp = 0.
-                    loss = loss_cls
-                    selected_for_stats = select_top_shape_tokens(
-                        structured['shape_attention'], structured['shape_mask'], config.shape_ratio,
-                    )
                 else:
-                    loss_instance, loss_shape, selected_for_stats = two_level_prototype_losses(
-                        structured, targets,
-                        model.shape_prototype_bank, model.instance_prototype_bank,
-                        config.shape_ratio, config.proto_temperature,
+                    loss_instance = instance_prototype_loss(
+                        structured['instance_feature'], targets,
+                        model.instance_prototype_bank, config.proto_temperature,
                     )
                     source_ramp = prototype_ramp(
                         epoch - config.proto_init_epoch,
                         config.proto_ramp_epochs,
                         config.proto_ramp_start,
                     )
-                    composed = compose_source_loss(
-                        loss_cls, loss_instance, loss_shape,
-                        source_ramp,
-                        config.proto_instance_weight, config.proto_shape_weight,
-                    )
-                    loss, loss_proto = composed.total, composed.prototype_total
+                loss_diversity = shapelet_diversity_loss(
+                    model.structure_branch.shapelet_dictionary.anchors,
+                    config.shapelet_diversity_margin,
+                )
+                loss_shaping = shapelet_data_support_loss(
+                    structured['shape_tokens'],
+                    model.structure_branch.shapelet_dictionary.anchors,
+                    config.shapelet_shaping_temperature,
+                )
+                composed = compose_source_loss(
+                    loss_cls, loss_instance, loss_diversity, loss_shaping,
+                    source_ramp, config.proto_instance_weight,
+                    config.shapelet_diversity_weight, config.shapelet_shaping_weight,
+                )
+                loss, loss_proto = composed.total, composed.prototype_total
             else:
                 outputs = model.forward(pixels, mask, positions, extra)
                 loss = criterion(outputs, targets)
 
             optimizer.zero_grad()
+            if structure_proto:
+                ensure_finite_structure_loss(loss)
             loss.backward()
+            if structure_proto:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=5., error_if_nonfinite=True,
+                )
             optimizer.step()
             if structure_proto and epoch >= config.proto_init_epoch:
-                update_source_banks(
-                    structured, targets,
-                    model.shape_prototype_bank, model.instance_prototype_bank,
-                    config.shape_ratio,
+                update_instance_bank(
+                    structured['instance_feature'], targets, model.instance_prototype_bank,
                 )
             if structure_proto:
                 _collect_structure_epoch_stats(
                     epoch_structure_stats,
-                    structure_batch_statistics(
-                        structured, targets,
-                        model.shape_prototype_bank, model.instance_prototype_bank,
-                        selected_for_stats,
-                    ),
+                    instance_batch_statistics(structured, targets, model.instance_prototype_bank),
                 )
             scheduler.step()
 
@@ -561,12 +615,10 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 if structure_proto:
                     writer.add_scalar("train/loss_cls_source", loss_cls.detach(), global_step + step)
                     writer.add_scalar("train/loss_proto_instance_source", loss_instance.detach(), global_step + step)
-                    writer.add_scalar("train/loss_proto_shape_source", loss_shape.detach(), global_step + step)
+                    writer.add_scalar("train/loss_shapelet_diversity", loss_diversity.detach(), global_step + step)
+                    writer.add_scalar("train/shapelet_shaping_loss", loss_shaping.detach(), global_step + step)
                     writer.add_scalar("train/loss_proto_source_total", loss_proto.detach(), global_step + step)
                     writer.add_scalar("train/proto_ramp_source", source_ramp, global_step + step)
-                    entropy = -(structured["shape_attention"].clamp_min(1e-12).log()
-                                * structured["shape_attention"]).sum(-1).mean()
-                    writer.add_scalar("structure/attention_entropy_mean", entropy.detach(), global_step + step)
 
         progress_bar.close()
 
@@ -593,15 +645,13 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 key: value for key, value in epoch_stats.items()
                 if key.startswith('source_')
             })
-            _append_csv(
-                os.path.join(config.fold_dir, 'prototype_stats.csv'),
-                prototype_stats,
-            )
-            _append_csv(
-                os.path.join(config.fold_dir, 'attention_stats.csv'),
-                {key: value for key, value in epoch_stats.items()
-                 if not key.startswith('source_')},
-            )
+            prototype_stats.update({
+                key: value for key, value in epoch_stats.items()
+                if not key.startswith('source_')
+            })
+            print('STRUCTURE_DIAG|' + '|'.join(
+                f'{key}={value}' for key, value in prototype_stats.items()
+            ))
 
 
 def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1, test_ratio=0.2):
@@ -649,23 +699,6 @@ def save_results(metrics, config):
     with open(os.path.join(out_dir, f'class_report_{target_name}.txt'), 'w') as outfile:
         outfile.write(str(class_report))
     pkl.dump(conf_mat, open(os.path.join(out_dir, f'conf_mat_{target_name}.pkl'), 'wb'))
-    if config.model == 'psestructureprotoltae':
-        with open(os.path.join(out_dir, 'metrics.json'), 'w') as outfile:
-            json.dump(metrics, outfile, indent=4)
-        np.savetxt(os.path.join(out_dir, 'confusion_matrix.csv'), conf_mat, delimiter=',', fmt='%d')
-        with open(os.path.join(out_dir, 'class_metrics.csv'), 'w', newline='') as stream:
-            writer = csv.DictWriter(stream, fieldnames=['class_id', 'class_name', 'precision', 'recall', 'f1', 'support'])
-            writer.writeheader()
-            for class_id, class_name in enumerate(config.classes):
-                tp = float(conf_mat[class_id, class_id])
-                support = float(conf_mat[class_id].sum())
-                predicted = float(conf_mat[:, class_id].sum())
-                precision = tp / predicted if predicted else 0.
-                recall = tp / support if support else 0.
-                f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.
-                writer.writerow(dict(class_id=class_id, class_name=class_name, precision=precision, recall=recall, f1=f1, support=int(support)))
-
-
 def overall_performance(config):
     overall_metrics = defaultdict(list)
     target_name = str(config.target).replace("/", "_")

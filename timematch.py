@@ -1,6 +1,5 @@
 from collections import Counter
 from copy import deepcopy
-import csv
 from collections import defaultdict
 import os
 
@@ -21,88 +20,42 @@ from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToT
 from utils.focal_loss import FocalLoss
 from utils.train_utils import AverageMeter, bool_flag, cycle, progress_bar_disabled, to_cuda
 from methods.structure_da.prototype_losses import (
+    accumulate_class_feature_sums,
+    centroid_alignment_summary,
     compose_da_loss,
+    ensure_finite_structure_loss,
+    instance_batch_statistics,
+    instance_prototype_loss,
     prototype_ramp,
-    select_top_shape_tokens,
-    two_level_prototype_losses,
-    update_source_banks,
-    structure_batch_statistics,
+    shapelet_data_support_loss,
+    shapelet_diversity_loss,
+    update_instance_bank,
 )
 
 
-def _append_structure_csv(path, row):
-    exists = os.path.isfile(path)
-    with open(path, "a", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(row))
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-
 def _new_epoch_structure_stats():
-    return {
-        "instance_cos": [], "shape_cos": [], "attention_entropy": [],
-        "top_counts": [], "selected_by_scale": defaultdict(lambda: [0., 0.]),
-    }
+    return {"instance_cos": []}
 
 
 def _collect_epoch_structure_stats(accumulator, batch):
-    for key in ("instance_cos", "shape_cos", "attention_entropy", "top_counts"):
-        accumulator[key].append(batch[key].detach())
-    for scale, (selected, valid) in batch["selected_by_scale"].items():
-        accumulator["selected_by_scale"][scale][0] += float(selected)
-        accumulator["selected_by_scale"][scale][1] += float(valid)
+    accumulator["instance_cos"].append(batch["instance_cos"].detach())
 
 
 def _summarize_epoch_structure_stats(accumulator, prefix, expected_scales=()):
     if not accumulator["instance_cos"]:
-        row = {
-            f"{prefix}_instance_cos_to_correct_proto": float("nan"),
-            f"{prefix}_shape_cos_to_correct_proto": float("nan"),
-            f"{prefix}_attention_entropy_mean": float("nan"),
-            f"{prefix}_attention_entropy_p10": float("nan"),
-            f"{prefix}_attention_entropy_p90": float("nan"),
-            f"{prefix}_top_shape_count_mean": 0.,
-            f"{prefix}_top_shape_count_min": 0,
-            f"{prefix}_top_shape_count_max": 0,
-        }
-        for scale in expected_scales:
-            row[f"{prefix}_selected_fraction_scale_{int(scale)}"] = float("nan")
-        return row
-    merged = {key: torch.cat(accumulator[key]) for key in (
-        "instance_cos", "shape_cos", "attention_entropy", "top_counts",
-    )}
-    row = {
-        f"{prefix}_instance_cos_to_correct_proto": float(merged["instance_cos"].mean()),
-        f"{prefix}_shape_cos_to_correct_proto": float(merged["shape_cos"].mean()),
-        f"{prefix}_attention_entropy_mean": float(merged["attention_entropy"].mean()),
-        f"{prefix}_attention_entropy_p10": float(torch.quantile(merged["attention_entropy"], .1)),
-        f"{prefix}_attention_entropy_p90": float(torch.quantile(merged["attention_entropy"], .9)),
-        f"{prefix}_top_shape_count_mean": float(merged["top_counts"].mean()),
-        f"{prefix}_top_shape_count_min": int(merged["top_counts"].min()),
-        f"{prefix}_top_shape_count_max": int(merged["top_counts"].max()),
-    }
-    for scale, (selected, valid) in sorted(accumulator["selected_by_scale"].items()):
-        row[f"{prefix}_selected_fraction_scale_{scale}"] = selected / max(valid, 1.)
-    for scale in expected_scales:
-        row.setdefault(f"{prefix}_selected_fraction_scale_{int(scale)}", float("nan"))
-    return row
+        return {f"{prefix}_instance_cos_to_correct_proto": float("nan")}
+    return {f"{prefix}_instance_cos_to_correct_proto": float(torch.cat(accumulator["instance_cos"]).mean())}
 
 
 def _prototype_bank_stats(model):
     row = {}
-    for prefix, bank in (
-        ("prototype_shape", model.shape_prototype_bank),
-        ("prototype_instance", model.instance_prototype_bank),
-    ):
-        active = bank.prototypes[bank.initialized]
-        similarity = active @ active.T
-        off_diagonal = similarity[
-            ~torch.eye(active.shape[0], dtype=torch.bool, device=active.device)
-        ]
-        row[f"{prefix}_initialized_classes"] = int(bank.initialized.sum())
-        row[f"{prefix}_mean_pairwise_cos"] = float(off_diagonal.mean()) if off_diagonal.numel() else 0.
-        row[f"{prefix}_min_pairwise_cos"] = float(off_diagonal.min()) if off_diagonal.numel() else 0.
+    bank = model.instance_prototype_bank
+    active = bank.prototypes[bank.initialized]
+    similarity = active @ active.T
+    off_diagonal = similarity[~torch.eye(active.shape[0], dtype=torch.bool, device=active.device)]
+    row["prototype_instance_initialized_classes"] = int(bank.initialized.sum())
+    row["prototype_instance_mean_pairwise_cos"] = float(off_diagonal.mean()) if off_diagonal.numel() else 0.
+    row["prototype_instance_min_pairwise_cos"] = float(off_diagonal.min()) if off_diagonal.numel() else 0.
     return row
 
 
@@ -325,8 +278,6 @@ def _train_structure_proto_timematch(
     checkpoint_path = os.path.join(config.weights, f"fold_{fold_num}", "model.pt")
     packet = torch.load(checkpoint_path, weights_only=False)
     student.load_state_dict(packet["state_dict"])
-    if not student.shape_prototype_bank.initialized.all():
-        raise RuntimeError("source shape prototype bank is incomplete")
     if not student.instance_prototype_bank.initialized.all():
         raise RuntimeError("source instance prototype bank is incomplete")
     student.to(device)
@@ -362,6 +313,18 @@ def _train_structure_proto_timematch(
         teacher.eval()
         source_epoch_stats = _new_epoch_structure_stats()
         target_epoch_stats = _new_epoch_structure_stats()
+        centroid_sums = {
+            "source_instance": torch.zeros(
+                config.num_classes, student.instance_dim, device=device,
+            ),
+            "target_instance": torch.zeros(
+                config.num_classes, student.instance_dim, device=device,
+            ),
+        }
+        centroid_counts = {
+            "source": torch.zeros(config.num_classes, device=device),
+            "target": torch.zeros(config.num_classes, device=device),
+        }
         progress = tqdm(
             range(config.steps_per_epoch),
             desc=f"StructureProto TimeMatch {epoch + 1}/{config.epochs}",
@@ -387,15 +350,16 @@ def _train_structure_proto_timematch(
                 return_dict=True,
             )
             loss_cls_source = criterion(source_output["logits"], source_labels)
-            source_ins, source_shape, source_selected = two_level_prototype_losses(
-                source_output, source_labels,
-                student.shape_prototype_bank, student.instance_prototype_bank,
-                config.shape_ratio, config.proto_temperature,
+            source_ins = instance_prototype_loss(
+                source_output["instance_feature"], source_labels,
+                student.instance_prototype_bank, config.proto_temperature,
             )
-            source_proto = (
-                config.proto_instance_weight * source_ins
-                + config.proto_shape_weight * source_shape
-            )
+            source_proto = config.proto_instance_weight * source_ins
+            with torch.no_grad():
+                accumulate_class_feature_sums(
+                    centroid_sums["source_instance"], centroid_counts["source"],
+                    source_output["instance_feature"], source_labels,
+                )
 
             target_count = int(pseudo_mask.sum())
             if target_count >= 2:
@@ -406,55 +370,55 @@ def _train_structure_proto_timematch(
                 )
                 target_labels = pseudo[pseudo_mask]
                 loss_pseudo_target = criterion(target_output["logits"], target_labels)
-                teacher_selected = select_top_shape_tokens(
-                    teacher_output["shape_attention"][pseudo_mask],
-                    teacher_output["shape_mask"][pseudo_mask],
-                    config.shape_ratio,
+                target_ins = instance_prototype_loss(
+                    target_output["instance_feature"], target_labels,
+                    student.instance_prototype_bank, config.proto_temperature,
                 )
-                target_ins, target_shape, _ = two_level_prototype_losses(
-                    target_output, target_labels,
-                    student.shape_prototype_bank, student.instance_prototype_bank,
-                    config.shape_ratio, config.proto_temperature,
-                    selected_tokens=teacher_selected,
-                )
-                target_proto = (
-                    config.proto_instance_weight * target_ins
-                    + config.proto_shape_weight * target_shape
-                )
+                target_proto = config.proto_instance_weight * target_ins
+                with torch.no_grad():
+                    accumulate_class_feature_sums(
+                        centroid_sums["target_instance"], centroid_counts["target"],
+                        target_output["instance_feature"], target_labels,
+                    )
                 _collect_epoch_structure_stats(
                     target_epoch_stats,
-                    structure_batch_statistics(
-                        target_output, target_labels,
-                        student.shape_prototype_bank, student.instance_prototype_bank,
-                        teacher_selected,
-                    ),
+                    instance_batch_statistics(target_output, target_labels, student.instance_prototype_bank),
                 )
             else:
                 zero = source_output["logits"].sum() * 0
-                loss_pseudo_target = target_ins = target_shape = target_proto = zero
+                loss_pseudo_target = target_ins = target_proto = zero
+
+            loss_diversity = shapelet_diversity_loss(
+                student.structure_branch.shapelet_dictionary.anchors,
+                config.shapelet_diversity_margin,
+            )
+            loss_shaping = shapelet_data_support_loss(
+                source_output["shape_tokens"],
+                student.structure_branch.shapelet_dictionary.anchors,
+                config.shapelet_shaping_temperature,
+            )
 
             loss = compose_da_loss(
                 loss_cls_source, loss_pseudo_target, config.trade_off,
-                source_ins, source_shape, target_ins, target_shape,
-                target_ramp,
-                config.proto_instance_weight, config.proto_shape_weight,
+                source_ins, target_ins, loss_diversity, loss_shaping,
+                target_ramp, config.proto_instance_weight,
+                config.shapelet_diversity_weight, config.shapelet_shaping_weight,
             )
             optimizer.zero_grad()
+            ensure_finite_structure_loss(loss)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                student.parameters(), max_norm=5., error_if_nonfinite=True,
+            )
             optimizer.step()
             scheduler.step()
-            update_source_banks(
-                source_output, source_labels,
-                student.shape_prototype_bank, student.instance_prototype_bank,
-                config.shape_ratio,
+            update_instance_bank(
+                source_output["instance_feature"], source_labels,
+                student.instance_prototype_bank,
             )
             _collect_epoch_structure_stats(
                 source_epoch_stats,
-                structure_batch_statistics(
-                    source_output, source_labels,
-                    student.shape_prototype_bank, student.instance_prototype_bank,
-                    source_selected,
-                ),
+                instance_batch_statistics(source_output, source_labels, student.instance_prototype_bank),
             )
             update_ema_variables(student, teacher, config.ema_decay)
             if global_step % config.log_step == 0:
@@ -462,9 +426,9 @@ def _train_structure_proto_timematch(
                     "loss_cls_source": loss_cls_source,
                     "loss_pseudo_target": loss_pseudo_target,
                     "loss_proto_instance_source": source_ins,
-                    "loss_proto_shape_source": source_shape,
                     "loss_proto_instance_target": target_ins,
-                    "loss_proto_shape_target": target_shape,
+                    "loss_shapelet_diversity": loss_diversity,
+                    "shapelet_shaping_loss": loss_shaping,
                     "loss_proto_source_total": source_proto,
                     "loss_proto_target_total": target_proto,
                     "proto_ramp_source": source_ins.new_tensor(1.),
@@ -485,23 +449,26 @@ def _train_structure_proto_timematch(
         prototype_row.update(_summarize_epoch_structure_stats(
             target_epoch_stats, "target", config.shape_window_scales,
         ))
-        _append_structure_csv(
-            os.path.join(config.fold_dir, "prototype_stats.csv"), prototype_row,
-        )
-        attention_row = {"epoch": epoch}
-        for prefix, accumulator in (
-            ("source", source_epoch_stats), ("target", target_epoch_stats),
-        ):
-            summary = _summarize_epoch_structure_stats(
-                accumulator, prefix, config.shape_window_scales,
+        print("STRUCTURE_DIAG|" + "|".join(
+            f"{key}={value}" for key, value in prototype_row.items()
+        ))
+        for level in ("instance",):
+            alignment = centroid_alignment_summary(
+                centroid_sums["source_instance"], centroid_counts["source"],
+                centroid_sums["target_instance"], centroid_counts["target"],
             )
-            attention_row.update({
-                key: value for key, value in summary.items()
-                if "attention_" in key or "top_shape_" in key or "selected_fraction_" in key
-            })
-        _append_structure_csv(
-            os.path.join(config.fold_dir, "attention_stats.csv"), attention_row,
-        )
+            valid_classes = alignment["valid_classes"].detach().cpu().tolist()
+            per_class_values = alignment["per_class"].detach().cpu().tolist()
+            per_class = ",".join(
+                f"{class_id}:{value:.6f}"
+                for class_id, value in zip(valid_classes, per_class_values)
+            )
+            macro = float(alignment["macro_cos"].detach().cpu())
+            print(
+                f"DOMAIN_CENTROID_ALIGN|epoch={epoch}|level={level}|"
+                f"macro_cos={macro:.6f}|valid_classes={len(valid_classes)}|"
+                f"per_class={per_class}"
+            )
         previous_best = best_f1
         if config.run_validation:
             student.eval()

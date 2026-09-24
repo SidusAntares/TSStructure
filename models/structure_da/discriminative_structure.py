@@ -26,16 +26,23 @@ class FourierStructureExposer(nn.Module):
         )
 
     def forward(self, features, positions):
-        coefficients, _ = self.analyzer(features, positions)
+        coefficients, diagnostics = self.analyzer(features, positions)
+        if torch.any(diagnostics["solver_info"] != 0):
+            raise FloatingPointError("non-finite Fourier solve in structure-shapelet training")
+        if not torch.isfinite(coefficients).all():
+            raise FloatingPointError("non-finite Fourier coefficients in structure-shapelet training")
         grid = self.canonical_grid.to(device=features.device, dtype=features.dtype)
         grid = grid.unsqueeze(0).expand(features.shape[0], -1)
-        return self.synthesizer(coefficients, grid), grid
+        exposed = self.synthesizer(coefficients, grid)
+        if not torch.isfinite(exposed).all():
+            raise FloatingPointError("non-finite Fourier reconstruction in structure-shapelet training")
+        return exposed, grid
 
 
 class MultiScaleWindowExtractor(nn.Module):
     """Extract fixed, dense, non-extrema local windows in deterministic order."""
 
-    def __init__(self, scales=(16, 32), stride=8):
+    def __init__(self, scales=(8, 16, 24), stride=4):
         super().__init__()
         scales = tuple(int(value) for value in scales)
         if not scales or min(scales) < 2 or stride < 1:
@@ -114,9 +121,12 @@ class _VariableLengthTemporalEncoder(nn.Module):
 class ShapeTokenGenerator(nn.Module):
     """Encode normalized morphology/dynamics and absolute level/variation."""
 
-    def __init__(self, channels, shape_dim=128, branch_dim=32, eps=1e-6):
+    def __init__(self, channels, shape_dim=128, branch_dim=32, eps=1e-6, resample_length=16):
         super().__init__()
         self.eps = eps
+        self.resample_length = int(resample_length)
+        if self.resample_length < 2:
+            raise ValueError("shape resample length must be at least 2")
         self.raw_encoder = _VariableLengthTemporalEncoder(channels, branch_dim)
         self.diff_encoder = _VariableLengthTemporalEncoder(channels, branch_dim)
         self.mean_encoder = nn.Sequential(nn.Linear(channels, branch_dim), nn.GELU(), nn.Linear(branch_dim, branch_dim))
@@ -137,51 +147,90 @@ class ShapeTokenGenerator(nn.Module):
         mean = (windows * weights).sum(2) / count
         centered = windows - mean.unsqueeze(2)
         variance = (centered.square() * weights).sum(2) / count
-        std = variance.sqrt()
-        normalized = centered / (std.unsqueeze(2) + self.eps)
+        variance = variance.clamp_min(0)
+        std = torch.sqrt(variance + self.eps)
+        normalized = centered / std.unsqueeze(2)
         normalized = normalized * weights
+        batch, tokens, _, channels = normalized.shape
+        normalized = F.interpolate(
+            normalized.reshape(batch * tokens, -1, channels).transpose(1, 2),
+            size=self.resample_length, mode="linear", align_corners=True,
+        ).transpose(1, 2).reshape(batch, tokens, self.resample_length, channels)
         difference = torch.zeros_like(normalized)
         difference[:, :, 1:] = normalized[:, :, 1:] - normalized[:, :, :-1]
-        difference = difference * weights
         return {"normalized": normalized, "difference": difference, "mean": mean, "std": std}
 
     def forward(self, windows, mask=None):
         parts = self.components(windows, mask)
-        raw = self.raw_encoder(parts["normalized"], mask)
-        difference = self.diff_encoder(parts["difference"], mask)
+        raw = self.raw_encoder(parts["normalized"])
+        difference = self.diff_encoder(parts["difference"])
         mean = self.mean_encoder(parts["mean"])
         std = self.std_encoder(parts["std"])
         return self.fusion(torch.cat((raw, difference, mean, std), dim=-1))
 
 
-class ShapeAttentionPool(nn.Module):
-    def __init__(self, shape_dim):
-        super().__init__()
-        self.score = nn.Sequential(
-            nn.Linear(shape_dim, 8),
-            nn.Tanh(),
-            nn.Linear(8, 1),
-        )
+class ShapeletDictionary(nn.Module):
+    """Shared learned morphology anchors with candidate-wise soft assignment."""
 
-    def forward(self, tokens, valid_token_mask):
-        scores = self.score(tokens).squeeze(-1)
-        scores = scores.masked_fill(~valid_token_mask, -torch.inf)
-        attention = torch.softmax(scores, dim=-1)
-        attention = torch.where(valid_token_mask, attention, torch.zeros_like(attention))
-        attention = attention / attention.sum(-1, keepdim=True).clamp_min(torch.finfo(attention.dtype).eps)
-        return torch.sum(tokens * attention.unsqueeze(-1), dim=1), attention, valid_token_mask
+    def __init__(self, shape_dim=128, count=16, beta=5.):
+        super().__init__()
+        if count < 1 or beta <= 0:
+            raise ValueError("shapelet count and beta must be positive")
+        self.anchors = nn.Parameter(torch.randn(int(count), int(shape_dim)))
+        self.beta = float(beta)
+
+    def forward(self, tokens):
+        similarity = F.normalize(tokens, dim=-1) @ F.normalize(self.anchors, dim=-1).T
+        weights = torch.softmax(self.beta * similarity, dim=1)
+        return (weights * similarity).sum(dim=1)
+
+
+def initialize_shapelet_dictionary_from_tokens(dictionary, tokens, seed):
+    """Copy deterministic spherical K-means centers into an existing dictionary."""
+    from sklearn.cluster import KMeans
+
+    if tokens.ndim != 2 or tokens.shape[1] != dictionary.anchors.shape[1]:
+        raise ValueError("tokens must be [N, shape_dim]")
+    count = int(dictionary.anchors.shape[0])
+    if tokens.shape[0] < count:
+        raise ValueError(f"need at least {count} source tokens, got {tokens.shape[0]}")
+    normalized = F.normalize(tokens.detach().float().cpu(), dim=-1, eps=1e-8)
+    estimator = KMeans(n_clusters=count, random_state=int(seed), n_init=10)
+    centers = torch.from_numpy(estimator.fit(normalized.numpy()).cluster_centers_)
+    centers = F.normalize(centers, dim=-1, eps=1e-8)
+    with torch.no_grad():
+        dictionary.anchors.copy_(centers.to(
+            device=dictionary.anchors.device,
+            dtype=dictionary.anchors.dtype,
+        ))
+    anchors = F.normalize(dictionary.anchors.detach(), dim=-1, eps=1e-8)
+    pairwise = anchors @ anchors.T
+    off_diagonal = pairwise[~torch.eye(count, dtype=torch.bool, device=pairwise.device)]
+    return {
+        "tokens": int(tokens.shape[0]),
+        "anchors": count,
+        "pairwise_cos_mean": float(off_diagonal.mean().cpu()) if off_diagonal.numel() else 0.,
+        "pairwise_cos_max": float(off_diagonal.max().cpu()) if off_diagonal.numel() else 0.,
+    }
 
 
 class DiscriminativeStructureBranch(nn.Module):
     def __init__(
         self, channels, shape_dim=128, num_modes=13, grid_points=64,
-        period_days=365.0, reg=1e-3, window_scales=(16, 32), window_stride=8,
+        period_days=365.0, reg=1e-3, window_scales=(8, 16, 24), window_stride=4,
+        shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
     ):
         super().__init__()
         self.exposer = FourierStructureExposer(num_modes, grid_points, period_days, reg)
         self.window_extractor = MultiScaleWindowExtractor(window_scales, window_stride)
-        self.token_generator = ShapeTokenGenerator(channels, shape_dim)
-        self.attention_pool = ShapeAttentionPool(shape_dim)
+        self.token_generator = ShapeTokenGenerator(
+            channels, shape_dim, resample_length=shape_resample_length,
+        )
+        self.shapelet_dictionary = ShapeletDictionary(shape_dim, shapelet_count, shapelet_beta)
+        self.response_to_query = nn.Sequential(
+            nn.Linear(shapelet_count, 64), nn.GELU(),
+            nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
+        )
 
     def forward(self, features, positions):
         exposed, grid = self.exposer(features, positions)
@@ -189,14 +238,11 @@ class DiscriminativeStructureBranch(nn.Module):
         tokens = torch.cat([
             self.token_generator(windows) for windows in window_groups
         ], dim=1)
-        token_mask = torch.ones(
-            tokens.shape[:2], dtype=torch.bool, device=tokens.device,
-        )
-        class_token, attention, token_mask = self.attention_pool(tokens, token_mask)
+        response = self.shapelet_dictionary(tokens)
+        class_token = self.response_to_query(response)
         return {
             "shape_tokens": tokens,
-            "shape_attention": attention,
-            "shape_mask": token_mask,
+            "shapelet_response": response,
             "shape_class_token": class_token,
             "shape_scales": scales,
             "exposed_curve": exposed,
