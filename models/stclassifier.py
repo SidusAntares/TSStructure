@@ -25,7 +25,7 @@ class PseStructureProtoLTae(nn.Module):
         n_head=16, d_k=8, d_model=256, mlp3=[256, 128], dropout=.2,
         T=1000, mlp4=[128, 64, 32], num_classes=20,
         max_temporal_shift=100, shape_dim=128,
-        shape_window_scales=(8, 16, 24), shape_window_stride=4,
+        shape_window_scales=(8, 16, 24), shape_window_stride=8,
         shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
         fourier_num_modes=13, fourier_reg=1e-3, fourier_period_days=365.,
     ):
@@ -52,6 +52,7 @@ class PseStructureProtoLTae(nn.Module):
             external_query_dim=shape_dim,
         )
         self.decoder = get_decoder(mlp4, num_classes)
+        self.shape_classifier = nn.Linear(shapelet_count, num_classes)
         self.shape_dim = shape_dim
         self.instance_dim = mlp3[-1]
         self.instance_prototype_bank = ClassPrototypeBank(num_classes, self.instance_dim)
@@ -62,9 +63,18 @@ class PseStructureProtoLTae(nn.Module):
     def prepare_temporal_features(self, spatial_feats, positions):
         return spatial_feats
 
-    def classify_prepared(self, prepared, positions, temporal_shift=0, return_feats=False):
+    def prepare_structure(self, prepared, positions):
+        return self.structure_branch(prepared, positions)
+
+    def classify_prepared(
+        self, prepared, positions, temporal_shift=0, return_feats=False,
+        prepared_structure=None,
+    ):
         shifted_positions = positions + temporal_shift
-        structure = self.structure_branch(prepared, positions)
+        structure = (
+            self.prepare_structure(prepared, positions)
+            if prepared_structure is None else prepared_structure
+        )
         instance = self.temporal_encoder(
             prepared, shifted_positions,
             external_query=structure["shape_class_token"],
@@ -88,7 +98,12 @@ class PseStructureProtoLTae(nn.Module):
         )
         logits = self.decoder(instance)
         if return_dict:
-            return {"logits": logits, "instance_feature": instance, **structure}
+            return {
+                "logits": logits,
+                "shape_logits": self.shape_classifier(structure["shapelet_response"]),
+                "instance_feature": instance,
+                **structure,
+            }
         if return_feats:
             return logits, instance
         return logits

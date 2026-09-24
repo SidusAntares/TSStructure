@@ -10,7 +10,6 @@ import random
 import numpy as np
 import torch
 import torch.backends.cudnn
-from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import transforms
 from tqdm import tqdm
 
@@ -37,6 +36,7 @@ from methods.structure_da.prototype_losses import (
     initialize_instance_bank,
     instance_batch_statistics,
     instance_prototype_loss,
+    log_shape_health,
     prototype_ramp,
     shapelet_data_support_loss,
     shapelet_diversity_loss,
@@ -74,10 +74,10 @@ def add_model_arguments(parser):
     parser.add_argument('--structure-exposer', dest='structure_exposer', default='fourier', choices=['fourier'])
     parser.add_argument('--shape-dim', dest='shape_dim', default=128, type=int)
     parser.add_argument('--shape-window-scales', dest='shape_window_scales', nargs='+', default=[8, 16, 24], type=int)
-    parser.add_argument('--shape-window-stride', dest='shape_window_stride', default=4, type=int)
+    parser.add_argument('--shape-window-stride', dest='shape_window_stride', default=8, type=int)
     parser.add_argument('--shapelet-count', dest='shapelet_count', default=16, type=int)
     parser.add_argument(
-        '--shapelet-init', dest='shapelet_init', default='kmeans',
+        '--shapelet-init', dest='shapelet_init', default='random',
         choices=['kmeans', 'random'],
     )
     parser.add_argument('--shapelet-beta', dest='shapelet_beta', default=5., type=float)
@@ -86,6 +86,7 @@ def add_model_arguments(parser):
     parser.add_argument('--shapelet-diversity-weight', dest='shapelet_diversity_weight', default=.01, type=float)
     parser.add_argument('--shapelet-shaping-weight', dest='shapelet_shaping_weight', default=.01, type=float)
     parser.add_argument('--shapelet-shaping-temperature', dest='shapelet_shaping_temperature', default=.1, type=float)
+    parser.add_argument('--shape-class-weight', dest='shape_class_weight', default=.1, type=float)
     parser.add_argument('--proto-momentum', dest='proto_momentum', default=.9, type=float)
     parser.add_argument('--proto-temperature', dest='proto_temperature', default=.1, type=float)
     parser.add_argument('--proto-instance-weight', dest='proto_instance_weight', default=.1, type=float)
@@ -184,6 +185,10 @@ def main(config):
                         'shapelet_diversity_weight': config.shapelet_diversity_weight,
                         'shapelet_shaping_weight': config.shapelet_shaping_weight,
                         'shapelet_shaping_temperature': config.shapelet_shaping_temperature,
+                        'shape_class_weight': config.shape_class_weight,
+                        'shapelet_init': config.shapelet_init,
+                        'shape_aux_classifier': 'linear',
+                        'shape_target_supervision': 'timematch_pseudo',
                         'proto_momentum': config.proto_momentum,
                         'proto_temperature': config.proto_temperature,
                         'proto_instance_weight': config.proto_instance_weight,
@@ -211,6 +216,7 @@ def main(config):
             #         print('Skipping fold', fold_num)
             #         continue
 
+            from torch.utils.tensorboard import SummaryWriter
             writer = SummaryWriter(log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0)
             if config.method == 'timematch':
                 train_timematch(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
@@ -501,7 +507,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
     if (
         structure_proto
         and not config.train_on_target
-        and getattr(config, 'shapelet_init', 'kmeans') == 'kmeans'
+        and getattr(config, 'shapelet_init', 'random') == 'kmeans'
     ):
         initialize_shapelet_dictionary_from_source(
             model, data_loader, device, config.seed,
@@ -534,6 +540,9 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
         model.train()
         loss_meter = AverageMeter()
         epoch_structure_stats = _new_structure_epoch_stats() if structure_proto else None
+        shape_source_loss_sum = 0.
+        shape_source_correct = 0
+        shape_source_count = 0
 
         progress_bar = tqdm(
             enumerate(data_loader),
@@ -552,6 +561,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 structured = model(pixels, mask, positions, extra, return_dict=True)
                 outputs = structured["logits"]
                 loss_cls = criterion(outputs, targets)
+                loss_shape_source = criterion(structured["shape_logits"], targets)
                 if epoch < config.proto_init_epoch:
                     loss_instance = outputs.sum() * 0
                     loss_proto = outputs.sum() * 0
@@ -580,7 +590,8 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     source_ramp, config.proto_instance_weight,
                     config.shapelet_diversity_weight, config.shapelet_shaping_weight,
                 )
-                loss, loss_proto = composed.total, composed.prototype_total
+                loss = composed.total + config.shape_class_weight * loss_shape_source
+                loss_proto = composed.prototype_total
             else:
                 outputs = model.forward(pixels, mask, positions, extra)
                 loss = criterion(outputs, targets)
@@ -590,6 +601,8 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 ensure_finite_structure_loss(loss)
             loss.backward()
             if structure_proto:
+                if step == 0:
+                    log_shape_health(writer, epoch, model, structured)
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_norm=5., error_if_nonfinite=True,
                 )
@@ -599,6 +612,12 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     structured['instance_feature'], targets, model.instance_prototype_bank,
                 )
             if structure_proto:
+                batch_count = int(targets.shape[0])
+                shape_source_loss_sum += float(loss_shape_source.detach()) * batch_count
+                shape_source_correct += int(
+                    (structured["shape_logits"].detach().argmax(1) == targets).sum()
+                )
+                shape_source_count += batch_count
                 _collect_structure_epoch_stats(
                     epoch_structure_stats,
                     instance_batch_statistics(structured, targets, model.instance_prototype_bank),
@@ -614,6 +633,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 writer.add_scalar("train/lr", lr, global_step + step)
                 if structure_proto:
                     writer.add_scalar("train/loss_cls_source", loss_cls.detach(), global_step + step)
+                    writer.add_scalar("train/loss_shape_source", loss_shape_source.detach(), global_step + step)
                     writer.add_scalar("train/loss_proto_instance_source", loss_instance.detach(), global_step + step)
                     writer.add_scalar("train/loss_shapelet_diversity", loss_diversity.detach(), global_step + step)
                     writer.add_scalar("train/shapelet_shaping_loss", loss_shaping.detach(), global_step + step)
@@ -621,6 +641,17 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     writer.add_scalar("train/proto_ramp_source", source_ramp, global_step + step)
 
         progress_bar.close()
+
+        if structure_proto:
+            shape_source_loss = shape_source_loss_sum / max(shape_source_count, 1)
+            shape_source_accuracy = shape_source_correct / max(shape_source_count, 1)
+            writer.add_scalar("epoch/shape_source_loss", shape_source_loss, epoch)
+            writer.add_scalar("epoch/shape_source_accuracy", shape_source_accuracy, epoch)
+            print(
+                f"SHAPE_AUX_EPOCH|epoch={epoch}|domain=source|"
+                f"loss={shape_source_loss:.6f}|accuracy={shape_source_accuracy:.6f}|"
+                f"samples={shape_source_count}"
+            )
 
         model.eval()
         previous_best = best_f1

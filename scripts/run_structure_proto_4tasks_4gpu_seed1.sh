@@ -44,10 +44,11 @@ run_task() {
     --model psestructureprotoltae \
     --structure-branch true --structure-exposer fourier \
     --fourier_num_modes 13 --shape-dim 128 \
-    --shape-window-scales 8 16 24 --shape-window-stride 4 \
+    --shape-window-scales 8 16 24 --shape-window-stride 8 \
     --shapelet-count 16 --shapelet-beta 5 --shape-resample-length 16 \
     --shapelet-diversity-margin 0.5 --shapelet-diversity-weight 0.01 \
     --shapelet-shaping-weight 0.01 --shapelet-shaping-temperature 0.1 \
+    --shape-class-weight 0.1 \
     --proto-momentum 0.9 --proto-temperature 0.1 \
     --proto-instance-weight 0.1 \
     --proto-init-epoch 1 --proto-ramp-start 0.1 --proto-ramp-epochs 5 \
@@ -79,10 +80,11 @@ run_task() {
     --model psestructureprotoltae \
     --structure-branch true --structure-exposer fourier \
     --fourier_num_modes 13 --shape-dim 128 \
-    --shape-window-scales 8 16 24 --shape-window-stride 4 \
+    --shape-window-scales 8 16 24 --shape-window-stride 8 \
     --shapelet-count 16 --shapelet-beta 5 --shape-resample-length 16 \
     --shapelet-diversity-margin 0.5 --shapelet-diversity-weight 0.01 \
     --shapelet-shaping-weight 0.01 --shapelet-shaping-temperature 0.1 \
+    --shape-class-weight 0.1 \
     --proto-momentum 0.9 --proto-temperature 0.1 \
     --proto-instance-weight 0.1 \
     --proto-init-epoch 1 --proto-ramp-start 0.1 --proto-ramp-epochs 5 \

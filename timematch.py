@@ -26,9 +26,11 @@ from methods.structure_da.prototype_losses import (
     ensure_finite_structure_loss,
     instance_batch_statistics,
     instance_prototype_loss,
+    log_shape_health,
     prototype_ramp,
     shapelet_data_support_loss,
     shapelet_diversity_loss,
+    selected_shape_pseudo_loss,
     update_instance_bank,
 )
 
@@ -253,16 +255,31 @@ def _prepare_temporal_features(
         return model.prepare_temporal_features(spatial_feats, positions)
     return spatial_feats
 
-def _classify_prepared(model, prepared, positions, temporal_shift=0):
+def _classify_prepared(
+    model, prepared, positions, temporal_shift=0, prepared_structure=None,
+):
     if hasattr(model, "classify_prepared"):
-        return model.classify_prepared(
-            prepared,
-            positions,
-            temporal_shift=temporal_shift,
-        )
+        kwargs = {"temporal_shift": temporal_shift}
+        if prepared_structure is not None:
+            kwargs["prepared_structure"] = prepared_structure
+        return model.classify_prepared(prepared, positions, **kwargs)
     return model.decoder(
         model.temporal_encoder(prepared, positions + temporal_shift)
     )
+
+
+def _classify_shift_grid(model, prepared, positions, shifts):
+    structure = (
+        model.prepare_structure(prepared, positions)
+        if hasattr(model, "prepare_structure") else None
+    )
+    return torch.stack([
+        _classify_prepared(
+            model, prepared, positions, temporal_shift=shift,
+            prepared_structure=structure,
+        )
+        for shift in shifts
+    ], dim=1)
 
 def _train_structure_proto_timematch(
     student, config, writer, val_loader, device, best_model_path, fold_num, splits,
@@ -330,16 +347,21 @@ def _train_structure_proto_timematch(
             desc=f"StructureProto TimeMatch {epoch + 1}/{config.epochs}",
             disable=progress_bar_disabled(getattr(config, "progress_bar", "auto")),
         )
-        for _ in progress:
+        shape_source_loss_sum = 0.
+        shape_source_correct = 0
+        shape_source_count = 0
+        shape_target_loss_sum = 0.
+        shape_target_correct = 0
+        shape_target_count = 0
+        for epoch_step in progress:
             source_sample = next(source_iter)
             target_weak, target_strong = next(target_iter)
             pw, mw, tw, ew = to_cuda(target_weak, device)
             with torch.no_grad():
                 teacher_output = teacher.forward_with_temporal_shift(
                     pw, mw, tw, ew, temporal_shift=target_to_source_shift,
-                    return_dict=True,
                 )
-                probabilities = F.softmax(teacher_output["logits"], dim=1)
+                probabilities = F.softmax(teacher_output, dim=1)
                 confidence, pseudo = probabilities.max(1)
                 pseudo_mask = confidence > config.pseudo_threshold
 
@@ -350,6 +372,7 @@ def _train_structure_proto_timematch(
                 return_dict=True,
             )
             loss_cls_source = criterion(source_output["logits"], source_labels)
+            loss_shape_source = criterion(source_output["shape_logits"], source_labels)
             source_ins = instance_prototype_loss(
                 source_output["instance_feature"], source_labels,
                 student.instance_prototype_bank, config.proto_temperature,
@@ -370,6 +393,10 @@ def _train_structure_proto_timematch(
                 )
                 target_labels = pseudo[pseudo_mask]
                 loss_pseudo_target = criterion(target_output["logits"], target_labels)
+                loss_shape_target, target_shape_accuracy = selected_shape_pseudo_loss(
+                    target_output["shape_logits"], pseudo, pseudo_mask, criterion,
+                    minimum=2,
+                )
                 target_ins = instance_prototype_loss(
                     target_output["instance_feature"], target_labels,
                     student.instance_prototype_bank, config.proto_temperature,
@@ -387,6 +414,8 @@ def _train_structure_proto_timematch(
             else:
                 zero = source_output["logits"].sum() * 0
                 loss_pseudo_target = target_ins = target_proto = zero
+                loss_shape_target = zero
+                target_shape_accuracy = 0.
 
             loss_diversity = shapelet_diversity_loss(
                 student.structure_branch.shapelet_dictionary.anchors,
@@ -404,9 +433,14 @@ def _train_structure_proto_timematch(
                 target_ramp, config.proto_instance_weight,
                 config.shapelet_diversity_weight, config.shapelet_shaping_weight,
             )
+            loss = loss + config.shape_class_weight * (
+                loss_shape_source + config.trade_off * loss_shape_target
+            )
             optimizer.zero_grad()
             ensure_finite_structure_loss(loss)
             loss.backward()
+            if epoch_step == 0:
+                log_shape_health(writer, epoch, student, source_output)
             torch.nn.utils.clip_grad_norm_(
                 student.parameters(), max_norm=5., error_if_nonfinite=True,
             )
@@ -420,11 +454,23 @@ def _train_structure_proto_timematch(
                 source_epoch_stats,
                 instance_batch_statistics(source_output, source_labels, student.instance_prototype_bank),
             )
+            source_batch_count = int(source_labels.shape[0])
+            shape_source_loss_sum += float(loss_shape_source.detach()) * source_batch_count
+            shape_source_correct += int(
+                (source_output["shape_logits"].detach().argmax(1) == source_labels).sum()
+            )
+            shape_source_count += source_batch_count
+            if target_count >= 2:
+                shape_target_loss_sum += float(loss_shape_target.detach()) * target_count
+                shape_target_correct += int(round(target_shape_accuracy * target_count))
+                shape_target_count += target_count
             update_ema_variables(student, teacher, config.ema_decay)
             if global_step % config.log_step == 0:
                 metrics = {
                     "loss_cls_source": loss_cls_source,
                     "loss_pseudo_target": loss_pseudo_target,
+                    "loss_shape_source": loss_shape_source,
+                    "loss_shape_target": loss_shape_target,
                     "loss_proto_instance_source": source_ins,
                     "loss_proto_instance_target": target_ins,
                     "loss_shapelet_diversity": loss_diversity,
@@ -442,6 +488,21 @@ def _train_structure_proto_timematch(
                 ))
             global_step += 1
         progress.close()
+        source_shape_loss_epoch = shape_source_loss_sum / max(shape_source_count, 1)
+        source_shape_accuracy_epoch = shape_source_correct / max(shape_source_count, 1)
+        target_shape_loss_epoch = shape_target_loss_sum / max(shape_target_count, 1)
+        target_shape_accuracy_epoch = shape_target_correct / max(shape_target_count, 1)
+        writer.add_scalar("epoch/shape_source_loss", source_shape_loss_epoch, epoch)
+        writer.add_scalar("epoch/shape_source_accuracy", source_shape_accuracy_epoch, epoch)
+        writer.add_scalar("epoch/shape_target_loss", target_shape_loss_epoch, epoch)
+        writer.add_scalar("epoch/shape_target_pseudo_accuracy", target_shape_accuracy_epoch, epoch)
+        print(
+            f"SHAPE_AUX_EPOCH|epoch={epoch}|source_loss={source_shape_loss_epoch:.6f}|"
+            f"source_accuracy={source_shape_accuracy_epoch:.6f}|"
+            f"target_loss={target_shape_loss_epoch:.6f}|"
+            f"target_pseudo_accuracy={target_shape_accuracy_epoch:.6f}|"
+            f"source_samples={shape_source_count}|target_samples={shape_target_count}"
+        )
         prototype_row = {"epoch": epoch, **_prototype_bank_stats(student)}
         prototype_row.update(_summarize_epoch_structure_stats(
             source_epoch_stats, "source", config.shape_window_scales,
@@ -913,35 +974,15 @@ def estimate_temporal_shift(
         if shift_estimation_view == 'fourier_recon':
             coeffs, _ = analyzer(prepared, positions)
             prepared = synthesizer(coeffs, positions)
-        shift_logits = torch.stack(
-            [
-                _classify_prepared(
-                    model,
-                    prepared,
-                    positions,
-                    temporal_shift=shift,
-                )
-                for shift in shifts
-            ],
-            dim=1,
-        )
+        shift_logits = _classify_shift_grid(model, prepared, positions, shifts)
         shift_probs = F.softmax(shift_logits, dim=2)
         shift_softmaxes.append(shift_probs)
         if compare_raw:
             if shift_estimation_view == 'raw':
                 raw_shift_softmaxes.append(shift_probs)
             else:
-                raw_logits = torch.stack(
-                    [
-                        _classify_prepared(
-                            model,
-                            raw_prepared,
-                            positions,
-                            temporal_shift=shift,
-                        )
-                        for shift in shifts
-                    ],
-                    dim=1,
+                raw_logits = _classify_shift_grid(
+                    model, raw_prepared, positions, shifts,
                 )
                 raw_shift_softmaxes.append(F.softmax(raw_logits, dim=2))
     shift_softmaxes = torch.cat(shift_softmaxes).cpu().numpy()  # (N, n_shifts, n_classes)

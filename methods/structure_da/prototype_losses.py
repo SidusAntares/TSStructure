@@ -127,6 +127,98 @@ def ensure_finite_structure_loss(loss):
         raise FloatingPointError("non-finite loss in structure-shapelet training")
 
 
+def selected_shape_pseudo_loss(logits, pseudo_labels, pseudo_mask, criterion, minimum=2):
+    """Apply the existing TimeMatch pseudo-label selection to shape logits."""
+    selected_labels = pseudo_labels[pseudo_mask]
+    if logits.shape[0] != selected_labels.shape[0]:
+        raise ValueError("shape logits must contain exactly the pseudo-mask-selected samples")
+    if logits.shape[0] < minimum:
+        return logits.sum() * 0, 0.
+    loss = criterion(logits, selected_labels)
+    accuracy = float((logits.detach().argmax(1) == selected_labels).float().mean())
+    return loss, accuracy
+
+
+def _parameter_l2_norm(module):
+    values = [parameter.detach().float().square().sum() for parameter in module.parameters()]
+    if not values:
+        return 0.
+    return float(torch.sqrt(torch.stack(values).sum()))
+
+
+def _gradient_l2_norm(module):
+    values = [
+        parameter.grad.detach().float().square().sum()
+        for parameter in module.parameters() if parameter.grad is not None
+    ]
+    if not values:
+        return 0.
+    return float(torch.sqrt(torch.stack(values).sum()))
+
+
+@torch.no_grad()
+def shape_health_snapshot(model, outputs):
+    response = outputs["shapelet_response"].detach().float()
+    tokens = outputs["shape_tokens"].detach().float()
+    response_std = response.std(dim=0, unbiased=False)
+    singular_values = torch.linalg.svdvals(response)
+    probabilities = singular_values / singular_values.sum().clamp_min(1e-12)
+    effective_rank = torch.exp(
+        -(probabilities * probabilities.clamp_min(1e-12).log()).sum()
+    )
+    branch = model.structure_branch
+    query_projection = model.temporal_encoder.attention_heads.external_query_projection
+    return {
+        "shape_response_std_mean": float(response_std.mean()),
+        "shape_response_std_min": float(response_std.min()),
+        "shape_response_effective_rank": float(effective_rank),
+        "shape_token_std": float(tokens.std(unbiased=False)),
+        "shape_token_norm": float(tokens.norm(dim=-1).mean()),
+        "shape_raw_encoder_param_norm": _parameter_l2_norm(branch.token_generator.raw_encoder),
+        "shape_diff_encoder_param_norm": _parameter_l2_norm(branch.token_generator.diff_encoder),
+        "shape_fusion_param_norm": _parameter_l2_norm(branch.token_generator.fusion),
+        "shape_anchor_param_norm": float(branch.shapelet_dictionary.anchors.detach().float().norm()),
+        "shape_query_projection_norm": _parameter_l2_norm(query_projection),
+    }
+
+
+def shape_gradient_snapshot(model):
+    return {
+        "grad_norm_shape_token_generator": _gradient_l2_norm(
+            model.structure_branch.token_generator
+        ),
+        "grad_norm_shapelet_anchors": _gradient_l2_norm(
+            model.structure_branch.shapelet_dictionary
+        ),
+        "grad_norm_shape_classifier": _gradient_l2_norm(model.shape_classifier),
+        "grad_norm_query_projection": _gradient_l2_norm(
+            model.temporal_encoder.attention_heads.external_query_projection
+        ),
+    }
+
+
+def log_shape_health(writer, epoch, model, outputs):
+    """Log the already-computed first training batch without another forward/backward."""
+    values = {**shape_health_snapshot(model, outputs), **shape_gradient_snapshot(model)}
+    for name, value in values.items():
+        writer.add_scalar(f"shape_health/{name}", value, epoch)
+    print("SHAPE_HEALTH|epoch=" + str(epoch) + "|" + "|".join(
+        f"{name}={value:.6f}" for name, value in values.items()
+    ))
+    warnings = (
+        ("shape_response_std_mean", 1e-5),
+        ("shape_response_effective_rank", 1.1),
+        ("shape_token_std", 1e-5),
+    )
+    for name, threshold in warnings:
+        if values[name] < threshold:
+            print(
+                f"SHAPE_COLLAPSE_WARNING|epoch={epoch}|metric={name}|"
+                f"value={values[name]:.6g}"
+            )
+    return values
+
+
 @torch.no_grad()
 def instance_batch_statistics(outputs, labels, instance_bank):
     instance = F.normalize(outputs["instance_feature"], dim=-1)

@@ -40,6 +40,21 @@ def test_fourier_exposer_matches_existing_finite_fourier_operators():
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
 
 
+def test_fourier_exposer_canonical_buffer_matches_dynamic_synthesis_matrix():
+    torch.manual_seed(101)
+    features = torch.randn(2, 9, 4, dtype=torch.float64)
+    positions = torch.arange(9).repeat(2, 1) * 31
+    exposer = FourierStructureExposer(7, grid_points=64).double()
+    coefficients, _ = exposer.analyzer(features, positions)
+    dynamic = exposer.synthesizer(
+        coefficients,
+        exposer.canonical_grid[None].expand(features.shape[0], -1),
+    )
+    buffered = exposer.synthesize_canonical(coefficients)
+    assert "canonical_synthesis_matrix" in dict(exposer.named_buffers())
+    assert torch.allclose(buffered, dynamic, atol=1e-12, rtol=1e-10)
+
+
 def test_multiscale_windows_are_circular_without_padding():
     curve = torch.arange(64, dtype=torch.float32)[None, :, None]
     groups, scales = MultiScaleWindowExtractor((8, 16, 24), 4)(curve)
@@ -49,6 +64,15 @@ def test_multiscale_windows_are_circular_without_padding():
     assert scales.tolist() == [8] * 16 + [16] * 16 + [24] * 16
     expected_wrap = torch.cat((curve[:, 60:64], curve[:, 0:4]), dim=1)
     assert torch.equal(groups[0][:, -1], expected_wrap)
+    extractor = MultiScaleWindowExtractor((8, 16, 24), 4, grid_points=64)
+    buffered, buffered_scales = extractor(curve)
+    for scale, actual in zip((8, 16, 24), buffered):
+        indices = torch.stack([
+            (torch.arange(scale) + start) % 64 for start in range(0, 64, 4)
+        ])
+        assert torch.equal(actual, curve[:, indices])
+    assert torch.equal(buffered_scales, scales)
+    assert len(dict(extractor.named_buffers())) == 3
 
 
 def test_shape_components_preserve_level_and_amplitude_information():
@@ -124,6 +148,47 @@ def test_shapelet_dictionary_normalizes_over_candidate_tokens_and_has_gradients(
     response.sum().backward()
     assert torch.isfinite(tokens.grad).all()
     assert torch.isfinite(dictionary.anchors.grad).all()
+
+
+def test_shapelet_candidate_masks_renormalize_without_changing_all_candidate_result():
+    torch.manual_seed(31)
+    dictionary = ShapeletDictionary(shape_dim=8, count=5, beta=5.)
+    tokens = torch.randn(2, 12, 8)
+    baseline = dictionary(tokens)
+    all_candidates = dictionary.compute_response(
+        tokens, candidate_mask=torch.ones(12, dtype=torch.bool), return_details=True,
+    )
+    torch.testing.assert_close(all_candidates["response"], baseline)
+    torch.testing.assert_close(
+        all_candidates["weights"].sum(dim=1), torch.ones(2, 5),
+    )
+    for mask in (
+        torch.arange(12) < 4,
+        ~((torch.arange(12) >= 4) & (torch.arange(12) < 8)),
+        torch.arange(12) % 2 == 0,
+    ):
+        details = dictionary.compute_response(tokens, candidate_mask=mask, return_details=True)
+        assert torch.isfinite(details["response"]).all()
+        assert details["weights"][:, ~mask].eq(0).all()
+        torch.testing.assert_close(details["weights"].sum(dim=1), torch.ones(2, 5))
+
+
+def test_cached_structure_classification_is_identical_to_uncached_path():
+    torch.manual_seed(37)
+    model = PseStructureProtoLTae(
+        input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
+        n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6],
+        num_classes=3, shape_dim=6, shape_window_scales=(8,),
+        shape_window_stride=8, shapelet_count=3, fourier_num_modes=5,
+    ).eval()
+    prepared = torch.randn(2, 10, 8)
+    positions = torch.arange(10).repeat(2, 1) * 20
+    cached = model.prepare_structure(prepared, positions)
+    expected = model.classify_prepared(prepared, positions, temporal_shift=3)
+    actual = model.classify_prepared(
+        prepared, positions, temporal_shift=3, prepared_structure=cached,
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_ltae_baseline_is_unchanged_when_external_query_is_none():
@@ -226,6 +291,7 @@ def test_full_model_returns_all_training_intermediates_without_second_forward():
     extra = torch.empty(2, 6, 0)
     result = model(pixels, mask, positions, extra, return_dict=True)
     assert result["logits"].shape == (2, 3)
+    assert result["shape_logits"].shape == (2, 3)
     assert result["instance_feature"].shape == (2, 6)
     assert result["shape_tokens"].shape[-1] == 10
     assert result["shapelet_response"].shape == (2, 16)

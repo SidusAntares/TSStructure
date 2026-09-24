@@ -21,6 +21,107 @@ from models.stclassifier import PseStructureProtoLTae
 import methods.structure_da.prototype_losses as prototype_losses
 
 
+def _small_structure_model():
+    return PseStructureProtoLTae(
+        input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
+        n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6],
+        num_classes=3, shape_dim=10, shapelet_count=4,
+        fourier_num_modes=5, dropout=0,
+    )
+
+
+def _small_structure_batch():
+    return {
+        "pixels": torch.randn(4, 9, 3, 5),
+        "valid_pixels": torch.ones(4, 9, 5),
+        "positions": torch.arange(9).repeat(4, 1) * 25,
+        "extra": torch.empty(4, 9, 0),
+        "label": torch.tensor([0, 1, 2, 1]),
+    }
+
+
+def _gradient_norm(module):
+    return torch.sqrt(sum(
+        parameter.grad.detach().square().sum()
+        for parameter in module.parameters() if parameter.grad is not None
+    ))
+
+
+def test_shape_classifier_directly_supervises_tokens_and_anchors_with_zero_query_projection():
+    model = _small_structure_model().eval()
+    batch = _small_structure_batch()
+    projection = model.temporal_encoder.attention_heads.external_query_projection
+    assert torch.count_nonzero(projection.weight) == 0
+    output = model(**{key: batch[key] for key in ("pixels", "positions", "extra")},
+                   mask=batch["valid_pixels"], return_dict=True)
+    assert output["shape_logits"].shape == (4, 3)
+    loss = torch.nn.functional.cross_entropy(output["shape_logits"], batch["label"])
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert _gradient_norm(model.structure_branch.token_generator) > 0
+    assert _gradient_norm(model.structure_branch.shapelet_dictionary) > 0
+    assert _gradient_norm(model.shape_classifier) > 0
+    assert projection.weight.grad is None
+
+
+def test_target_shape_loss_uses_only_existing_pseudo_mask_and_returns_zero_when_empty():
+    from timematch import selected_shape_pseudo_loss
+
+    criterion = torch.nn.CrossEntropyLoss()
+    pseudo = torch.tensor([2, 0, 1, 2])
+    mask = torch.tensor([True, False, True, False])
+    selected_logits = torch.tensor([[0., 1., 3.], [0., 4., 1.]], requires_grad=True)
+    loss, accuracy = selected_shape_pseudo_loss(
+        selected_logits, pseudo, mask, criterion, minimum=2,
+    )
+    assert torch.allclose(loss, criterion(selected_logits, pseudo[mask]))
+    assert accuracy == 1.
+    empty_logits = selected_logits[:0]
+    zero, empty_accuracy = selected_shape_pseudo_loss(
+        empty_logits, pseudo, torch.zeros_like(mask), criterion, minimum=2,
+    )
+    assert zero.item() == 0.
+    assert empty_accuracy == 0.
+
+
+def test_new_structure_defaults_are_random_stride8_and_24_candidates():
+    import argparse
+    import train
+
+    parser = train.add_model_arguments(argparse.ArgumentParser())
+    defaults = parser.parse_args([])
+    assert defaults.shapelet_init == "random"
+    assert defaults.shape_window_stride == 8
+    explicit = parser.parse_args(["--shapelet-init", "kmeans"])
+    assert explicit.shapelet_init == "kmeans"
+    model = _small_structure_model()
+    assert model.structure_branch.window_extractor.scales == (8, 16, 24)
+    curve = torch.randn(2, 64, 8)
+    groups, scales = model.structure_branch.window_extractor(curve)
+    assert sum(group.shape[1] for group in groups) == 24
+    assert scales.numel() == 24
+
+
+def test_shape_health_snapshot_is_finite_and_detects_collapsed_response():
+    from methods.structure_da.prototype_losses import shape_health_snapshot
+
+    model = _small_structure_model()
+    output = {
+        "shapelet_response": torch.ones(4, 4),
+        "shape_tokens": torch.randn(4, 24, 10),
+    }
+    health = shape_health_snapshot(model, output)
+    assert health["shape_response_std_mean"] == 0.
+    assert health["shape_response_effective_rank"] == pytest.approx(1.)
+    assert health["shape_token_std"] > 0
+    for key in (
+        "shape_raw_encoder_param_norm", "shape_diff_encoder_param_norm",
+        "shape_fusion_param_norm", "shape_anchor_param_norm",
+        "shape_query_projection_norm",
+    ):
+        assert np.isfinite(health[key])
+
+
 def test_bank_updates_source_classes_by_ema_and_leaves_absent_class():
     bank = ClassPrototypeBank(3, 2, momentum=.5)
     features = torch.tensor([[1., 0.], [1., 0.], [0., 1.]])
@@ -215,7 +316,7 @@ def test_teacher_ema_covers_all_new_trainable_submodules():
         "structure_branch.token_generator.fusion", "structure_branch.shapelet_dictionary",
         "structure_branch.response_to_query",
         "temporal_encoder.attention_heads.external_query_projection",
-        "temporal_encoder.mlp", "decoder",
+        "temporal_encoder.mlp", "decoder", "shape_classifier",
     )
     for prefix in required:
         assert any(name.startswith(prefix) and torch.allclose(value, torch.ones_like(value))

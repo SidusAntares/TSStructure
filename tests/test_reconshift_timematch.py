@@ -565,7 +565,8 @@ def test_structure_proto_four_task_launcher_has_canonical_domains_and_gpu_mappin
     assert '"$EXP_ROOT/logs"' not in text
     assert "--with_shift_aug false" in text
     assert "--shape-window-scales 8 16 24" in text
-    assert "--shape-window-stride 4" in text
+    assert "--shape-window-stride 8" in text
+    assert text.count("--shape-class-weight 0.1") == 2
     assert "--shapelet-count 16" in text
     assert "--shapelet-beta 5" in text
     assert "--shape-resample-length 16" in text
@@ -588,3 +589,35 @@ def test_kmeans_structure_launcher_is_isolated_and_explicit():
     assert 'run_task "$GPU1" FR1 "$FR1" FR2 "$FR2"' in text
     assert 'run_task "$GPU2" FR2 "$FR2" DK1 "$DK1"' in text
     assert 'run_task "$GPU3" DK1 "$DK1" AT1 "$AT1"' in text
+
+
+def test_shift_grid_caches_structure_once_and_matches_uncached_logits(monkeypatch):
+    from timematch import _classify_shift_grid
+    from models.stclassifier import PseStructureProtoLTae
+
+    torch.manual_seed(41)
+    model = PseStructureProtoLTae(
+        input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
+        n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6],
+        num_classes=3, shape_dim=6, shape_window_scales=(8,),
+        shape_window_stride=8, shapelet_count=3, fourier_num_modes=5,
+    ).eval()
+    prepared = torch.randn(2, 10, 8)
+    positions = torch.arange(10).repeat(2, 1) * 20
+    shifts = [-2, -1, 0, 1, 2]
+    expected = torch.stack([
+        model.classify_prepared(prepared, positions, temporal_shift=shift)
+        for shift in shifts
+    ], dim=1)
+    calls = 0
+    original = model.structure_branch.forward
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model.structure_branch, "forward", counted)
+    actual = _classify_shift_grid(model, prepared, positions, shifts)
+    assert calls == 1
+    torch.testing.assert_close(actual, expected)

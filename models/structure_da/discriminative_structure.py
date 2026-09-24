@@ -7,6 +7,8 @@ from torch.nn import functional as F
 from models.fourier_reconstruction import (
     BatchedDirectFourierAnalyzer,
     BatchedDirectFourierSynthesizer,
+    _batched_fourier_matrix,
+    positions_to_periodic_points,
 )
 
 
@@ -24,6 +26,38 @@ class FourierStructureExposer(nn.Module):
             torch.arange(self.grid_points, dtype=torch.float32)
             * (self.period_days / self.grid_points),
         )
+        points = positions_to_periodic_points(self.canonical_grid, self.period_days)
+        self.register_buffer(
+            "canonical_synthesis_matrix",
+            _batched_fourier_matrix(
+                points, num_modes, self.synthesizer.synthesis_isign,
+                torch.complex64,
+            ),
+            persistent=False,
+        )
+        double_points = positions_to_periodic_points(
+            self.canonical_grid.double(), self.period_days,
+        )
+        self.register_buffer(
+            "canonical_synthesis_matrix_double",
+            _batched_fourier_matrix(
+                double_points, num_modes, self.synthesizer.synthesis_isign,
+                torch.complex128,
+            ),
+            persistent=False,
+        )
+
+    def synthesize_canonical(self, coefficients):
+        """Evaluate only the fixed canonical grid using its cached Fourier basis."""
+        cached = (
+            self.canonical_synthesis_matrix_double
+            if coefficients.dtype == torch.complex128
+            else self.canonical_synthesis_matrix
+        )
+        matrix = cached.to(
+            device=coefficients.device, dtype=coefficients.dtype,
+        )
+        return torch.matmul(matrix.unsqueeze(0), coefficients).real
 
     def forward(self, features, positions):
         coefficients, diagnostics = self.analyzer(features, positions)
@@ -33,7 +67,7 @@ class FourierStructureExposer(nn.Module):
             raise FloatingPointError("non-finite Fourier coefficients in structure-shapelet training")
         grid = self.canonical_grid.to(device=features.device, dtype=features.dtype)
         grid = grid.unsqueeze(0).expand(features.shape[0], -1)
-        exposed = self.synthesizer(coefficients, grid)
+        exposed = self.synthesize_canonical(coefficients)
         if not torch.isfinite(exposed).all():
             raise FloatingPointError("non-finite Fourier reconstruction in structure-shapelet training")
         return exposed, grid
@@ -42,27 +76,36 @@ class FourierStructureExposer(nn.Module):
 class MultiScaleWindowExtractor(nn.Module):
     """Extract fixed, dense, non-extrema local windows in deterministic order."""
 
-    def __init__(self, scales=(8, 16, 24), stride=4):
+    def __init__(self, scales=(8, 16, 24), stride=4, grid_points=64):
         super().__init__()
         scales = tuple(int(value) for value in scales)
-        if not scales or min(scales) < 2 or stride < 1:
+        if not scales or min(scales) < 2 or stride < 1 or grid_points < 2:
             raise ValueError("window scales must be >=2 and stride must be positive")
+        if max(scales) > grid_points:
+            raise ValueError("window scales cannot exceed the exposed curve length")
         self.scales = scales
         self.stride = int(stride)
+        self.grid_points = int(grid_points)
+        for index, scale in enumerate(scales):
+            starts = torch.arange(0, self.grid_points, self.stride)
+            offsets = torch.arange(scale)
+            self.register_buffer(
+                f"indices_{index}",
+                (starts[:, None] + offsets[None, :]) % self.grid_points,
+                persistent=False,
+            )
 
     def forward(self, curve):
         if curve.ndim != 3:
             raise ValueError("curve must be [B,G,D]")
         _, points, _ = curve.shape
+        if points != self.grid_points:
+            raise ValueError(
+                f"expected exposed curve length {self.grid_points}, got {points}"
+            )
         windows, scale_ids = [], []
-        for scale in self.scales:
-            if scale > points:
-                raise ValueError("window scales cannot exceed the exposed curve length")
-            starts = range(0, points, self.stride)
-            indices = torch.stack([
-                (torch.arange(scale, device=curve.device) + start) % points
-                for start in starts
-            ])
+        for index, scale in enumerate(self.scales):
+            indices = getattr(self, f"indices_{index}")
             windows.append(curve[:, indices])
             scale_ids.extend([scale] * indices.shape[0])
         if not windows:
@@ -179,10 +222,41 @@ class ShapeletDictionary(nn.Module):
         self.anchors = nn.Parameter(torch.randn(int(count), int(shape_dim)))
         self.beta = float(beta)
 
+    def compute_similarity(self, tokens):
+        return F.normalize(tokens, dim=-1) @ F.normalize(self.anchors, dim=-1).T
+
+    def compute_response(self, tokens, candidate_mask=None, return_details=False):
+        similarity = self.compute_similarity(tokens)
+        if candidate_mask is None:
+            candidate_mask = torch.ones(
+                similarity.shape[:2], dtype=torch.bool, device=similarity.device,
+            )
+        else:
+            candidate_mask = torch.as_tensor(
+                candidate_mask, dtype=torch.bool, device=similarity.device,
+            )
+            if candidate_mask.ndim == 1:
+                candidate_mask = candidate_mask.unsqueeze(0).expand(similarity.shape[0], -1)
+            if candidate_mask.shape != similarity.shape[:2]:
+                raise ValueError("candidate_mask must be [N] or [B,N]")
+        if not candidate_mask.any(dim=1).all():
+            raise ValueError("every sample must retain at least one candidate")
+        scores = (self.beta * similarity).masked_fill(
+            ~candidate_mask.unsqueeze(-1), -torch.inf,
+        )
+        weights = torch.softmax(scores, dim=1)
+        response = (weights * similarity).sum(dim=1)
+        if return_details:
+            return {
+                "response": response,
+                "similarity": similarity,
+                "weights": weights,
+                "candidate_mask": candidate_mask,
+            }
+        return response
+
     def forward(self, tokens):
-        similarity = F.normalize(tokens, dim=-1) @ F.normalize(self.anchors, dim=-1).T
-        weights = torch.softmax(self.beta * similarity, dim=1)
-        return (weights * similarity).sum(dim=1)
+        return self.compute_response(tokens)
 
 
 def initialize_shapelet_dictionary_from_tokens(dictionary, tokens, seed):
@@ -217,12 +291,14 @@ def initialize_shapelet_dictionary_from_tokens(dictionary, tokens, seed):
 class DiscriminativeStructureBranch(nn.Module):
     def __init__(
         self, channels, shape_dim=128, num_modes=13, grid_points=64,
-        period_days=365.0, reg=1e-3, window_scales=(8, 16, 24), window_stride=4,
+        period_days=365.0, reg=1e-3, window_scales=(8, 16, 24), window_stride=8,
         shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
     ):
         super().__init__()
         self.exposer = FourierStructureExposer(num_modes, grid_points, period_days, reg)
-        self.window_extractor = MultiScaleWindowExtractor(window_scales, window_stride)
+        self.window_extractor = MultiScaleWindowExtractor(
+            window_scales, window_stride, grid_points=grid_points,
+        )
         self.token_generator = ShapeTokenGenerator(
             channels, shape_dim, resample_length=shape_resample_length,
         )
