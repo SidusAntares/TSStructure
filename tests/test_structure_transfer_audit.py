@@ -9,6 +9,7 @@ from analysis.structure_transfer_audit import (
     forward_prepared_intervention,
     gradient_conflict_metrics,
     prepare_intervention,
+    query_geometry,
     remove_direction,
 )
 from models.stclassifier import PseStructureProtoLTae
@@ -110,3 +111,15 @@ def test_fixed_seed_class_sampling_is_reproducible():
     assert np.array_equal(first, second)
     assert not np.array_equal(first, third)
     assert all(np.sum(labels[first] == label) == 4 for label in (0, 1, 2))
+
+
+def test_query_geometry_aggregates_at_cpu_logging_boundary():
+    qmaster = torch.tensor([[3.0, 4.0], [0.0, 5.0]])
+    qshape = torch.tensor([[[3.0, 4.0], [0.0, 5.0]], [[0.0, 5.0], [3.0, 4.0]]])
+    result = query_geometry(qmaster, qshape)
+    assert result["qmaster_norm"] == 5.0
+    assert result["qshape_qmaster_norm_ratio"] == 1.0
+    assert np.isfinite(result["qmaster_qshape_cosine"])
+    if torch.cuda.is_available():
+        mixed = query_geometry(qmaster.cuda(), qshape.cpu())
+        assert mixed == result

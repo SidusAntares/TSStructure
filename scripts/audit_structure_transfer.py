@@ -31,7 +31,7 @@ from analysis.structure_transfer_audit import (
     candidate_mask, class_centroid_metrics, deterministic_class_indices,
     domain_gap, effective_rank, forward_prepared_intervention,
     gradient_conflict_metrics, prepare_intervention, pse_domain_gap,
-    pse_temporal_metrics, remove_direction,
+    pse_temporal_metrics, query_geometry, remove_direction,
 )
 
 
@@ -559,11 +559,11 @@ def run(args):
             if stage == "uda_best": best_pseudo = packet_values
         write_csv(output / f"pseudo_confusion_{task}.csv", task_confusions)
         query, query_per_class, query_storage = evaluate_interventions(best_model, datasets[(target, "test")], device, config.classes, args.batch_size, args.seed, "query")
-        projection = best_model.temporal_encoder.attention_heads.external_query_projection
         qmaster = best_model.temporal_encoder.attention_heads.query.detach()
         full_qshape = torch.cat(query_storage["1.0"]["qshape"])
+        geometry = query_geometry(qmaster, full_qshape)
         for row in query:
-            row.update({"task": task, "qmaster_norm": float(qmaster.norm(dim=-1).mean()), "qshape_qmaster_norm_ratio": float(full_qshape.norm(dim=-1).mean() / qmaster.norm(dim=-1).mean().clamp_min(1e-12)), "qmaster_qshape_cosine": float(F.cosine_similarity(qmaster.flatten()[None], full_qshape.mean(0).flatten()[None]))})
+            row.update({"task": task, **geometry})
         for row in query_per_class: row["task"] = task
         del query_storage, full_qshape
         component, component_per_class, _ = evaluate_interventions(best_model, datasets[(target, "test")], device, config.classes, args.batch_size, args.seed, "component")

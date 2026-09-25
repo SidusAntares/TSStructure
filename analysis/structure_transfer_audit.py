@@ -52,6 +52,22 @@ def effective_rank(values, eps=1e-12):
     return float(torch.exp(-(probability * probability.clamp_min(eps).log()).sum()))
 
 
+def query_geometry(qmaster, qshape, eps=1e-12):
+    """Aggregate query geometry after moving both tensors to the CPU log boundary."""
+    qmaster = torch.as_tensor(qmaster).detach().float().cpu()
+    qshape = torch.as_tensor(qshape).detach().float().cpu()
+    master_norm = qmaster.norm(dim=-1).mean()
+    shape_norm = qshape.norm(dim=-1).mean()
+    shape_mean = qshape.mean(0)
+    return {
+        "qmaster_norm": float(master_norm),
+        "qshape_qmaster_norm_ratio": float(shape_norm / master_norm.clamp_min(eps)),
+        "qmaster_qshape_cosine": float(F.cosine_similarity(
+            qmaster.flatten()[None], shape_mean.flatten()[None], eps=eps,
+        )),
+    }
+
+
 def candidate_mask(branch, mode, device):
     """Return a mask over the production stride-8 candidate ordering."""
     scales, starts = [], []
