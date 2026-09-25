@@ -705,6 +705,21 @@ def test_structure_proto_v4_launcher_retrains_sources_and_has_no_removed_weights
         assert removed not in text
 
 
+def test_structure_proto_v5_launcher_reuses_v4_sources_and_runs_only_uda():
+    text = Path("scripts/run_structure_proto_v5_4tasks_4gpu_seed1.sh").read_text(
+        encoding="utf-8",
+    )
+    assert 'SOURCE_ROOT="${SOURCE_ROOT:-outputs/structure_proto_v4_4tasks_seed1/source}"' in text
+    assert 'EXP_ROOT="${EXP_ROOT:-outputs/structure_proto_v5_4tasks_seed1}"' in text
+    assert 'LOG_ROOT="${LOG_ROOT:-logs/structure_proto_v5_4tasks_seed1}"' in text
+    assert 'RUN_ROOT="${RUN_ROOT:-runs/structure_proto_v5_4tasks_seed1}"' in text
+    assert '--epochs 100' not in text
+    assert text.count('--epochs 20 --steps_per_epoch 500') == 1
+    assert '--shared-adv-weight 0.1' in text
+    assert '--private-domain-weight 0.1' in text
+    assert '--separation-weight 0.01' in text
+
+
 def test_shift_grid_caches_structure_once_and_matches_uncached_logits(monkeypatch):
     from timematch import _classify_shift_grid
     from models.stclassifier import PseStructureProtoLTae

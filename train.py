@@ -169,7 +169,7 @@ def main(config):
             with open(os.path.join(config.fold_dir, 'manifest.json'), 'w') as stream:
                 json.dump(
                     {
-                        'method': 'discriminative_structure_adversarial_v4',
+                        'method': 'discriminative_structure_shared_private_v5',
                         'structure_exposer': config.structure_exposer,
                         'fourier_num_modes': config.fourier_num_modes,
                         'shape_dim': config.shape_dim,
@@ -183,15 +183,22 @@ def main(config):
                         'shape_class_weight': config.shape_class_weight,
                         'shapelet_response': 'strength+concentration',
                         'shape_response_dim': 2 * config.shapelet_count,
-                        'invariant_projector': 'residual_mlp',
-                        'domain_adaptation': 'structure_grl',
-                        'domain_classifier_input': 'shape_invariant_feature',
-                        'domain_target_scope': 'all_target_samples',
+                        'structure_decomposition': 'shared_private',
+                        'shared_dim': 64,
+                        'domain_dim': 32,
+                        'shared_usage': 'shape_classifier+Qshape',
+                        'domain_usage': 'domain_only',
+                        'shared_domain_objective': 'GRL',
+                        'private_domain_objective': 'domain_classification',
+                        'separation': 'cross_covariance',
+                        'shared_adv_weight': getattr(config, 'shared_adv_weight', .1),
+                        'private_domain_weight': getattr(config, 'private_domain_weight', .1),
+                        'separation_weight': getattr(config, 'separation_weight', .01),
                         'target_shape_loss': False,
                         'instance_prototype': False,
                         'shape_support_loss': False,
-                        'shape_alignment': False,
-                        'stats_alignment': False,
+                        'shape_stats_alignment': False,
+                        'ema_memory': False,
                         'shapelet_init': config.shapelet_init,
                         'shape_aux_classifier': 'linear',
                     },
@@ -804,6 +811,9 @@ if __name__ == '__main__':
     timematch.add_argument("--pseudo_threshold", default=0.9, type=float, help='confidence threshold for assigning pseudo labels')
     timematch.add_argument("--ema_decay", default=0.9999, type=float, help='decay rate for mean teacher')
     timematch.add_argument("--trade_off", type=float, default=2.0, help='weight for unsupervised loss')
+    timematch.add_argument('--shared-adv-weight', dest='shared_adv_weight', default=.1, type=float)
+    timematch.add_argument('--private-domain-weight', dest='private_domain_weight', default=.1, type=float)
+    timematch.add_argument('--separation-weight', dest='separation_weight', default=.01, type=float)
     timematch.add_argument("--estimate_shift", type=bool_flag, default=True, help='whether to account for temporal shift')
     timematch.add_argument('--epochs', default=20, type=int, help='Number of epochs per fold')
     timematch.add_argument("--steps_per_epoch", type=int, default=500, help='n steps per epoch')

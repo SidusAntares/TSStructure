@@ -13,7 +13,10 @@ from models.ltae import LTAE
 from models.pse import PixelSetEncoder
 from models.tae import TemporalAttentionEncoder
 from models.structure_da.discriminative_structure import DiscriminativeStructureBranch
-from models.structure_da.discriminative_structure import StructureDomainClassifier
+from models.structure_da.discriminative_structure import (
+    PrivateDomainClassifier,
+    StructureDomainClassifier,
+)
 from models.structure_da.prototype_bank import ClassPrototypeBank
 
 
@@ -55,6 +58,7 @@ class PseStructureProtoLTae(nn.Module):
         self.decoder = get_decoder(mlp4, num_classes)
         self.shape_classifier = nn.Linear(2 * shapelet_count, num_classes)
         self.domain_classifier = StructureDomainClassifier(2 * shapelet_count)
+        self.private_domain_classifier = PrivateDomainClassifier(32)
         self.shape_dim = shape_dim
         self.instance_dim = mlp3[-1]
         self.instance_prototype_bank = ClassPrototypeBank(num_classes, self.instance_dim)
@@ -102,7 +106,7 @@ class PseStructureProtoLTae(nn.Module):
         if return_dict:
             return {
                 "logits": logits,
-                "shape_logits": self.shape_classifier(structure["shape_invariant_feature"]),
+                "shape_logits": self.shape_classifier(structure["shape_shared_feature"]),
                 "instance_feature": instance,
                 **structure,
             }

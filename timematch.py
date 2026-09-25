@@ -28,7 +28,7 @@ from methods.structure_da.prototype_losses import (
     memory_class_balanced_shape_pseudo_loss,
     memory_class_relative_domain_alignment,
     compose_da_loss,
-    compose_structure_v4_da_loss,
+    compose_structure_v5_da_loss,
     ensure_finite_structure_loss,
     instance_batch_statistics,
     instance_prototype_loss,
@@ -38,10 +38,43 @@ from methods.structure_da.prototype_losses import (
     shapelet_diversity_loss,
     selected_shape_pseudo_loss,
     masked_pseudo_classification_loss,
+    shared_private_separation_loss,
     structure_domain_adversarial_loss,
+    structure_private_domain_loss,
     update_instance_bank,
 )
 from models.structure_da.prototype_bank import ClassFeatureMemory
+
+
+def _reset_trainable_module(module):
+    for child in module.modules():
+        if child is not module and hasattr(child, "reset_parameters"):
+            child.reset_parameters()
+
+
+def load_v4_source_for_v5(model, checkpoint):
+    """Load a V4 source checkpoint and initialize only V5 domain modules."""
+    incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    allowed = (
+        "structure_branch.domain_projector.",
+        "private_domain_classifier.",
+    )
+    invalid_missing = [
+        key for key in incompatible.missing_keys if not key.startswith(allowed)
+    ]
+    if invalid_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "incompatible V4 source checkpoint: "
+            f"invalid_missing={invalid_missing}, "
+            f"unexpected={list(incompatible.unexpected_keys)}"
+        )
+    _reset_trainable_module(model.domain_classifier)
+    _reset_trainable_module(model.structure_branch.domain_projector)
+    _reset_trainable_module(model.private_domain_classifier)
+    return {
+        "missing_keys": list(incompatible.missing_keys),
+        "unexpected_keys": list(incompatible.unexpected_keys),
+    }
 
 
 def _new_epoch_structure_stats():
@@ -772,7 +805,14 @@ def _train_structure_proto_timematch(
         splits, config, config.balance_source,
     )
     checkpoint_path = os.path.join(config.weights, f"fold_{fold_num}", "model.pt")
-    student.load_state_dict(torch.load(checkpoint_path, weights_only=False)["state_dict"])
+    compatibility = load_v4_source_for_v5(
+        student, torch.load(checkpoint_path, weights_only=False),
+    )
+    print(
+        "STRUCTURE_V5_SOURCE_LOAD|"
+        f"checkpoint={checkpoint_path}|"
+        f"missing={','.join(compatibility['missing_keys'])}|unexpected=none"
+    )
     student.to(device)
     teacher = deepcopy(student).to(device)
     teacher.eval()
@@ -807,11 +847,11 @@ def _train_structure_proto_timematch(
         epoch_sums = defaultdict(float)
         pseudo_total = pseudo_accepted = 0
         source_shape_correct = source_samples = 0
-        domain_source_correct = domain_target_correct = 0
-        domain_source_count = domain_target_count = 0
+        shared_domain_correct = private_domain_correct = 0
+        domain_sample_count = 0
         progress = tqdm(
             range(config.steps_per_epoch),
-            desc=f"StructureV4 TimeMatch {epoch + 1}/{config.epochs}",
+            desc=f"StructureV5 TimeMatch {epoch + 1}/{config.epochs}",
             disable=progress_bar_disabled(getattr(config, "progress_bar", "auto")),
         )
         for epoch_step in progress:
@@ -849,16 +889,34 @@ def _train_structure_proto_timematch(
             )
             progress_value = global_step / max(total_steps - 1, 1)
             grl_alpha = 2. / (1. + math.exp(-10. * progress_value)) - 1.
-            domain = structure_domain_adversarial_loss(
+            shared_domain = structure_domain_adversarial_loss(
                 student.domain_classifier,
-                source_output["shape_invariant_feature"],
-                target_output["shape_invariant_feature"],
+                source_output["shape_shared_feature"],
+                target_output["shape_shared_feature"],
                 grl_alpha,
             )
-            loss = compose_structure_v4_da_loss(
+            private_domain = structure_private_domain_loss(
+                student.private_domain_classifier,
+                source_output["shape_domain_feature"],
+                target_output["shape_domain_feature"],
+            )
+            loss_separation = shared_private_separation_loss(
+                torch.cat((
+                    source_output["shape_shared_feature"],
+                    target_output["shape_shared_feature"],
+                )),
+                torch.cat((
+                    source_output["shape_domain_feature"],
+                    target_output["shape_domain_feature"],
+                )),
+            )
+            loss = compose_structure_v5_da_loss(
                 loss_cls_source, loss_pseudo_target, loss_shape_source,
-                loss_diversity, domain["loss"], config.trade_off,
+                loss_diversity, shared_domain["loss"], private_domain["loss"],
+                loss_separation, config.trade_off,
                 config.shape_class_weight, config.shapelet_diversity_weight,
+                config.shared_adv_weight, config.private_domain_weight,
+                config.separation_weight,
             )
 
             optimizer.zero_grad()
@@ -879,29 +937,23 @@ def _train_structure_proto_timematch(
             source_shape_correct += int(
                 (source_output["shape_logits"].detach().argmax(1) == source_labels).sum()
             )
-            domain_source_count += source_count
-            domain_target_count += target_count
-            domain_source_correct += int(round(float(domain["source_accuracy"]) * source_count))
-            domain_target_correct += int(round(float(domain["target_accuracy"]) * target_count))
-            strength = source_output["shapelet_strength"].detach().float()
-            concentration = source_output["shapelet_concentration"].detach().float()
-            singular = torch.linalg.svdvals(
-                source_output["shapelet_response"].detach().float(),
-            )
-            singular_probability = singular / singular.sum().clamp_min(1e-12)
-            response_rank = torch.exp(-(
-                singular_probability
-                * singular_probability.clamp_min(1e-12).log()
-            ).sum())
+            domain_sample_count += source_count + target_count
+            shared_domain_correct += int(round(
+                float(shared_domain["source_accuracy"]) * source_count
+                + float(shared_domain["target_accuracy"]) * target_count
+            ))
+            private_domain_correct += int(round(
+                float(private_domain["source_accuracy"]) * source_count
+                + float(private_domain["target_accuracy"]) * target_count
+            ))
             values = {
                 "loss_cls_source": loss_cls_source.detach(),
                 "loss_pseudo_target": loss_pseudo_target.detach(),
                 "loss_shape_source": loss_shape_source.detach(),
                 "loss_shapelet_diversity": loss_diversity.detach(),
-                "loss_domain": domain["loss"].detach(),
-                "shape_response_effective_rank": response_rank,
-                "shape_concentration_mean": concentration.mean(),
-                "shape_concentration_std": concentration.std(unbiased=False),
+                "loss_shared_adv": shared_domain["loss"].detach(),
+                "loss_private_domain": private_domain["loss"].detach(),
+                "loss_separation": loss_separation.detach(),
                 "grl_alpha": source_output["logits"].new_tensor(grl_alpha),
             }
             for name, value in values.items():
@@ -910,7 +962,7 @@ def _train_structure_proto_timematch(
                 metrics = {**values, "loss_total": loss.detach()}
                 for name, value in metrics.items():
                     writer.add_scalar(f"train/{name}", value, global_step)
-                print("STRUCTURE_V4_DA|" + "|".join(
+                print("STRUCTURE_V5_DA|" + "|".join(
                     f"{name}={float(value):.6f}" for name, value in metrics.items()
                 ))
             global_step += 1
@@ -920,16 +972,13 @@ def _train_structure_proto_timematch(
         epoch_values = {name: value / batches for name, value in epoch_sums.items()}
         epoch_values.update({
             "pseudo_coverage": pseudo_accepted / max(pseudo_total, 1),
-            "domain_accuracy_source": domain_source_correct / max(domain_source_count, 1),
-            "domain_accuracy_target": domain_target_correct / max(domain_target_count, 1),
-            "domain_accuracy_overall": (
-                domain_source_correct + domain_target_correct
-            ) / max(domain_source_count + domain_target_count, 1),
+            "shared_domain_accuracy": shared_domain_correct / max(domain_sample_count, 1),
+            "private_domain_accuracy": private_domain_correct / max(domain_sample_count, 1),
             "source_shape_accuracy": source_shape_correct / max(source_samples, 1),
         })
         for name, value in epoch_values.items():
             writer.add_scalar(f"epoch/{name}", value, epoch)
-        print("SHAPE_V4_EPOCH|epoch=" + str(epoch) + "|" + "|".join(
+        print("SHAPE_V5_EPOCH|epoch=" + str(epoch) + "|" + "|".join(
             f"{name}={value:.6f}" for name, value in epoch_values.items()
         ))
 

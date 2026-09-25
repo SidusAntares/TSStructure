@@ -144,6 +144,21 @@ def compose_structure_v4_da_loss(
     )
 
 
+def compose_structure_v5_da_loss(
+    classification, pseudo_target, source_shape, diversity,
+    shared_adversarial, private_domain, separation,
+    trade_off=2., shape_weight=.1, diversity_weight=.01,
+    shared_adv_weight=.1, private_domain_weight=.1, separation_weight=.01,
+):
+    return (
+        classification + trade_off * pseudo_target
+        + shape_weight * source_shape + diversity_weight * diversity
+        + shared_adv_weight * shared_adversarial
+        + private_domain_weight * private_domain
+        + separation_weight * separation
+    )
+
+
 def masked_pseudo_classification_loss(logits, pseudo_labels, pseudo_mask, criterion):
     if not (logits.shape[0] == pseudo_labels.shape[0] == pseudo_mask.shape[0]):
         raise ValueError("target logits, pseudo labels, and mask must align")
@@ -176,6 +191,39 @@ def structure_domain_adversarial_loss(
         "source_count": int(source_logits.shape[0]),
         "target_count": int(target_logits.shape[0]),
     }
+
+
+def structure_private_domain_loss(classifier, source_features, target_features):
+    source_logits = classifier(source_features)
+    target_logits = classifier(target_features)
+    source_labels = torch.zeros(
+        source_logits.shape[0], dtype=torch.long, device=source_logits.device,
+    )
+    target_labels = torch.ones(
+        target_logits.shape[0], dtype=torch.long, device=target_logits.device,
+    )
+    source_loss = F.cross_entropy(source_logits, source_labels)
+    target_loss = F.cross_entropy(target_logits, target_labels)
+    return {
+        "loss": .5 * (source_loss + target_loss),
+        "source_loss": source_loss,
+        "target_loss": target_loss,
+        "source_accuracy": (source_logits.detach().argmax(1) == source_labels).float().mean(),
+        "target_accuracy": (target_logits.detach().argmax(1) == target_labels).float().mean(),
+        "source_count": int(source_logits.shape[0]),
+        "target_count": int(target_logits.shape[0]),
+    }
+
+
+def shared_private_separation_loss(shared_features, private_features):
+    if shared_features.ndim != 2 or private_features.ndim != 2:
+        raise ValueError("shared/private features must both be rank-2")
+    if shared_features.shape[0] != private_features.shape[0]:
+        raise ValueError("shared/private features must contain the same samples")
+    shared_centered = shared_features - shared_features.mean(dim=0, keepdim=True)
+    private_centered = private_features - private_features.mean(dim=0, keepdim=True)
+    covariance = shared_centered.T @ private_centered / max(shared_features.shape[0], 1)
+    return covariance.square().mean()
 
 
 def selected_shape_pseudo_loss(logits, pseudo_labels, pseudo_mask, criterion, minimum=2):

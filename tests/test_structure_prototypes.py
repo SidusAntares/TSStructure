@@ -13,18 +13,21 @@ from methods.structure_da.prototype_losses import (
     compose_source_loss,
     compose_structure_v4_da_loss,
     compose_structure_v4_source_loss,
+    compose_structure_v5_da_loss,
     initialize_instance_bank,
     instance_prototype_loss,
     prototype_contrastive_loss,
     shapelet_diversity_loss,
     shapelet_data_support_loss,
     masked_pseudo_classification_loss,
+    shared_private_separation_loss,
+    structure_private_domain_loss,
     structure_domain_adversarial_loss,
     update_instance_bank,
     ensure_finite_structure_loss,
 )
 from models.structure_da.prototype_bank import ClassFeatureMemory, ClassPrototypeBank
-from timematch import update_ema_variables
+from timematch import load_v4_source_for_v5, update_ema_variables
 from models.stclassifier import PseStructureProtoLTae
 import methods.structure_da.prototype_losses as prototype_losses
 
@@ -95,6 +98,117 @@ def test_v4_synthetic_source_target_step_is_finite_and_uses_full_target_domain_b
     total.backward()
     assert _gradient_norm(model.structure_branch.invariant_projector) > 0
     assert _gradient_norm(model.domain_classifier) > 0
+
+
+def test_v5_shared_and_private_gradient_paths_are_isolated():
+    model = _small_structure_model().train()
+    batch = _small_structure_batch()
+    output = model(
+        batch["pixels"], batch["valid_pixels"], batch["positions"], batch["extra"],
+        return_dict=True,
+    )
+    shared_loss = structure_domain_adversarial_loss(
+        model.domain_classifier,
+        output["shape_shared_feature"], output["shape_shared_feature"].detach(),
+        alpha=.5,
+    )["loss"]
+    shared_parameters = tuple(model.structure_branch.invariant_projector.parameters())
+    private_parameters = tuple(model.structure_branch.domain_projector.parameters())
+    shared_grads = torch.autograd.grad(
+        shared_loss, shared_parameters + private_parameters,
+        retain_graph=True, allow_unused=True,
+    )
+    assert any(value is not None for value in shared_grads[:len(shared_parameters)])
+    assert all(value is None for value in shared_grads[len(shared_parameters):])
+
+    private_loss = structure_private_domain_loss(
+        model.private_domain_classifier,
+        output["shape_domain_feature"], output["shape_domain_feature"].detach(),
+    )["loss"]
+    private_grads = torch.autograd.grad(
+        private_loss, shared_parameters + private_parameters,
+        allow_unused=True,
+    )
+    assert all(value is None for value in private_grads[:len(shared_parameters)])
+    assert any(value is not None for value in private_grads[len(shared_parameters):])
+
+
+def test_v5_cross_covariance_separation_zero_and_positive():
+    shared = torch.tensor([[1., 0.], [-1., 0.]])
+    independent = torch.ones(2, 1)
+    correlated = shared[:, :1].clone()
+    assert shared_private_separation_loss(shared, independent).item() == 0
+    assert shared_private_separation_loss(shared, correlated).item() > 0
+
+
+def test_v5_empty_pseudo_keeps_all_structure_decomposition_losses():
+    model = _small_structure_model().train()
+    source = _small_structure_batch()
+    target = _small_structure_batch()
+    source_output = model(
+        source["pixels"], source["valid_pixels"], source["positions"], source["extra"],
+        return_dict=True,
+    )
+    target_output = model(
+        target["pixels"], target["valid_pixels"], target["positions"], target["extra"],
+        return_dict=True,
+    )
+    criterion = torch.nn.CrossEntropyLoss()
+    pseudo_loss = masked_pseudo_classification_loss(
+        target_output["logits"], torch.zeros(4, dtype=torch.long),
+        torch.zeros(4, dtype=torch.bool), criterion,
+    )
+    shared = structure_domain_adversarial_loss(
+        model.domain_classifier, source_output["shape_shared_feature"],
+        target_output["shape_shared_feature"], alpha=.5,
+    )["loss"]
+    private = structure_private_domain_loss(
+        model.private_domain_classifier, source_output["shape_domain_feature"],
+        target_output["shape_domain_feature"],
+    )["loss"]
+    separation = shared_private_separation_loss(
+        torch.cat((source_output["shape_shared_feature"], target_output["shape_shared_feature"])),
+        torch.cat((source_output["shape_domain_feature"], target_output["shape_domain_feature"])),
+    )
+    total = compose_structure_v5_da_loss(
+        criterion(source_output["logits"], source["label"]), pseudo_loss,
+        criterion(source_output["shape_logits"], source["label"]),
+        shapelet_diversity_loss(model.structure_branch.shapelet_dictionary.anchors, .5),
+        shared, private, separation,
+    )
+    assert pseudo_loss.item() == 0
+    assert shared > 0 and private > 0 and separation >= 0
+    assert torch.isfinite(total)
+
+
+def test_v5_loads_v4_source_with_only_new_missing_keys_and_resets_domain_modules():
+    source_model = _small_structure_model()
+    with torch.no_grad():
+        for parameter in source_model.structure_branch.invariant_projector.parameters():
+            parameter.fill_(.25)
+        for parameter in source_model.domain_classifier.parameters():
+            parameter.fill_(7.)
+    v4_state = {
+        key: value.clone() for key, value in source_model.state_dict().items()
+        if not key.startswith("structure_branch.domain_projector.")
+        and not key.startswith("private_domain_classifier.")
+    }
+    target_model = _small_structure_model()
+    report = load_v4_source_for_v5(target_model, {"state_dict": v4_state})
+    assert report["unexpected_keys"] == []
+    assert report["missing_keys"]
+    assert all(
+        key.startswith(("structure_branch.domain_projector.", "private_domain_classifier."))
+        for key in report["missing_keys"]
+    )
+    assert all(
+        torch.allclose(parameter, torch.full_like(parameter, .25))
+        for parameter in target_model.structure_branch.invariant_projector.parameters()
+    )
+    assert not all(
+        torch.allclose(parameter, torch.full_like(parameter, 7.))
+        for parameter in target_model.domain_classifier.parameters()
+    )
 
 
 def test_shape_classifier_directly_supervises_tokens_and_anchors_with_zero_query_projection():
@@ -389,6 +503,19 @@ def test_v4_loss_composition_contains_only_frozen_terms():
     )
 
 
+def test_v5_loss_composition_contains_only_frozen_and_three_decomposition_terms():
+    values = [torch.tensor(float(value)) for value in range(1, 8)]
+    actual = compose_structure_v5_da_loss(
+        *values, trade_off=2., shape_weight=.1, diversity_weight=.01,
+        shared_adv_weight=.1, private_domain_weight=.1, separation_weight=.01,
+    )
+    expected = (
+        values[0] + 2 * values[1] + .1 * values[2] + .01 * values[3]
+        + .1 * values[4] + .1 * values[5] + .01 * values[6]
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 def test_bank_updates_source_classes_by_ema_and_leaves_absent_class():
     bank = ClassPrototypeBank(3, 2, momentum=.5)
     features = torch.tensor([[1., 0.], [1., 0.], [0., 1.]])
@@ -581,9 +708,11 @@ def test_teacher_ema_covers_all_new_trainable_submodules():
         "structure_branch.token_generator.mean_encoder",
         "structure_branch.token_generator.std_encoder",
         "structure_branch.token_generator.fusion", "structure_branch.shapelet_dictionary",
-        "structure_branch.invariant_projector", "structure_branch.response_to_query",
+        "structure_branch.invariant_projector", "structure_branch.domain_projector",
+        "structure_branch.response_to_query",
         "temporal_encoder.attention_heads.external_query_projection",
         "temporal_encoder.mlp", "decoder", "shape_classifier", "domain_classifier",
+        "private_domain_classifier",
     )
     for prefix in required:
         assert any(name.startswith(prefix) and torch.allclose(value, torch.ones_like(value))

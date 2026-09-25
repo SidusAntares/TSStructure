@@ -340,6 +340,30 @@ class StructureDomainClassifier(nn.Module):
         return self.network(features)
 
 
+class DomainProjector(nn.Module):
+    def __init__(self, input_dim=64, domain_dim=32):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 64), nn.GELU(), nn.Linear(64, domain_dim),
+            nn.LayerNorm(domain_dim),
+        )
+
+    def forward(self, features):
+        return self.network(features)
+
+
+class PrivateDomainClassifier(nn.Module):
+    def __init__(self, feature_dim=32):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(feature_dim, 64), nn.GELU(), nn.Dropout(.1),
+            nn.Linear(64, 32), nn.GELU(), nn.Linear(32, 2),
+        )
+
+    def forward(self, features):
+        return self.network(features)
+
+
 def initialize_shapelet_dictionary_from_tokens(dictionary, tokens, seed):
     """Copy deterministic spherical K-means centers into an existing dictionary."""
     from sklearn.cluster import KMeans
@@ -386,6 +410,7 @@ class DiscriminativeStructureBranch(nn.Module):
         self.shapelet_dictionary = ShapeletDictionary(shape_dim, shapelet_count, shapelet_beta)
         response_dim = 2 * shapelet_count
         self.invariant_projector = InvariantProjector(response_dim)
+        self.domain_projector = DomainProjector(response_dim, 32)
         self.response_to_query = nn.Sequential(
             nn.Linear(response_dim, 64), nn.GELU(),
             nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
@@ -424,13 +449,16 @@ class DiscriminativeStructureBranch(nn.Module):
         response = self.compose_rich_response(details)
         concentration = response[:, strength.shape[1]:]
         invariant = self.invariant_projector(response)
+        domain = self.domain_projector(response)
         class_token = self.response_to_query(invariant)
         return {
             "shape_tokens": tokens,
             "shapelet_strength": strength,
             "shapelet_concentration": concentration,
             "shapelet_response": response,
+            "shape_shared_feature": invariant,
             "shape_invariant_feature": invariant,
+            "shape_domain_feature": domain,
             "shape_stats_feature": stats_tokens.mean(dim=1),
             "shape_class_token": class_token,
             "shape_scales": scales,

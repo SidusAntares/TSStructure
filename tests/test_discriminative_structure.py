@@ -3,12 +3,14 @@ import torch
 from models.ltae import LTAE
 from models.structure_da.discriminative_structure import (
     DiscriminativeStructureBranch,
+    DomainProjector,
     FourierStructureExposer,
     InvariantProjector,
     MultiScaleWindowExtractor,
     ShapeletDictionary,
     ShapeTokenGenerator,
     StructureDomainClassifier,
+    PrivateDomainClassifier,
     gradient_reverse,
     initialize_shapelet_dictionary_from_tokens,
 )
@@ -295,6 +297,33 @@ def test_v4_q24_shape_dimensions_are_8_by_32_and_64():
     assert output["shapelet_concentration"].shape == (2, 32)
     assert output["shapelet_response"].shape == (2, 64)
     assert output["shape_invariant_feature"].shape == (2, 64)
+
+
+def test_v5_shared_private_dimensions_alias_and_query_dependency():
+    branch = DiscriminativeStructureBranch(
+        6, shape_dim=16, shapelet_count=32,
+        window_scales=(24,), window_stride=8,
+    )
+    output = branch(
+        torch.randn(2, 20, 6),
+        torch.arange(20).repeat(2, 1) * 10,
+    )
+    assert output["shapelet_response"].shape == (2, 64)
+    assert output["shape_shared_feature"].shape == (2, 64)
+    assert output["shape_domain_feature"].shape == (2, 32)
+    assert output["shape_shared_feature"] is output["shape_invariant_feature"]
+    torch.testing.assert_close(
+        output["shape_class_token"],
+        branch.response_to_query(output["shape_shared_feature"]),
+    )
+
+
+def test_v5_domain_projector_and_private_classifier_shapes():
+    projector = DomainProjector(64, 32)
+    classifier = PrivateDomainClassifier(32)
+    private = projector(torch.randn(5, 64))
+    assert private.shape == (5, 32)
+    assert classifier(private).shape == (5, 2)
 
 
 def test_invariant_projector_zero_initialization_is_finite_residual_layernorm():
