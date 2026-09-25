@@ -149,7 +149,7 @@ def _structure_from_prepared(model, prepared, component_mode, scale_mode):
     details = branch.shapelet_dictionary.compute_response(
         tokens, candidate_mask=mask, return_details=True,
     )
-    response = details["response"]
+    response = branch.compose_rich_response(details)
     class_token = branch.response_to_query(response)
     return {
         "shape_tokens": tokens,

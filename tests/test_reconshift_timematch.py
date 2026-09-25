@@ -591,6 +591,26 @@ def test_kmeans_structure_launcher_is_isolated_and_explicit():
     assert 'run_task "$GPU3" DK1 "$DK1" AT1 "$AT1"' in text
 
 
+def test_structure_proto_v2_launcher_is_q24_and_retrains_four_sources():
+    text = Path("scripts/run_structure_proto_v2_4tasks_4gpu_seed1.sh").read_text(
+        encoding="utf-8",
+    )
+    assert 'EXP_ROOT="${EXP_ROOT:-outputs/structure_proto_v2_4tasks_seed1}"' in text
+    assert 'LOG_ROOT="${LOG_ROOT:-logs/structure_proto_v2_4tasks_seed1}"' in text
+    assert text.count('--shape-window-scales 24 --shape-window-stride 8') == 2
+    assert text.count('--shape-target-weight 0.05') == 2
+    assert text.count('--shape-align-weight 0.05 --stats-align-weight 0.02') == 2
+    assert '--epochs 100' in text
+    assert '--epochs 20 --steps_per_epoch 500' in text
+    for task in (
+        'AT1 "$AT1" DK1 "$DK1"',
+        'FR1 "$FR1" FR2 "$FR2"',
+        'FR2 "$FR2" DK1 "$DK1"',
+        'DK1 "$DK1" AT1 "$AT1"',
+    ):
+        assert task in text
+
+
 def test_shift_grid_caches_structure_once_and_matches_uncached_logits(monkeypatch):
     from timematch import _classify_shift_grid
     from models.stclassifier import PseStructureProtoLTae

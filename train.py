@@ -73,7 +73,7 @@ def add_model_arguments(parser):
     parser.add_argument('--structure-branch', dest='structure_branch', default=False, type=bool_flag)
     parser.add_argument('--structure-exposer', dest='structure_exposer', default='fourier', choices=['fourier'])
     parser.add_argument('--shape-dim', dest='shape_dim', default=128, type=int)
-    parser.add_argument('--shape-window-scales', dest='shape_window_scales', nargs='+', default=[8, 16, 24], type=int)
+    parser.add_argument('--shape-window-scales', dest='shape_window_scales', nargs='+', default=[24], type=int)
     parser.add_argument('--shape-window-stride', dest='shape_window_stride', default=8, type=int)
     parser.add_argument('--shapelet-count', dest='shapelet_count', default=16, type=int)
     parser.add_argument(
@@ -87,6 +87,9 @@ def add_model_arguments(parser):
     parser.add_argument('--shapelet-shaping-weight', dest='shapelet_shaping_weight', default=.01, type=float)
     parser.add_argument('--shapelet-shaping-temperature', dest='shapelet_shaping_temperature', default=.1, type=float)
     parser.add_argument('--shape-class-weight', dest='shape_class_weight', default=.1, type=float)
+    parser.add_argument('--shape-target-weight', dest='shape_target_weight', default=.05, type=float)
+    parser.add_argument('--shape-align-weight', dest='shape_align_weight', default=.05, type=float)
+    parser.add_argument('--stats-align-weight', dest='stats_align_weight', default=.02, type=float)
     parser.add_argument('--proto-momentum', dest='proto_momentum', default=.9, type=float)
     parser.add_argument('--proto-temperature', dest='proto_temperature', default=.1, type=float)
     parser.add_argument('--proto-instance-weight', dest='proto_instance_weight', default=.1, type=float)
@@ -172,7 +175,7 @@ def main(config):
             with open(os.path.join(config.fold_dir, 'manifest.json'), 'w') as stream:
                 json.dump(
                     {
-                        'method': 'discriminative_structure_shapelet_v1',
+                        'method': 'discriminative_structure_shapelet_v2',
                         'structure_exposer': config.structure_exposer,
                         'fourier_num_modes': config.fourier_num_modes,
                         'shape_dim': config.shape_dim,
@@ -186,6 +189,14 @@ def main(config):
                         'shapelet_shaping_weight': config.shapelet_shaping_weight,
                         'shapelet_shaping_temperature': config.shapelet_shaping_temperature,
                         'shape_class_weight': config.shape_class_weight,
+                        'shapelet_response': 'strength+concentration',
+                        'shape_response_dim': 2 * config.shapelet_count,
+                        'shape_target_weight': config.shape_target_weight,
+                        'shape_target_balance': 'class_mean+confidence+support',
+                        'shape_align_weight': config.shape_align_weight,
+                        'stats_align_weight': config.stats_align_weight,
+                        'stats_feature': 'encoded_mean_std',
+                        'alignment': 'class_balanced_global_plus_relative',
                         'shapelet_init': config.shapelet_init,
                         'shape_aux_classifier': 'linear',
                         'shape_target_supervision': 'timematch_pseudo',

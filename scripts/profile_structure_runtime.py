@@ -81,7 +81,7 @@ def _source_step(model, sample, device):
             tokens.append(branch.token_generator.fusion(torch.cat((raw, diff, mean, std), -1)))
         return torch.cat(tokens, dim=1)
     tokens, timings["mean/std + fusion"] = _measure(device, fuse)
-    response, timings["shapelet dictionary"] = _measure(device, lambda: branch.shapelet_dictionary(tokens))
+    response, timings["shapelet dictionary"] = _measure(device, lambda: branch.compute_rich_response(tokens))
     query, timings["response_to_query"] = _measure(device, lambda: branch.response_to_query(response))
     instance, timings["LTAE"] = _measure(
         device, lambda: model.temporal_encoder(spatial, sample["positions"], external_query=query),

@@ -203,13 +203,51 @@ class ShapeTokenGenerator(nn.Module):
         difference[:, :, 1:] = normalized[:, :, 1:] - normalized[:, :, :-1]
         return {"normalized": normalized, "difference": difference, "mean": mean, "std": std}
 
-    def forward(self, windows, mask=None):
+    def forward(self, windows, mask=None, return_encoded_components=False):
         parts = self.components(windows, mask)
         raw = self.raw_encoder(parts["normalized"])
         difference = self.diff_encoder(parts["difference"])
         mean = self.mean_encoder(parts["mean"])
         std = self.std_encoder(parts["std"])
-        return self.fusion(torch.cat((raw, difference, mean, std), dim=-1))
+        token = self.fusion(torch.cat((raw, difference, mean, std), dim=-1))
+        if return_encoded_components:
+            return {
+                "raw_encoded": raw,
+                "diff_encoded": difference,
+                "mean_encoded": mean,
+                "std_encoded": std,
+                "shape_token": token,
+            }
+        return token
+
+
+def normalized_candidate_concentration(weights, candidate_mask=None, eps=1e-12):
+    """Return one minus candidate entropy, normalized by valid candidate count."""
+    if weights.ndim != 3:
+        raise ValueError("weights must be [B,N,M]")
+    if candidate_mask is None:
+        candidate_mask = torch.ones(
+            weights.shape[:2], dtype=torch.bool, device=weights.device,
+        )
+    else:
+        candidate_mask = torch.as_tensor(
+            candidate_mask, dtype=torch.bool, device=weights.device,
+        )
+        if candidate_mask.ndim == 1:
+            candidate_mask = candidate_mask.unsqueeze(0).expand(weights.shape[0], -1)
+    if candidate_mask.shape != weights.shape[:2]:
+        raise ValueError("candidate_mask must be [N] or [B,N]")
+    valid_count = candidate_mask.sum(1).to(weights.dtype)
+    if torch.any(valid_count == 0):
+        raise ValueError("every sample must retain at least one candidate")
+    entropy = -(weights * weights.clamp_min(eps).log()).sum(1)
+    denominator = valid_count.log()
+    normalized = torch.where(
+        valid_count[:, None] > 1,
+        entropy / denominator[:, None].clamp_min(eps),
+        torch.zeros_like(entropy),
+    )
+    return (1. - normalized).clamp(0., 1.)
 
 
 class ShapeletDictionary(nn.Module):
@@ -291,7 +329,7 @@ def initialize_shapelet_dictionary_from_tokens(dictionary, tokens, seed):
 class DiscriminativeStructureBranch(nn.Module):
     def __init__(
         self, channels, shape_dim=128, num_modes=13, grid_points=64,
-        period_days=365.0, reg=1e-3, window_scales=(8, 16, 24), window_stride=8,
+        period_days=365.0, reg=1e-3, window_scales=(24,), window_stride=8,
         shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
     ):
         super().__init__()
@@ -304,21 +342,49 @@ class DiscriminativeStructureBranch(nn.Module):
         )
         self.shapelet_dictionary = ShapeletDictionary(shape_dim, shapelet_count, shapelet_beta)
         self.response_to_query = nn.Sequential(
-            nn.Linear(shapelet_count, 64), nn.GELU(),
+            nn.Linear(2 * shapelet_count, 64), nn.GELU(),
             nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
         )
+
+    def compose_rich_response(self, details):
+        strength = details["response"]
+        concentration = normalized_candidate_concentration(
+            details["weights"], details["candidate_mask"],
+        )
+        return torch.cat((strength, concentration), dim=-1)
+
+    def compute_rich_response(self, tokens, candidate_mask=None, return_details=False):
+        details = self.shapelet_dictionary.compute_response(
+            tokens, candidate_mask=candidate_mask, return_details=True,
+        )
+        rich = self.compose_rich_response(details)
+        if return_details:
+            return {**details, "strength": details["response"], "rich_response": rich}
+        return rich
 
     def forward(self, features, positions):
         exposed, grid = self.exposer(features, positions)
         window_groups, scales = self.window_extractor(exposed)
-        tokens = torch.cat([
-            self.token_generator(windows) for windows in window_groups
+        encoded = [
+            self.token_generator(windows, return_encoded_components=True)
+            for windows in window_groups
+        ]
+        tokens = torch.cat([value["shape_token"] for value in encoded], dim=1)
+        stats_tokens = torch.cat([
+            torch.cat((value["mean_encoded"], value["std_encoded"]), dim=-1)
+            for value in encoded
         ], dim=1)
-        response = self.shapelet_dictionary(tokens)
+        details = self.shapelet_dictionary.compute_response(tokens, return_details=True)
+        strength = details["response"]
+        response = self.compose_rich_response(details)
+        concentration = response[:, strength.shape[1]:]
         class_token = self.response_to_query(response)
         return {
             "shape_tokens": tokens,
+            "shapelet_strength": strength,
+            "shapelet_concentration": concentration,
             "shapelet_response": response,
+            "shape_stats_feature": stats_tokens.mean(dim=1),
             "shape_class_token": class_token,
             "shape_scales": scales,
             "exposed_curve": exposed,

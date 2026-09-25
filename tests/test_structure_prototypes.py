@@ -5,6 +5,8 @@ import pytest
 import torch
 
 from methods.structure_da.prototype_losses import (
+    class_balanced_shape_pseudo_loss,
+    class_relative_domain_alignment,
     compose_da_loss,
     compose_source_loss,
     initialize_instance_bank,
@@ -95,11 +97,94 @@ def test_new_structure_defaults_are_random_stride8_and_24_candidates():
     explicit = parser.parse_args(["--shapelet-init", "kmeans"])
     assert explicit.shapelet_init == "kmeans"
     model = _small_structure_model()
-    assert model.structure_branch.window_extractor.scales == (8, 16, 24)
+    assert defaults.shape_window_scales == [24]
+    assert model.structure_branch.window_extractor.scales == (24,)
     curve = torch.randn(2, 64, 8)
     groups, scales = model.structure_branch.window_extractor(curve)
-    assert sum(group.shape[1] for group in groups) == 24
-    assert scales.numel() == 24
+    assert sum(group.shape[1] for group in groups) == 8
+    assert scales.numel() == 8
+
+
+def test_balanced_target_shape_loss_is_class_balanced_and_handles_empty():
+    logits = torch.tensor([
+        [3., 0.], [2., 0.], [0., 2.], [0., 3.],
+        [0., 2.5], [0., 2.2],
+    ], requires_grad=True)
+    labels = torch.tensor([0, 0, 1, 1, 1, 1])
+    confidence = torch.full((6,), .99)
+    base = class_balanced_shape_pseudo_loss(
+        logits, labels, confidence, pseudo_threshold=.9, focal_gamma=0,
+    )
+    duplicated = class_balanced_shape_pseudo_loss(
+        torch.cat((logits, logits[2:].repeat(3, 1))),
+        torch.cat((labels, labels[2:].repeat(3))),
+        torch.cat((confidence, confidence[2:].repeat(3))),
+        pseudo_threshold=.9, focal_gamma=0,
+    )
+    torch.testing.assert_close(base["loss"], duplicated["loss"])
+    empty = class_balanced_shape_pseudo_loss(
+        logits[:0], labels[:0], confidence[:0],
+        pseudo_threshold=.9, focal_gamma=1,
+    )
+    assert empty["loss"].item() == 0
+    assert empty["valid_classes"] == 0
+    assert torch.isfinite(empty["loss"])
+
+
+def test_balanced_target_shape_reliability_increases_with_support_and_confidence():
+    def reliability(count, confidence):
+        result = class_balanced_shape_pseudo_loss(
+            torch.tensor([[2., 0.]]).repeat(count, 1),
+            torch.zeros(count, dtype=torch.long),
+            torch.full((count,), confidence),
+            pseudo_threshold=.9, focal_gamma=0,
+        )
+        return result["per_class_reliability"][0]
+
+    assert reliability(1, .99) < reliability(4, .99)
+    assert reliability(4, .91) < reliability(4, .99)
+
+
+def test_class_relative_alignment_separates_translation_from_relative_change_and_detaches_source():
+    source = torch.tensor([[0., 0.], [0., 0.], [2., 0.], [2., 0.]], requires_grad=True)
+    labels = torch.tensor([0, 0, 1, 1])
+    target = torch.tensor([[1., 3.], [1., 3.], [3., 3.], [3., 3.]], requires_grad=True)
+    confidence = torch.full((4,), .99)
+    translated = class_relative_domain_alignment(
+        source, labels, target, labels, confidence,
+        pseudo_threshold=.9, distance="mse", min_target_support=2,
+    )
+    assert translated["global_loss"] > 0
+    torch.testing.assert_close(translated["relative_loss"], torch.tensor(0.))
+    translated["total_loss"].backward()
+    assert source.grad is None
+    assert target.grad is not None and target.grad.abs().sum() > 0
+
+    altered = target.detach().clone()
+    altered[2:, 0] += 1
+    changed = class_relative_domain_alignment(
+        source.detach(), labels, altered, labels, confidence,
+        pseudo_threshold=.9, distance="smooth_l1", min_target_support=2,
+    )
+    assert changed["relative_loss"] > 0
+
+
+def test_class_relative_alignment_handles_zero_and_one_valid_class():
+    source = torch.randn(4, 3)
+    source_labels = torch.tensor([0, 0, 1, 1])
+    empty = class_relative_domain_alignment(
+        source, source_labels, source[:0], source_labels[:0], torch.empty(0),
+        pseudo_threshold=.9,
+    )
+    assert empty["valid_classes"] == 0
+    assert empty["total_loss"].item() == 0
+    one = class_relative_domain_alignment(
+        source, source_labels, torch.randn(2, 3), torch.zeros(2, dtype=torch.long),
+        torch.full((2,), .99), pseudo_threshold=.9,
+    )
+    assert one["valid_classes"] == 1
+    assert one["global_loss"] >= 0
+    assert one["relative_loss"].item() == 0
 
 
 def test_shape_health_snapshot_is_finite_and_detects_collapsed_response():

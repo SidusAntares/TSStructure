@@ -22,6 +22,8 @@ from utils.train_utils import AverageMeter, bool_flag, cycle, progress_bar_disab
 from methods.structure_da.prototype_losses import (
     accumulate_class_feature_sums,
     centroid_alignment_summary,
+    class_balanced_shape_pseudo_loss,
+    class_relative_domain_alignment,
     compose_da_loss,
     ensure_finite_structure_loss,
     instance_batch_statistics,
@@ -353,6 +355,9 @@ def _train_structure_proto_timematch(
         shape_target_loss_sum = 0.
         shape_target_correct = 0
         shape_target_count = 0
+        shape_target_batches = 0
+        v2_epoch_sums = defaultdict(float)
+        v2_epoch_batches = 0
         for epoch_step in progress:
             source_sample = next(source_iter)
             target_weak, target_strong = next(target_iter)
@@ -393,9 +398,27 @@ def _train_structure_proto_timematch(
                 )
                 target_labels = pseudo[pseudo_mask]
                 loss_pseudo_target = criterion(target_output["logits"], target_labels)
-                loss_shape_target, target_shape_accuracy = selected_shape_pseudo_loss(
-                    target_output["shape_logits"], pseudo, pseudo_mask, criterion,
-                    minimum=2,
+                target_confidence = confidence[pseudo_mask]
+                target_shape = class_balanced_shape_pseudo_loss(
+                    target_output["shape_logits"], target_labels, target_confidence,
+                    config.pseudo_threshold, config.focal_loss_gamma,
+                )
+                loss_shape_target = target_shape["loss"]
+                target_shape_accuracy = float(
+                    (target_output["shape_logits"].detach().argmax(1) == target_labels)
+                    .float().mean()
+                )
+                shape_alignment = class_relative_domain_alignment(
+                    source_output["shapelet_response"], source_labels,
+                    target_output["shapelet_response"], target_labels,
+                    target_confidence, config.pseudo_threshold, distance="mse",
+                    min_target_support=2,
+                )
+                stats_alignment = class_relative_domain_alignment(
+                    source_output["shape_stats_feature"], source_labels,
+                    target_output["shape_stats_feature"], target_labels,
+                    target_confidence, config.pseudo_threshold, distance="smooth_l1",
+                    min_target_support=2,
                 )
                 target_ins = instance_prototype_loss(
                     target_output["instance_feature"], target_labels,
@@ -416,6 +439,15 @@ def _train_structure_proto_timematch(
                 loss_pseudo_target = target_ins = target_proto = zero
                 loss_shape_target = zero
                 target_shape_accuracy = 0.
+                target_shape = {
+                    "valid_classes": 0,
+                    "mean_class_reliability": zero.detach(),
+                }
+                shape_alignment = stats_alignment = {
+                    "total_loss": zero, "global_loss": zero,
+                    "relative_loss": zero, "center_gap": zero.detach(),
+                    "valid_classes": 0,
+                }
 
             loss_diversity = shapelet_diversity_loss(
                 student.structure_branch.shapelet_dictionary.anchors,
@@ -433,8 +465,15 @@ def _train_structure_proto_timematch(
                 target_ramp, config.proto_instance_weight,
                 config.shapelet_diversity_weight, config.shapelet_shaping_weight,
             )
-            loss = loss + config.shape_class_weight * (
-                loss_shape_source + config.trade_off * loss_shape_target
+            loss = (
+                loss
+                + config.shape_class_weight * loss_shape_source
+                + target_ramp * getattr(config, "shape_target_weight", .05)
+                * loss_shape_target
+                + target_ramp * getattr(config, "shape_align_weight", .05)
+                * shape_alignment["total_loss"]
+                + target_ramp * getattr(config, "stats_align_weight", .02)
+                * stats_alignment["total_loss"]
             )
             optimizer.zero_grad()
             ensure_finite_structure_loss(loss)
@@ -461,9 +500,40 @@ def _train_structure_proto_timematch(
             )
             shape_source_count += source_batch_count
             if target_count >= 2:
-                shape_target_loss_sum += float(loss_shape_target.detach()) * target_count
+                shape_target_loss_sum += float(loss_shape_target.detach())
                 shape_target_correct += int(round(target_shape_accuracy * target_count))
                 shape_target_count += target_count
+                shape_target_batches += 1
+            strength = source_output["shapelet_strength"].detach().float()
+            concentration = source_output["shapelet_concentration"].detach().float()
+            singular = torch.linalg.svdvals(
+                source_output["shapelet_response"].detach().float()
+            )
+            probability = singular / singular.sum().clamp_min(1e-12)
+            response_rank = torch.exp(
+                -(probability * probability.clamp_min(1e-12).log()).sum()
+            )
+            v2_values = {
+                "shape_strength_std": strength.std(dim=0, unbiased=False).mean(),
+                "shape_concentration_mean": concentration.mean(),
+                "shape_concentration_std": concentration.std(unbiased=False),
+                "shape_response_effective_rank": response_rank,
+                "target_shape_valid_classes": target_shape["valid_classes"],
+                "target_shape_mean_reliability": target_shape["mean_class_reliability"],
+                "loss_shape_target_balanced": loss_shape_target.detach(),
+                "loss_shape_align_global": shape_alignment["global_loss"].detach(),
+                "loss_shape_align_relative": shape_alignment["relative_loss"].detach(),
+                "loss_stats_align_global": stats_alignment["global_loss"].detach(),
+                "loss_stats_align_relative": stats_alignment["relative_loss"].detach(),
+                "shape_domain_center_gap": shape_alignment["center_gap"],
+                "stats_domain_center_gap": stats_alignment["center_gap"],
+                "shape_valid_align_classes": shape_alignment["valid_classes"],
+                "stats_valid_align_classes": stats_alignment["valid_classes"],
+            }
+            for name, value in v2_values.items():
+                value = torch.as_tensor(value, device=device).detach()
+                v2_epoch_sums[name] = v2_epoch_sums.get(name, torch.zeros_like(value)) + value
+            v2_epoch_batches += 1
             update_ema_variables(student, teacher, config.ema_decay)
             if global_step % config.log_step == 0:
                 metrics = {
@@ -490,7 +560,7 @@ def _train_structure_proto_timematch(
         progress.close()
         source_shape_loss_epoch = shape_source_loss_sum / max(shape_source_count, 1)
         source_shape_accuracy_epoch = shape_source_correct / max(shape_source_count, 1)
-        target_shape_loss_epoch = shape_target_loss_sum / max(shape_target_count, 1)
+        target_shape_loss_epoch = shape_target_loss_sum / max(shape_target_batches, 1)
         target_shape_accuracy_epoch = shape_target_correct / max(shape_target_count, 1)
         writer.add_scalar("epoch/shape_source_loss", source_shape_loss_epoch, epoch)
         writer.add_scalar("epoch/shape_source_accuracy", source_shape_accuracy_epoch, epoch)
@@ -503,6 +573,15 @@ def _train_structure_proto_timematch(
             f"target_pseudo_accuracy={target_shape_accuracy_epoch:.6f}|"
             f"source_samples={shape_source_count}|target_samples={shape_target_count}"
         )
+        v2_epoch = {
+            name: float((total / max(v2_epoch_batches, 1)).cpu())
+            for name, total in v2_epoch_sums.items()
+        }
+        for name, value in v2_epoch.items():
+            writer.add_scalar(f"epoch/{name}", value, epoch)
+        print("SHAPE_V2_EPOCH|epoch=" + str(epoch) + "|" + "|".join(
+            f"{name}={value:.6f}" for name, value in v2_epoch.items()
+        ))
         prototype_row = {"epoch": epoch, **_prototype_bank_stats(student)}
         prototype_row.update(_summarize_epoch_structure_stats(
             source_epoch_stats, "source", config.shape_window_scales,

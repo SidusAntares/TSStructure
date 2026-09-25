@@ -139,6 +139,141 @@ def selected_shape_pseudo_loss(logits, pseudo_labels, pseudo_mask, criterion, mi
     return loss, accuracy
 
 
+def _confidence_weight(confidence, threshold):
+    if not 0 <= threshold < 1:
+        raise ValueError("pseudo threshold must be in [0, 1)")
+    return ((confidence - threshold) / (1. - threshold)).clamp(0., 1.)
+
+
+def _per_sample_focal_loss(logits, labels, gamma):
+    cross_entropy = F.cross_entropy(logits, labels.long(), reduction="none")
+    if gamma == 0:
+        return cross_entropy
+    probability = torch.exp(-cross_entropy)
+    return (1. - probability).pow(gamma) * cross_entropy
+
+
+def class_balanced_shape_pseudo_loss(
+    shape_logits, pseudo_labels, teacher_confidence, pseudo_threshold,
+    focal_gamma=1., min_support=1, support_saturation=4, eps=1e-12,
+):
+    """Confidence- and support-reliable mean of pseudo-class shape losses."""
+    if not (shape_logits.shape[0] == pseudo_labels.shape[0]
+            == teacher_confidence.shape[0]):
+        raise ValueError("shape logits, pseudo labels, and confidence must align")
+    zero = shape_logits.sum() * 0
+    if shape_logits.shape[0] == 0:
+        return {
+            "loss": zero, "valid_classes": 0,
+            "mean_class_reliability": zero.detach(),
+            "class_ids": pseudo_labels.new_empty(0),
+            "per_class_support": pseudo_labels.new_empty(0),
+            "per_class_reliability": teacher_confidence.new_empty(0),
+        }
+    weights = _confidence_weight(teacher_confidence, pseudo_threshold)
+    losses = _per_sample_focal_loss(shape_logits, pseudo_labels, focal_gamma)
+    class_ids, class_losses, supports, reliabilities = [], [], [], []
+    for class_id in torch.unique(pseudo_labels, sorted=True):
+        selected = pseudo_labels == class_id
+        support = int(selected.sum())
+        if support < int(min_support):
+            continue
+        class_weights = weights[selected]
+        reliability = min(1., support / float(support_saturation)) * class_weights.mean()
+        class_loss = (class_weights * losses[selected]).sum() / class_weights.sum().clamp_min(eps)
+        class_ids.append(class_id)
+        class_losses.append(class_loss)
+        supports.append(support)
+        reliabilities.append(reliability)
+    if not class_ids:
+        return {
+            "loss": zero, "valid_classes": 0,
+            "mean_class_reliability": zero.detach(),
+            "class_ids": pseudo_labels.new_empty(0),
+            "per_class_support": pseudo_labels.new_empty(0),
+            "per_class_reliability": teacher_confidence.new_empty(0),
+        }
+    reliability = torch.stack(reliabilities)
+    loss = (reliability * torch.stack(class_losses)).sum() / reliability.sum().clamp_min(eps)
+    return {
+        "loss": loss,
+        "valid_classes": len(class_ids),
+        "mean_class_reliability": reliability.detach().mean(),
+        "class_ids": torch.stack(class_ids).detach(),
+        "per_class_support": pseudo_labels.new_tensor(supports).detach(),
+        "per_class_reliability": reliability.detach(),
+    }
+
+
+def class_relative_domain_alignment(
+    source_features, source_labels, target_features, target_pseudo,
+    target_confidence, pseudo_threshold, distance="mse",
+    min_target_support=2, support_saturation=4, eps=1e-12,
+):
+    """Align class-balanced global centers and class-relative residuals."""
+    if distance not in {"mse", "smooth_l1"}:
+        raise ValueError("distance must be mse or smooth_l1")
+    if not (target_features.shape[0] == target_pseudo.shape[0]
+            == target_confidence.shape[0]):
+        raise ValueError("target features, pseudo labels, and confidence must align")
+    zero = target_features.sum() * 0
+    target_weights = _confidence_weight(target_confidence, pseudo_threshold)
+    source_centers, target_centers, reliabilities, class_ids = [], [], [], []
+    for class_id in torch.unique(target_pseudo, sorted=True):
+        source_selected = source_labels == class_id
+        target_selected = target_pseudo == class_id
+        support = int(target_selected.sum())
+        if not source_selected.any() or support < int(min_target_support):
+            continue
+        weights = target_weights[target_selected]
+        target_center = (
+            weights[:, None] * target_features[target_selected]
+        ).sum(0) / weights.sum().clamp_min(eps)
+        source_centers.append(source_features[source_selected].mean(0).detach())
+        target_centers.append(target_center)
+        reliabilities.append(
+            min(1., support / float(support_saturation)) * weights.mean()
+        )
+        class_ids.append(class_id)
+    if not class_ids:
+        return {
+            "total_loss": zero, "global_loss": zero, "relative_loss": zero,
+            "center_gap": zero.detach(), "valid_classes": 0,
+            "mean_class_reliability": zero.detach(),
+            "class_ids": target_pseudo.new_empty(0),
+        }
+    source_centers = torch.stack(source_centers)
+    target_centers = torch.stack(target_centers)
+    reliability = torch.stack(reliabilities)
+    normalized_reliability = reliability / reliability.sum().clamp_min(eps)
+    source_mean = (normalized_reliability[:, None] * source_centers).sum(0).detach()
+    target_mean = (normalized_reliability[:, None] * target_centers).sum(0)
+
+    def metric(left, right):
+        if distance == "mse":
+            return F.mse_loss(left, right, reduction="none").mean(-1)
+        return F.smooth_l1_loss(left, right, reduction="none").mean(-1)
+
+    global_loss = metric(target_mean, source_mean)
+    if len(class_ids) < 2:
+        relative_loss = zero
+    else:
+        relative = metric(
+            target_centers - target_mean,
+            source_centers - source_mean,
+        )
+        relative_loss = (reliability * relative).sum() / reliability.sum().clamp_min(eps)
+    return {
+        "total_loss": global_loss + relative_loss,
+        "global_loss": global_loss,
+        "relative_loss": relative_loss,
+        "center_gap": (target_mean - source_mean).norm().detach(),
+        "valid_classes": len(class_ids),
+        "mean_class_reliability": reliability.detach().mean(),
+        "class_ids": torch.stack(class_ids).detach(),
+    }
+
+
 def _parameter_l2_norm(module):
     values = [parameter.detach().float().square().sum() for parameter in module.parameters()]
     if not values:
@@ -168,7 +303,7 @@ def shape_health_snapshot(model, outputs):
     )
     branch = model.structure_branch
     query_projection = model.temporal_encoder.attention_heads.external_query_projection
-    return {
+    values = {
         "shape_response_std_mean": float(response_std.mean()),
         "shape_response_std_min": float(response_std.min()),
         "shape_response_effective_rank": float(effective_rank),
@@ -180,6 +315,16 @@ def shape_health_snapshot(model, outputs):
         "shape_anchor_param_norm": float(branch.shapelet_dictionary.anchors.detach().float().norm()),
         "shape_query_projection_norm": _parameter_l2_norm(query_projection),
     }
+    if "shapelet_strength" in outputs:
+        values["shape_strength_std"] = float(
+            outputs["shapelet_strength"].detach().float()
+            .std(dim=0, unbiased=False).mean()
+        )
+    if "shapelet_concentration" in outputs:
+        concentration = outputs["shapelet_concentration"].detach().float()
+        values["shape_concentration_mean"] = float(concentration.mean())
+        values["shape_concentration_std"] = float(concentration.std(unbiased=False))
+    return values
 
 
 def shape_gradient_snapshot(model):

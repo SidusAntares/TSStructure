@@ -278,6 +278,40 @@ def test_structure_branch_returns_single_forward_intermediates():
     assert features.grad is not None and features.grad.abs().sum() > 0
 
 
+def test_v2_q24_branch_returns_rich_response_and_reuses_strength():
+    torch.manual_seed(41)
+    branch = DiscriminativeStructureBranch(
+        6, shape_dim=16, window_scales=(24,), window_stride=8,
+        shapelet_count=5,
+    )
+    features = torch.randn(2, 20, 6)
+    positions = torch.arange(20).repeat(2, 1) * 10
+    result = branch(features, positions)
+    assert result["shape_tokens"].shape == (2, 8, 16)
+    assert result["shapelet_strength"].shape == (2, 5)
+    assert result["shapelet_concentration"].shape == (2, 5)
+    assert result["shapelet_response"].shape == (2, 10)
+    assert result["shape_stats_feature"].shape == (2, 64)
+    assert torch.isfinite(result["shapelet_concentration"]).all()
+    assert torch.all((result["shapelet_concentration"] >= 0)
+                     & (result["shapelet_concentration"] <= 1))
+    expected = branch.shapelet_dictionary.compute_response(result["shape_tokens"])
+    torch.testing.assert_close(result["shapelet_strength"], expected)
+
+
+def test_normalized_candidate_concentration_distinguishes_uniform_and_peaked_weights():
+    from models.structure_da.discriminative_structure import normalized_candidate_concentration
+
+    uniform = torch.full((2, 8, 3), 1 / 8)
+    peaked = torch.zeros(2, 8, 3)
+    peaked[:, 0] = 1
+    torch.testing.assert_close(
+        normalized_candidate_concentration(uniform), torch.zeros(2, 3),
+        atol=1e-6, rtol=0,
+    )
+    assert torch.all(normalized_candidate_concentration(peaked) > .999)
+
+
 def test_full_model_returns_all_training_intermediates_without_second_forward():
     model = PseStructureProtoLTae(
         input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
@@ -294,7 +328,7 @@ def test_full_model_returns_all_training_intermediates_without_second_forward():
     assert result["shape_logits"].shape == (2, 3)
     assert result["instance_feature"].shape == (2, 6)
     assert result["shape_tokens"].shape[-1] == 10
-    assert result["shapelet_response"].shape == (2, 16)
+    assert result["shapelet_response"].shape == (2, 32)
     assert "shape_" + "attention" not in result
     result["logits"].sum().backward()
     assert model.structure_branch.token_generator.raw_encoder.input_projection.weight.grad is not None

@@ -176,11 +176,11 @@ def validate_end_checkpoint_packet(path, packet):
 
 def _load_model(path, device, require_final=False):
     import torch
-    from train import create_model
 
     path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"checkpoint not found: {path}")
+    from train import create_model
     packet = torch.load(path, map_location=device, weights_only=False)
     if require_final:
         validate_end_checkpoint_packet(path, packet)

@@ -71,15 +71,14 @@ def test_synthetic_domain_collection_covers_all_ablation_and_representation_leve
     }
     result = _collect_domain(model, [sample], "S", [0, 1], max_candidates=48)
     assert set(result["predictions"]) == {
-        "FULL", "ONLY_Q8", "ONLY_Q16", "ONLY_Q24",
-        "REMOVE_Q8", "REMOVE_Q16", "REMOVE_Q24", "STRIDE_8", "STRIDE_16",
+        "FULL", "ONLY_Q24", "STRIDE_8", "STRIDE_16",
     }
-    assert result["candidate_counts"]["FULL"] == 24
-    assert result["candidate_counts"]["STRIDE_8"] == 24
-    assert result["candidate_counts"]["STRIDE_16"] == 12
+    assert result["candidate_counts"]["FULL"] == 8
+    assert result["candidate_counts"]["STRIDE_8"] == 8
+    assert result["candidate_counts"]["STRIDE_16"] == 4
     assert set(result["representations"]) == {
         "normalized_morphology", "first_difference", "mean", "std", "shape_token",
     }
-    assert result["responses"].shape == (2, 3)
+    assert result["responses"].shape == (2, 6)
     assert len(result["anchor_removed"]) == 3
     assert all(np.isfinite(values).all() for values in result["reconstruction"].values())

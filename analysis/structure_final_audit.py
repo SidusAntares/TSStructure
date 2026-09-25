@@ -185,7 +185,7 @@ def collect_structure_layers(model, spatial, positions, temporal_shift=0):
         tokens.append(token)
     combined = {key: torch.cat(value, dim=1) for key, value in layer_groups.items()}
     token = combined["shape_token"]
-    response = branch.shapelet_dictionary(token)
+    response = branch.compute_rich_response(token)
     query = branch.response_to_query(response)
     qshape = model.temporal_encoder.attention_heads.external_query_projection(query)
     instance = model.temporal_encoder(

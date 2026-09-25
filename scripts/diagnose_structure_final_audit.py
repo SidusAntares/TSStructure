@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from models.structure_da.discriminative_structure import normalized_candidate_concentration
+
 from analysis.structure_efficiency_metrics import (
     candidate_effective_number, effective_rank, macro_f1, within_class_dispersion,
 )
@@ -267,6 +269,9 @@ def _beta_rows(task, model, loader, device, shift):
             response, weights = response_from_similarity(
                 similarity, beta=float(name) if name != "hard" else 5., hard_max=name == "hard",
             )
+            response = torch.cat((
+                response, normalized_candidate_concentration(weights),
+            ), dim=-1)
             query = model.structure_branch.response_to_query(response)
             instance = model.temporal_encoder(
                 spatial, sample["positions"] + shift, external_query=query,

@@ -125,9 +125,11 @@ def _candidate_metadata(branch, device):
 
 def _masks(scales, starts):
     masks = {"FULL": torch.ones_like(scales, dtype=torch.bool)}
-    for scale in (8, 16, 24):
+    for scale in torch.unique(scales, sorted=True).tolist():
         masks[f"ONLY_Q{scale}"] = scales == scale
-        masks[f"REMOVE_Q{scale}"] = scales != scale
+        removed = scales != scale
+        if removed.any():
+            masks[f"REMOVE_Q{scale}"] = removed
     for stride in (4, 8, 16):
         masks[f"STRIDE_{stride}"] = starts.remainder(stride) == 0
     return masks
@@ -173,24 +175,30 @@ def _collect_domain(model, loader, domain, classes, max_candidates, seed=1):
             component_groups["std"].append(components["std"])
             adjacent[scale].append(adjacent_cosine(tokens.cpu().numpy()))
         tokens = torch.cat(token_groups, dim=1); component_groups["shape_token"] = token_groups
-        details = branch.shapelet_dictionary.compute_response(tokens, return_details=True)
-        response, weights = details["response"], details["weights"]
+        details = branch.compute_rich_response(tokens, return_details=True)
+        response, weights = details["rich_response"], details["weights"]
         responses.append(response.cpu().numpy()); full_weights.append(weights.cpu().numpy())
-        scale_mass.append(torch.stack([weights[:, scales == scale].sum(1) for scale in (8, 16, 24)], -1).cpu().numpy())
+        scale_mass.append(torch.stack([
+            weights[:, scales == scale].sum(1)
+            for scale in branch.window_extractor.scales
+        ], -1).cpu().numpy())
         effective_total.append(candidate_effective_number(weights.cpu().numpy()))
-        for scale in (8, 16, 24):
+        for scale in branch.window_extractor.scales:
             selected = weights[:, scales == scale]
             selected = selected / selected.sum(1, keepdim=True).clamp_min(1e-12)
             effective_scale[scale].append(candidate_effective_number(selected.cpu().numpy()))
         for name, mask in masks.items():
             if name == "STRIDE_4":
                 continue
-            current = branch.shapelet_dictionary.compute_response(tokens, candidate_mask=mask)
+            current = branch.compute_rich_response(tokens, candidate_mask=mask)
             query = branch.response_to_query(current)
             instance = model.temporal_encoder(spatial, positions, external_query=query)
             predictions[name].append(model.decoder(instance).argmax(1).cpu().numpy())
-        for anchor in range(response.shape[1]):
-            ablated = response.clone(); ablated[:, anchor] = 0
+        anchor_count = branch.shapelet_dictionary.anchors.shape[0]
+        for anchor in range(anchor_count):
+            ablated = response.clone()
+            ablated[:, anchor] = 0
+            ablated[:, anchor_count + anchor] = 0
             query = branch.response_to_query(ablated)
             instance = model.temporal_encoder(spatial, positions, external_query=query)
             anchor_removed[anchor].append(model.decoder(instance).argmax(1).cpu().numpy())
