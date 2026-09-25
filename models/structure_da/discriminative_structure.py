@@ -297,6 +297,49 @@ class ShapeletDictionary(nn.Module):
         return self.compute_response(tokens)
 
 
+class InvariantProjector(nn.Module):
+    """Residual projector used by the formal V4 structure representation."""
+
+    def __init__(self, feature_dim=64):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim, 128), nn.GELU(), nn.Linear(128, feature_dim),
+        )
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[2].bias)
+        self.norm = nn.LayerNorm(feature_dim)
+
+    def forward(self, response):
+        return self.norm(response + self.mlp(response))
+
+
+class _GradientReversal(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, features, alpha):
+        ctx.alpha = float(alpha)
+        return features.view_as(features)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return -ctx.alpha * gradient, None
+
+
+def gradient_reverse(features, alpha):
+    return _GradientReversal.apply(features, alpha)
+
+
+class StructureDomainClassifier(nn.Module):
+    def __init__(self, feature_dim=64):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(feature_dim, 128), nn.GELU(), nn.Dropout(.1),
+            nn.Linear(128, 64), nn.GELU(), nn.Linear(64, 2),
+        )
+
+    def forward(self, features):
+        return self.network(features)
+
+
 def initialize_shapelet_dictionary_from_tokens(dictionary, tokens, seed):
     """Copy deterministic spherical K-means centers into an existing dictionary."""
     from sklearn.cluster import KMeans
@@ -330,7 +373,7 @@ class DiscriminativeStructureBranch(nn.Module):
     def __init__(
         self, channels, shape_dim=128, num_modes=13, grid_points=64,
         period_days=365.0, reg=1e-3, window_scales=(24,), window_stride=8,
-        shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
+        shapelet_count=32, shapelet_beta=5., shape_resample_length=16,
     ):
         super().__init__()
         self.exposer = FourierStructureExposer(num_modes, grid_points, period_days, reg)
@@ -341,8 +384,10 @@ class DiscriminativeStructureBranch(nn.Module):
             channels, shape_dim, resample_length=shape_resample_length,
         )
         self.shapelet_dictionary = ShapeletDictionary(shape_dim, shapelet_count, shapelet_beta)
+        response_dim = 2 * shapelet_count
+        self.invariant_projector = InvariantProjector(response_dim)
         self.response_to_query = nn.Sequential(
-            nn.Linear(2 * shapelet_count, 64), nn.GELU(),
+            nn.Linear(response_dim, 64), nn.GELU(),
             nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
         )
 
@@ -378,12 +423,14 @@ class DiscriminativeStructureBranch(nn.Module):
         strength = details["response"]
         response = self.compose_rich_response(details)
         concentration = response[:, strength.shape[1]:]
-        class_token = self.response_to_query(response)
+        invariant = self.invariant_projector(response)
+        class_token = self.response_to_query(invariant)
         return {
             "shape_tokens": tokens,
             "shapelet_strength": strength,
             "shapelet_concentration": concentration,
             "shapelet_response": response,
+            "shape_invariant_feature": invariant,
             "shape_stats_feature": stats_tokens.mean(dim=1),
             "shape_class_token": class_token,
             "shape_scales": scales,

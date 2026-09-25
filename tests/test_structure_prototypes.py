@@ -11,11 +11,15 @@ from methods.structure_da.prototype_losses import (
     memory_class_relative_domain_alignment,
     compose_da_loss,
     compose_source_loss,
+    compose_structure_v4_da_loss,
+    compose_structure_v4_source_loss,
     initialize_instance_bank,
     instance_prototype_loss,
     prototype_contrastive_loss,
     shapelet_diversity_loss,
     shapelet_data_support_loss,
+    masked_pseudo_classification_loss,
+    structure_domain_adversarial_loss,
     update_instance_bank,
     ensure_finite_structure_loss,
 )
@@ -49,6 +53,48 @@ def _gradient_norm(module):
         parameter.grad.detach().square().sum()
         for parameter in module.parameters() if parameter.grad is not None
     ))
+
+
+def test_v4_synthetic_source_target_step_is_finite_and_uses_full_target_domain_batch():
+    model = _small_structure_model().train()
+    source = _small_structure_batch()
+    target = _small_structure_batch()
+    keys = ("pixels", "positions", "extra")
+    source_output = model(
+        **{key: source[key] for key in keys}, mask=source["valid_pixels"],
+        return_dict=True,
+    )
+    target_output = model(
+        **{key: target[key] for key in keys}, mask=target["valid_pixels"],
+        return_dict=True,
+    )
+    criterion = torch.nn.CrossEntropyLoss()
+    pseudo = torch.tensor([0, 1, 2, 1])
+    pseudo_mask = torch.tensor([True, False, False, False])
+    pseudo_loss = masked_pseudo_classification_loss(
+        target_output["logits"], pseudo, pseudo_mask, criterion,
+    )
+    domain = structure_domain_adversarial_loss(
+        model.domain_classifier,
+        source_output["shape_invariant_feature"],
+        target_output["shape_invariant_feature"],
+        alpha=.5,
+    )
+    total = compose_structure_v4_da_loss(
+        criterion(source_output["logits"], source["label"]),
+        pseudo_loss,
+        criterion(source_output["shape_logits"], source["label"]),
+        shapelet_diversity_loss(
+            model.structure_branch.shapelet_dictionary.anchors, margin=.5,
+        ),
+        domain["loss"],
+    )
+    assert domain["target_count"] == 4
+    assert int(pseudo_mask.sum()) == 1
+    assert torch.isfinite(total)
+    total.backward()
+    assert _gradient_norm(model.structure_branch.invariant_projector) > 0
+    assert _gradient_norm(model.domain_classifier) > 0
 
 
 def test_shape_classifier_directly_supervises_tokens_and_anchors_with_zero_query_projection():
@@ -100,6 +146,7 @@ def test_new_structure_defaults_are_random_stride8_and_24_candidates():
     assert explicit.shapelet_init == "kmeans"
     model = _small_structure_model()
     assert defaults.shape_window_scales == [24]
+    assert defaults.shapelet_count == 32
     assert model.structure_branch.window_extractor.scales == (24,)
     curve = torch.randn(2, 64, 8)
     groups, scales = model.structure_branch.window_extractor(curve)
@@ -289,6 +336,57 @@ def test_shape_health_snapshot_is_finite_and_detects_collapsed_response():
         "shape_query_projection_norm",
     ):
         assert np.isfinite(health[key])
+
+
+def test_v4_domain_loss_uses_all_target_while_pseudo_uses_only_mask():
+    from models.structure_da.discriminative_structure import StructureDomainClassifier
+
+    source = torch.randn(4, 64, requires_grad=True)
+    target = torch.randn(8, 64, requires_grad=True)
+    classifier = StructureDomainClassifier(64)
+    domain = structure_domain_adversarial_loss(classifier, source, target, alpha=.5)
+    assert domain["source_count"] == 4
+    assert domain["target_count"] == 8
+    assert domain["loss"] > 0
+
+    logits = torch.randn(8, 3, requires_grad=True)
+    pseudo = torch.arange(8) % 3
+    mask = torch.tensor([True, False, False, False, False, False, False, False])
+    pseudo_loss = masked_pseudo_classification_loss(
+        logits, pseudo, mask, torch.nn.CrossEntropyLoss(),
+    )
+    torch.testing.assert_close(pseudo_loss, torch.nn.functional.cross_entropy(logits[:1], pseudo[:1]))
+
+
+def test_v4_empty_pseudo_keeps_nonzero_finite_domain_loss():
+    from models.structure_da.discriminative_structure import StructureDomainClassifier
+
+    logits = torch.randn(8, 3, requires_grad=True)
+    pseudo = torch.zeros(8, dtype=torch.long)
+    pseudo_loss = masked_pseudo_classification_loss(
+        logits, pseudo, torch.zeros(8, dtype=torch.bool),
+        torch.nn.CrossEntropyLoss(),
+    )
+    domain = structure_domain_adversarial_loss(
+        StructureDomainClassifier(64), torch.randn(4, 64),
+        torch.randn(8, 64), alpha=.5,
+    )
+    assert pseudo_loss.item() == 0
+    assert domain["loss"] > 0 and torch.isfinite(domain["loss"])
+
+
+def test_v4_loss_composition_contains_only_frozen_terms():
+    values = [torch.tensor(float(value)) for value in range(1, 6)]
+    source = compose_structure_v4_source_loss(
+        values[0], values[1], values[2], shape_weight=.1, diversity_weight=.01,
+    )
+    torch.testing.assert_close(source, values[0] + .1 * values[1] + .01 * values[2])
+    uda = compose_structure_v4_da_loss(
+        *values, trade_off=2., shape_weight=.1, diversity_weight=.01,
+    )
+    torch.testing.assert_close(
+        uda, values[0] + 2 * values[1] + .1 * values[2] + .01 * values[3] + values[4],
+    )
 
 
 def test_bank_updates_source_classes_by_ema_and_leaves_absent_class():
@@ -483,9 +581,9 @@ def test_teacher_ema_covers_all_new_trainable_submodules():
         "structure_branch.token_generator.mean_encoder",
         "structure_branch.token_generator.std_encoder",
         "structure_branch.token_generator.fusion", "structure_branch.shapelet_dictionary",
-        "structure_branch.response_to_query",
+        "structure_branch.invariant_projector", "structure_branch.response_to_query",
         "temporal_encoder.attention_heads.external_query_projection",
-        "temporal_encoder.mlp", "decoder", "shape_classifier",
+        "temporal_encoder.mlp", "decoder", "shape_classifier", "domain_classifier",
     )
     for prefix in required:
         assert any(name.startswith(prefix) and torch.allclose(value, torch.ones_like(value))

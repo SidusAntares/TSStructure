@@ -4,9 +4,12 @@ from models.ltae import LTAE
 from models.structure_da.discriminative_structure import (
     DiscriminativeStructureBranch,
     FourierStructureExposer,
+    InvariantProjector,
     MultiScaleWindowExtractor,
     ShapeletDictionary,
     ShapeTokenGenerator,
+    StructureDomainClassifier,
+    gradient_reverse,
     initialize_shapelet_dictionary_from_tokens,
 )
 from models.stclassifier import PseStructureProtoLTae
@@ -274,8 +277,63 @@ def test_structure_branch_returns_single_forward_intermediates():
     result = branch(features, positions)
     assert set(result) >= {"shape_tokens", "shapelet_response", "shape_class_token"}
     assert "shape_" + "attention" not in result
-    result["shape_class_token"].sum().backward()
+    result["shape_class_token"].square().sum().backward()
     assert features.grad is not None and features.grad.abs().sum() > 0
+
+
+def test_v4_q24_shape_dimensions_are_8_by_32_and_64():
+    branch = DiscriminativeStructureBranch(
+        6, shape_dim=16, shapelet_count=32,
+        window_scales=(24,), window_stride=8,
+    )
+    output = branch(
+        torch.randn(2, 20, 6),
+        torch.arange(20).repeat(2, 1) * 10,
+    )
+    assert output["shape_tokens"].shape == (2, 8, 16)
+    assert output["shapelet_strength"].shape == (2, 32)
+    assert output["shapelet_concentration"].shape == (2, 32)
+    assert output["shapelet_response"].shape == (2, 64)
+    assert output["shape_invariant_feature"].shape == (2, 64)
+
+
+def test_invariant_projector_zero_initialization_is_finite_residual_layernorm():
+    projector = InvariantProjector(64)
+    final = projector.mlp[2]
+    assert torch.count_nonzero(final.weight) == 0
+    assert torch.count_nonzero(final.bias) == 0
+    values = torch.randn(4, 64, requires_grad=True)
+    output = projector(values)
+    torch.testing.assert_close(output, projector.norm(values))
+    assert torch.isfinite(output).all()
+    output.square().mean().backward()
+    assert values.grad is not None and torch.isfinite(values.grad).all()
+
+
+def test_gradient_reversal_scales_only_feature_gradient_direction():
+    baseline = torch.tensor([[1., -2.]], requires_grad=True)
+    baseline.sum().backward()
+    reference = baseline.grad.detach().clone()
+    feature = torch.tensor([[1., -2.]], requires_grad=True)
+    gradient_reverse(feature, .5).sum().backward()
+    torch.testing.assert_close(feature.grad, -.5 * reference)
+
+    classifier = torch.nn.Linear(2, 1, bias=False)
+    reference_classifier = torch.nn.Linear(2, 1, bias=False)
+    reference_classifier.load_state_dict(classifier.state_dict())
+    classifier(gradient_reverse(feature.detach(), .5)).sum().backward()
+    reference_classifier(feature.detach()).sum().backward()
+    torch.testing.assert_close(
+        classifier.weight.grad, reference_classifier.weight.grad,
+    )
+
+    classifier = StructureDomainClassifier(64)
+    source = torch.randn(3, 64, requires_grad=True)
+    logits = classifier(gradient_reverse(source, .5))
+    loss = torch.nn.functional.cross_entropy(logits, torch.zeros(3, dtype=torch.long))
+    loss.backward()
+    assert source.grad is not None
+    assert all(parameter.grad is not None for parameter in classifier.parameters())
 
 
 def test_v2_q24_branch_returns_rich_response_and_reuses_strength():
@@ -328,7 +386,8 @@ def test_full_model_returns_all_training_intermediates_without_second_forward():
     assert result["shape_logits"].shape == (2, 3)
     assert result["instance_feature"].shape == (2, 6)
     assert result["shape_tokens"].shape[-1] == 10
-    assert result["shapelet_response"].shape == (2, 32)
+    assert result["shapelet_response"].shape == (2, 64)
+    assert result["shape_invariant_feature"].shape == (2, 64)
     assert "shape_" + "attention" not in result
     result["logits"].sum().backward()
     assert model.structure_branch.token_generator.raw_encoder.input_projection.weight.grad is not None

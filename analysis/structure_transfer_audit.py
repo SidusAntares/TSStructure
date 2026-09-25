@@ -150,10 +150,12 @@ def _structure_from_prepared(model, prepared, component_mode, scale_mode):
         tokens, candidate_mask=mask, return_details=True,
     )
     response = branch.compose_rich_response(details)
-    class_token = branch.response_to_query(response)
+    invariant = branch.invariant_projector(response)
+    class_token = branch.response_to_query(invariant)
     return {
         "shape_tokens": tokens,
         "shapelet_response": response,
+        "shape_invariant_feature": invariant,
         "shape_class_token": class_token,
         "shape_scales": prepared["shape_scales"],
         "exposed_curve": prepared["exposed_curve"],
@@ -186,7 +188,7 @@ def forward_prepared_intervention(
         instance, attention = temporal, None
     result = {
         "logits": model.decoder(instance),
-        "shape_logits": model.shape_classifier(structure["shapelet_response"]),
+        "shape_logits": model.shape_classifier(structure["shape_invariant_feature"]),
         "instance_feature": instance,
         "pse_feature": spatial,
         **structure,

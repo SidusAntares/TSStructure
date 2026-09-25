@@ -31,16 +31,10 @@ from models.structure_da.discriminative_structure import (
     initialize_shapelet_dictionary_from_tokens,
 )
 from methods.structure_da.prototype_losses import (
-    compose_source_loss,
+    compose_structure_v4_source_loss,
     ensure_finite_structure_loss,
-    initialize_instance_bank,
-    instance_batch_statistics,
-    instance_prototype_loss,
     log_shape_health,
-    prototype_ramp,
-    shapelet_data_support_loss,
     shapelet_diversity_loss,
-    update_instance_bank,
 )
 from timematch import add_shift_estimation_arguments, train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
@@ -75,7 +69,7 @@ def add_model_arguments(parser):
     parser.add_argument('--shape-dim', dest='shape_dim', default=128, type=int)
     parser.add_argument('--shape-window-scales', dest='shape_window_scales', nargs='+', default=[24], type=int)
     parser.add_argument('--shape-window-stride', dest='shape_window_stride', default=8, type=int)
-    parser.add_argument('--shapelet-count', dest='shapelet_count', default=16, type=int)
+    parser.add_argument('--shapelet-count', dest='shapelet_count', default=32, type=int)
     parser.add_argument(
         '--shapelet-init', dest='shapelet_init', default='random',
         choices=['kmeans', 'random'],
@@ -175,7 +169,7 @@ def main(config):
             with open(os.path.join(config.fold_dir, 'manifest.json'), 'w') as stream:
                 json.dump(
                     {
-                        'method': 'discriminative_structure_shapelet_v2',
+                        'method': 'discriminative_structure_adversarial_v4',
                         'structure_exposer': config.structure_exposer,
                         'fourier_num_modes': config.fourier_num_modes,
                         'shape_dim': config.shape_dim,
@@ -186,27 +180,20 @@ def main(config):
                         'shape_resample_length': config.shape_resample_length,
                         'shapelet_diversity_margin': config.shapelet_diversity_margin,
                         'shapelet_diversity_weight': config.shapelet_diversity_weight,
-                        'shapelet_shaping_weight': config.shapelet_shaping_weight,
-                        'shapelet_shaping_temperature': config.shapelet_shaping_temperature,
                         'shape_class_weight': config.shape_class_weight,
                         'shapelet_response': 'strength+concentration',
                         'shape_response_dim': 2 * config.shapelet_count,
-                        'shape_target_weight': config.shape_target_weight,
-                        'shape_target_balance': 'class_mean+confidence+support',
-                        'shape_align_weight': config.shape_align_weight,
-                        'stats_align_weight': config.stats_align_weight,
-                        'stats_feature': 'encoded_mean_std',
-                        'alignment': 'class_balanced_global_plus_relative',
+                        'invariant_projector': 'residual_mlp',
+                        'domain_adaptation': 'structure_grl',
+                        'domain_classifier_input': 'shape_invariant_feature',
+                        'domain_target_scope': 'all_target_samples',
+                        'target_shape_loss': False,
+                        'instance_prototype': False,
+                        'shape_support_loss': False,
+                        'shape_alignment': False,
+                        'stats_alignment': False,
                         'shapelet_init': config.shapelet_init,
                         'shape_aux_classifier': 'linear',
-                        'shape_target_supervision': 'timematch_pseudo',
-                        'proto_momentum': config.proto_momentum,
-                        'proto_temperature': config.proto_temperature,
-                        'proto_instance_weight': config.proto_instance_weight,
-                        'proto_init_epoch': config.proto_init_epoch,
-                        'proto_ramp_start': config.proto_ramp_start,
-                        'proto_ramp_epochs': config.proto_ramp_epochs,
-                        'prototype_update_domain': 'source_ground_truth_only',
                     },
                     stream,
                     indent=2,
@@ -489,8 +476,6 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
 
     best_f1 = 0
     structure_proto = isinstance(model, PseStructureProtoLTae)
-    if structure_proto and config.epochs <= config.proto_init_epoch:
-        raise ValueError("structure prototype source training requires at least one epoch after initialization")
 
     train_transform = transforms.Compose([
         RandomSamplePixels(config.num_pixels),
@@ -534,23 +519,8 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
 
     best_f1 = 0
     for epoch in range(config.epochs):
-        if structure_proto and epoch == config.proto_init_epoch:
-            model.eval()
-            def initialization_batches():
-                for initialization_sample in data_loader:
-                    initialization_labels = initialization_sample['label'].cuda(device=device, non_blocking=True)
-                    init_pixels, init_mask, init_positions, init_extra = to_cuda(initialization_sample, device)
-                    output = model(init_pixels, init_mask, init_positions, init_extra, return_dict=True)
-                    yield output['instance_feature'], initialization_labels
-            initialize_instance_bank(initialization_batches(), model.instance_prototype_bank)
-            print(
-                "STRUCTURE_PROTO_INITIALIZED|"
-                f"instance_classes={int(model.instance_prototype_bank.initialized.sum())}"
-            )
-            best_f1 = 0
         model.train()
         loss_meter = AverageMeter()
-        epoch_structure_stats = _new_structure_epoch_stats() if structure_proto else None
         shape_source_loss_sum = 0.
         shape_source_correct = 0
         shape_source_count = 0
@@ -573,36 +543,14 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 outputs = structured["logits"]
                 loss_cls = criterion(outputs, targets)
                 loss_shape_source = criterion(structured["shape_logits"], targets)
-                if epoch < config.proto_init_epoch:
-                    loss_instance = outputs.sum() * 0
-                    loss_proto = outputs.sum() * 0
-                    source_ramp = 0.
-                else:
-                    loss_instance = instance_prototype_loss(
-                        structured['instance_feature'], targets,
-                        model.instance_prototype_bank, config.proto_temperature,
-                    )
-                    source_ramp = prototype_ramp(
-                        epoch - config.proto_init_epoch,
-                        config.proto_ramp_epochs,
-                        config.proto_ramp_start,
-                    )
                 loss_diversity = shapelet_diversity_loss(
                     model.structure_branch.shapelet_dictionary.anchors,
                     config.shapelet_diversity_margin,
                 )
-                loss_shaping = shapelet_data_support_loss(
-                    structured['shape_tokens'],
-                    model.structure_branch.shapelet_dictionary.anchors,
-                    config.shapelet_shaping_temperature,
+                loss = compose_structure_v4_source_loss(
+                    loss_cls, loss_shape_source, loss_diversity,
+                    config.shape_class_weight, config.shapelet_diversity_weight,
                 )
-                composed = compose_source_loss(
-                    loss_cls, loss_instance, loss_diversity, loss_shaping,
-                    source_ramp, config.proto_instance_weight,
-                    config.shapelet_diversity_weight, config.shapelet_shaping_weight,
-                )
-                loss = composed.total + config.shape_class_weight * loss_shape_source
-                loss_proto = composed.prototype_total
             else:
                 outputs = model.forward(pixels, mask, positions, extra)
                 loss = criterion(outputs, targets)
@@ -618,10 +566,6 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     model.parameters(), max_norm=5., error_if_nonfinite=True,
                 )
             optimizer.step()
-            if structure_proto and epoch >= config.proto_init_epoch:
-                update_instance_bank(
-                    structured['instance_feature'], targets, model.instance_prototype_bank,
-                )
             if structure_proto:
                 batch_count = int(targets.shape[0])
                 shape_source_loss_sum += float(loss_shape_source.detach()) * batch_count
@@ -629,10 +573,6 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     (structured["shape_logits"].detach().argmax(1) == targets).sum()
                 )
                 shape_source_count += batch_count
-                _collect_structure_epoch_stats(
-                    epoch_structure_stats,
-                    instance_batch_statistics(structured, targets, model.instance_prototype_bank),
-                )
             scheduler.step()
 
             loss_meter.update(loss.item(), n=config.batch_size)
@@ -645,11 +585,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 if structure_proto:
                     writer.add_scalar("train/loss_cls_source", loss_cls.detach(), global_step + step)
                     writer.add_scalar("train/loss_shape_source", loss_shape_source.detach(), global_step + step)
-                    writer.add_scalar("train/loss_proto_instance_source", loss_instance.detach(), global_step + step)
                     writer.add_scalar("train/loss_shapelet_diversity", loss_diversity.detach(), global_step + step)
-                    writer.add_scalar("train/shapelet_shaping_loss", loss_shaping.detach(), global_step + step)
-                    writer.add_scalar("train/loss_proto_source_total", loss_proto.detach(), global_step + step)
-                    writer.add_scalar("train/proto_ramp_source", source_ramp, global_step + step)
 
         progress_bar.close()
 
@@ -679,21 +615,6 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             if best_f1 > previous_best or not os.path.isfile(best_model_path):
                 torch.save(checkpoint, best_model_path)
                 torch.save(checkpoint, os.path.join(config.fold_dir, 'checkpoint_best.pt'))
-            epoch_stats = _summarize_structure_epoch_stats(
-                epoch_structure_stats, epoch, 'source',
-            )
-            prototype_stats = _prototype_diagnostics(model, epoch)
-            prototype_stats.update({
-                key: value for key, value in epoch_stats.items()
-                if key.startswith('source_')
-            })
-            prototype_stats.update({
-                key: value for key, value in epoch_stats.items()
-                if not key.startswith('source_')
-            })
-            print('STRUCTURE_DIAG|' + '|'.join(
-                f'{key}={value}' for key, value in prototype_stats.items()
-            ))
 
 
 def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1, test_ratio=0.2):

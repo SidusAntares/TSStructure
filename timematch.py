@@ -1,6 +1,7 @@
 from collections import Counter
 from copy import deepcopy
 from collections import defaultdict
+import math
 import os
 
 import numpy as np
@@ -27,6 +28,7 @@ from methods.structure_da.prototype_losses import (
     memory_class_balanced_shape_pseudo_loss,
     memory_class_relative_domain_alignment,
     compose_da_loss,
+    compose_structure_v4_da_loss,
     ensure_finite_structure_loss,
     instance_batch_statistics,
     instance_prototype_loss,
@@ -35,6 +37,8 @@ from methods.structure_da.prototype_losses import (
     shapelet_data_support_loss,
     shapelet_diversity_loss,
     selected_shape_pseudo_loss,
+    masked_pseudo_classification_loss,
+    structure_domain_adversarial_loss,
     update_instance_bank,
 )
 from models.structure_da.prototype_bank import ClassFeatureMemory
@@ -334,7 +338,7 @@ def _memory_center_gap(source_memory, target_memory, support_saturation=4):
     target_center = (weights[:, None] * target_memory.prototypes[valid]).sum(0)
     return (target_center - source_center).norm()
 
-def _train_structure_proto_timematch(
+def _train_structure_proto_timematch_v3_reference(
     student, config, writer, val_loader, device, best_model_path, fold_num, splits,
 ):
     if config.with_shift_aug:
@@ -581,7 +585,6 @@ def _train_structure_proto_timematch(
                 shape_target_correct += int(round(target_shape_accuracy * target_count))
                 shape_target_count += target_count
                 shape_target_batches += 1
-            strength = source_output["shapelet_strength"].detach().float()
             concentration = source_output["shapelet_concentration"].detach().float()
             singular = torch.linalg.svdvals(
                 source_output["shapelet_response"].detach().float()
@@ -750,6 +753,202 @@ def _train_structure_proto_timematch(
             "config": vars(config),
             "best_f1": best_f1,
             "structure_memory": _structure_memory_checkpoint(memories),
+        }
+        torch.save(checkpoint, os.path.join(config.fold_dir, "checkpoint_last.pt"))
+        if best_f1 > previous_best or not os.path.isfile(best_model_path):
+            torch.save(checkpoint, best_model_path)
+            torch.save(checkpoint, os.path.join(config.fold_dir, "checkpoint_best.pt"))
+
+
+def _train_structure_proto_timematch(
+    student, config, writer, val_loader, device, best_model_path, fold_num, splits,
+):
+    if config.with_shift_aug:
+        raise ValueError(
+            "structure prototype TimeMatch requires identical canonical window indexing; "
+            "set --with_shift_aug false"
+        )
+    source_loader, target_loader_no_aug, target_loader = get_data_loaders(
+        splits, config, config.balance_source,
+    )
+    checkpoint_path = os.path.join(config.weights, f"fold_{fold_num}", "model.pt")
+    student.load_state_dict(torch.load(checkpoint_path, weights_only=False)["state_dict"])
+    student.to(device)
+    teacher = deepcopy(student).to(device)
+    teacher.eval()
+    criterion = (
+        FocalLoss(gamma=config.focal_loss_gamma)
+        if config.use_focal_loss else torch.nn.CrossEntropyLoss()
+    )
+    optimizer = torch.optim.Adam(
+        student.parameters(), lr=config.lr, weight_decay=config.weight_decay,
+    )
+    total_steps = config.epochs * config.steps_per_epoch
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps, eta_min=0,
+    )
+    source_iter, target_iter = iter(cycle(source_loader)), iter(cycle(target_loader))
+    initial_shift, class_distribution, initial_diagnostics = _initialize_timematch_shift(
+        teacher, target_loader_no_aug, device, config,
+    )
+    target_to_source_shift = initial_shift
+    best_f1 = 0
+    global_step = 0
+    for epoch in range(config.epochs):
+        target_to_source_shift = _reestimate_timematch_shift(
+            teacher, target_loader_no_aug, device, config,
+            initial_shift, class_distribution, initial_diagnostics, epoch,
+        )
+        source_to_target_shift = (
+            -target_to_source_shift if getattr(config, "shift_source", True) else 0
+        )
+        student.train()
+        teacher.eval()
+        epoch_sums = defaultdict(float)
+        pseudo_total = pseudo_accepted = 0
+        source_shape_correct = source_samples = 0
+        domain_source_correct = domain_target_correct = 0
+        domain_source_count = domain_target_count = 0
+        progress = tqdm(
+            range(config.steps_per_epoch),
+            desc=f"StructureV4 TimeMatch {epoch + 1}/{config.epochs}",
+            disable=progress_bar_disabled(getattr(config, "progress_bar", "auto")),
+        )
+        for epoch_step in progress:
+            source_sample = next(source_iter)
+            target_weak, target_strong = next(target_iter)
+
+            pw, mw, tw, ew = to_cuda(target_weak, device)
+            with torch.no_grad():
+                teacher_logits = teacher.forward_with_temporal_shift(
+                    pw, mw, tw, ew, temporal_shift=target_to_source_shift,
+                )
+                probabilities = F.softmax(teacher_logits, dim=1)
+                confidence, pseudo = probabilities.max(1)
+                pseudo_mask = confidence > config.pseudo_threshold
+            pseudo_total += int(pseudo_mask.numel())
+            pseudo_accepted += int(pseudo_mask.sum())
+
+            ps, ms, ts, es = to_cuda(source_sample, device)
+            source_labels = source_sample["label"].cuda(device=device, non_blocking=True)
+            source_output = student.forward_with_temporal_shift(
+                ps, ms, ts, es, temporal_shift=source_to_target_shift,
+                return_dict=True,
+            )
+            pt, mt, tt, et = to_cuda(target_strong, device)
+            target_output = student(pt, mt, tt, et, return_dict=True)
+
+            loss_cls_source = criterion(source_output["logits"], source_labels)
+            loss_pseudo_target = masked_pseudo_classification_loss(
+                target_output["logits"], pseudo, pseudo_mask, criterion,
+            )
+            loss_shape_source = criterion(source_output["shape_logits"], source_labels)
+            loss_diversity = shapelet_diversity_loss(
+                student.structure_branch.shapelet_dictionary.anchors,
+                config.shapelet_diversity_margin,
+            )
+            progress_value = global_step / max(total_steps - 1, 1)
+            grl_alpha = 2. / (1. + math.exp(-10. * progress_value)) - 1.
+            domain = structure_domain_adversarial_loss(
+                student.domain_classifier,
+                source_output["shape_invariant_feature"],
+                target_output["shape_invariant_feature"],
+                grl_alpha,
+            )
+            loss = compose_structure_v4_da_loss(
+                loss_cls_source, loss_pseudo_target, loss_shape_source,
+                loss_diversity, domain["loss"], config.trade_off,
+                config.shape_class_weight, config.shapelet_diversity_weight,
+            )
+
+            optimizer.zero_grad()
+            ensure_finite_structure_loss(loss)
+            loss.backward()
+            if epoch_step == 0:
+                log_shape_health(writer, epoch, student, source_output)
+            torch.nn.utils.clip_grad_norm_(
+                student.parameters(), max_norm=5., error_if_nonfinite=True,
+            )
+            optimizer.step()
+            scheduler.step()
+            update_ema_variables(student, teacher, config.ema_decay)
+
+            source_count = int(source_labels.shape[0])
+            target_count = int(pseudo.shape[0])
+            source_samples += source_count
+            source_shape_correct += int(
+                (source_output["shape_logits"].detach().argmax(1) == source_labels).sum()
+            )
+            domain_source_count += source_count
+            domain_target_count += target_count
+            domain_source_correct += int(round(float(domain["source_accuracy"]) * source_count))
+            domain_target_correct += int(round(float(domain["target_accuracy"]) * target_count))
+            strength = source_output["shapelet_strength"].detach().float()
+            concentration = source_output["shapelet_concentration"].detach().float()
+            singular = torch.linalg.svdvals(
+                source_output["shapelet_response"].detach().float(),
+            )
+            singular_probability = singular / singular.sum().clamp_min(1e-12)
+            response_rank = torch.exp(-(
+                singular_probability
+                * singular_probability.clamp_min(1e-12).log()
+            ).sum())
+            values = {
+                "loss_cls_source": loss_cls_source.detach(),
+                "loss_pseudo_target": loss_pseudo_target.detach(),
+                "loss_shape_source": loss_shape_source.detach(),
+                "loss_shapelet_diversity": loss_diversity.detach(),
+                "loss_domain": domain["loss"].detach(),
+                "shape_response_effective_rank": response_rank,
+                "shape_concentration_mean": concentration.mean(),
+                "shape_concentration_std": concentration.std(unbiased=False),
+                "grl_alpha": source_output["logits"].new_tensor(grl_alpha),
+            }
+            for name, value in values.items():
+                epoch_sums[name] += float(value)
+            if global_step % config.log_step == 0:
+                metrics = {**values, "loss_total": loss.detach()}
+                for name, value in metrics.items():
+                    writer.add_scalar(f"train/{name}", value, global_step)
+                print("STRUCTURE_V4_DA|" + "|".join(
+                    f"{name}={float(value):.6f}" for name, value in metrics.items()
+                ))
+            global_step += 1
+        progress.close()
+
+        batches = max(config.steps_per_epoch, 1)
+        epoch_values = {name: value / batches for name, value in epoch_sums.items()}
+        epoch_values.update({
+            "pseudo_coverage": pseudo_accepted / max(pseudo_total, 1),
+            "domain_accuracy_source": domain_source_correct / max(domain_source_count, 1),
+            "domain_accuracy_target": domain_target_correct / max(domain_target_count, 1),
+            "domain_accuracy_overall": (
+                domain_source_correct + domain_target_correct
+            ) / max(domain_source_count + domain_target_count, 1),
+            "source_shape_accuracy": source_shape_correct / max(source_samples, 1),
+        })
+        for name, value in epoch_values.items():
+            writer.add_scalar(f"epoch/{name}", value, epoch)
+        print("SHAPE_V4_EPOCH|epoch=" + str(epoch) + "|" + "|".join(
+            f"{name}={value:.6f}" for name, value in epoch_values.items()
+        ))
+
+        previous_best = best_f1
+        if config.run_validation:
+            student.eval()
+            best_f1 = validation(
+                best_f1, None, config, criterion, device, epoch,
+                student if config.output_student else teacher, val_loader, writer,
+            )
+        state_model = student if config.output_student else teacher
+        checkpoint = {
+            "epoch": epoch,
+            "state_dict": state_model.state_dict(),
+            "teacher_state_dict": teacher.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "global_temporal_shift": target_to_source_shift,
+            "config": vars(config),
+            "best_f1": best_f1,
         }
         torch.save(checkpoint, os.path.join(config.fold_dir, "checkpoint_last.pt"))
         if best_f1 > previous_best or not os.path.isfile(best_model_path):

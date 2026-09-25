@@ -127,6 +127,57 @@ def ensure_finite_structure_loss(loss):
         raise FloatingPointError("non-finite loss in structure-shapelet training")
 
 
+def compose_structure_v4_source_loss(
+    classification, source_shape, diversity,
+    shape_weight=.1, diversity_weight=.01,
+):
+    return classification + shape_weight * source_shape + diversity_weight * diversity
+
+
+def compose_structure_v4_da_loss(
+    classification, pseudo_target, source_shape, diversity, domain,
+    trade_off=2., shape_weight=.1, diversity_weight=.01,
+):
+    return (
+        classification + trade_off * pseudo_target
+        + shape_weight * source_shape + diversity_weight * diversity + domain
+    )
+
+
+def masked_pseudo_classification_loss(logits, pseudo_labels, pseudo_mask, criterion):
+    if not (logits.shape[0] == pseudo_labels.shape[0] == pseudo_mask.shape[0]):
+        raise ValueError("target logits, pseudo labels, and mask must align")
+    if not pseudo_mask.any():
+        return logits.sum() * 0
+    return criterion(logits[pseudo_mask], pseudo_labels[pseudo_mask])
+
+
+def structure_domain_adversarial_loss(
+    classifier, source_features, target_features, alpha,
+):
+    from models.structure_da.discriminative_structure import gradient_reverse
+
+    source_logits = classifier(gradient_reverse(source_features, alpha))
+    target_logits = classifier(gradient_reverse(target_features, alpha))
+    source_labels = torch.zeros(
+        source_logits.shape[0], dtype=torch.long, device=source_logits.device,
+    )
+    target_labels = torch.ones(
+        target_logits.shape[0], dtype=torch.long, device=target_logits.device,
+    )
+    source_loss = F.cross_entropy(source_logits, source_labels)
+    target_loss = F.cross_entropy(target_logits, target_labels)
+    return {
+        "loss": .5 * (source_loss + target_loss),
+        "source_loss": source_loss,
+        "target_loss": target_loss,
+        "source_accuracy": (source_logits.detach().argmax(1) == source_labels).float().mean(),
+        "target_accuracy": (target_logits.detach().argmax(1) == target_labels).float().mean(),
+        "source_count": int(source_logits.shape[0]),
+        "target_count": int(target_logits.shape[0]),
+    }
+
+
 def selected_shape_pseudo_loss(logits, pseudo_labels, pseudo_mask, criterion, minimum=2):
     """Apply the existing TimeMatch pseudo-label selection to shape logits."""
     selected_labels = pseudo_labels[pseudo_mask]

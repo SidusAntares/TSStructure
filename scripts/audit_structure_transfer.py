@@ -281,6 +281,7 @@ def collect_fixed(model, dataset, indices, device, batch_size, seed):
         store["morphology"].append(torch.cat((components["raw"], components["diff"]), -1).mean(1).cpu())
         store["instance"].append(output["instance_feature"].cpu())
         store["response"].append(output["shapelet_response"].cpu())
+        store["invariant"].append(output["shape_invariant_feature"].cpu())
         store["pse"].append(output["pse_feature"].cpu())
         labels.append(batch["label"].cpu()); positions.append(batch["positions"].cpu())
     packed = {key: torch.cat(value) for key, value in store.items()}
@@ -398,7 +399,10 @@ def direction_rows(task, source_data, target_data, pseudo_packet, seed):
 
 
 def source_shape_discrimination(task, model, data, classes):
-    response, labels, logits = data["response"], data["labels"], model.shape_classifier(data["response"].to(next(model.parameters()).device)).detach().cpu()
+    response, labels = data["invariant"], data["labels"]
+    logits = model.shape_classifier(
+        response.to(next(model.parameters()).device)
+    ).detach().cpu()
     prediction = logits.argmax(1); cm = confusion_matrix(labels, prediction, labels=np.arange(len(classes)))
     precision, recall, f1, support = precision_recall_fscore_support(labels, prediction, labels=np.arange(len(classes)), zero_division=0)
     rows = []
