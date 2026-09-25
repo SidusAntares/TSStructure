@@ -7,6 +7,8 @@ import torch
 from methods.structure_da.prototype_losses import (
     class_balanced_shape_pseudo_loss,
     class_relative_domain_alignment,
+    memory_class_balanced_shape_pseudo_loss,
+    memory_class_relative_domain_alignment,
     compose_da_loss,
     compose_source_loss,
     initialize_instance_bank,
@@ -17,7 +19,7 @@ from methods.structure_da.prototype_losses import (
     update_instance_bank,
     ensure_finite_structure_loss,
 )
-from models.structure_da.prototype_bank import ClassPrototypeBank
+from models.structure_da.prototype_bank import ClassFeatureMemory, ClassPrototypeBank
 from timematch import update_ema_variables
 from models.stclassifier import PseStructureProtoLTae
 import methods.structure_da.prototype_losses as prototype_losses
@@ -143,6 +145,88 @@ def test_balanced_target_shape_reliability_increases_with_support_and_confidence
 
     assert reliability(1, .99) < reliability(4, .99)
     assert reliability(4, .91) < reliability(4, .99)
+
+
+def test_class_feature_memory_accumulates_rare_class_across_batches():
+    memory = ClassFeatureMemory(3, 2, momentum=.9)
+    for count in (1, 1, 2):
+        memory.update_target(
+            torch.tensor([[2., 1.]]).repeat(count, 1),
+            torch.zeros(count, dtype=torch.long),
+            torch.full((count,), .99),
+            pseudo_threshold=.9,
+        )
+    assert memory.sample_count.tolist() == [4, 0, 0]
+    assert memory.update_count.tolist() == [3, 0, 0]
+    assert memory.reliability()[0] == pytest.approx(.9)
+    assert not list(memory.parameters())
+    assert memory.prototypes.requires_grad is False
+
+
+def test_memory_balanced_shape_loss_uses_reliable_history_for_single_sample():
+    memory = ClassFeatureMemory(2, 3)
+    memory.update_target(
+        torch.randn(4, 3), torch.zeros(4, dtype=torch.long),
+        torch.full((4,), .99), pseudo_threshold=.9,
+    )
+    logits = torch.tensor([[0., 2.]], requires_grad=True)
+    result = memory_class_balanced_shape_pseudo_loss(
+        logits, torch.tensor([0]), torch.tensor([.99]), memory,
+        pseudo_threshold=.9, focal_gamma=0,
+    )
+    assert result["valid_classes"] == 1
+    assert result["loss"] > 0
+    result["loss"].backward()
+    assert logits.grad is not None
+
+
+def test_memory_relative_alignment_remains_active_with_one_current_class():
+    source_memory = ClassFeatureMemory(3, 2)
+    target_memory = ClassFeatureMemory(3, 2)
+    labels = torch.tensor([0, 1])
+    source_memory.update_source(torch.tensor([[0., 0.], [2., 0.]]), labels)
+    target_memory.update_target(
+        torch.tensor([[1., 1.], [4., 1.]]), labels,
+        torch.full((2,), .99), pseudo_threshold=.9,
+    )
+    current = torch.tensor([[2., 1.]], requires_grad=True)
+    result = memory_class_relative_domain_alignment(
+        source_memory, target_memory, current, torch.tensor([0]),
+        torch.tensor([.99]), pseudo_threshold=.9, distance="mse",
+    )
+    assert result["valid_memory_classes"] == 2
+    assert result["valid_current_classes"] == 1
+    assert result["relative_active"] is True
+    assert result["relative_loss"] > 0
+    result["total_loss"].backward()
+    assert current.grad is not None and current.grad.abs().sum() > 0
+    assert source_memory.prototypes.grad is None
+    assert target_memory.prototypes.grad is None
+
+
+def test_memory_alignment_is_finite_for_empty_and_one_memory_class():
+    source_memory = ClassFeatureMemory(2, 3)
+    target_memory = ClassFeatureMemory(2, 3)
+    empty = memory_class_relative_domain_alignment(
+        source_memory, target_memory, torch.empty(0, 3),
+        torch.empty(0, dtype=torch.long), torch.empty(0),
+        pseudo_threshold=.9,
+    )
+    assert empty["total_loss"].item() == 0
+    assert torch.isfinite(empty["total_loss"])
+    source_memory.update_source(torch.ones(1, 3), torch.tensor([0]))
+    target_memory.update_target(
+        torch.ones(1, 3), torch.tensor([0]), torch.tensor([.99]),
+        pseudo_threshold=.9,
+    )
+    one = memory_class_relative_domain_alignment(
+        source_memory, target_memory, torch.ones(1, 3, requires_grad=True),
+        torch.tensor([0]), torch.tensor([.99]), pseudo_threshold=.9,
+    )
+    assert one["valid_memory_classes"] == 1
+    assert one["relative_active"] is False
+    assert one["relative_loss"].item() == 0
+    assert torch.isfinite(one["total_loss"])
 
 
 def test_class_relative_alignment_separates_translation_from_relative_change_and_detaches_source():

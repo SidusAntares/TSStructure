@@ -24,6 +24,8 @@ from methods.structure_da.prototype_losses import (
     centroid_alignment_summary,
     class_balanced_shape_pseudo_loss,
     class_relative_domain_alignment,
+    memory_class_balanced_shape_pseudo_loss,
+    memory_class_relative_domain_alignment,
     compose_da_loss,
     ensure_finite_structure_loss,
     instance_batch_statistics,
@@ -35,6 +37,7 @@ from methods.structure_da.prototype_losses import (
     selected_shape_pseudo_loss,
     update_instance_bank,
 )
+from models.structure_da.prototype_bank import ClassFeatureMemory
 
 
 def _new_epoch_structure_stats():
@@ -283,6 +286,54 @@ def _classify_shift_grid(model, prepared, positions, shifts):
         for shift in shifts
     ], dim=1)
 
+
+@torch.no_grad()
+def _update_structure_feature_memories(
+    memories, source_output, source_labels, teacher_output,
+    pseudo, confidence, pseudo_mask, pseudo_threshold,
+):
+    memories["shape_source"].update_source(
+        source_output["shapelet_response"], source_labels,
+    )
+    memories["stats_source"].update_source(
+        source_output["shape_stats_feature"], source_labels,
+    )
+    if pseudo_mask.any():
+        memories["shape_target"].update_target(
+            teacher_output["shapelet_response"][pseudo_mask], pseudo[pseudo_mask],
+            confidence[pseudo_mask], pseudo_threshold,
+        )
+        memories["stats_target"].update_target(
+            teacher_output["shape_stats_feature"][pseudo_mask], pseudo[pseudo_mask],
+            confidence[pseudo_mask], pseudo_threshold,
+        )
+
+
+def _structure_memory_checkpoint(memories):
+    return {
+        name: {
+            key: value.detach().cpu().clone()
+            for key, value in memory.state_dict().items()
+        }
+        for name, memory in memories.items()
+    }
+
+
+@torch.no_grad()
+def _memory_center_gap(source_memory, target_memory, support_saturation=4):
+    reliability = target_memory.reliability(support_saturation)
+    valid = (
+        source_memory.initialized & target_memory.initialized
+        & (reliability > 0)
+    )
+    if not valid.any():
+        return reliability.new_tensor(0.)
+    weights = reliability[valid]
+    weights = weights / weights.sum().clamp_min(1e-12)
+    source_center = (weights[:, None] * source_memory.prototypes[valid]).sum(0)
+    target_center = (weights[:, None] * target_memory.prototypes[valid]).sum(0)
+    return (target_center - source_center).norm()
+
 def _train_structure_proto_timematch(
     student, config, writer, val_loader, device, best_model_path, fold_num, splits,
 ):
@@ -302,6 +353,20 @@ def _train_structure_proto_timematch(
     student.to(device)
     teacher = deepcopy(student).to(device)
     teacher.eval()
+    memories = {
+        "shape_source": ClassFeatureMemory(
+            config.num_classes, student.shape_classifier.in_features, momentum=.9,
+        ).to(device),
+        "shape_target": ClassFeatureMemory(
+            config.num_classes, student.shape_classifier.in_features, momentum=.9,
+        ).to(device),
+        "stats_source": ClassFeatureMemory(
+            config.num_classes, 64, momentum=.9,
+        ).to(device),
+        "stats_target": ClassFeatureMemory(
+            config.num_classes, 64, momentum=.9,
+        ).to(device),
+    }
     criterion = (
         FocalLoss(gamma=config.focal_loss_gamma)
         if config.use_focal_loss else torch.nn.CrossEntropyLoss()
@@ -358,6 +423,8 @@ def _train_structure_proto_timematch(
         shape_target_batches = 0
         v2_epoch_sums = defaultdict(float)
         v2_epoch_batches = 0
+        pseudo_total_count = 0
+        pseudo_accepted_count = 0
         for epoch_step in progress:
             source_sample = next(source_iter)
             target_weak, target_strong = next(target_iter)
@@ -365,10 +432,13 @@ def _train_structure_proto_timematch(
             with torch.no_grad():
                 teacher_output = teacher.forward_with_temporal_shift(
                     pw, mw, tw, ew, temporal_shift=target_to_source_shift,
+                    return_dict=True,
                 )
-                probabilities = F.softmax(teacher_output, dim=1)
+                probabilities = F.softmax(teacher_output["logits"], dim=1)
                 confidence, pseudo = probabilities.max(1)
                 pseudo_mask = confidence > config.pseudo_threshold
+            pseudo_total_count += int(confidence.numel())
+            pseudo_accepted_count += int(pseudo_mask.sum())
 
             ps, ms, ts, es = to_cuda(source_sample, device)
             source_labels = source_sample["label"].cuda(device=device, non_blocking=True)
@@ -399,26 +469,29 @@ def _train_structure_proto_timematch(
                 target_labels = pseudo[pseudo_mask]
                 loss_pseudo_target = criterion(target_output["logits"], target_labels)
                 target_confidence = confidence[pseudo_mask]
-                target_shape = class_balanced_shape_pseudo_loss(
+                _update_structure_feature_memories(
+                    memories, source_output, source_labels, teacher_output,
+                    pseudo, confidence, pseudo_mask, config.pseudo_threshold,
+                )
+                target_shape = memory_class_balanced_shape_pseudo_loss(
                     target_output["shape_logits"], target_labels, target_confidence,
-                    config.pseudo_threshold, config.focal_loss_gamma,
+                    memories["shape_target"], config.pseudo_threshold,
+                    config.focal_loss_gamma,
                 )
                 loss_shape_target = target_shape["loss"]
                 target_shape_accuracy = float(
                     (target_output["shape_logits"].detach().argmax(1) == target_labels)
                     .float().mean()
                 )
-                shape_alignment = class_relative_domain_alignment(
-                    source_output["shapelet_response"], source_labels,
+                shape_alignment = memory_class_relative_domain_alignment(
+                    memories["shape_source"], memories["shape_target"],
                     target_output["shapelet_response"], target_labels,
                     target_confidence, config.pseudo_threshold, distance="mse",
-                    min_target_support=2,
                 )
-                stats_alignment = class_relative_domain_alignment(
-                    source_output["shape_stats_feature"], source_labels,
+                stats_alignment = memory_class_relative_domain_alignment(
+                    memories["stats_source"], memories["stats_target"],
                     target_output["shape_stats_feature"], target_labels,
                     target_confidence, config.pseudo_threshold, distance="smooth_l1",
-                    min_target_support=2,
                 )
                 target_ins = instance_prototype_loss(
                     target_output["instance_feature"], target_labels,
@@ -435,6 +508,10 @@ def _train_structure_proto_timematch(
                     instance_batch_statistics(target_output, target_labels, student.instance_prototype_bank),
                 )
             else:
+                _update_structure_feature_memories(
+                    memories, source_output, source_labels, teacher_output,
+                    pseudo, confidence, pseudo_mask, config.pseudo_threshold,
+                )
                 zero = source_output["logits"].sum() * 0
                 loss_pseudo_target = target_ins = target_proto = zero
                 loss_shape_target = zero
@@ -446,7 +523,7 @@ def _train_structure_proto_timematch(
                 shape_alignment = stats_alignment = {
                     "total_loss": zero, "global_loss": zero,
                     "relative_loss": zero, "center_gap": zero.detach(),
-                    "valid_classes": 0,
+                    "valid_classes": 0, "relative_active": False,
                 }
 
             loss_diversity = shapelet_diversity_loss(
@@ -529,6 +606,12 @@ def _train_structure_proto_timematch(
                 "stats_domain_center_gap": stats_alignment["center_gap"],
                 "shape_valid_align_classes": shape_alignment["valid_classes"],
                 "stats_valid_align_classes": stats_alignment["valid_classes"],
+                "shape_relative_active_batch_ratio": float(
+                    shape_alignment["relative_active"]
+                ),
+                "stats_relative_active_batch_ratio": float(
+                    stats_alignment["relative_active"]
+                ),
             }
             for name, value in v2_values.items():
                 value = torch.as_tensor(value, device=device).detach()
@@ -582,6 +665,47 @@ def _train_structure_proto_timematch(
         print("SHAPE_V2_EPOCH|epoch=" + str(epoch) + "|" + "|".join(
             f"{name}={value:.6f}" for name, value in v2_epoch.items()
         ))
+        target_reliability = memories["shape_target"].reliability()
+        initialized_target = memories["shape_target"].initialized
+        active_reliability = target_reliability[initialized_target]
+        if active_reliability.numel():
+            memory_mean_reliability = float(active_reliability.mean())
+            memory_min_reliability = float(active_reliability.min())
+            memory_mean_support = float(
+                memories["shape_target"].sample_count[initialized_target]
+                .float().mean()
+            )
+        else:
+            memory_mean_reliability = 0.
+            memory_min_reliability = 0.
+            memory_mean_support = 0.
+        v3_epoch = {
+            "pseudo_coverage": pseudo_accepted_count / max(pseudo_total_count, 1),
+            "shape_memory_source_classes": int(memories["shape_source"].initialized.sum()),
+            "shape_memory_target_classes": int(memories["shape_target"].initialized.sum()),
+            "stats_memory_source_classes": int(memories["stats_source"].initialized.sum()),
+            "stats_memory_target_classes": int(memories["stats_target"].initialized.sum()),
+            "target_memory_mean_reliability": memory_mean_reliability,
+            "target_memory_min_reliability": memory_min_reliability,
+            "target_memory_mean_support": memory_mean_support,
+            "shape_relative_active_batch_ratio": v2_epoch["shape_relative_active_batch_ratio"],
+            "stats_relative_active_batch_ratio": v2_epoch["stats_relative_active_batch_ratio"],
+            "shape_memory_center_gap": float(_memory_center_gap(
+                memories["shape_source"], memories["shape_target"],
+            )),
+            "stats_memory_center_gap": float(_memory_center_gap(
+                memories["stats_source"], memories["stats_target"],
+            )),
+            "loss_shape_align_global": v2_epoch["loss_shape_align_global"],
+            "loss_shape_align_relative": v2_epoch["loss_shape_align_relative"],
+            "loss_stats_align_global": v2_epoch["loss_stats_align_global"],
+            "loss_stats_align_relative": v2_epoch["loss_stats_align_relative"],
+        }
+        for name, value in v3_epoch.items():
+            writer.add_scalar(f"epoch/{name}", value, epoch)
+        print("SHAPE_V3_EPOCH|epoch=" + str(epoch) + "|" + "|".join(
+            f"{name}={value:.6f}" for name, value in v3_epoch.items()
+        ))
         prototype_row = {"epoch": epoch, **_prototype_bank_stats(student)}
         prototype_row.update(_summarize_epoch_structure_stats(
             source_epoch_stats, "source", config.shape_window_scales,
@@ -625,6 +749,7 @@ def _train_structure_proto_timematch(
             "global_temporal_shift": target_to_source_shift,
             "config": vars(config),
             "best_f1": best_f1,
+            "structure_memory": _structure_memory_checkpoint(memories),
         }
         torch.save(checkpoint, os.path.join(config.fold_dir, "checkpoint_last.pt"))
         if best_f1 > previous_best or not os.path.isfile(best_model_path):

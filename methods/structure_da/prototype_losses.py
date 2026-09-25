@@ -205,6 +205,58 @@ def class_balanced_shape_pseudo_loss(
     }
 
 
+def memory_class_balanced_shape_pseudo_loss(
+    shape_logits, pseudo_labels, teacher_confidence, target_memory,
+    pseudo_threshold, focal_gamma=1., support_saturation=4, eps=1e-12,
+):
+    """Class-balanced target shape loss weighted by cross-batch reliability."""
+    if not (shape_logits.shape[0] == pseudo_labels.shape[0]
+            == teacher_confidence.shape[0]):
+        raise ValueError("shape logits, pseudo labels, and confidence must align")
+    zero = shape_logits.sum() * 0
+    if shape_logits.shape[0] == 0:
+        return {
+            "loss": zero, "valid_classes": 0,
+            "mean_class_reliability": zero.detach(),
+            "class_ids": pseudo_labels.new_empty(0),
+            "per_class_support": pseudo_labels.new_empty(0),
+            "per_class_reliability": teacher_confidence.new_empty(0),
+        }
+    sample_weights = _confidence_weight(teacher_confidence, pseudo_threshold)
+    sample_losses = _per_sample_focal_loss(shape_logits, pseudo_labels, focal_gamma)
+    memory_reliability = target_memory.reliability(support_saturation)
+    class_ids, class_losses, supports, reliabilities = [], [], [], []
+    for class_id in torch.unique(pseudo_labels, sorted=True):
+        selected = pseudo_labels == class_id
+        reliability = memory_reliability[class_id]
+        if not target_memory.initialized[class_id] or reliability <= 0:
+            continue
+        weights = sample_weights[selected]
+        class_losses.append(
+            (weights * sample_losses[selected]).sum() / weights.sum().clamp_min(eps)
+        )
+        class_ids.append(class_id)
+        supports.append(int(selected.sum()))
+        reliabilities.append(reliability)
+    if not class_ids:
+        return {
+            "loss": zero, "valid_classes": 0,
+            "mean_class_reliability": zero.detach(),
+            "class_ids": pseudo_labels.new_empty(0),
+            "per_class_support": pseudo_labels.new_empty(0),
+            "per_class_reliability": teacher_confidence.new_empty(0),
+        }
+    reliability = torch.stack(reliabilities).detach()
+    loss = (reliability * torch.stack(class_losses)).sum() / reliability.sum().clamp_min(eps)
+    return {
+        "loss": loss, "valid_classes": len(class_ids),
+        "mean_class_reliability": reliability.mean(),
+        "class_ids": torch.stack(class_ids).detach(),
+        "per_class_support": pseudo_labels.new_tensor(supports).detach(),
+        "per_class_reliability": reliability,
+    }
+
+
 def class_relative_domain_alignment(
     source_features, source_labels, target_features, target_pseudo,
     target_confidence, pseudo_threshold, distance="mse",
@@ -271,6 +323,102 @@ def class_relative_domain_alignment(
         "valid_classes": len(class_ids),
         "mean_class_reliability": reliability.detach().mean(),
         "class_ids": torch.stack(class_ids).detach(),
+    }
+
+
+def memory_class_relative_domain_alignment(
+    source_memory, target_memory, target_features, target_pseudo,
+    target_confidence, pseudo_threshold, distance="mse",
+    support_saturation=4, eps=1e-12,
+):
+    """Align current target centers to detached cross-batch class geometry."""
+    if distance not in {"mse", "smooth_l1"}:
+        raise ValueError("distance must be mse or smooth_l1")
+    if not (target_features.shape[0] == target_pseudo.shape[0]
+            == target_confidence.shape[0]):
+        raise ValueError("target features, pseudo labels, and confidence must align")
+    zero = target_features.sum() * 0
+    reliability = target_memory.reliability(support_saturation)
+    common = (
+        source_memory.initialized & target_memory.initialized
+        & (reliability > 0)
+    )
+    memory_ids = torch.nonzero(common, as_tuple=False).flatten()
+    if memory_ids.numel() == 0 or target_features.shape[0] == 0:
+        return {
+            "total_loss": zero, "global_loss": zero, "relative_loss": zero,
+            "center_gap": zero.detach(), "valid_classes": 0,
+            "valid_current_classes": 0, "valid_memory_classes": int(memory_ids.numel()),
+            "mean_class_reliability": zero.detach(),
+            "class_ids": target_pseudo.new_empty(0), "relative_active": False,
+        }
+
+    memory_weights = reliability[memory_ids]
+    memory_weights = memory_weights / memory_weights.sum().clamp_min(eps)
+    source_memory_mean = (
+        memory_weights[:, None] * source_memory.prototypes[memory_ids].detach()
+    ).sum(0).detach()
+    target_memory_mean = (
+        memory_weights[:, None] * target_memory.prototypes[memory_ids].detach()
+    ).sum(0).detach()
+    sample_weights = _confidence_weight(target_confidence, pseudo_threshold)
+    current_ids, current_centers, current_source, current_reliability = [], [], [], []
+    for class_id in torch.unique(target_pseudo, sorted=True):
+        if not common[class_id]:
+            continue
+        selected = target_pseudo == class_id
+        weights = sample_weights[selected]
+        center = (
+            weights[:, None] * target_features[selected]
+        ).sum(0) / weights.sum().clamp_min(eps)
+        current_ids.append(class_id)
+        current_centers.append(center)
+        current_source.append(source_memory.prototypes[class_id].detach())
+        current_reliability.append(reliability[class_id])
+    if not current_ids:
+        return {
+            "total_loss": zero, "global_loss": zero, "relative_loss": zero,
+            "center_gap": (target_memory_mean - source_memory_mean).norm().detach(),
+            "valid_classes": 0, "valid_current_classes": 0,
+            "valid_memory_classes": int(memory_ids.numel()),
+            "mean_class_reliability": zero.detach(),
+            "class_ids": target_pseudo.new_empty(0), "relative_active": False,
+        }
+    current_centers = torch.stack(current_centers)
+    current_source = torch.stack(current_source)
+    current_reliability = torch.stack(current_reliability).detach()
+    normalized = current_reliability / current_reliability.sum().clamp_min(eps)
+
+    def metric(left, right):
+        if distance == "mse":
+            return F.mse_loss(left, right, reduction="none").mean(-1)
+        return F.smooth_l1_loss(left, right, reduction="none").mean(-1)
+
+    target_batch_mean = (normalized[:, None] * current_centers).sum(0)
+    source_reference_mean = (normalized[:, None] * current_source).sum(0).detach()
+    global_loss = metric(target_batch_mean, source_reference_mean)
+    relative_active = memory_ids.numel() >= 2
+    if relative_active:
+        relative = metric(
+            current_centers - target_memory_mean,
+            current_source - source_memory_mean,
+        )
+        relative_loss = (
+            current_reliability * relative
+        ).sum() / current_reliability.sum().clamp_min(eps)
+    else:
+        relative_loss = zero
+    return {
+        "total_loss": global_loss + relative_loss,
+        "global_loss": global_loss,
+        "relative_loss": relative_loss,
+        "center_gap": (target_memory_mean - source_memory_mean).norm().detach(),
+        "valid_classes": len(current_ids),
+        "valid_current_classes": len(current_ids),
+        "valid_memory_classes": int(memory_ids.numel()),
+        "mean_class_reliability": current_reliability.mean(),
+        "class_ids": torch.stack(current_ids).detach(),
+        "relative_active": bool(relative_active),
     }
 
 

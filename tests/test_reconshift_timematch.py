@@ -540,6 +540,61 @@ def test_structure_proto_timematch_rejects_temporal_shift_augmentation():
         )
 
 
+def test_structure_memory_target_update_uses_teacher_weak_features():
+    from models.structure_da.prototype_bank import ClassFeatureMemory
+
+    memories = {
+        "shape_source": ClassFeatureMemory(2, 2),
+        "shape_target": ClassFeatureMemory(2, 2),
+        "stats_source": ClassFeatureMemory(2, 3),
+        "stats_target": ClassFeatureMemory(2, 3),
+    }
+    source_output = {
+        "shapelet_response": torch.tensor([[1., 2.], [3., 4.]]),
+        "shape_stats_feature": torch.tensor([[1., 2., 3.], [4., 5., 6.]]),
+    }
+    teacher_weak = {
+        "shapelet_response": torch.tensor([[10., 20.], [30., 40.]]),
+        "shape_stats_feature": torch.tensor([[10., 20., 30.], [30., 40., 50.]]),
+    }
+    student_strong = {
+        "shapelet_response": torch.full((2, 2), -99.),
+        "shape_stats_feature": torch.full((2, 3), -99.),
+    }
+    timematch._update_structure_feature_memories(
+        memories, source_output, torch.tensor([0, 1]), teacher_weak,
+        torch.tensor([0, 1]), torch.tensor([.99, .99]),
+        torch.tensor([True, True]), .9,
+    )
+    torch.testing.assert_close(
+        memories["shape_target"].prototypes, teacher_weak["shapelet_response"],
+    )
+    assert not torch.equal(
+        memories["shape_target"].prototypes,
+        student_strong["shapelet_response"],
+    )
+
+
+def test_structure_memory_checkpoint_contains_only_required_buffer_state():
+    from models.structure_da.prototype_bank import ClassFeatureMemory
+
+    memories = {
+        name: ClassFeatureMemory(2, dimension)
+        for name, dimension in (
+            ("shape_source", 32), ("shape_target", 32),
+            ("stats_source", 64), ("stats_target", 64),
+        )
+    }
+    packet = timematch._structure_memory_checkpoint(memories)
+    assert set(packet) == set(memories)
+    required = {
+        "prototypes", "initialized", "sample_count",
+        "confidence_ema", "update_count",
+    }
+    assert all(set(state) == required for state in packet.values())
+    assert all(value.device.type == "cpu" for state in packet.values() for value in state.values())
+
+
 def test_structure_proto_four_task_launcher_has_canonical_domains_and_gpu_mapping():
     text = Path("scripts/run_structure_proto_4tasks_4gpu_seed1.sh").read_text(
         encoding="utf-8",
@@ -602,6 +657,27 @@ def test_structure_proto_v2_launcher_is_q24_and_retrains_four_sources():
     assert text.count('--shape-align-weight 0.05 --stats-align-weight 0.02') == 2
     assert '--epochs 100' in text
     assert '--epochs 20 --steps_per_epoch 500' in text
+    for task in (
+        'AT1 "$AT1" DK1 "$DK1"',
+        'FR1 "$FR1" FR2 "$FR2"',
+        'FR2 "$FR2" DK1 "$DK1"',
+        'DK1 "$DK1" AT1 "$AT1"',
+    ):
+        assert task in text
+
+
+def test_structure_proto_v3_launcher_reuses_v2_sources_and_runs_only_uda():
+    text = Path("scripts/run_structure_proto_v3_4tasks_4gpu_seed1.sh").read_text(
+        encoding="utf-8",
+    )
+    assert 'SOURCE_ROOT="${SOURCE_ROOT:-outputs/structure_proto_v2_4tasks_seed1/source}"' in text
+    assert 'EXP_ROOT="${EXP_ROOT:-outputs/structure_proto_v3_4tasks_seed1}"' in text
+    assert 'LOG_ROOT="${LOG_ROOT:-logs/structure_proto_v3_4tasks_seed1}"' in text
+    assert '--epochs 100' not in text
+    assert text.count('--epochs 20 --steps_per_epoch 500') == 1
+    assert text.count('--shape-window-scales 24 --shape-window-stride 8') == 1
+    assert text.count('--shape-target-weight 0.05') == 1
+    assert text.count('--shape-align-weight 0.05 --stats-align-weight 0.02') == 1
     for task in (
         'AT1 "$AT1" DK1 "$DK1"',
         'FR1 "$FR1" FR2 "$FR2"',
