@@ -123,7 +123,7 @@ def test_model_reconstruction_keeps_pse_gradient():
     assert any(torch.count_nonzero(gradient) > 0 for gradient in gradients)
 
 
-def test_factory_exposes_only_neutral_fourier_model(monkeypatch):
+def test_factory_exposes_neutral_fourier_and_v2clean_structure_models(monkeypatch):
     tensorboard_stub = types.ModuleType("torch.utils.tensorboard")
     tensorboard_stub.SummaryWriter = object
     monkeypatch.setitem(sys.modules, "torch.utils.tensorboard", tensorboard_stub)
@@ -144,7 +144,7 @@ def test_factory_exposes_only_neutral_fourier_model(monkeypatch):
         setattr(module_stub, function_name, lambda *args, **kwargs: None)
         monkeypatch.setitem(sys.modules, module_name, module_stub)
     import train
-    from models.stclassifier import PseFourierReconLTae, PseLTae
+    from models.stclassifier import PseFourierReconLTae, PseLTae, PseStructureProtoLTae
 
     parser = argparse.ArgumentParser()
     train.add_model_arguments(parser)
@@ -175,6 +175,17 @@ def test_factory_exposes_only_neutral_fourier_model(monkeypatch):
     configured.num_classes = 6
     configured.with_extra = True
     assert isinstance(train.create_model(configured), PseFourierReconLTae)
+
+    v2clean = parser.parse_args([
+        "--model", "psestructureprotoltae",
+        "--shapelet-count", "16",
+    ])
+    v2clean.input_dim = 10
+    v2clean.num_classes = 6
+    v2clean.with_extra = True
+    model = train.create_model(v2clean)
+    assert isinstance(model, PseStructureProtoLTae)
+    assert not hasattr(model, "instance_prototype_bank")
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--model", "psefrednltae"])

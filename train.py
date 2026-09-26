@@ -128,7 +128,6 @@ def create_model(config):
             fourier_reg=config.fourier_reg,
             fourier_period_days=config.fourier_period_days,
         )
-        model.instance_prototype_bank.momentum = config.proto_momentum
         return model
     raise NotImplementedError(config.model)
 
