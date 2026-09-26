@@ -169,7 +169,7 @@ def main(config):
             with open(os.path.join(config.fold_dir, 'manifest.json'), 'w') as stream:
                 json.dump(
                     {
-                        'method': 'discriminative_structure_shared_private_v5',
+                        'method': 'discriminative_structure_occurrence_phase_v6',
                         'structure_exposer': config.structure_exposer,
                         'fourier_num_modes': config.fourier_num_modes,
                         'shape_dim': config.shape_dim,
@@ -186,8 +186,14 @@ def main(config):
                         'structure_decomposition': 'shared_private',
                         'shared_dim': 64,
                         'domain_dim': 32,
-                        'shared_usage': 'shape_classifier+Qshape',
+                        'shared_usage': 'morphology_domain_invariant',
                         'domain_usage': 'domain_only',
+                        'occurrence_phase': 'weighted_circular_sin_cos',
+                        'phase_response_dim': 2 * config.shapelet_count,
+                        'phase_projector': 'linear_gelu_linear_layernorm',
+                        'semantic_fusion': 'layernorm(shared+phase)',
+                        'semantic_usage': 'shape_classifier+Qshape',
+                        'phase_loss': False,
                         'shared_domain_objective': 'GRL',
                         'private_domain_objective': 'domain_classification',
                         'separation': 'cross_covariance',

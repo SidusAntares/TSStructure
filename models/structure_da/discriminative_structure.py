@@ -95,7 +95,7 @@ class MultiScaleWindowExtractor(nn.Module):
                 persistent=False,
             )
 
-    def forward(self, curve):
+    def forward(self, curve, return_centers=False):
         if curve.ndim != 3:
             raise ValueError("curve must be [B,G,D]")
         _, points, _ = curve.shape
@@ -103,14 +103,22 @@ class MultiScaleWindowExtractor(nn.Module):
             raise ValueError(
                 f"expected exposed curve length {self.grid_points}, got {points}"
             )
-        windows, scale_ids = [], []
+        windows, scale_ids, centers = [], [], []
         for index, scale in enumerate(self.scales):
             indices = getattr(self, f"indices_{index}")
             windows.append(curve[:, indices])
             scale_ids.extend([scale] * indices.shape[0])
+            starts = torch.arange(
+                0, self.grid_points, self.stride,
+                device=curve.device, dtype=curve.dtype,
+            )
+            centers.append((starts + (scale - 1) / 2.) % self.grid_points)
         if not windows:
             raise ValueError("no window scale fits the exposed curve")
-        return windows, torch.tensor(scale_ids, device=curve.device)
+        scales = torch.tensor(scale_ids, device=curve.device)
+        if return_centers:
+            return windows, scales, torch.cat(centers)
+        return windows, scales
 
 
 class _ResidualTemporalBlock(nn.Module):
@@ -411,6 +419,11 @@ class DiscriminativeStructureBranch(nn.Module):
         response_dim = 2 * shapelet_count
         self.invariant_projector = InvariantProjector(response_dim)
         self.domain_projector = DomainProjector(response_dim, 32)
+        self.phase_projector = nn.Sequential(
+            nn.Linear(response_dim, 128), nn.GELU(),
+            nn.Linear(128, response_dim), nn.LayerNorm(response_dim),
+        )
+        self.semantic_norm = nn.LayerNorm(response_dim)
         self.response_to_query = nn.Sequential(
             nn.Linear(response_dim, 64), nn.GELU(),
             nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
@@ -432,9 +445,39 @@ class DiscriminativeStructureBranch(nn.Module):
             return {**details, "strength": details["response"], "rich_response": rich}
         return rich
 
-    def forward(self, features, positions):
+    def compute_phase_response(self, weights, window_centers, phase_shift=0):
+        """Summarize shapelet occurrence on the shifted annual phase circle."""
+        if weights.ndim != 3:
+            raise ValueError("weights must be [B,N,M]")
+        centers = torch.as_tensor(
+            window_centers, device=weights.device, dtype=weights.dtype,
+        ).flatten()
+        if centers.numel() != weights.shape[1]:
+            raise ValueError("window centers must match the candidate dimension")
+        shift = torch.as_tensor(
+            phase_shift, device=weights.device, dtype=weights.dtype,
+        )
+        if shift.ndim == 0:
+            shift = shift.expand(weights.shape[0])
+        shift = shift.reshape(weights.shape[0], -1)
+        if shift.shape[1] != 1:
+            raise ValueError("phase_shift must be scalar or one value per sample")
+        days = centers[None, :] * (
+            self.exposer.period_days / self.window_extractor.grid_points
+        )
+        phase = 2. * torch.pi * torch.remainder(
+            days + shift, self.exposer.period_days,
+        ) / self.exposer.period_days
+        cosine = (weights * torch.cos(phase).unsqueeze(-1)).sum(dim=1)
+        sine = (weights * torch.sin(phase).unsqueeze(-1)).sum(dim=1)
+        return torch.cat((cosine, sine), dim=-1)
+
+    def prepare_morphology(self, features, positions):
+        """Compute the shift-independent morphology once for later phase reuse."""
         exposed, grid = self.exposer(features, positions)
-        window_groups, scales = self.window_extractor(exposed)
+        window_groups, scales, centers = self.window_extractor(
+            exposed, return_centers=True,
+        )
         encoded = [
             self.token_generator(windows, return_encoded_components=True)
             for windows in window_groups
@@ -450,18 +493,44 @@ class DiscriminativeStructureBranch(nn.Module):
         concentration = response[:, strength.shape[1]:]
         invariant = self.invariant_projector(response)
         domain = self.domain_projector(response)
-        class_token = self.response_to_query(invariant)
         return {
             "shape_tokens": tokens,
             "shapelet_strength": strength,
             "shapelet_concentration": concentration,
             "shapelet_response": response,
+            "shapelet_weights": details["weights"],
+            "shape_window_centers": centers,
             "shape_shared_feature": invariant,
             "shape_invariant_feature": invariant,
             "shape_domain_feature": domain,
             "shape_stats_feature": stats_tokens.mean(dim=1),
-            "shape_class_token": class_token,
             "shape_scales": scales,
             "exposed_curve": exposed,
             "exposed_grid": grid,
         }
+
+    def apply_phase(self, prepared_structure, phase_shift=0):
+        """Apply only occurrence phase and semantic fusion to cached morphology."""
+        phase_response = self.compute_phase_response(
+            prepared_structure["shapelet_weights"],
+            prepared_structure["shape_window_centers"],
+            phase_shift,
+        )
+        phase_feature = self.phase_projector(phase_response)
+        semantic = self.semantic_norm(
+            prepared_structure["shape_shared_feature"] + phase_feature
+        )
+        return {
+            **prepared_structure,
+            "shapelet_phase_cos": phase_response[:, :phase_response.shape[1] // 2],
+            "shapelet_phase_sin": phase_response[:, phase_response.shape[1] // 2:],
+            "shapelet_phase_response": phase_response,
+            "shape_phase_feature": phase_feature,
+            "shape_semantic_feature": semantic,
+            "shape_class_token": self.response_to_query(semantic),
+        }
+
+    def forward(self, features, positions, phase_shift=0):
+        return self.apply_phase(
+            self.prepare_morphology(features, positions), phase_shift,
+        )

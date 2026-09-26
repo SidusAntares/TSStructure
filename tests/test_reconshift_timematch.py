@@ -738,15 +738,43 @@ def test_shift_grid_caches_structure_once_and_matches_uncached_logits(monkeypatc
         model.classify_prepared(prepared, positions, temporal_shift=shift)
         for shift in shifts
     ], dim=1)
-    calls = 0
-    original = model.structure_branch.forward
+    morphology_calls = 0
+    phase_shifts = []
+    phase_tokens = []
+    original_prepare = model.structure_branch.prepare_morphology
+    original_apply = model.structure_branch.apply_phase
 
-    def counted(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
+    def counted_prepare(*args, **kwargs):
+        nonlocal morphology_calls
+        morphology_calls += 1
+        return original_prepare(*args, **kwargs)
 
-    monkeypatch.setattr(model.structure_branch, "forward", counted)
+    def counted_apply(prepared_structure, phase_shift):
+        phase_shifts.append(phase_shift)
+        output = original_apply(prepared_structure, phase_shift)
+        phase_tokens.append(output["shape_class_token"])
+        return output
+
+    monkeypatch.setattr(model.structure_branch, "prepare_morphology", counted_prepare)
+    monkeypatch.setattr(model.structure_branch, "apply_phase", counted_apply)
     actual = _classify_shift_grid(model, prepared, positions, shifts)
-    assert calls == 1
+    assert morphology_calls == 1
+    assert phase_shifts == shifts
+    assert any(
+        not torch.allclose(phase_tokens[0], current)
+        for current in phase_tokens[1:]
+    )
     torch.testing.assert_close(actual, expected)
+
+
+def test_structure_proto_v6_launcher_retrains_sources_and_runs_four_tasks():
+    text = Path("scripts/run_structure_proto_v6_4tasks_4gpu_seed1.sh").read_text(
+        encoding="utf-8",
+    )
+    assert 'EXP_ROOT="${EXP_ROOT:-outputs/structure_proto_v6_4tasks_seed1}"' in text
+    assert 'LOG_ROOT="${LOG_ROOT:-logs/structure_proto_v6_4tasks_seed1}"' in text
+    assert 'RUN_ROOT="${RUN_ROOT:-runs/structure_proto_v6_4tasks_seed1}"' in text
+    assert text.count('--epochs 100') == 1
+    assert text.count('--epochs 20 --steps_per_epoch 500') == 1
+    assert text.count('run_task "$GPU') == 4
+    assert '--shapelet-count 32' in text

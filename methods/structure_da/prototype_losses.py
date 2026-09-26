@@ -571,6 +571,16 @@ def shape_health_snapshot(model, outputs):
         concentration = outputs["shapelet_concentration"].detach().float()
         values["shape_concentration_mean"] = float(concentration.mean())
         values["shape_concentration_std"] = float(concentration.std(unbiased=False))
+    if "shapelet_phase_response" in outputs:
+        values["phase_response_norm"] = float(
+            outputs["shapelet_phase_response"].detach().float().norm(dim=-1).mean()
+        )
+        values["phase_feature_norm"] = float(
+            outputs["shape_phase_feature"].detach().float().norm(dim=-1).mean()
+        )
+        values["semantic_feature_norm"] = float(
+            outputs["shape_semantic_feature"].detach().float().norm(dim=-1).mean()
+        )
     return values
 
 

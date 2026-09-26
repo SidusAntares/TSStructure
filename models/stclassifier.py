@@ -70,7 +70,7 @@ class PseStructureProtoLTae(nn.Module):
         return spatial_feats
 
     def prepare_structure(self, prepared, positions):
-        return self.structure_branch(prepared, positions)
+        return self.structure_branch.prepare_morphology(prepared, positions)
 
     def classify_prepared(
         self, prepared, positions, temporal_shift=0, return_feats=False,
@@ -81,6 +81,7 @@ class PseStructureProtoLTae(nn.Module):
             self.prepare_structure(prepared, positions)
             if prepared_structure is None else prepared_structure
         )
+        structure = self.structure_branch.apply_phase(structure, temporal_shift)
         instance = self.temporal_encoder(
             prepared, shifted_positions,
             external_query=structure["shape_class_token"],
@@ -97,7 +98,9 @@ class PseStructureProtoLTae(nn.Module):
         del collect_diagnostics
         spatial = self.spatial_encoder(pixels, mask, extra)
         shifted_positions = positions + temporal_shift
-        structure = self.structure_branch(spatial, positions)
+        structure = self.structure_branch(
+            spatial, positions, phase_shift=temporal_shift,
+        )
         instance = self.temporal_encoder(
             spatial, shifted_positions,
             external_query=structure["shape_class_token"],
@@ -106,7 +109,7 @@ class PseStructureProtoLTae(nn.Module):
         if return_dict:
             return {
                 "logits": logits,
-                "shape_logits": self.shape_classifier(structure["shape_shared_feature"]),
+                "shape_logits": self.shape_classifier(structure["shape_semantic_feature"]),
                 "instance_feature": instance,
                 **structure,
             }

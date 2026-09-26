@@ -113,7 +113,9 @@ def prepare_intervention(model, batch):
     branch = model.structure_branch
     positions = batch["positions"]
     exposed, grid = branch.exposer(spatial, positions)
-    groups, scales = branch.window_extractor(exposed)
+    groups, scales, centers = branch.window_extractor(
+        exposed, return_centers=True,
+    )
     component_groups = []
     for windows in groups:
         parts = branch.token_generator.components(windows)
@@ -127,10 +129,13 @@ def prepare_intervention(model, batch):
     return {
         "spatial": spatial, "components_by_scale": component_groups,
         "shape_scales": scales, "exposed_curve": exposed, "exposed_grid": grid,
+        "shape_window_centers": centers,
     }
 
 
-def _structure_from_prepared(model, prepared, component_mode, scale_mode):
+def _structure_from_prepared(
+    model, prepared, component_mode, scale_mode, temporal_shift=0,
+):
     if component_mode not in COMPONENTS:
         raise ValueError(f"unknown component intervention: {component_mode}")
     branch, keep = model.structure_branch, set(COMPONENTS[component_mode])
@@ -151,12 +156,16 @@ def _structure_from_prepared(model, prepared, component_mode, scale_mode):
     )
     response = branch.compose_rich_response(details)
     invariant = branch.invariant_projector(response)
-    class_token = branch.response_to_query(invariant)
-    return {
+    morphology = {
         "shape_tokens": tokens,
+        "shapelet_strength": details["response"],
+        "shapelet_concentration": response[:, details["response"].shape[1]:],
         "shapelet_response": response,
+        "shapelet_weights": details["weights"],
+        "shape_window_centers": prepared["shape_window_centers"],
+        "shape_shared_feature": invariant,
         "shape_invariant_feature": invariant,
-        "shape_class_token": class_token,
+        "shape_domain_feature": branch.domain_projector(response),
         "shape_scales": prepared["shape_scales"],
         "exposed_curve": prepared["exposed_curve"],
         "exposed_grid": prepared["exposed_grid"],
@@ -166,6 +175,7 @@ def _structure_from_prepared(model, prepared, component_mode, scale_mode):
             name: torch.cat(values, dim=1) for name, values in combined_components.items()
         },
     }
+    return branch.apply_phase(morphology, temporal_shift)
 
 
 def forward_prepared_intervention(
@@ -174,7 +184,9 @@ def forward_prepared_intervention(
 ):
     """Apply lightweight interventions to cached read-only representations."""
     spatial = prepared["spatial"]
-    structure = _structure_from_prepared(model, prepared, component_mode, scale_mode)
+    structure = _structure_from_prepared(
+        model, prepared, component_mode, scale_mode, temporal_shift,
+    )
     projection = model.temporal_encoder.attention_heads.external_query_projection
     with _scaled_projection(projection, query_alpha):
         temporal = model.temporal_encoder(
@@ -188,7 +200,7 @@ def forward_prepared_intervention(
         instance, attention = temporal, None
     result = {
         "logits": model.decoder(instance),
-        "shape_logits": model.shape_classifier(structure["shape_invariant_feature"]),
+        "shape_logits": model.shape_classifier(structure["shape_semantic_feature"]),
         "instance_feature": instance,
         "pse_feature": spatial,
         **structure,

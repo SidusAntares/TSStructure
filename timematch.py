@@ -77,6 +77,15 @@ def load_v4_source_for_v5(model, checkpoint):
     }
 
 
+def load_v6_source_for_v6(model, checkpoint):
+    """Strictly load the independently trained V6 source before UDA."""
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    _reset_trainable_module(model.domain_classifier)
+    _reset_trainable_module(model.structure_branch.domain_projector)
+    _reset_trainable_module(model.private_domain_classifier)
+    return {"missing_keys": [], "unexpected_keys": []}
+
+
 def _new_epoch_structure_stats():
     return {"instance_cos": []}
 
@@ -805,11 +814,11 @@ def _train_structure_proto_timematch(
         splits, config, config.balance_source,
     )
     checkpoint_path = os.path.join(config.weights, f"fold_{fold_num}", "model.pt")
-    compatibility = load_v4_source_for_v5(
+    compatibility = load_v6_source_for_v6(
         student, torch.load(checkpoint_path, weights_only=False),
     )
     print(
-        "STRUCTURE_V5_SOURCE_LOAD|"
+        "STRUCTURE_V6_SOURCE_LOAD|"
         f"checkpoint={checkpoint_path}|"
         f"missing={','.join(compatibility['missing_keys'])}|unexpected=none"
     )
@@ -851,7 +860,7 @@ def _train_structure_proto_timematch(
         domain_sample_count = 0
         progress = tqdm(
             range(config.steps_per_epoch),
-            desc=f"StructureV5 TimeMatch {epoch + 1}/{config.epochs}",
+            desc=f"StructureV6 TimeMatch {epoch + 1}/{config.epochs}",
             disable=progress_bar_disabled(getattr(config, "progress_bar", "auto")),
         )
         for epoch_step in progress:
@@ -962,7 +971,7 @@ def _train_structure_proto_timematch(
                 metrics = {**values, "loss_total": loss.detach()}
                 for name, value in metrics.items():
                     writer.add_scalar(f"train/{name}", value, global_step)
-                print("STRUCTURE_V5_DA|" + "|".join(
+                print("STRUCTURE_V6_DA|" + "|".join(
                     f"{name}={float(value):.6f}" for name, value in metrics.items()
                 ))
             global_step += 1
@@ -978,7 +987,7 @@ def _train_structure_proto_timematch(
         })
         for name, value in epoch_values.items():
             writer.add_scalar(f"epoch/{name}", value, epoch)
-        print("SHAPE_V5_EPOCH|epoch=" + str(epoch) + "|" + "|".join(
+        print("SHAPE_V6_EPOCH|epoch=" + str(epoch) + "|" + "|".join(
             f"{name}={value:.6f}" for name, value in epoch_values.items()
         ))
 

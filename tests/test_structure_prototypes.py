@@ -132,6 +132,28 @@ def test_v5_shared_and_private_gradient_paths_are_isolated():
     assert all(value is None for value in private_grads[:len(shared_parameters)])
     assert any(value is not None for value in private_grads[len(shared_parameters):])
 
+    phase_parameters = tuple(model.structure_branch.phase_projector.parameters())
+    domain_grads = torch.autograd.grad(
+        shared_loss + private_loss, phase_parameters,
+        allow_unused=True,
+    )
+    assert all(value is None for value in domain_grads)
+
+
+def test_v6_source_shape_loss_trains_phase_projector():
+    model = _small_structure_model().train()
+    batch = _small_structure_batch()
+    output = model(
+        batch["pixels"], batch["valid_pixels"], batch["positions"], batch["extra"],
+        return_dict=True,
+    )
+    loss = torch.nn.functional.cross_entropy(output["shape_logits"], batch["label"])
+    gradients = torch.autograd.grad(
+        loss, tuple(model.structure_branch.phase_projector.parameters()),
+        allow_unused=True,
+    )
+    assert any(value is not None and value.abs().sum() > 0 for value in gradients)
+
 
 def test_v5_cross_covariance_separation_zero_and_positive():
     shared = torch.tensor([[1., 0.], [-1., 0.]])
@@ -516,6 +538,19 @@ def test_v5_loss_composition_contains_only_frozen_and_three_decomposition_terms(
     torch.testing.assert_close(actual, expected)
 
 
+def test_v6_reuses_v5_loss_without_any_phase_term():
+    values = [torch.tensor(float(value)) for value in range(1, 8)]
+    actual = compose_structure_v5_da_loss(
+        *values, trade_off=2., shape_weight=.1, diversity_weight=.01,
+        shared_adv_weight=.1, private_domain_weight=.1, separation_weight=.01,
+    )
+    expected = (
+        values[0] + 2 * values[1] + .1 * values[2] + .01 * values[3]
+        + .1 * values[4] + .1 * values[5] + .01 * values[6]
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 def test_bank_updates_source_classes_by_ema_and_leaves_absent_class():
     bank = ClassPrototypeBank(3, 2, momentum=.5)
     features = torch.tensor([[1., 0.], [1., 0.], [0., 1.]])
@@ -709,6 +744,7 @@ def test_teacher_ema_covers_all_new_trainable_submodules():
         "structure_branch.token_generator.std_encoder",
         "structure_branch.token_generator.fusion", "structure_branch.shapelet_dictionary",
         "structure_branch.invariant_projector", "structure_branch.domain_projector",
+        "structure_branch.phase_projector", "structure_branch.semantic_norm",
         "structure_branch.response_to_query",
         "temporal_encoder.attention_heads.external_query_projection",
         "temporal_encoder.mlp", "decoder", "shape_classifier", "domain_classifier",
