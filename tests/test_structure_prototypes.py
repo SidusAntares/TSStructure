@@ -26,6 +26,93 @@ from methods.structure_da.prototype_losses import (
     update_instance_bank,
     ensure_finite_structure_loss,
 )
+
+
+def test_v2clean_loss_composition_has_only_frozen_terms_and_ramped_alignment():
+    from methods.structure_da.prototype_losses import compose_structure_v2clean_da_loss
+
+    values = [torch.tensor(float(value)) for value in range(1, 6)]
+    actual = compose_structure_v2clean_da_loss(
+        *values, ramp=.4, trade_off=2., shape_weight=.1,
+        diversity_weight=.01, shape_align_weight=.05,
+    )
+    expected = (
+        values[0] + 2. * values[1] + .1 * values[2]
+        + .01 * values[3] + .4 * .05 * values[4]
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_v2clean_batch_alignment_zero_one_and_two_classes_and_gradient():
+    source = torch.tensor([
+        [0., 0.], [0., 0.], [2., 0.], [2., 0.],
+    ])
+    source_labels = torch.tensor([0, 0, 1, 1])
+    empty_features = torch.empty(0, 2, requires_grad=True)
+    empty = class_relative_domain_alignment(
+        source, source_labels, empty_features,
+        torch.empty(0, dtype=torch.long), torch.empty(0), .9,
+    )
+    assert empty["valid_classes"] == 0
+    assert empty["total_loss"].item() == 0
+
+    one_features = torch.tensor([[1., 1.], [1., 1.]], requires_grad=True)
+    one = class_relative_domain_alignment(
+        source, source_labels, one_features, torch.zeros(2, dtype=torch.long),
+        torch.full((2,), .99), .9,
+    )
+    assert one["valid_classes"] == 1
+    assert one["global_loss"] > 0
+    assert one["relative_loss"].item() == 0
+
+    two_features = torch.tensor([
+        [1., 1.], [1., 1.], [4., 1.], [4., 1.],
+    ], requires_grad=True)
+    two = class_relative_domain_alignment(
+        source, source_labels, two_features, source_labels,
+        torch.full((4,), .99), .9,
+    )
+    assert two["valid_classes"] == 2
+    assert two["global_loss"] > 0
+    assert two["relative_loss"] > 0
+    two["total_loss"].backward()
+    assert two_features.grad is not None and two_features.grad.abs().sum() > 0
+
+
+def test_v2clean_empty_pseudo_total_is_finite():
+    from methods.structure_da.prototype_losses import compose_structure_v2clean_da_loss
+
+    logits = torch.randn(4, 3, requires_grad=True)
+    pseudo = torch.zeros(4, dtype=torch.long)
+    mask = torch.zeros(4, dtype=torch.bool)
+    pseudo_loss = masked_pseudo_classification_loss(
+        logits, pseudo, mask, torch.nn.CrossEntropyLoss(),
+    )
+    zero_align = logits.sum() * 0
+    total = compose_structure_v2clean_da_loss(
+        logits.square().mean(), pseudo_loss, logits.abs().mean(),
+        logits.sum() * 0, zero_align, ramp=.1,
+    )
+    assert pseudo_loss.item() == 0
+    assert torch.isfinite(total)
+
+
+def test_v2clean_formal_trainer_uses_only_batch_shape_alignment():
+    import inspect
+    import timematch
+
+    source = inspect.getsource(timematch._train_structure_proto_timematch)
+    assert "class_relative_domain_alignment(" in source
+    assert "compose_structure_v2clean_da_loss(" in source
+    assert 'target_output["shapelet_response"][pseudo_mask]' in source
+    for removed in (
+        "loss_shape_target", "shapelet_data_support_loss(",
+        "instance_prototype_loss(", "stats_alignment",
+        "memory_class_relative_domain_alignment(",
+        "structure_domain_adversarial_loss(", "structure_private_domain_loss(",
+        "shared_private_separation_loss(", "phase_",
+    ):
+        assert removed not in source
 from models.structure_da.prototype_bank import ClassFeatureMemory, ClassPrototypeBank
 from timematch import load_v4_source_for_v5, update_ema_variables
 from models.stclassifier import PseStructureProtoLTae
@@ -58,179 +145,12 @@ def _gradient_norm(module):
     ))
 
 
-def test_v4_synthetic_source_target_step_is_finite_and_uses_full_target_domain_batch():
-    model = _small_structure_model().train()
-    source = _small_structure_batch()
-    target = _small_structure_batch()
-    keys = ("pixels", "positions", "extra")
-    source_output = model(
-        **{key: source[key] for key in keys}, mask=source["valid_pixels"],
-        return_dict=True,
-    )
-    target_output = model(
-        **{key: target[key] for key in keys}, mask=target["valid_pixels"],
-        return_dict=True,
-    )
-    criterion = torch.nn.CrossEntropyLoss()
-    pseudo = torch.tensor([0, 1, 2, 1])
-    pseudo_mask = torch.tensor([True, False, False, False])
-    pseudo_loss = masked_pseudo_classification_loss(
-        target_output["logits"], pseudo, pseudo_mask, criterion,
-    )
-    domain = structure_domain_adversarial_loss(
-        model.domain_classifier,
-        source_output["shape_invariant_feature"],
-        target_output["shape_invariant_feature"],
-        alpha=.5,
-    )
-    total = compose_structure_v4_da_loss(
-        criterion(source_output["logits"], source["label"]),
-        pseudo_loss,
-        criterion(source_output["shape_logits"], source["label"]),
-        shapelet_diversity_loss(
-            model.structure_branch.shapelet_dictionary.anchors, margin=.5,
-        ),
-        domain["loss"],
-    )
-    assert domain["target_count"] == 4
-    assert int(pseudo_mask.sum()) == 1
-    assert torch.isfinite(total)
-    total.backward()
-    assert _gradient_norm(model.structure_branch.invariant_projector) > 0
-    assert _gradient_norm(model.domain_classifier) > 0
-
-
-def test_v5_shared_and_private_gradient_paths_are_isolated():
-    model = _small_structure_model().train()
-    batch = _small_structure_batch()
-    output = model(
-        batch["pixels"], batch["valid_pixels"], batch["positions"], batch["extra"],
-        return_dict=True,
-    )
-    shared_loss = structure_domain_adversarial_loss(
-        model.domain_classifier,
-        output["shape_shared_feature"], output["shape_shared_feature"].detach(),
-        alpha=.5,
-    )["loss"]
-    shared_parameters = tuple(model.structure_branch.invariant_projector.parameters())
-    private_parameters = tuple(model.structure_branch.domain_projector.parameters())
-    shared_grads = torch.autograd.grad(
-        shared_loss, shared_parameters + private_parameters,
-        retain_graph=True, allow_unused=True,
-    )
-    assert any(value is not None for value in shared_grads[:len(shared_parameters)])
-    assert all(value is None for value in shared_grads[len(shared_parameters):])
-
-    private_loss = structure_private_domain_loss(
-        model.private_domain_classifier,
-        output["shape_domain_feature"], output["shape_domain_feature"].detach(),
-    )["loss"]
-    private_grads = torch.autograd.grad(
-        private_loss, shared_parameters + private_parameters,
-        allow_unused=True,
-    )
-    assert all(value is None for value in private_grads[:len(shared_parameters)])
-    assert any(value is not None for value in private_grads[len(shared_parameters):])
-
-    phase_parameters = tuple(model.structure_branch.phase_projector.parameters())
-    domain_grads = torch.autograd.grad(
-        shared_loss + private_loss, phase_parameters,
-        allow_unused=True,
-    )
-    assert all(value is None for value in domain_grads)
-
-
-def test_v6_source_shape_loss_trains_phase_projector():
-    model = _small_structure_model().train()
-    batch = _small_structure_batch()
-    output = model(
-        batch["pixels"], batch["valid_pixels"], batch["positions"], batch["extra"],
-        return_dict=True,
-    )
-    loss = torch.nn.functional.cross_entropy(output["shape_logits"], batch["label"])
-    gradients = torch.autograd.grad(
-        loss, tuple(model.structure_branch.phase_projector.parameters()),
-        allow_unused=True,
-    )
-    assert any(value is not None and value.abs().sum() > 0 for value in gradients)
-
-
 def test_v5_cross_covariance_separation_zero_and_positive():
     shared = torch.tensor([[1., 0.], [-1., 0.]])
     independent = torch.ones(2, 1)
     correlated = shared[:, :1].clone()
     assert shared_private_separation_loss(shared, independent).item() == 0
     assert shared_private_separation_loss(shared, correlated).item() > 0
-
-
-def test_v5_empty_pseudo_keeps_all_structure_decomposition_losses():
-    model = _small_structure_model().train()
-    source = _small_structure_batch()
-    target = _small_structure_batch()
-    source_output = model(
-        source["pixels"], source["valid_pixels"], source["positions"], source["extra"],
-        return_dict=True,
-    )
-    target_output = model(
-        target["pixels"], target["valid_pixels"], target["positions"], target["extra"],
-        return_dict=True,
-    )
-    criterion = torch.nn.CrossEntropyLoss()
-    pseudo_loss = masked_pseudo_classification_loss(
-        target_output["logits"], torch.zeros(4, dtype=torch.long),
-        torch.zeros(4, dtype=torch.bool), criterion,
-    )
-    shared = structure_domain_adversarial_loss(
-        model.domain_classifier, source_output["shape_shared_feature"],
-        target_output["shape_shared_feature"], alpha=.5,
-    )["loss"]
-    private = structure_private_domain_loss(
-        model.private_domain_classifier, source_output["shape_domain_feature"],
-        target_output["shape_domain_feature"],
-    )["loss"]
-    separation = shared_private_separation_loss(
-        torch.cat((source_output["shape_shared_feature"], target_output["shape_shared_feature"])),
-        torch.cat((source_output["shape_domain_feature"], target_output["shape_domain_feature"])),
-    )
-    total = compose_structure_v5_da_loss(
-        criterion(source_output["logits"], source["label"]), pseudo_loss,
-        criterion(source_output["shape_logits"], source["label"]),
-        shapelet_diversity_loss(model.structure_branch.shapelet_dictionary.anchors, .5),
-        shared, private, separation,
-    )
-    assert pseudo_loss.item() == 0
-    assert shared > 0 and private > 0 and separation >= 0
-    assert torch.isfinite(total)
-
-
-def test_v5_loads_v4_source_with_only_new_missing_keys_and_resets_domain_modules():
-    source_model = _small_structure_model()
-    with torch.no_grad():
-        for parameter in source_model.structure_branch.invariant_projector.parameters():
-            parameter.fill_(.25)
-        for parameter in source_model.domain_classifier.parameters():
-            parameter.fill_(7.)
-    v4_state = {
-        key: value.clone() for key, value in source_model.state_dict().items()
-        if not key.startswith("structure_branch.domain_projector.")
-        and not key.startswith("private_domain_classifier.")
-    }
-    target_model = _small_structure_model()
-    report = load_v4_source_for_v5(target_model, {"state_dict": v4_state})
-    assert report["unexpected_keys"] == []
-    assert report["missing_keys"]
-    assert all(
-        key.startswith(("structure_branch.domain_projector.", "private_domain_classifier."))
-        for key in report["missing_keys"]
-    )
-    assert all(
-        torch.allclose(parameter, torch.full_like(parameter, .25))
-        for parameter in target_model.structure_branch.invariant_projector.parameters()
-    )
-    assert not all(
-        torch.allclose(parameter, torch.full_like(parameter, 7.))
-        for parameter in target_model.domain_classifier.parameters()
-    )
 
 
 def test_shape_classifier_directly_supervises_tokens_and_anchors_with_zero_query_projection():
@@ -282,7 +202,7 @@ def test_new_structure_defaults_are_random_stride8_and_24_candidates():
     assert explicit.shapelet_init == "kmeans"
     model = _small_structure_model()
     assert defaults.shape_window_scales == [24]
-    assert defaults.shapelet_count == 32
+    assert defaults.shapelet_count == 16
     assert model.structure_branch.window_extractor.scales == (24,)
     curve = torch.randn(2, 64, 8)
     groups, scales = model.structure_branch.window_extractor(curve)
@@ -580,14 +500,14 @@ def test_bank_has_no_target_update_api_and_roundtrips_state():
     assert torch.equal(restored.update_count, bank.update_count)
 
 
-def test_structure_model_has_only_source_only_instance_prototype_bank():
+def test_v2clean_structure_model_has_no_instance_prototype_bank():
     model = PseStructureProtoLTae(
         input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
         n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6],
         num_classes=3, shape_dim=10, shape_window_scales=(8, 16),
         shape_window_stride=8, fourier_num_modes=5,
     )
-    assert hasattr(model, "instance_prototype_bank")
+    assert not hasattr(model, "instance_prototype_bank")
     assert not hasattr(model, "shape_" + "prototype_bank")
     assert not hasattr(model, "target_instance_prototype_bank")
 
@@ -715,7 +635,7 @@ def test_teacher_ema_updates_parameters_but_not_prototype_banks():
     assert torch.equal(teacher.instance_prototype_bank.prototypes, teacher_bank)
 
 
-def test_teacher_ema_covers_all_new_trainable_submodules():
+def test_teacher_ema_covers_all_v2clean_trainable_submodules():
     student = PseStructureProtoLTae(
         input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
         n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6],
@@ -733,8 +653,6 @@ def test_teacher_ema_covers_all_new_trainable_submodules():
             parameter.fill_(2.)
         for parameter in teacher.parameters():
             parameter.zero_()
-        student.instance_prototype_bank.prototypes.fill_(1.)
-    bank_before = teacher.instance_prototype_bank.prototypes.clone()
     update_ema_variables(student, teacher, .5)
     named = dict(teacher.named_parameters())
     required = (
@@ -743,17 +661,13 @@ def test_teacher_ema_covers_all_new_trainable_submodules():
         "structure_branch.token_generator.mean_encoder",
         "structure_branch.token_generator.std_encoder",
         "structure_branch.token_generator.fusion", "structure_branch.shapelet_dictionary",
-        "structure_branch.invariant_projector", "structure_branch.domain_projector",
-        "structure_branch.phase_projector", "structure_branch.semantic_norm",
         "structure_branch.response_to_query",
         "temporal_encoder.attention_heads.external_query_projection",
-        "temporal_encoder.mlp", "decoder", "shape_classifier", "domain_classifier",
-        "private_domain_classifier",
+        "temporal_encoder.mlp", "decoder", "shape_classifier",
     )
     for prefix in required:
         assert any(name.startswith(prefix) and torch.allclose(value, torch.ones_like(value))
                    for name, value in named.items()), prefix
-    assert torch.equal(teacher.instance_prototype_bank.prototypes, bank_before)
 
 
 def test_source_shapelet_initialization_is_eval_no_grad_and_only_changes_anchors():

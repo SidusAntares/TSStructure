@@ -69,7 +69,7 @@ def add_model_arguments(parser):
     parser.add_argument('--shape-dim', dest='shape_dim', default=128, type=int)
     parser.add_argument('--shape-window-scales', dest='shape_window_scales', nargs='+', default=[24], type=int)
     parser.add_argument('--shape-window-stride', dest='shape_window_stride', default=8, type=int)
-    parser.add_argument('--shapelet-count', dest='shapelet_count', default=32, type=int)
+    parser.add_argument('--shapelet-count', dest='shapelet_count', default=16, type=int)
     parser.add_argument(
         '--shapelet-init', dest='shapelet_init', default='random',
         choices=['kmeans', 'random'],
@@ -169,7 +169,7 @@ def main(config):
             with open(os.path.join(config.fold_dir, 'manifest.json'), 'w') as stream:
                 json.dump(
                     {
-                        'method': 'discriminative_structure_occurrence_phase_v6',
+                        'method': 'discriminative_shapelet_alignment_v2_clean',
                         'structure_exposer': config.structure_exposer,
                         'fourier_num_modes': config.fourier_num_modes,
                         'shape_dim': config.shape_dim,
@@ -183,28 +183,17 @@ def main(config):
                         'shape_class_weight': config.shape_class_weight,
                         'shapelet_response': 'strength+concentration',
                         'shape_response_dim': 2 * config.shapelet_count,
-                        'structure_decomposition': 'shared_private',
-                        'shared_dim': 64,
-                        'domain_dim': 32,
-                        'shared_usage': 'morphology_domain_invariant',
-                        'domain_usage': 'domain_only',
-                        'occurrence_phase': 'weighted_circular_sin_cos',
-                        'phase_response_dim': 2 * config.shapelet_count,
-                        'phase_projector': 'linear_gelu_linear_layernorm',
-                        'semantic_fusion': 'layernorm(shared+phase)',
-                        'semantic_usage': 'shape_classifier+Qshape',
-                        'phase_loss': False,
-                        'shared_domain_objective': 'GRL',
-                        'private_domain_objective': 'domain_classification',
-                        'separation': 'cross_covariance',
-                        'shared_adv_weight': getattr(config, 'shared_adv_weight', .1),
-                        'private_domain_weight': getattr(config, 'private_domain_weight', .1),
-                        'separation_weight': getattr(config, 'separation_weight', .01),
+                        'source_shape_supervision': True,
+                        'shape_alignment': 'batch_class_relative',
+                        'shape_align_weight': config.shape_align_weight,
                         'target_shape_loss': False,
                         'instance_prototype': False,
                         'shape_support_loss': False,
-                        'shape_stats_alignment': False,
+                        'stats_alignment': False,
                         'ema_memory': False,
+                        'domain_adversarial': False,
+                        'shared_private': False,
+                        'occurrence_phase': False,
                         'shapelet_init': config.shapelet_init,
                         'shape_aux_classifier': 'linear',
                     },

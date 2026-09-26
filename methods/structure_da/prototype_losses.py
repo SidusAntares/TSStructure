@@ -159,6 +159,19 @@ def compose_structure_v5_da_loss(
     )
 
 
+def compose_structure_v2clean_da_loss(
+    classification, pseudo_target, source_shape, diversity, shape_alignment,
+    ramp=1., trade_off=2., shape_weight=.1, diversity_weight=.01,
+    shape_align_weight=.05,
+):
+    """V2-Clean: TimeMatch plus source shape and batch class-relative alignment."""
+    return (
+        classification + trade_off * pseudo_target
+        + shape_weight * source_shape + diversity_weight * diversity
+        + ramp * shape_align_weight * shape_alignment
+    )
+
+
 def masked_pseudo_classification_loss(logits, pseudo_labels, pseudo_mask, criterion):
     if not (logits.shape[0] == pseudo_labels.shape[0] == pseudo_mask.shape[0]):
         raise ValueError("target logits, pseudo labels, and mask must align")
@@ -571,16 +584,6 @@ def shape_health_snapshot(model, outputs):
         concentration = outputs["shapelet_concentration"].detach().float()
         values["shape_concentration_mean"] = float(concentration.mean())
         values["shape_concentration_std"] = float(concentration.std(unbiased=False))
-    if "shapelet_phase_response" in outputs:
-        values["phase_response_norm"] = float(
-            outputs["shapelet_phase_response"].detach().float().norm(dim=-1).mean()
-        )
-        values["phase_feature_norm"] = float(
-            outputs["shape_phase_feature"].detach().float().norm(dim=-1).mean()
-        )
-        values["semantic_feature_norm"] = float(
-            outputs["shape_semantic_feature"].detach().float().norm(dim=-1).mean()
-        )
     return values
 
 

@@ -93,44 +93,6 @@ def test_q24_stride8_window_centers_follow_candidate_order():
     )
 
 
-def test_shapelet_occurrence_phase_matches_centers_and_is_circular():
-    branch = DiscriminativeStructureBranch(
-        2, shape_dim=8, shapelet_count=2,
-        window_scales=(24,), window_stride=8,
-    )
-    centers = torch.tensor([11.5, 19.5, 27.5, 35.5, 43.5, 51.5, 59.5, 3.5])
-    weights = torch.zeros(1, 8, 2)
-    weights[:, 0, 0] = 1
-    weights[:, 7, 1] = 1
-    response = branch.compute_phase_response(weights, centers, phase_shift=0)
-    angles = 2 * torch.pi * centers * 365. / 64. / 365.
-    expected = torch.cat((
-        torch.tensor([[torch.cos(angles[0]), torch.cos(angles[7])]]),
-        torch.tensor([[torch.sin(angles[0]), torch.sin(angles[7])]]),
-    ), dim=-1)
-    torch.testing.assert_close(response, expected)
-    torch.testing.assert_close(
-        branch.compute_phase_response(weights, centers, phase_shift=365),
-        response, atol=1e-6, rtol=1e-6,
-    )
-    torch.testing.assert_close(
-        branch.compute_phase_response(weights, centers, phase_shift=182.5),
-        -response, atol=1e-6, rtol=1e-6,
-    )
-
-
-def test_uniform_q24_occurrence_phase_cancels_on_circular_grid():
-    branch = DiscriminativeStructureBranch(
-        2, shape_dim=8, shapelet_count=1,
-        window_scales=(24,), window_stride=8,
-    )
-    centers = torch.tensor([11.5, 19.5, 27.5, 35.5, 43.5, 51.5, 59.5, 3.5])
-    response = branch.compute_phase_response(
-        torch.full((1, 8, 1), 1 / 8), centers, phase_shift=0,
-    )
-    torch.testing.assert_close(response, torch.zeros_like(response), atol=1e-6, rtol=0)
-
-
 def test_shape_components_preserve_level_and_amplitude_information():
     t = torch.linspace(-1, 1, 16)
     base = torch.stack((t, t.square()), dim=-1)[None, None]
@@ -334,9 +296,9 @@ def test_structure_branch_returns_single_forward_intermediates():
     assert features.grad is not None and features.grad.abs().sum() > 0
 
 
-def test_v4_q24_shape_dimensions_are_8_by_32_and_64():
+def test_v2clean_q24_shape_dimensions_are_8_by_16_and_32():
     branch = DiscriminativeStructureBranch(
-        6, shape_dim=16, shapelet_count=32,
+        6, shape_dim=16, shapelet_count=16,
         window_scales=(24,), window_stride=8,
     )
     output = branch(
@@ -344,55 +306,9 @@ def test_v4_q24_shape_dimensions_are_8_by_32_and_64():
         torch.arange(20).repeat(2, 1) * 10,
     )
     assert output["shape_tokens"].shape == (2, 8, 16)
-    assert output["shapelet_strength"].shape == (2, 32)
-    assert output["shapelet_concentration"].shape == (2, 32)
-    assert output["shapelet_response"].shape == (2, 64)
-    assert output["shapelet_phase_cos"].shape == (2, 32)
-    assert output["shapelet_phase_sin"].shape == (2, 32)
-    assert output["shapelet_phase_response"].shape == (2, 64)
-    assert output["shape_invariant_feature"].shape == (2, 64)
-
-
-def test_v5_shared_private_dimensions_alias_and_query_dependency():
-    branch = DiscriminativeStructureBranch(
-        6, shape_dim=16, shapelet_count=32,
-        window_scales=(24,), window_stride=8,
-    )
-    output = branch(
-        torch.randn(2, 20, 6),
-        torch.arange(20).repeat(2, 1) * 10,
-    )
-    assert output["shapelet_response"].shape == (2, 64)
-    assert output["shape_shared_feature"].shape == (2, 64)
-    assert output["shape_domain_feature"].shape == (2, 32)
-    assert output["shape_shared_feature"] is output["shape_invariant_feature"]
-    assert output["shape_phase_feature"].shape == (2, 64)
-    assert output["shape_semantic_feature"].shape == (2, 64)
-    torch.testing.assert_close(
-        output["shape_class_token"],
-        branch.response_to_query(output["shape_semantic_feature"]),
-    )
-
-
-def test_phase_shift_changes_only_phase_semantic_and_query_outputs():
-    torch.manual_seed(310)
-    branch = DiscriminativeStructureBranch(
-        6, shape_dim=16, shapelet_count=5,
-        window_scales=(24,), window_stride=8,
-    ).eval()
-    prepared = branch.prepare_morphology(
-        torch.randn(2, 20, 6), torch.arange(20).repeat(2, 1) * 10,
-    )
-    zero = branch.apply_phase(prepared, 0)
-    shifted = branch.apply_phase(prepared, 37)
-    for key in (
-        "shape_tokens", "shapelet_response", "shape_shared_feature",
-        "shape_invariant_feature", "shape_domain_feature",
-    ):
-        assert torch.equal(zero[key], shifted[key]), key
-    assert not torch.allclose(zero["shape_phase_feature"], shifted["shape_phase_feature"])
-    assert not torch.allclose(zero["shape_semantic_feature"], shifted["shape_semantic_feature"])
-    assert not torch.allclose(zero["shape_class_token"], shifted["shape_class_token"])
+    assert output["shapelet_strength"].shape == (2, 16)
+    assert output["shapelet_concentration"].shape == (2, 16)
+    assert output["shapelet_response"].shape == (2, 32)
 
 
 def test_v5_domain_projector_and_private_classifier_shapes():
@@ -492,14 +408,14 @@ def test_full_model_returns_all_training_intermediates_without_second_forward():
     assert result["shape_logits"].shape == (2, 3)
     assert result["instance_feature"].shape == (2, 6)
     assert result["shape_tokens"].shape[-1] == 10
-    assert result["shapelet_response"].shape == (2, 64)
-    assert result["shape_invariant_feature"].shape == (2, 64)
+    assert result["shapelet_response"].shape == (2, 32)
+    assert "shape_invariant_feature" not in result
     assert "shape_" + "attention" not in result
     result["logits"].sum().backward()
     assert model.structure_branch.token_generator.raw_encoder.input_projection.weight.grad is not None
 
 
-def test_structure_morphology_is_decoupled_but_phase_tracks_timematch_shift():
+def test_v2clean_structure_is_shift_independent_while_ltae_uses_shift():
     torch.manual_seed(9)
     model = PseStructureProtoLTae(
         input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
@@ -517,15 +433,55 @@ def test_structure_morphology_is_decoupled_but_phase_tracks_timematch_shift():
     output1 = model.forward_with_temporal_shift(
         pixels, mask, positions, extra, temporal_shift=10, return_dict=True,
     )
-    for key in (
-        "shape_tokens", "shapelet_response", "shape_shared_feature",
-        "shape_domain_feature",
-    ):
+    for key in ("shape_tokens", "shapelet_response", "shape_class_token"):
         assert torch.equal(output0[key], output1[key])
-    assert not torch.allclose(output0["shape_phase_feature"], output1["shape_phase_feature"])
-    assert not torch.allclose(output0["shape_semantic_feature"], output1["shape_semantic_feature"])
-    assert not torch.allclose(output0["shape_class_token"], output1["shape_class_token"])
     torch.testing.assert_close(
-        output1["shape_logits"], model.shape_classifier(output1["shape_semantic_feature"]),
+        output1["shape_logits"], model.shape_classifier(output1["shapelet_response"]),
     )
     assert not torch.allclose(output0["instance_feature"], output1["instance_feature"])
+
+
+def test_v2clean_uses_direct_16_shapelet_response_without_projectors():
+    branch = DiscriminativeStructureBranch(
+        6, shape_dim=16, shapelet_count=16,
+        window_scales=(24,), window_stride=8, num_modes=5,
+    ).eval()
+    positions = torch.tensor([
+        [0., 40., 80., 120., 160., 200., 240., 280.],
+        [5., 45., 85., 125., 165., 205., 245., 285.],
+    ])
+    with torch.no_grad():
+        output = branch(torch.randn(2, 8, 6), positions)
+    assert output["shapelet_strength"].shape == (2, 16)
+    assert output["shapelet_concentration"].shape == (2, 16)
+    assert output["shapelet_response"].shape == (2, 32)
+    torch.testing.assert_close(
+        output["shape_class_token"],
+        branch.response_to_query(output["shapelet_response"]),
+    )
+    for removed in (
+        "invariant_projector", "domain_projector", "phase_projector",
+        "semantic_norm", "compute_phase_response", "apply_phase",
+    ):
+        assert not hasattr(branch, removed)
+
+
+def test_v2clean_model_classifies_direct_shapelet_response():
+    model = PseStructureProtoLTae(
+        input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
+        n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6],
+        num_classes=3, shape_dim=6, shape_window_scales=(24,),
+        shape_window_stride=8, shapelet_count=16, fourier_num_modes=5,
+    ).eval()
+    assert model.shape_classifier.in_features == 32
+    assert model.structure_branch.response_to_query[0].in_features == 32
+    assert not hasattr(model, "domain_classifier")
+    assert not hasattr(model, "private_domain_classifier")
+    pixels = torch.randn(2, 8, 3, 4)
+    mask = torch.ones(2, 8, 4)
+    positions = torch.arange(8).repeat(2, 1) * 40
+    with torch.no_grad():
+        output = model(pixels, mask, positions, torch.zeros(2, 4), return_dict=True)
+    torch.testing.assert_close(
+        output["shape_logits"], model.shape_classifier(output["shapelet_response"]),
+    )

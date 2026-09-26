@@ -720,51 +720,63 @@ def test_structure_proto_v5_launcher_reuses_v4_sources_and_runs_only_uda():
     assert '--separation-weight 0.01' in text
 
 
-def test_shift_grid_caches_structure_once_and_matches_uncached_logits(monkeypatch):
+def test_v2clean_shift_grid_reuses_one_phase_independent_structure(monkeypatch):
     from timematch import _classify_shift_grid
     from models.stclassifier import PseStructureProtoLTae
 
-    torch.manual_seed(41)
+    torch.manual_seed(71)
     model = PseStructureProtoLTae(
         input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
         n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6],
-        num_classes=3, shape_dim=6, shape_window_scales=(8,),
-        shape_window_stride=8, shapelet_count=3, fourier_num_modes=5,
+        num_classes=3, shape_dim=6, shape_window_scales=(24,),
+        shape_window_stride=8, shapelet_count=16, fourier_num_modes=5,
     ).eval()
     prepared = torch.randn(2, 10, 8)
     positions = torch.arange(10).repeat(2, 1) * 20
-    shifts = [-2, -1, 0, 1, 2]
+    shifts = [-2, 0, 2]
+    prepare_calls, structure_ids = 0, []
+    original_prepare = model.prepare_structure
+    original_classify = model.classify_prepared
     expected = torch.stack([
-        model.classify_prepared(prepared, positions, temporal_shift=shift)
+        original_classify(prepared, positions, temporal_shift=shift)
         for shift in shifts
     ], dim=1)
-    morphology_calls = 0
-    phase_shifts = []
-    phase_tokens = []
-    original_prepare = model.structure_branch.prepare_morphology
-    original_apply = model.structure_branch.apply_phase
 
     def counted_prepare(*args, **kwargs):
-        nonlocal morphology_calls
-        morphology_calls += 1
+        nonlocal prepare_calls
+        prepare_calls += 1
         return original_prepare(*args, **kwargs)
 
-    def counted_apply(prepared_structure, phase_shift):
-        phase_shifts.append(phase_shift)
-        output = original_apply(prepared_structure, phase_shift)
-        phase_tokens.append(output["shape_class_token"])
-        return output
+    def observed_classify(*args, **kwargs):
+        structure_ids.append(id(kwargs["prepared_structure"]))
+        return original_classify(*args, **kwargs)
 
-    monkeypatch.setattr(model.structure_branch, "prepare_morphology", counted_prepare)
-    monkeypatch.setattr(model.structure_branch, "apply_phase", counted_apply)
+    monkeypatch.setattr(model, "prepare_structure", counted_prepare)
+    monkeypatch.setattr(model, "classify_prepared", observed_classify)
     actual = _classify_shift_grid(model, prepared, positions, shifts)
-    assert morphology_calls == 1
-    assert phase_shifts == shifts
-    assert any(
-        not torch.allclose(phase_tokens[0], current)
-        for current in phase_tokens[1:]
-    )
+    assert prepare_calls == 1
+    assert len(set(structure_ids)) == 1
+    assert not hasattr(model.structure_branch, "apply_phase")
     torch.testing.assert_close(actual, expected)
+
+
+def test_v2clean_launcher_retrains_four_sources_then_runs_uda():
+    text = Path(
+        "scripts/run_structure_proto_v2clean_4tasks_4gpu_seed1.sh"
+    ).read_text(encoding="utf-8")
+    assert 'EXP_ROOT="${EXP_ROOT:-outputs/structure_proto_v2clean_4tasks_seed1}"' in text
+    assert 'LOG_ROOT="${LOG_ROOT:-logs/structure_proto_v2clean_4tasks_seed1}"' in text
+    assert 'RUN_ROOT="${RUN_ROOT:-runs/structure_proto_v2clean_4tasks_seed1}"' in text
+    assert text.count('--shapelet-count 16') == 2
+    assert '--epochs 100' in text
+    assert '--epochs 20 --steps_per_epoch 500' in text
+    assert '--shape-align-weight 0.05' in text
+    for removed in (
+        '--shared-adv-weight', '--private-domain-weight', '--separation-weight',
+        '--shape-target-weight', '--stats-align-weight', '--proto-instance-weight',
+        '--shapelet-shaping-weight',
+    ):
+        assert removed not in text
 
 
 def test_structure_proto_v6_launcher_retrains_sources_and_runs_four_tasks():

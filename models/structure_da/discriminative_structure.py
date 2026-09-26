@@ -405,7 +405,7 @@ class DiscriminativeStructureBranch(nn.Module):
     def __init__(
         self, channels, shape_dim=128, num_modes=13, grid_points=64,
         period_days=365.0, reg=1e-3, window_scales=(24,), window_stride=8,
-        shapelet_count=32, shapelet_beta=5., shape_resample_length=16,
+        shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
     ):
         super().__init__()
         self.exposer = FourierStructureExposer(num_modes, grid_points, period_days, reg)
@@ -417,13 +417,6 @@ class DiscriminativeStructureBranch(nn.Module):
         )
         self.shapelet_dictionary = ShapeletDictionary(shape_dim, shapelet_count, shapelet_beta)
         response_dim = 2 * shapelet_count
-        self.invariant_projector = InvariantProjector(response_dim)
-        self.domain_projector = DomainProjector(response_dim, 32)
-        self.phase_projector = nn.Sequential(
-            nn.Linear(response_dim, 128), nn.GELU(),
-            nn.Linear(128, response_dim), nn.LayerNorm(response_dim),
-        )
-        self.semantic_norm = nn.LayerNorm(response_dim)
         self.response_to_query = nn.Sequential(
             nn.Linear(response_dim, 64), nn.GELU(),
             nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
@@ -445,39 +438,9 @@ class DiscriminativeStructureBranch(nn.Module):
             return {**details, "strength": details["response"], "rich_response": rich}
         return rich
 
-    def compute_phase_response(self, weights, window_centers, phase_shift=0):
-        """Summarize shapelet occurrence on the shifted annual phase circle."""
-        if weights.ndim != 3:
-            raise ValueError("weights must be [B,N,M]")
-        centers = torch.as_tensor(
-            window_centers, device=weights.device, dtype=weights.dtype,
-        ).flatten()
-        if centers.numel() != weights.shape[1]:
-            raise ValueError("window centers must match the candidate dimension")
-        shift = torch.as_tensor(
-            phase_shift, device=weights.device, dtype=weights.dtype,
-        )
-        if shift.ndim == 0:
-            shift = shift.expand(weights.shape[0])
-        shift = shift.reshape(weights.shape[0], -1)
-        if shift.shape[1] != 1:
-            raise ValueError("phase_shift must be scalar or one value per sample")
-        days = centers[None, :] * (
-            self.exposer.period_days / self.window_extractor.grid_points
-        )
-        phase = 2. * torch.pi * torch.remainder(
-            days + shift, self.exposer.period_days,
-        ) / self.exposer.period_days
-        cosine = (weights * torch.cos(phase).unsqueeze(-1)).sum(dim=1)
-        sine = (weights * torch.sin(phase).unsqueeze(-1)).sum(dim=1)
-        return torch.cat((cosine, sine), dim=-1)
-
-    def prepare_morphology(self, features, positions):
-        """Compute the shift-independent morphology once for later phase reuse."""
+    def forward(self, features, positions):
         exposed, grid = self.exposer(features, positions)
-        window_groups, scales, centers = self.window_extractor(
-            exposed, return_centers=True,
-        )
+        window_groups, scales = self.window_extractor(exposed)
         encoded = [
             self.token_generator(windows, return_encoded_components=True)
             for windows in window_groups
@@ -491,46 +454,14 @@ class DiscriminativeStructureBranch(nn.Module):
         strength = details["response"]
         response = self.compose_rich_response(details)
         concentration = response[:, strength.shape[1]:]
-        invariant = self.invariant_projector(response)
-        domain = self.domain_projector(response)
         return {
             "shape_tokens": tokens,
             "shapelet_strength": strength,
             "shapelet_concentration": concentration,
             "shapelet_response": response,
-            "shapelet_weights": details["weights"],
-            "shape_window_centers": centers,
-            "shape_shared_feature": invariant,
-            "shape_invariant_feature": invariant,
-            "shape_domain_feature": domain,
             "shape_stats_feature": stats_tokens.mean(dim=1),
+            "shape_class_token": self.response_to_query(response),
             "shape_scales": scales,
             "exposed_curve": exposed,
             "exposed_grid": grid,
         }
-
-    def apply_phase(self, prepared_structure, phase_shift=0):
-        """Apply only occurrence phase and semantic fusion to cached morphology."""
-        phase_response = self.compute_phase_response(
-            prepared_structure["shapelet_weights"],
-            prepared_structure["shape_window_centers"],
-            phase_shift,
-        )
-        phase_feature = self.phase_projector(phase_response)
-        semantic = self.semantic_norm(
-            prepared_structure["shape_shared_feature"] + phase_feature
-        )
-        return {
-            **prepared_structure,
-            "shapelet_phase_cos": phase_response[:, :phase_response.shape[1] // 2],
-            "shapelet_phase_sin": phase_response[:, phase_response.shape[1] // 2:],
-            "shapelet_phase_response": phase_response,
-            "shape_phase_feature": phase_feature,
-            "shape_semantic_feature": semantic,
-            "shape_class_token": self.response_to_query(semantic),
-        }
-
-    def forward(self, features, positions, phase_shift=0):
-        return self.apply_phase(
-            self.prepare_morphology(features, positions), phase_shift,
-        )

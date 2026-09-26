@@ -13,11 +13,6 @@ from models.ltae import LTAE
 from models.pse import PixelSetEncoder
 from models.tae import TemporalAttentionEncoder
 from models.structure_da.discriminative_structure import DiscriminativeStructureBranch
-from models.structure_da.discriminative_structure import (
-    PrivateDomainClassifier,
-    StructureDomainClassifier,
-)
-from models.structure_da.prototype_bank import ClassPrototypeBank
 
 
 class PseStructureProtoLTae(nn.Module):
@@ -30,7 +25,7 @@ class PseStructureProtoLTae(nn.Module):
         T=1000, mlp4=[128, 64, 32], num_classes=20,
         max_temporal_shift=100, shape_dim=128,
         shape_window_scales=(24,), shape_window_stride=8,
-        shapelet_count=32, shapelet_beta=5., shape_resample_length=16,
+        shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
         fourier_num_modes=13, fourier_reg=1e-3, fourier_period_days=365.,
     ):
         super().__init__()
@@ -57,11 +52,8 @@ class PseStructureProtoLTae(nn.Module):
         )
         self.decoder = get_decoder(mlp4, num_classes)
         self.shape_classifier = nn.Linear(2 * shapelet_count, num_classes)
-        self.domain_classifier = StructureDomainClassifier(2 * shapelet_count)
-        self.private_domain_classifier = PrivateDomainClassifier(32)
         self.shape_dim = shape_dim
         self.instance_dim = mlp3[-1]
-        self.instance_prototype_bank = ClassPrototypeBank(num_classes, self.instance_dim)
 
     def get_temporal_encoders(self):
         return (self.temporal_encoder,)
@@ -70,7 +62,7 @@ class PseStructureProtoLTae(nn.Module):
         return spatial_feats
 
     def prepare_structure(self, prepared, positions):
-        return self.structure_branch.prepare_morphology(prepared, positions)
+        return self.structure_branch(prepared, positions)
 
     def classify_prepared(
         self, prepared, positions, temporal_shift=0, return_feats=False,
@@ -81,7 +73,6 @@ class PseStructureProtoLTae(nn.Module):
             self.prepare_structure(prepared, positions)
             if prepared_structure is None else prepared_structure
         )
-        structure = self.structure_branch.apply_phase(structure, temporal_shift)
         instance = self.temporal_encoder(
             prepared, shifted_positions,
             external_query=structure["shape_class_token"],
@@ -98,9 +89,7 @@ class PseStructureProtoLTae(nn.Module):
         del collect_diagnostics
         spatial = self.spatial_encoder(pixels, mask, extra)
         shifted_positions = positions + temporal_shift
-        structure = self.structure_branch(
-            spatial, positions, phase_shift=temporal_shift,
-        )
+        structure = self.structure_branch(spatial, positions)
         instance = self.temporal_encoder(
             spatial, shifted_positions,
             external_query=structure["shape_class_token"],
@@ -109,7 +98,7 @@ class PseStructureProtoLTae(nn.Module):
         if return_dict:
             return {
                 "logits": logits,
-                "shape_logits": self.shape_classifier(structure["shape_semantic_feature"]),
+                "shape_logits": self.shape_classifier(structure["shapelet_response"]),
                 "instance_feature": instance,
                 **structure,
             }

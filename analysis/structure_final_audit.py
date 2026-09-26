@@ -18,9 +18,7 @@ def diagnostic_full(model, batch, temporal_shift=0):
     spatial = model.spatial_encoder(
         batch["pixels"], batch["valid_pixels"], batch["extra"],
     )
-    structure = model.structure_branch(
-        spatial, batch["positions"], phase_shift=temporal_shift,
-    )
+    structure = model.structure_branch(spatial, batch["positions"])
     instance = model.temporal_encoder(
         spatial, batch["positions"] + temporal_shift,
         external_query=structure["shape_class_token"],
@@ -45,7 +43,6 @@ def compare_forward_paths(model, batch, temporal_shift=0):
     )
     prepared = model.prepare_temporal_features(spatial, batch["positions"])
     structure = model.prepare_structure(prepared, batch["positions"])
-    structure = model.structure_branch.apply_phase(structure, temporal_shift)
     instance = model.temporal_encoder(
         prepared, batch["positions"] + temporal_shift,
         external_query=structure["shape_class_token"],
