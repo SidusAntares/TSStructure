@@ -97,6 +97,109 @@ def test_v2clean_empty_pseudo_total_is_finite():
     assert torch.isfinite(total)
 
 
+def test_oracle_pseudo_switch_changes_only_accepted_training_labels():
+    from timematch import target_supervision_labels
+
+    pseudo = torch.tensor([0, 1, 2, 0])
+    target_gt = torch.tensor([2, 1, 0, 1])
+    confidence = torch.tensor([.95, .40, .99, .91])
+    pseudo_mask = confidence > .9
+
+    normal = target_supervision_labels(pseudo, target_gt, oracle=False)
+    oracle = target_supervision_labels(pseudo, target_gt, oracle=True)
+    changed_gt = target_gt.roll(1)
+
+    assert torch.equal(normal, pseudo)
+    assert torch.equal(oracle, target_gt)
+    assert torch.equal(pseudo_mask, confidence > .9)
+    assert torch.equal(pseudo_mask, confidence > .9)  # GT is not an input.
+    assert torch.equal(
+        target_supervision_labels(pseudo, changed_gt, oracle=True)[pseudo_mask],
+        changed_gt[pseudo_mask],
+    )
+
+    logits = torch.tensor([
+        [4., 0., 0.], [0., 4., 0.], [0., 0., 4.], [4., 0., 0.],
+    ])
+    criterion = torch.nn.CrossEntropyLoss()
+    normal_loss = masked_pseudo_classification_loss(
+        logits, normal, pseudo_mask, criterion,
+    )
+    oracle_loss = masked_pseudo_classification_loss(
+        logits, oracle, pseudo_mask, criterion,
+    )
+    torch.testing.assert_close(normal_loss, criterion(logits[pseudo_mask], pseudo[pseudo_mask]))
+    torch.testing.assert_close(oracle_loss, criterion(logits[pseudo_mask], target_gt[pseudo_mask]))
+
+
+def test_oracle_pseudo_shape_alignment_uses_gt_only_inside_existing_mask():
+    from timematch import target_supervision_labels
+
+    source_features = torch.tensor([[0., 0.], [0., 0.], [4., 0.], [4., 0.]])
+    source_labels = torch.tensor([0, 0, 1, 1])
+    target_features = torch.tensor([[1., 1.], [1., 1.], [6., 1.], [6., 1.], [99., 99.]])
+    pseudo = torch.tensor([0, 0, 0, 0, 1])
+    target_gt = torch.tensor([0, 0, 1, 1, 1])
+    confidence = torch.tensor([.99, .99, .99, .99, .2])
+    pseudo_mask = confidence > .9
+
+    normal_labels = target_supervision_labels(pseudo, target_gt, oracle=False)
+    oracle_labels = target_supervision_labels(pseudo, target_gt, oracle=True)
+    normal = class_relative_domain_alignment(
+        source_features, source_labels, target_features[pseudo_mask],
+        normal_labels[pseudo_mask], confidence[pseudo_mask], .9,
+        min_target_support=2, support_saturation=4,
+    )
+    oracle = class_relative_domain_alignment(
+        source_features, source_labels, target_features[pseudo_mask],
+        oracle_labels[pseudo_mask], confidence[pseudo_mask], .9,
+        min_target_support=2, support_saturation=4,
+    )
+    assert normal["valid_classes"] == 1
+    assert oracle["valid_classes"] == 2
+    assert normal["relative_loss"].item() == 0
+    assert oracle["relative_loss"].item() > 0
+
+
+def test_accepted_pseudo_statistics_always_audit_teacher_predictions():
+    from timematch import accepted_pseudo_statistics, target_supervision_labels
+
+    pseudo = torch.tensor([0, 1, 2, 0])
+    target_gt = torch.tensor([0, 2, 2, 1])
+    mask = torch.tensor([True, True, False, True])
+    oracle_labels = target_supervision_labels(pseudo, target_gt, oracle=True)
+    statistics = accepted_pseudo_statistics(pseudo, target_gt, mask, num_classes=3)
+
+    assert torch.equal(oracle_labels[mask], target_gt[mask])
+    assert statistics["accepted_count"] == 3
+    assert statistics["correct_count"] == 1
+    assert statistics["accuracy"] == pytest.approx(1 / 3)
+    assert statistics["class_accepted_count"] == [1, 1, 1]
+    assert statistics["class_correct_count"] == [1, 0, 0]
+
+
+def test_oracle_pseudo_empty_mask_keeps_pseudo_and_alignment_losses_zero():
+    from timematch import target_supervision_labels
+
+    logits = torch.randn(4, 3, requires_grad=True)
+    pseudo = torch.tensor([0, 1, 2, 0])
+    target_gt = torch.tensor([2, 2, 1, 1])
+    mask = torch.zeros(4, dtype=torch.bool)
+    confidence = torch.empty(0)
+    oracle_labels = target_supervision_labels(pseudo, target_gt, oracle=True)
+    pseudo_loss = masked_pseudo_classification_loss(
+        logits, oracle_labels, mask, torch.nn.CrossEntropyLoss(),
+    )
+    alignment = class_relative_domain_alignment(
+        torch.randn(4, 2), torch.tensor([0, 0, 1, 1]),
+        torch.empty(0, 2), oracle_labels[mask], confidence, .9,
+        min_target_support=2, support_saturation=4,
+    )
+    assert pseudo_loss.item() == 0
+    assert alignment["total_loss"].item() == 0
+    assert torch.isfinite(pseudo_loss + alignment["total_loss"])
+
+
 def test_v2clean_formal_trainer_uses_only_batch_shape_alignment():
     import inspect
     import timematch
@@ -105,6 +208,8 @@ def test_v2clean_formal_trainer_uses_only_batch_shape_alignment():
     assert "class_relative_domain_alignment(" in source
     assert "compose_structure_v2clean_da_loss(" in source
     assert 'target_output["shapelet_response"][pseudo_mask]' in source
+    assert "target_supervision_labels(" in source
+    assert "training_target_labels" in source
     for removed in (
         "loss_shape_target", "shapelet_data_support_loss(",
         "instance_prototype_loss(", "stats_alignment",

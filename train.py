@@ -195,6 +195,7 @@ def main(config):
                         'occurrence_phase': False,
                         'shapelet_init': config.shapelet_init,
                         'shape_aux_classifier': 'linear',
+                        'oracle_pseudo_labels': getattr(config, 'oracle_pseudo_labels', False),
                     },
                     stream,
                     indent=2,
@@ -803,6 +804,11 @@ if __name__ == '__main__':
     timematch.add_argument('--weights', type=str, help='path to source trained model weights')
     timematch.add_argument('--lr', default=0.0001, type=float, help='Learning rate')
     timematch.add_argument("--pseudo_threshold", default=0.9, type=float, help='confidence threshold for assigning pseudo labels')
+    timematch.add_argument(
+        "--oracle-pseudo-labels", dest="oracle_pseudo_labels",
+        default=False, type=bool_flag,
+        help="use target GT only as labels for teacher-accepted target samples",
+    )
     timematch.add_argument("--ema_decay", default=0.9999, type=float, help='decay rate for mean teacher')
     timematch.add_argument("--trade_off", type=float, default=2.0, help='weight for unsupervised loss')
     timematch.add_argument('--shared-adv-weight', dest='shared_adv_weight', default=.1, type=float)

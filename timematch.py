@@ -45,6 +45,38 @@ from methods.structure_da.prototype_losses import (
 from models.structure_da.prototype_bank import ClassFeatureMemory
 
 
+def target_supervision_labels(pseudo_pred, target_gt, oracle=False):
+    """Choose training labels without changing teacher acceptance decisions."""
+    if pseudo_pred.shape != target_gt.shape:
+        raise ValueError("teacher pseudo labels and target GT must align")
+    return target_gt if oracle else pseudo_pred
+
+
+@torch.no_grad()
+def accepted_pseudo_statistics(pseudo_pred, target_gt, pseudo_mask, num_classes):
+    """Audit the teacher predictions on the already accepted target subset."""
+    if not (pseudo_pred.shape == target_gt.shape == pseudo_mask.shape):
+        raise ValueError("pseudo predictions, target GT, and mask must align")
+    accepted_gt = target_gt[pseudo_mask].long()
+    accepted_pred = pseudo_pred[pseudo_mask].long()
+    correct = accepted_pred == accepted_gt
+    class_accepted = torch.bincount(
+        accepted_gt, minlength=num_classes,
+    )
+    class_correct = torch.bincount(
+        accepted_gt[correct], minlength=num_classes,
+    )
+    accepted_count = int(accepted_gt.numel())
+    correct_count = int(correct.sum())
+    return {
+        "accepted_count": accepted_count,
+        "correct_count": correct_count,
+        "accuracy": correct_count / max(accepted_count, 1),
+        "class_accepted_count": class_accepted.cpu().tolist(),
+        "class_correct_count": class_correct.cpu().tolist(),
+    }
+
+
 def _reset_trainable_module(module):
     for child in module.modules():
         if child is not module and hasattr(child, "reset_parameters"):
@@ -843,7 +875,9 @@ def _train_structure_proto_timematch(
         student.train()
         teacher.eval()
         epoch_sums = defaultdict(float)
-        pseudo_total = pseudo_accepted = 0
+        pseudo_total = pseudo_accepted = pseudo_correct = 0
+        class_pseudo_accepted = np.zeros(config.num_classes, dtype=np.int64)
+        class_pseudo_correct = np.zeros(config.num_classes, dtype=np.int64)
         source_shape_correct = source_samples = 0
         progress = tqdm(
             range(config.steps_per_epoch),
@@ -862,8 +896,27 @@ def _train_structure_proto_timematch(
                 probabilities = F.softmax(teacher_logits, dim=1)
                 confidence, pseudo = probabilities.max(1)
                 pseudo_mask = confidence > config.pseudo_threshold
+            if not torch.equal(target_weak["label"], target_strong["label"]):
+                raise RuntimeError("weak and strong target batches have misaligned labels")
+            target_gt = target_weak["label"].cuda(
+                device=device, non_blocking=True,
+            )
+            training_target_labels = target_supervision_labels(
+                pseudo, target_gt,
+                oracle=getattr(config, "oracle_pseudo_labels", False),
+            )
+            pseudo_statistics = accepted_pseudo_statistics(
+                pseudo, target_gt, pseudo_mask, config.num_classes,
+            )
             pseudo_total += int(pseudo_mask.numel())
             pseudo_accepted += int(pseudo_mask.sum())
+            pseudo_correct += pseudo_statistics["correct_count"]
+            class_pseudo_accepted += np.asarray(
+                pseudo_statistics["class_accepted_count"], dtype=np.int64,
+            )
+            class_pseudo_correct += np.asarray(
+                pseudo_statistics["class_correct_count"], dtype=np.int64,
+            )
 
             ps, ms, ts, es = to_cuda(source_sample, device)
             source_labels = source_sample["label"].cuda(device=device, non_blocking=True)
@@ -876,7 +929,8 @@ def _train_structure_proto_timematch(
 
             loss_cls_source = criterion(source_output["logits"], source_labels)
             loss_pseudo_target = masked_pseudo_classification_loss(
-                target_output["logits"], pseudo, pseudo_mask, criterion,
+                target_output["logits"], training_target_labels,
+                pseudo_mask, criterion,
             )
             loss_shape_source = criterion(source_output["shape_logits"], source_labels)
             loss_diversity = shapelet_diversity_loss(
@@ -886,7 +940,7 @@ def _train_structure_proto_timematch(
             shape_alignment = class_relative_domain_alignment(
                 source_output["shapelet_response"], source_labels,
                 target_output["shapelet_response"][pseudo_mask],
-                pseudo[pseudo_mask], confidence[pseudo_mask],
+                training_target_labels[pseudo_mask], confidence[pseudo_mask],
                 config.pseudo_threshold, distance="mse",
                 min_target_support=2, support_saturation=4,
             )
@@ -956,6 +1010,8 @@ def _train_structure_proto_timematch(
         epoch_values = {name: value / batches for name, value in epoch_sums.items()}
         epoch_values.update({
             "pseudo_coverage": pseudo_accepted / max(pseudo_total, 1),
+            "accepted_pseudo_accuracy": pseudo_correct / max(pseudo_accepted, 1),
+            "accepted_pseudo_count": pseudo_accepted,
             "source_shape_accuracy": source_shape_correct / max(source_samples, 1),
             "shape_align_ramp": target_ramp,
         })
@@ -964,6 +1020,21 @@ def _train_structure_proto_timematch(
         print("SHAPE_V2CLEAN_EPOCH|epoch=" + str(epoch) + "|" + "|".join(
             f"{name}={value:.6f}" for name, value in epoch_values.items()
         ))
+        per_class = []
+        for class_id, (accepted, correct) in enumerate(zip(
+            class_pseudo_accepted, class_pseudo_correct,
+        )):
+            accuracy = correct / max(accepted, 1)
+            per_class.append(
+                f"{class_id}:{int(accepted)}:{int(correct)}:{accuracy:.6f}"
+            )
+        print(
+            "PSEUDO_ORACLE_AUDIT|"
+            f"epoch={epoch}|oracle={str(getattr(config, 'oracle_pseudo_labels', False)).lower()}|"
+            f"accepted_count={pseudo_accepted}|"
+            f"accepted_pseudo_accuracy={pseudo_correct / max(pseudo_accepted, 1):.6f}|"
+            "per_true_class=" + ",".join(per_class)
+        )
 
         previous_best = best_f1
         if config.run_validation:
