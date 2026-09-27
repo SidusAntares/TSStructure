@@ -69,6 +69,99 @@ def initialize_instance_bank(batches, instance_bank):
 
 
 @torch.no_grad()
+def initialize_source_shape_prototypes(prototype_bank, features, labels):
+    """Initialize a normalized, source-only shape prototype bank."""
+    features = F.normalize(features.detach(), dim=-1)
+    labels = labels.detach().long()
+    prototype_bank.initialize_source(features, labels)
+    similarity = features @ prototype_bank.prototypes.detach().T
+    predictions = similarity.argmax(dim=1)
+    active = prototype_bank.prototypes[prototype_bank.initialized]
+    pairwise = active @ active.T
+    upper = torch.triu_indices(
+        active.shape[0], active.shape[0], offset=1, device=active.device,
+    )
+    off_diagonal = pairwise[upper[0], upper[1]]
+    return {
+        "initialized_classes": int(prototype_bank.initialized.sum()),
+        "source_proto_accuracy": float((predictions == labels).float().mean()),
+        "pairwise_cos_mean": float(off_diagonal.mean()) if off_diagonal.numel() else 0.,
+        "pairwise_cos_max": float(off_diagonal.max()) if off_diagonal.numel() else 0.,
+    }
+
+
+def shape_prototype_predictions(features, prototype_bank):
+    """Classify shape responses against initialized source prototypes."""
+    normalized = F.normalize(features, dim=-1)
+    prototypes = F.normalize(prototype_bank.prototypes.detach(), dim=-1)
+    similarity = normalized @ prototypes.T
+    similarity = similarity.masked_fill(
+        ~prototype_bank.initialized.detach().unsqueeze(0), -torch.inf,
+    )
+    if not prototype_bank.initialized.any():
+        raise RuntimeError("shape prototype bank has no initialized classes")
+    return similarity.argmax(dim=1), similarity
+
+
+def prototype_agreement_mask(trusted_mask, pseudo_labels, prototype_predictions):
+    if not (
+        trusted_mask.shape == pseudo_labels.shape == prototype_predictions.shape
+    ):
+        raise ValueError("trusted mask, pseudo labels, and prototype predictions must align")
+    return trusted_mask.bool() & (prototype_predictions.long() == pseudo_labels.long())
+
+
+def source_prototype_center_alignment(
+    target_features, target_labels, target_confidence, agreement_mask,
+    prototype_bank, pseudo_threshold=.9, min_target_support=2,
+    support_saturation=4, eps=1e-12,
+):
+    """Align accepted target class centers to detached source-only prototypes."""
+    if not (
+        target_features.shape[0] == target_labels.shape[0]
+        == target_confidence.shape[0] == agreement_mask.shape[0]
+    ):
+        raise ValueError("target features, labels, confidence, and mask must align")
+    zero = target_features.sum() * 0.
+    weights = (
+        (target_confidence - pseudo_threshold) / max(1. - pseudo_threshold, eps)
+    ).clamp(0., 1.)
+    normalized = F.normalize(target_features, dim=-1)
+    losses, reliabilities, cosine_values = [], [], []
+    for class_id in torch.unique(target_labels[agreement_mask], sorted=True).tolist():
+        selected = agreement_mask & (target_labels == class_id)
+        support = int(selected.sum())
+        if support < min_target_support or not bool(prototype_bank.initialized[class_id]):
+            continue
+        class_weights = weights[selected]
+        center = F.normalize(
+            (class_weights[:, None] * normalized[selected]).sum(0)
+            / class_weights.sum().clamp_min(eps),
+            dim=0,
+        )
+        prototype = prototype_bank.prototypes[class_id].detach()
+        cosine = F.cosine_similarity(center.unsqueeze(0), prototype.unsqueeze(0))[0]
+        reliability = min(1., support / float(support_saturation)) * class_weights.mean()
+        losses.append(1. - cosine)
+        reliabilities.append(reliability)
+        cosine_values.append(cosine)
+    if not losses:
+        return {
+            "total_loss": zero,
+            "valid_classes": 0,
+            "target_mean_cos": zero.detach(),
+        }
+    losses = torch.stack(losses)
+    reliabilities = torch.stack(reliabilities)
+    cosine_values = torch.stack(cosine_values)
+    return {
+        "total_loss": (reliabilities * losses).sum() / reliabilities.sum().clamp_min(eps),
+        "valid_classes": len(losses),
+        "target_mean_cos": cosine_values.mean().detach(),
+    }
+
+
+@torch.no_grad()
 def accumulate_class_feature_sums(class_sums, class_counts, features, labels):
     normalized = F.normalize(features.detach(), dim=-1)
     labels = labels.detach().long()
@@ -164,7 +257,7 @@ def compose_structure_v2clean_da_loss(
     ramp=1., trade_off=2., shape_weight=.1, diversity_weight=.01,
     shape_align_weight=.05,
 ):
-    """V2-Clean: TimeMatch plus source shape and batch class-relative alignment."""
+    """V2-Clean: TimeMatch plus source shape and the selected DA alignment."""
     return (
         classification + trade_off * pseudo_target
         + shape_weight * source_shape + diversity_weight * diversity

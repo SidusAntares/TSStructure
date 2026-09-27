@@ -283,10 +283,11 @@ def test_v2clean_adaptive_trainer_shares_trusted_mask_and_empty_is_finite():
     import inspect
     import timematch
 
-    source = inspect.getsource(timematch._train_structure_proto_timematch)
-    assert 'target_output["logits"], training_target_labels,\n                trusted_mask' in source
-    assert 'target_output["shapelet_response"][trusted_mask]' in source
-    assert 'training_target_labels[trusted_mask]' in source
+    trainer = inspect.getsource(timematch._train_structure_proto_timematch)
+    alignment = inspect.getsource(timematch.compute_shape_da_alignment)
+    assert 'target_output["logits"], training_target_labels,\n                trusted_mask' in trainer
+    assert 'target_output["shapelet_response"][trusted_mask]' in alignment
+    assert 'target_labels[trusted_mask]' in alignment
 
     logits = torch.randn(3, 2, requires_grad=True)
     labels = torch.tensor([0, 1, 0])
@@ -316,14 +317,17 @@ def test_adaptive_selector_is_initialized_in_formal_v2clean_trainer_scope():
     assert initialization not in legacy
 
 
-def test_v2clean_formal_trainer_uses_only_batch_shape_alignment():
+def test_v2clean_formal_trainer_dispatches_shape_alignment_and_preserves_batch_path():
     import inspect
     import timematch
 
     source = inspect.getsource(timematch._train_structure_proto_timematch)
-    assert "class_relative_domain_alignment(" in source
+    alignment = inspect.getsource(timematch.compute_shape_da_alignment)
+    assert "compute_shape_da_alignment(" in source
+    assert 'if mode == "batch_align":' in alignment
+    assert "class_relative_domain_alignment(" in alignment
     assert "compose_structure_v2clean_da_loss(" in source
-    assert 'target_output["shapelet_response"][trusted_mask]' in source
+    assert 'target_output["shapelet_response"][trusted_mask]' in alignment
     assert "target_supervision_labels(" in source
     assert "training_target_labels" in source
     for removed in (

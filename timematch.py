@@ -2,6 +2,7 @@ from collections import Counter
 from copy import deepcopy
 from collections import defaultdict
 import os
+import random
 
 import numpy as np
 import sklearn.metrics
@@ -37,12 +38,16 @@ from methods.structure_da.prototype_losses import (
     shapelet_diversity_loss,
     selected_shape_pseudo_loss,
     masked_pseudo_classification_loss,
+    initialize_source_shape_prototypes,
+    prototype_agreement_mask,
+    shape_prototype_predictions,
+    source_prototype_center_alignment,
     shared_private_separation_loss,
     structure_domain_adversarial_loss,
     structure_private_domain_loss,
     update_instance_bank,
 )
-from models.structure_da.prototype_bank import ClassFeatureMemory
+from models.structure_da.prototype_bank import ClassFeatureMemory, ClassPrototypeBank
 
 
 def target_supervision_labels(pseudo_pred, target_gt, oracle=False):
@@ -50,6 +55,95 @@ def target_supervision_labels(pseudo_pred, target_gt, oracle=False):
     if pseudo_pred.shape != target_gt.shape:
         raise ValueError("teacher pseudo labels and target GT must align")
     return target_gt if oracle else pseudo_pred
+
+
+def compute_shape_da_alignment(
+    mode, source_output, source_labels, target_output, target_labels,
+    confidence, trusted_mask, pseudo_threshold, prototype_bank=None,
+    prototype_agreement=None,
+):
+    if mode == "batch_align":
+        return class_relative_domain_alignment(
+            source_output["shapelet_response"], source_labels,
+            target_output["shapelet_response"][trusted_mask],
+            target_labels[trusted_mask], confidence[trusted_mask],
+            pseudo_threshold, distance="mse",
+            min_target_support=2, support_saturation=4,
+        )
+    if mode != "source_prototype":
+        raise ValueError(f"unknown shape DA mode: {mode}")
+    if prototype_bank is None or prototype_agreement is None:
+        raise ValueError("source_prototype mode requires a bank and agreement mask")
+    return source_prototype_center_alignment(
+        target_output["shapelet_response"], target_labels, confidence,
+        prototype_agreement, prototype_bank,
+        pseudo_threshold=pseudo_threshold,
+        min_target_support=2, support_saturation=4,
+    )
+
+
+def _shape_prototype_pairwise_stats(prototype_bank):
+    active = prototype_bank.prototypes[prototype_bank.initialized]
+    similarity = active @ active.T
+    upper = torch.triu_indices(
+        active.shape[0], active.shape[0], offset=1, device=active.device,
+    )
+    values = similarity[upper[0], upper[1]]
+    return {
+        "mean": float(values.mean()) if values.numel() else 0.,
+        "max": float(values.max()) if values.numel() else 0.,
+    }
+
+
+def initialize_shape_prototype_bank_from_source(
+    model, source_loader, prototype_bank, device,
+):
+    """Replay every source-train sample once without perturbing training RNG."""
+    python_rng = random.getstate()
+    numpy_rng = np.random.get_state()
+    torch_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    was_training = model.training
+    features, labels = [], []
+    initialization_loader = data.DataLoader(
+        source_loader.dataset,
+        num_workers=source_loader.num_workers,
+        pin_memory=True,
+        batch_size=source_loader.batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+    model.eval()
+    try:
+        with torch.no_grad():
+            for sample in initialization_loader:
+                pixels, mask, positions, extra = to_cuda(sample, device)
+                output = model.forward_with_temporal_shift(
+                    pixels, mask, positions, extra,
+                    temporal_shift=0, return_dict=True,
+                )
+                features.append(output["shapelet_response"].detach().cpu())
+                labels.append(sample["label"].detach().cpu())
+        features = torch.cat(features).to(device)
+        labels = torch.cat(labels).to(device)
+        diagnostics = initialize_source_shape_prototypes(
+            prototype_bank, features, labels,
+        )
+    finally:
+        model.train(was_training)
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+        torch.set_rng_state(torch_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+    print(
+        "SHAPE_PROTO_INIT|"
+        f"initialized_classes={diagnostics['initialized_classes']}|"
+        f"source_proto_accuracy={diagnostics['source_proto_accuracy']:.6f}|"
+        f"pairwise_cos_mean={diagnostics['pairwise_cos_mean']:.6f}|"
+        f"pairwise_cos_max={diagnostics['pairwise_cos_max']:.6f}"
+    )
+    return diagnostics
 
 
 @torch.no_grad()
@@ -925,6 +1019,7 @@ def _train_structure_proto_timematch(
     source_loader, target_loader_no_aug, target_loader = get_data_loaders(
         splits, config, config.balance_source,
     )
+    shape_da_mode = getattr(config, "shape_da_mode", "batch_align")
     checkpoint_path = os.path.join(config.weights, f"fold_{fold_num}", "model.pt")
     student.load_state_dict(
         torch.load(checkpoint_path, weights_only=False)["state_dict"], strict=True,
@@ -933,6 +1028,14 @@ def _train_structure_proto_timematch(
     student.to(device)
     teacher = deepcopy(student).to(device)
     teacher.eval()
+    shape_prototype_bank = None
+    if shape_da_mode == "source_prototype":
+        shape_prototype_bank = ClassPrototypeBank(
+            config.num_classes, 2 * config.shapelet_count, momentum=.9,
+        ).to(device)
+        initialize_shape_prototype_bank_from_source(
+            student, source_loader, shape_prototype_bank, device,
+        )
     criterion = (
         FocalLoss(gamma=config.focal_loss_gamma)
         if config.use_focal_loss else torch.nn.CrossEntropyLoss()
@@ -976,6 +1079,7 @@ def _train_structure_proto_timematch(
         teacher.eval()
         epoch_sums = defaultdict(float)
         pseudo_total = raw_pseudo_accepted = pseudo_accepted = pseudo_correct = 0
+        proto_trusted = proto_agreed = proto_agreed_correct = 0
         class_pseudo_accepted = np.zeros(config.num_classes, dtype=np.int64)
         class_pseudo_correct = np.zeros(config.num_classes, dtype=np.int64)
         class_trusted_count = np.zeros(config.num_classes, dtype=np.int64)
@@ -991,14 +1095,32 @@ def _train_structure_proto_timematch(
 
             pw, mw, tw, ew = to_cuda(target_weak, device)
             with torch.no_grad():
-                teacher_logits = teacher.forward_with_temporal_shift(
-                    pw, mw, tw, ew, temporal_shift=target_to_source_shift,
-                )
+                if shape_da_mode == "source_prototype":
+                    teacher_output = teacher.forward_with_temporal_shift(
+                        pw, mw, tw, ew,
+                        temporal_shift=target_to_source_shift,
+                        return_dict=True,
+                    )
+                    teacher_logits = teacher_output["logits"]
+                else:
+                    teacher_output = None
+                    teacher_logits = teacher.forward_with_temporal_shift(
+                        pw, mw, tw, ew, temporal_shift=target_to_source_shift,
+                    )
                 probabilities = F.softmax(teacher_logits, dim=1)
                 confidence, pseudo = probabilities.max(1)
                 raw_pseudo_mask, trusted_mask = adaptive_selector.select(
                     confidence, pseudo, epoch,
                 )
+                if shape_da_mode == "source_prototype":
+                    proto_pred, _ = shape_prototype_predictions(
+                        teacher_output["shapelet_response"], shape_prototype_bank,
+                    )
+                    proto_agree_mask = prototype_agreement_mask(
+                        trusted_mask, pseudo, proto_pred,
+                    )
+                else:
+                    proto_agree_mask = None
             if not torch.equal(target_weak["label"], target_strong["label"]):
                 raise RuntimeError("weak and strong target batches have misaligned labels")
             target_gt = target_weak["label"].cuda(
@@ -1015,6 +1137,12 @@ def _train_structure_proto_timematch(
             raw_pseudo_accepted += int(raw_pseudo_mask.sum())
             pseudo_accepted += int(trusted_mask.sum())
             pseudo_correct += pseudo_statistics["correct_count"]
+            if shape_da_mode == "source_prototype":
+                proto_trusted += int(trusted_mask.sum())
+                proto_agreed += int(proto_agree_mask.sum())
+                proto_agreed_correct += int(
+                    (pseudo[proto_agree_mask] == target_gt[proto_agree_mask]).sum()
+                )
             class_pseudo_accepted += np.asarray(
                 pseudo_statistics["class_accepted_count"], dtype=np.int64,
             )
@@ -1045,12 +1173,13 @@ def _train_structure_proto_timematch(
                 student.structure_branch.shapelet_dictionary.anchors,
                 config.shapelet_diversity_margin,
             )
-            shape_alignment = class_relative_domain_alignment(
-                source_output["shapelet_response"], source_labels,
-                target_output["shapelet_response"][trusted_mask],
-                training_target_labels[trusted_mask], confidence[trusted_mask],
-                config.pseudo_threshold, distance="mse",
-                min_target_support=2, support_saturation=4,
+            shape_alignment = compute_shape_da_alignment(
+                shape_da_mode, source_output, source_labels,
+                target_output,
+                pseudo if shape_da_mode == "source_prototype" else training_target_labels,
+                confidence, trusted_mask, config.pseudo_threshold,
+                prototype_bank=shape_prototype_bank,
+                prototype_agreement=proto_agree_mask,
             )
             loss = compose_structure_v2clean_da_loss(
                 loss_cls_source, loss_pseudo_target, loss_shape_source,
@@ -1069,6 +1198,10 @@ def _train_structure_proto_timematch(
                 student.parameters(), max_norm=5., error_if_nonfinite=True,
             )
             optimizer.step()
+            if shape_da_mode == "source_prototype":
+                shape_prototype_bank.update_source(
+                    source_output["shapelet_response"].detach(), source_labels,
+                )
             scheduler.step()
             update_ema_variables(student, teacher, config.ema_decay)
 
@@ -1091,17 +1224,35 @@ def _train_structure_proto_timematch(
                 "loss_pseudo_target": loss_pseudo_target.detach(),
                 "loss_shape_source": loss_shape_source.detach(),
                 "loss_shapelet_diversity": loss_diversity.detach(),
-                "loss_shape_align": shape_alignment["total_loss"].detach(),
-                "loss_shape_align_global": shape_alignment["global_loss"].detach(),
-                "loss_shape_align_relative": shape_alignment["relative_loss"].detach(),
-                "shape_align_valid_classes": source_output["logits"].new_tensor(
-                    shape_alignment["valid_classes"]
-                ),
-                "shape_align_center_gap": shape_alignment["center_gap"],
                 "shape_response_effective_rank": response_rank,
                 "shape_concentration_mean": concentration.mean(),
                 "shape_concentration_std": concentration.std(unbiased=False),
             }
+            if shape_da_mode == "source_prototype":
+                pairwise = _shape_prototype_pairwise_stats(shape_prototype_bank)
+                values.update({
+                    "loss_proto_align": shape_alignment["total_loss"].detach(),
+                    "proto_valid_classes": source_output["logits"].new_tensor(
+                        shape_alignment["valid_classes"]
+                    ),
+                    "proto_target_mean_cos": shape_alignment["target_mean_cos"],
+                    "source_proto_pairwise_cos_mean": source_output["logits"].new_tensor(
+                        pairwise["mean"]
+                    ),
+                    "source_proto_pairwise_cos_max": source_output["logits"].new_tensor(
+                        pairwise["max"]
+                    ),
+                })
+            else:
+                values.update({
+                    "loss_shape_align": shape_alignment["total_loss"].detach(),
+                    "loss_shape_align_global": shape_alignment["global_loss"].detach(),
+                    "loss_shape_align_relative": shape_alignment["relative_loss"].detach(),
+                    "shape_align_valid_classes": source_output["logits"].new_tensor(
+                        shape_alignment["valid_classes"]
+                    ),
+                    "shape_align_center_gap": shape_alignment["center_gap"],
+                })
             for name, value in values.items():
                 epoch_sums[name] += float(value)
             if global_step % config.log_step == 0:
@@ -1124,8 +1275,16 @@ def _train_structure_proto_timematch(
             "accepted_pseudo_accuracy": pseudo_correct / max(pseudo_accepted, 1),
             "accepted_pseudo_count": pseudo_accepted,
             "source_shape_accuracy": source_shape_correct / max(source_samples, 1),
-            "shape_align_ramp": target_ramp,
         })
+        if shape_da_mode == "source_prototype":
+            epoch_values.update({
+                "prototype_align_ramp": target_ramp,
+                "proto_agreement_coverage": proto_agreed / max(proto_trusted, 1),
+                "proto_agreement_target_coverage": proto_agreed / max(pseudo_total, 1),
+                "agreement_pseudo_accuracy": proto_agreed_correct / max(proto_agreed, 1),
+            })
+        else:
+            epoch_values["shape_align_ramp"] = target_ramp
         for name, value in epoch_values.items():
             writer.add_scalar(f"epoch/{name}", value, epoch)
         print("SHAPE_V2CLEAN_EPOCH|epoch=" + str(epoch) + "|" + "|".join(
@@ -1179,6 +1338,8 @@ def _train_structure_proto_timematch(
             "config": vars(config),
             "best_f1": best_f1,
         }
+        if shape_prototype_bank is not None:
+            checkpoint["shape_prototype_bank"] = shape_prototype_bank.state_dict()
         torch.save(checkpoint, os.path.join(config.fold_dir, "checkpoint_last.pt"))
         if best_f1 > previous_best or not os.path.isfile(best_model_path):
             torch.save(checkpoint, best_model_path)

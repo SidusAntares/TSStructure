@@ -165,10 +165,27 @@ def main(config):
 
         model = create_model(config)
         if isinstance(model, PseStructureProtoLTae):
-            with open(os.path.join(config.fold_dir, 'manifest.json'), 'w') as stream:
-                json.dump(
-                    {
-                        'method': 'discriminative_shapelet_alignment_v2_clean',
+            shape_da_mode = getattr(config, 'shape_da_mode', 'batch_align')
+            manifest = {
+                'method': (
+                    'discriminative_shapelet_source_prototype_alignment'
+                    if shape_da_mode == 'source_prototype'
+                    else 'discriminative_shapelet_alignment_v2_clean'
+                ),
+                'shape_da_mode': shape_da_mode,
+            }
+            if shape_da_mode == 'source_prototype':
+                manifest.update({
+                    'shape_prototype_feature_dim': 2 * config.shapelet_count,
+                    'shape_prototype_source_only': True,
+                    'shape_prototype_momentum': .9,
+                    'shape_prototype_target_update': False,
+                    'target_alignment': 'prototype_consistent_class_center',
+                    'prototype_alignment_weight': config.shape_align_weight,
+                })
+            else:
+                manifest['shape_alignment'] = 'batch_class_relative'
+            manifest.update({
                         'structure_exposer': config.structure_exposer,
                         'fourier_num_modes': config.fourier_num_modes,
                         'shape_dim': config.shape_dim,
@@ -183,7 +200,6 @@ def main(config):
                         'shapelet_response': 'strength+concentration',
                         'shape_response_dim': 2 * config.shapelet_count,
                         'source_shape_supervision': True,
-                        'shape_alignment': 'batch_class_relative',
                         'shape_align_weight': config.shape_align_weight,
                         'target_shape_loss': False,
                         'instance_prototype': False,
@@ -202,10 +218,9 @@ def main(config):
                         'pseudo_min_ratio': getattr(config, 'pseudo_min_ratio', .2),
                         'pseudo_max_ratio': getattr(config, 'pseudo_max_ratio', .8),
                         'pseudo_min_class_count': getattr(config, 'pseudo_min_class_count', 4),
-                    },
-                    stream,
-                    indent=2,
-                )
+            })
+            with open(os.path.join(config.fold_dir, 'manifest.json'), 'w') as stream:
+                json.dump(manifest, stream, indent=2)
         
         model.to(config.device)
 
@@ -818,6 +833,10 @@ if __name__ == '__main__':
     timematch.add_argument(
         "--adaptive-pseudo-selection", dest="adaptive_pseudo_selection",
         default=False, type=bool_flag,
+    )
+    timematch.add_argument(
+        "--shape-da-mode", dest="shape_da_mode", default="batch_align",
+        choices=["batch_align", "source_prototype"],
     )
     timematch.add_argument("--pseudo-base-ratio", dest="pseudo_base_ratio", default=.5, type=float)
     timematch.add_argument("--pseudo-balance-power", dest="pseudo_balance_power", default=.5, type=float)
