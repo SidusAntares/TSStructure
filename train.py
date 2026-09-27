@@ -196,6 +196,12 @@ def main(config):
                         'shapelet_init': config.shapelet_init,
                         'shape_aux_classifier': 'linear',
                         'oracle_pseudo_labels': getattr(config, 'oracle_pseudo_labels', False),
+                        'adaptive_pseudo_selection': getattr(config, 'adaptive_pseudo_selection', False),
+                        'pseudo_base_ratio': getattr(config, 'pseudo_base_ratio', .5),
+                        'pseudo_balance_power': getattr(config, 'pseudo_balance_power', .5),
+                        'pseudo_min_ratio': getattr(config, 'pseudo_min_ratio', .2),
+                        'pseudo_max_ratio': getattr(config, 'pseudo_max_ratio', .8),
+                        'pseudo_min_class_count': getattr(config, 'pseudo_min_class_count', 4),
                     },
                     stream,
                     indent=2,
@@ -809,6 +815,15 @@ if __name__ == '__main__':
         default=False, type=bool_flag,
         help="use target GT only as labels for teacher-accepted target samples",
     )
+    timematch.add_argument(
+        "--adaptive-pseudo-selection", dest="adaptive_pseudo_selection",
+        default=False, type=bool_flag,
+    )
+    timematch.add_argument("--pseudo-base-ratio", dest="pseudo_base_ratio", default=.5, type=float)
+    timematch.add_argument("--pseudo-balance-power", dest="pseudo_balance_power", default=.5, type=float)
+    timematch.add_argument("--pseudo-min-ratio", dest="pseudo_min_ratio", default=.2, type=float)
+    timematch.add_argument("--pseudo-max-ratio", dest="pseudo_max_ratio", default=.8, type=float)
+    timematch.add_argument("--pseudo-min-class-count", dest="pseudo_min_class_count", default=4, type=int)
     timematch.add_argument("--ema_decay", default=0.9999, type=float, help='decay rate for mean teacher')
     timematch.add_argument("--trade_off", type=float, default=2.0, help='weight for unsupervised loss')
     timematch.add_argument('--shared-adv-weight', dest='shared_adv_weight', default=.1, type=float)

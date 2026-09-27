@@ -200,6 +200,122 @@ def test_oracle_pseudo_empty_mask_keeps_pseudo_and_alignment_losses_zero():
     assert torch.isfinite(pseudo_loss + alignment["total_loss"])
 
 
+def test_adaptive_selector_disabled_exactly_matches_absolute_threshold():
+    from timematch import AdaptiveClasswisePseudoSelector
+
+    selector = AdaptiveClasswisePseudoSelector(3, enabled=False)
+    confidence = torch.tensor([.89, .90, .9001, .99])
+    pseudo = torch.tensor([0, 1, 1, 2])
+    raw, trusted = selector.select(confidence, pseudo, epoch=4)
+    expected = confidence > .9
+    assert torch.equal(raw, expected)
+    assert torch.equal(trusted, expected)
+
+
+def test_adaptive_ratios_follow_sqrt_balance_and_clipping():
+    from timematch import adaptive_class_selection_ratios
+
+    counts = [25, 100, 400, 1, 10000]
+    ratios, n_ref = adaptive_class_selection_ratios(
+        counts, base_ratio=.5, balance_power=.5,
+        min_ratio=.2, max_ratio=.8,
+    )
+    assert n_ref == 100
+    assert ratios[1] == pytest.approx(.5)
+    assert ratios[0] > .5
+    assert ratios[2] < .5
+    assert ratios[3] == pytest.approx(.8)
+    assert ratios[4] == pytest.approx(.2)
+    selected = [round(counts[index] * ratios[index]) for index in (0, 1, 2)]
+    assert len(set(selected)) > 1
+
+
+def test_adaptive_selector_epoch0_collects_then_epoch1_uses_class_thresholds():
+    from timematch import AdaptiveClasswisePseudoSelector
+
+    selector = AdaptiveClasswisePseudoSelector(
+        3, enabled=True, base_ratio=.5, balance_power=.5,
+        min_ratio=.2, max_ratio=.8, min_class_count=4,
+    )
+    confidence = torch.tensor([
+        .91, .92, .93, .94,
+        .91, .92, .93, .94, .95, .96, .97, .98,
+        .999,
+    ])
+    pseudo = torch.tensor([0] * 4 + [1] * 8 + [2])
+    raw0, trusted0 = selector.select(confidence, pseudo, epoch=0)
+    assert torch.equal(raw0, trusted0)
+    report = selector.finish_epoch()
+
+    assert report["high_conf_count"] == [4, 8, 1]
+    assert report["n_ref"] == 4
+    assert selector.thresholds[0] > .9
+    assert selector.thresholds[1] > .9
+    assert selector.thresholds[2] == pytest.approx(.9)
+
+    next_confidence = torch.tensor([.91, .94, .89, .999])
+    next_pseudo = torch.tensor([0, 0, 1, 2])
+    raw1, trusted1 = selector.select(next_confidence, next_pseudo, epoch=1)
+    assert torch.equal(raw1, torch.tensor([True, True, False, True]))
+    assert torch.equal(trusted1, torch.tensor([False, True, False, True]))
+
+
+def test_adaptive_selector_never_accepts_below_floor_and_zero_class_can_reappear():
+    from timematch import AdaptiveClasswisePseudoSelector
+
+    selector = AdaptiveClasswisePseudoSelector(2, enabled=True, min_class_count=4)
+    selector.select(
+        torch.tensor([.91, .92, .93, .94]), torch.zeros(4, dtype=torch.long),
+        epoch=0,
+    )
+    report = selector.finish_epoch()
+    assert report["high_conf_count"] == [4, 0]
+    assert selector.thresholds[1] == pytest.approx(.9)
+
+    raw, trusted = selector.select(
+        torch.tensor([.90, .9001]), torch.ones(2, dtype=torch.long), epoch=1,
+    )
+    assert torch.equal(raw, torch.tensor([False, True]))
+    assert torch.equal(trusted, torch.tensor([False, True]))
+
+
+def test_v2clean_adaptive_trainer_shares_trusted_mask_and_empty_is_finite():
+    import inspect
+    import timematch
+
+    source = inspect.getsource(timematch._train_structure_proto_timematch)
+    assert 'target_output["logits"], training_target_labels,\n                trusted_mask' in source
+    assert 'target_output["shapelet_response"][trusted_mask]' in source
+    assert 'training_target_labels[trusted_mask]' in source
+
+    logits = torch.randn(3, 2, requires_grad=True)
+    labels = torch.tensor([0, 1, 0])
+    empty = torch.zeros(3, dtype=torch.bool)
+    pseudo_loss = masked_pseudo_classification_loss(
+        logits, labels, empty, torch.nn.CrossEntropyLoss(),
+    )
+    alignment = class_relative_domain_alignment(
+        torch.randn(4, 2), torch.tensor([0, 0, 1, 1]),
+        torch.empty(0, 2), labels[empty], torch.empty(0), .9,
+        min_target_support=2, support_saturation=4,
+    )
+    assert pseudo_loss.item() == 0
+    assert alignment["total_loss"].item() == 0
+    assert torch.isfinite(pseudo_loss + alignment["total_loss"])
+
+
+def test_adaptive_selector_is_initialized_in_formal_v2clean_trainer_scope():
+    import inspect
+    import timematch
+
+    formal = inspect.getsource(timematch._train_structure_proto_timematch)
+    legacy = inspect.getsource(timematch._train_structure_proto_timematch_v3_reference)
+    initialization = "adaptive_selector = AdaptiveClasswisePseudoSelector("
+    assert initialization in formal
+    assert formal.index(initialization) < formal.index("for epoch in range(config.epochs):")
+    assert initialization not in legacy
+
+
 def test_v2clean_formal_trainer_uses_only_batch_shape_alignment():
     import inspect
     import timematch
@@ -207,7 +323,7 @@ def test_v2clean_formal_trainer_uses_only_batch_shape_alignment():
     source = inspect.getsource(timematch._train_structure_proto_timematch)
     assert "class_relative_domain_alignment(" in source
     assert "compose_structure_v2clean_da_loss(" in source
-    assert 'target_output["shapelet_response"][pseudo_mask]' in source
+    assert 'target_output["shapelet_response"][trusted_mask]' in source
     assert "target_supervision_labels(" in source
     assert "training_target_labels" in source
     for removed in (

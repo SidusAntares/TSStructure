@@ -77,6 +77,96 @@ def accepted_pseudo_statistics(pseudo_pred, target_gt, pseudo_mask, num_classes)
     }
 
 
+def adaptive_class_selection_ratios(
+    counts, base_ratio=.5, balance_power=.5, min_ratio=.2, max_ratio=.8,
+):
+    counts = np.asarray(counts, dtype=np.int64)
+    positive = counts[counts > 0]
+    n_ref = float(np.median(positive)) if positive.size else 0.
+    ratios = np.ones(counts.shape[0], dtype=np.float64)
+    if n_ref > 0:
+        present = counts > 0
+        ratios[present] = np.clip(
+            base_ratio * np.power(n_ref / counts[present], balance_power),
+            min_ratio, max_ratio,
+        )
+    return ratios.tolist(), n_ref
+
+
+class AdaptiveClasswisePseudoSelector:
+    """Carry teacher-only class confidence statistics between UDA epochs."""
+
+    def __init__(
+        self, num_classes, enabled=False, absolute_threshold=.9,
+        base_ratio=.5, balance_power=.5, min_ratio=.2, max_ratio=.8,
+        min_class_count=4,
+    ):
+        self.num_classes = int(num_classes)
+        self.enabled = bool(enabled)
+        self.absolute_threshold = float(absolute_threshold)
+        self.base_ratio = float(base_ratio)
+        self.balance_power = float(balance_power)
+        self.min_ratio = float(min_ratio)
+        self.max_ratio = float(max_ratio)
+        self.min_class_count = int(min_class_count)
+        if not 0 < self.min_ratio <= self.max_ratio <= 1:
+            raise ValueError("adaptive pseudo ratios must satisfy 0 < min <= max <= 1")
+        if self.min_class_count < 1:
+            raise ValueError("pseudo min class count must be positive")
+        self.thresholds = np.full(self.num_classes, self.absolute_threshold)
+        self.selection_ratios = np.ones(self.num_classes, dtype=np.float64)
+        self._values = [[] for _ in range(self.num_classes)]
+
+    def select(self, confidence, pseudo_pred, epoch):
+        if confidence.shape != pseudo_pred.shape:
+            raise ValueError("teacher confidence and pseudo predictions must align")
+        raw_mask = confidence > self.absolute_threshold
+        if not self.enabled:
+            return raw_mask, raw_mask.clone()
+        for class_id in range(self.num_classes):
+            values = confidence[raw_mask & (pseudo_pred == class_id)]
+            if values.numel():
+                self._values[class_id].append(values.detach().cpu())
+        if epoch == 0:
+            return raw_mask, raw_mask.clone()
+        threshold = torch.as_tensor(
+            self.thresholds, dtype=confidence.dtype, device=confidence.device,
+        )[pseudo_pred.long()]
+        return raw_mask, raw_mask & (confidence >= threshold)
+
+    def finish_epoch(self):
+        values = [
+            torch.cat(parts).numpy() if parts else np.empty(0, dtype=np.float32)
+            for parts in self._values
+        ]
+        counts = [int(class_values.size) for class_values in values]
+        ratios, n_ref = adaptive_class_selection_ratios(
+            counts, self.base_ratio, self.balance_power,
+            self.min_ratio, self.max_ratio,
+        )
+        next_thresholds = np.full(self.num_classes, self.absolute_threshold)
+        if self.enabled:
+            for class_id, class_values in enumerate(values):
+                count = class_values.size
+                if count < self.min_class_count:
+                    continue
+                keep_count = max(1, int(np.ceil(count * ratios[class_id])))
+                descending = np.sort(class_values)[::-1]
+                next_thresholds[class_id] = float(descending[keep_count - 1])
+            self.selection_ratios = np.asarray(ratios, dtype=np.float64)
+            self.thresholds = next_thresholds
+        else:
+            self.selection_ratios = np.ones(self.num_classes, dtype=np.float64)
+            self.thresholds.fill(self.absolute_threshold)
+        self._values = [[] for _ in range(self.num_classes)]
+        return {
+            "high_conf_count": counts,
+            "n_ref": n_ref,
+            "selection_ratio": self.selection_ratios.tolist(),
+            "class_threshold": self.thresholds.tolist(),
+        }
+
+
 def _reset_trainable_module(module):
     for child in module.modules():
         if child is not module and hasattr(child, "reset_parameters"):
@@ -861,6 +951,16 @@ def _train_structure_proto_timematch(
     target_to_source_shift = initial_shift
     best_f1 = 0
     global_step = 0
+    adaptive_selector = AdaptiveClasswisePseudoSelector(
+        config.num_classes,
+        enabled=getattr(config, "adaptive_pseudo_selection", False),
+        absolute_threshold=config.pseudo_threshold,
+        base_ratio=getattr(config, "pseudo_base_ratio", .5),
+        balance_power=getattr(config, "pseudo_balance_power", .5),
+        min_ratio=getattr(config, "pseudo_min_ratio", .2),
+        max_ratio=getattr(config, "pseudo_max_ratio", .8),
+        min_class_count=getattr(config, "pseudo_min_class_count", 4),
+    )
     for epoch in range(config.epochs):
         target_ramp = prototype_ramp(
             epoch, config.proto_ramp_epochs, config.proto_ramp_start,
@@ -875,9 +975,10 @@ def _train_structure_proto_timematch(
         student.train()
         teacher.eval()
         epoch_sums = defaultdict(float)
-        pseudo_total = pseudo_accepted = pseudo_correct = 0
+        pseudo_total = raw_pseudo_accepted = pseudo_accepted = pseudo_correct = 0
         class_pseudo_accepted = np.zeros(config.num_classes, dtype=np.int64)
         class_pseudo_correct = np.zeros(config.num_classes, dtype=np.int64)
+        class_trusted_count = np.zeros(config.num_classes, dtype=np.int64)
         source_shape_correct = source_samples = 0
         progress = tqdm(
             range(config.steps_per_epoch),
@@ -895,7 +996,9 @@ def _train_structure_proto_timematch(
                 )
                 probabilities = F.softmax(teacher_logits, dim=1)
                 confidence, pseudo = probabilities.max(1)
-                pseudo_mask = confidence > config.pseudo_threshold
+                raw_pseudo_mask, trusted_mask = adaptive_selector.select(
+                    confidence, pseudo, epoch,
+                )
             if not torch.equal(target_weak["label"], target_strong["label"]):
                 raise RuntimeError("weak and strong target batches have misaligned labels")
             target_gt = target_weak["label"].cuda(
@@ -906,16 +1009,21 @@ def _train_structure_proto_timematch(
                 oracle=getattr(config, "oracle_pseudo_labels", False),
             )
             pseudo_statistics = accepted_pseudo_statistics(
-                pseudo, target_gt, pseudo_mask, config.num_classes,
+                pseudo, target_gt, trusted_mask, config.num_classes,
             )
-            pseudo_total += int(pseudo_mask.numel())
-            pseudo_accepted += int(pseudo_mask.sum())
+            pseudo_total += int(trusted_mask.numel())
+            raw_pseudo_accepted += int(raw_pseudo_mask.sum())
+            pseudo_accepted += int(trusted_mask.sum())
             pseudo_correct += pseudo_statistics["correct_count"]
             class_pseudo_accepted += np.asarray(
                 pseudo_statistics["class_accepted_count"], dtype=np.int64,
             )
             class_pseudo_correct += np.asarray(
                 pseudo_statistics["class_correct_count"], dtype=np.int64,
+            )
+            class_trusted_count += np.bincount(
+                pseudo[trusted_mask].detach().cpu().numpy(),
+                minlength=config.num_classes,
             )
 
             ps, ms, ts, es = to_cuda(source_sample, device)
@@ -930,7 +1038,7 @@ def _train_structure_proto_timematch(
             loss_cls_source = criterion(source_output["logits"], source_labels)
             loss_pseudo_target = masked_pseudo_classification_loss(
                 target_output["logits"], training_target_labels,
-                pseudo_mask, criterion,
+                trusted_mask, criterion,
             )
             loss_shape_source = criterion(source_output["shape_logits"], source_labels)
             loss_diversity = shapelet_diversity_loss(
@@ -939,8 +1047,8 @@ def _train_structure_proto_timematch(
             )
             shape_alignment = class_relative_domain_alignment(
                 source_output["shapelet_response"], source_labels,
-                target_output["shapelet_response"][pseudo_mask],
-                training_target_labels[pseudo_mask], confidence[pseudo_mask],
+                target_output["shapelet_response"][trusted_mask],
+                training_target_labels[trusted_mask], confidence[trusted_mask],
                 config.pseudo_threshold, distance="mse",
                 min_target_support=2, support_saturation=4,
             )
@@ -1007,9 +1115,12 @@ def _train_structure_proto_timematch(
         progress.close()
 
         batches = max(config.steps_per_epoch, 1)
+        selection_report = adaptive_selector.finish_epoch()
         epoch_values = {name: value / batches for name, value in epoch_sums.items()}
         epoch_values.update({
             "pseudo_coverage": pseudo_accepted / max(pseudo_total, 1),
+            "raw_pseudo_coverage": raw_pseudo_accepted / max(pseudo_total, 1),
+            "trusted_pseudo_coverage": pseudo_accepted / max(pseudo_total, 1),
             "accepted_pseudo_accuracy": pseudo_correct / max(pseudo_accepted, 1),
             "accepted_pseudo_count": pseudo_accepted,
             "source_shape_accuracy": source_shape_correct / max(source_samples, 1),
@@ -1034,6 +1145,21 @@ def _train_structure_proto_timematch(
             f"accepted_count={pseudo_accepted}|"
             f"accepted_pseudo_accuracy={pseudo_correct / max(pseudo_accepted, 1):.6f}|"
             "per_true_class=" + ",".join(per_class)
+        )
+        adaptive_classes = []
+        for class_id in range(config.num_classes):
+            adaptive_classes.append(
+                f"{class_id}:{selection_report['high_conf_count'][class_id]}:"
+                f"{selection_report['selection_ratio'][class_id]:.6f}:"
+                f"{selection_report['class_threshold'][class_id]:.6f}:"
+                f"{int(class_trusted_count[class_id])}"
+            )
+        print(
+            "ADAPTIVE_PSEUDO_EPOCH|"
+            f"epoch={epoch}|"
+            f"enabled={str(adaptive_selector.enabled).lower()}|"
+            f"n_ref={selection_report['n_ref']:.6f}|"
+            "per_class=" + ",".join(adaptive_classes)
         )
 
         previous_best = best_f1
