@@ -54,6 +54,15 @@ def test_sweep_launcher_freezes_v2clean_and_isolates_each_mode():
     assert 'fourier_mode_sweep_per_class.csv' in source
 
 
+def test_sweep_launcher_supports_a_bounded_task_and_mode_rerun():
+    source = LAUNCHER.read_text(encoding="utf-8")
+
+    assert 'ONLY_TASK="${ONLY_TASK:-all}"' in source
+    assert 'MODES_OVERRIDE="${MODES_OVERRIDE:-}"' in source
+    assert 'read -r -a MODES <<< "$MODES_OVERRIDE"' in source
+    assert 'task_selected "$task"' in source
+
+
 @pytest.mark.skipif(os.name == "nt", reason="launcher execution requires a POSIX shell")
 def test_sweep_launcher_dry_run_lists_16_unique_gpu_assignments():
     result = subprocess.run(
@@ -74,3 +83,22 @@ def test_sweep_launcher_dry_run_lists_16_unique_gpu_assignments():
         ("AT1_DK1", "0"), ("FR1_FR2", "1"),
         ("FR2_DK1", "2"), ("DK1_AT1", "3"),
     }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="launcher execution requires a POSIX shell")
+def test_sweep_launcher_dry_run_can_select_only_dk1_at1_modes_17_and_21():
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)], cwd=ROOT,
+        env={
+            **os.environ,
+            "DRY_RUN": "1",
+            "ONLY_TASK": "DK1_AT1",
+            "MODES_OVERRIDE": "17 21",
+        },
+        text=True, capture_output=True, check=True,
+    )
+    plans = [line for line in result.stdout.splitlines() if line.startswith("SWEEP_PLAN|")]
+    assert plans == [
+        "SWEEP_PLAN|gpu=3|task=DK1_AT1|mode=17",
+        "SWEEP_PLAN|gpu=3|task=DK1_AT1|mode=21",
+    ]

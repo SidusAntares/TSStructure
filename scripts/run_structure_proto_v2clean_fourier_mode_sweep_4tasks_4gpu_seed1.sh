@@ -8,21 +8,39 @@ GPU3="${GPU3:-3}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DRY_RUN="${DRY_RUN:-0}"
+ONLY_TASK="${ONLY_TASK:-all}"
+MODES_OVERRIDE="${MODES_OVERRIDE:-}"
 
 EXP_ROOT="${EXP_ROOT:-outputs/structure_proto_v2clean_fourier_mode_sweep_seed1}"
 LOG_ROOT="${LOG_ROOT:-logs/structure_proto_v2clean_fourier_mode_sweep_seed1}"
 RUN_ROOT="${RUN_ROOT:-runs/structure_proto_v2clean_fourier_mode_sweep_seed1}"
 MODES=(9 13 17 21)
+if [[ -n "$MODES_OVERRIDE" ]]; then
+  read -r -a MODES <<< "$MODES_OVERRIDE"
+fi
 
 AT1="austria/33UVP/2017"
 DK1="denmark/32VNH/2017"
 FR1="france/30TXT/2017"
 FR2="france/31TCJ/2017"
 
+for mode in "${MODES[@]}"; do
+  case "$mode" in
+    9|13|17|21) ;;
+    *) echo "ERROR: unsupported sweep mode: $mode" >&2; exit 2 ;;
+  esac
+done
+
+task_selected() {
+  local task="$1"
+  [[ "$ONLY_TASK" == "all" || "$ONLY_TASK" == "$task" ]]
+}
+
 print_plan() {
   local gpu="$1" src_name="$2" tgt_name="$3"
   local task="${src_name}_${tgt_name}"
   local mode
+  task_selected "$task" || return 0
   for mode in "${MODES[@]}"; do
     echo "SWEEP_PLAN|gpu=${gpu}|task=${task}|mode=${mode}"
   done
@@ -30,11 +48,17 @@ print_plan() {
 
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "SWEEP_CONFIG|method=v2clean_fourier_mode_sweep|seed=1|modes=9,13,17,21"
-  print_plan "$GPU0" AT1 DK1
-  print_plan "$GPU1" FR1 FR2
-  print_plan "$GPU2" FR2 DK1
-  print_plan "$GPU3" DK1 AT1
-  echo "SWEEP_TOTAL|source_commands=16|uda_commands=16|combinations=16"
+  selected_tasks=0
+  if task_selected AT1_DK1; then print_plan "$GPU0" AT1 DK1; selected_tasks=$((selected_tasks + 1)); fi
+  if task_selected FR1_FR2; then print_plan "$GPU1" FR1 FR2; selected_tasks=$((selected_tasks + 1)); fi
+  if task_selected FR2_DK1; then print_plan "$GPU2" FR2 DK1; selected_tasks=$((selected_tasks + 1)); fi
+  if task_selected DK1_AT1; then print_plan "$GPU3" DK1 AT1; selected_tasks=$((selected_tasks + 1)); fi
+  if [[ "$selected_tasks" -eq 0 ]]; then
+    echo "ERROR: ONLY_TASK does not match a sweep task: $ONLY_TASK" >&2
+    exit 2
+  fi
+  combinations=$((selected_tasks * ${#MODES[@]}))
+  echo "SWEEP_TOTAL|source_commands=${combinations}|uda_commands=${combinations}|combinations=${combinations}"
   exit 0
 fi
 
@@ -223,20 +247,23 @@ print(f"FOURIER_MODE_SWEEP_PER_CLASS|rows={len(class_rows)}|path={per_class_path
 PY
 }
 
-worker_task "$GPU0" AT1 "$AT1" DK1 "$DK1" & PID0=$!
-worker_task "$GPU1" FR1 "$FR1" FR2 "$FR2" & PID1=$!
-worker_task "$GPU2" FR2 "$FR2" DK1 "$DK1" & PID2=$!
-worker_task "$GPU3" DK1 "$DK1" AT1 "$AT1" & PID3=$!
-
+PIDS=()
+if task_selected AT1_DK1; then worker_task "$GPU0" AT1 "$AT1" DK1 "$DK1" & PIDS+=("$!"); fi
+if task_selected FR1_FR2; then worker_task "$GPU1" FR1 "$FR1" FR2 "$FR2" & PIDS+=("$!"); fi
+if task_selected FR2_DK1; then worker_task "$GPU2" FR2 "$FR2" DK1 "$DK1" & PIDS+=("$!"); fi
+if task_selected DK1_AT1; then worker_task "$GPU3" DK1 "$DK1" AT1 "$AT1" & PIDS+=("$!"); fi
+if [[ "${#PIDS[@]}" -eq 0 ]]; then
+  echo "ERROR: ONLY_TASK does not match a sweep task: $ONLY_TASK" >&2
+  exit 2
+fi
 status=0
-wait "$PID0" || status=1
-wait "$PID1" || status=1
-wait "$PID2" || status=1
-wait "$PID3" || status=1
+for pid in "${PIDS[@]}"; do
+  wait "$pid" || status=1
+done
 if [[ "$status" -ne 0 ]]; then
   echo "FOURIER_MODE_SWEEP_FAILED|one_or_more_workers_failed=true" >&2
   exit 1
 fi
 
 summarize_results
-echo "FOURIER_MODE_SWEEP_ALL_FINISHED|combinations=16"
+echo "FOURIER_MODE_SWEEP_ALL_FINISHED|current_run_combinations=$((${#PIDS[@]} * ${#MODES[@]}))|summary_rows=16"
