@@ -1228,6 +1228,7 @@ def _train_structure_proto_timematch(
                 "shape_concentration_mean": concentration.mean(),
                 "shape_concentration_std": concentration.std(unbiased=False),
             }
+            values.update(student.structure_usage_diagnostics(source_output))
             if shape_da_mode == "source_prototype":
                 pairwise = _shape_prototype_pairwise_stats(shape_prototype_bank)
                 values.update({

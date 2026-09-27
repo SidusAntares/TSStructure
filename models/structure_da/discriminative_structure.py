@@ -258,6 +258,13 @@ def normalized_candidate_concentration(weights, candidate_mask=None, eps=1e-12):
     return (1. - normalized).clamp(0., 1.)
 
 
+def sorted_anchor_profile(similarity):
+    """Keep each anchor's full response distribution without window order."""
+    if similarity.ndim != 3:
+        raise ValueError("similarity must be [B,N,M]")
+    return similarity.sort(dim=1, descending=True).values.transpose(1, 2).flatten(1)
+
+
 class ShapeletDictionary(nn.Module):
     """Shared learned morphology anchors with candidate-wise soft assignment."""
 
@@ -438,7 +445,7 @@ class DiscriminativeStructureBranch(nn.Module):
             return {**details, "strength": details["response"], "rich_response": rich}
         return rich
 
-    def forward(self, features, positions):
+    def forward(self, features, positions, include_legacy_query=True):
         exposed, grid = self.exposer(features, positions)
         window_groups, scales = self.window_extractor(exposed)
         encoded = [
@@ -454,13 +461,18 @@ class DiscriminativeStructureBranch(nn.Module):
         strength = details["response"]
         response = self.compose_rich_response(details)
         concentration = response[:, strength.shape[1]:]
+        profile = sorted_anchor_profile(details["similarity"])
         return {
             "shape_tokens": tokens,
+            "shapelet_similarity": details["similarity"],
             "shapelet_strength": strength,
             "shapelet_concentration": concentration,
             "shapelet_response": response,
+            "sorted_anchor_profile": profile,
             "shape_stats_feature": stats_tokens.mean(dim=1),
-            "shape_class_token": self.response_to_query(response),
+            "shape_class_token": (
+                self.response_to_query(response) if include_legacy_query else None
+            ),
             "shape_scales": scales,
             "exposed_curve": exposed,
             "exposed_grid": grid,

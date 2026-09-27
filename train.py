@@ -81,6 +81,14 @@ def add_model_arguments(parser):
     parser.add_argument('--shapelet-shaping-weight', dest='shapelet_shaping_weight', default=.01, type=float)
     parser.add_argument('--shapelet-shaping-temperature', dest='shapelet_shaping_temperature', default=.1, type=float)
     parser.add_argument('--shape-class-weight', dest='shape_class_weight', default=.1, type=float)
+    parser.add_argument(
+        '--shape-representation', dest='shape_representation', default='current',
+        choices=['current', 'sorted_profile'],
+    )
+    parser.add_argument(
+        '--shape-injection', dest='shape_injection', default='current_query',
+        choices=['current_query', 'direct_query', 'late_fusion'],
+    )
     parser.add_argument('--shape-target-weight', dest='shape_target_weight', default=.05, type=float)
     parser.add_argument('--shape-align-weight', dest='shape_align_weight', default=.05, type=float)
     parser.add_argument('--stats-align-weight', dest='stats_align_weight', default=.02, type=float)
@@ -127,9 +135,29 @@ def create_model(config):
             fourier_num_modes=config.fourier_num_modes,
             fourier_reg=config.fourier_reg,
             fourier_period_days=config.fourier_period_days,
+            shape_representation=config.shape_representation,
+            shape_injection=config.shape_injection,
         )
         return model
     raise NotImplementedError(config.model)
+
+
+def structure_usage_manifest(config):
+    candidates_per_scale = (
+        64 + int(config.shape_window_stride) - 1
+    ) // int(config.shape_window_stride)
+    evidence_dim = (
+        2 * int(config.shapelet_count)
+        if config.shape_representation == 'current'
+        else int(config.shapelet_count) * candidates_per_scale
+        * len(config.shape_window_scales)
+    )
+    return {
+        'shape_representation': config.shape_representation,
+        'shape_injection': config.shape_injection,
+        'shape_evidence_dim': evidence_dim,
+        'shape_align_weight': config.shape_align_weight,
+    }
 
 
 def main(config):
@@ -165,6 +193,14 @@ def main(config):
 
         model = create_model(config)
         if isinstance(model, PseStructureProtoLTae):
+            usage = structure_usage_manifest(config)
+            print(
+                "STRUCTURE_USAGE_CONFIG|"
+                f"representation={usage['shape_representation']}|"
+                f"injection={usage['shape_injection']}|"
+                f"evidence_dim={usage['shape_evidence_dim']}|"
+                f"shape_align_weight={usage['shape_align_weight']:g}"
+            )
             shape_da_mode = getattr(config, 'shape_da_mode', 'batch_align')
             manifest = {
                 'method': (
@@ -219,6 +255,7 @@ def main(config):
                         'pseudo_max_ratio': getattr(config, 'pseudo_max_ratio', .8),
                         'pseudo_min_class_count': getattr(config, 'pseudo_min_class_count', 4),
             })
+            manifest.update(structure_usage_manifest(config))
             with open(os.path.join(config.fold_dir, 'manifest.json'), 'w') as stream:
                 json.dump(manifest, stream, indent=2)
         
@@ -585,6 +622,14 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             if structure_proto:
                 if step == 0:
                     log_shape_health(writer, epoch, model, structured)
+                    usage_diagnostics = model.structure_usage_diagnostics(structured)
+                    for name, value in usage_diagnostics.items():
+                        writer.add_scalar(f"shape_health/{name}", value, epoch)
+                    if usage_diagnostics:
+                        print("STRUCTURE_USAGE_DIAG|epoch=" + str(epoch) + "|" + "|".join(
+                            f"{name}={float(value):.6f}"
+                            for name, value in usage_diagnostics.items()
+                        ))
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_norm=5., error_if_nonfinite=True,
                 )
