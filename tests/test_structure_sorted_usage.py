@@ -96,6 +96,23 @@ def test_sorted_late_fusion_omits_external_query_and_zero_initializes_projection
     assert torch.isfinite(output["logits"]).all()
 
 
+def test_late_fusion_shape_health_uses_late_projection_without_external_query():
+    from methods.structure_da.prototype_losses import (
+        shape_gradient_snapshot,
+        shape_health_snapshot,
+    )
+
+    model = _model("sorted_profile", "late_fusion")
+    output = model(*_batch(), return_dict=True)
+    output["logits"].sum().backward()
+    health = shape_health_snapshot(model, output)
+    gradients = shape_gradient_snapshot(model)
+    assert health["shape_query_projection_norm"] == pytest.approx(
+        float(model.late_fusion_projection.weight.detach().norm())
+    )
+    assert gradients["grad_norm_query_projection"] >= 0.
+
+
 def test_current_defaults_preserve_legacy_modules_and_strict_checkpoint_load():
     implicit = PseStructureProtoLTae(
         input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,

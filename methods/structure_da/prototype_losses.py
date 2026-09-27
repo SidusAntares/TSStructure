@@ -644,6 +644,15 @@ def _gradient_l2_norm(module):
     return float(torch.sqrt(torch.stack(values).sum()))
 
 
+def _structure_usage_projection(model):
+    projection = model.temporal_encoder.attention_heads.external_query_projection
+    if projection is None:
+        projection = getattr(model, "late_fusion_projection", None)
+    if projection is None:
+        raise RuntimeError("structure model has no active query or late-fusion projection")
+    return projection
+
+
 @torch.no_grad()
 def shape_health_snapshot(model, outputs):
     response = outputs["shapelet_response"].detach().float()
@@ -655,7 +664,7 @@ def shape_health_snapshot(model, outputs):
         -(probabilities * probabilities.clamp_min(1e-12).log()).sum()
     )
     branch = model.structure_branch
-    query_projection = model.temporal_encoder.attention_heads.external_query_projection
+    query_projection = _structure_usage_projection(model)
     values = {
         "shape_response_std_mean": float(response_std.mean()),
         "shape_response_std_min": float(response_std.min()),
@@ -681,6 +690,7 @@ def shape_health_snapshot(model, outputs):
 
 
 def shape_gradient_snapshot(model):
+    usage_projection = _structure_usage_projection(model)
     return {
         "grad_norm_shape_token_generator": _gradient_l2_norm(
             model.structure_branch.token_generator
@@ -689,9 +699,7 @@ def shape_gradient_snapshot(model):
             model.structure_branch.shapelet_dictionary
         ),
         "grad_norm_shape_classifier": _gradient_l2_norm(model.shape_classifier),
-        "grad_norm_query_projection": _gradient_l2_norm(
-            model.temporal_encoder.attention_heads.external_query_projection
-        ),
+        "grad_norm_query_projection": _gradient_l2_norm(usage_projection),
     }
 
 
