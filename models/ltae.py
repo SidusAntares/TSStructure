@@ -124,6 +124,19 @@ class LTAE(nn.Module):
             return base, local, base_attn, local_attn
         return base, local
 
+    def forward_with_explicit_queries(self, x, positions, queries, return_att=False):
+        """Read the shared temporal memory using only caller-provided queries."""
+        if self.inconv is not None:
+            x = self.inconv(x)
+        memory = x + self.positional_enc(positions + self.max_temporal_shift)
+        local, attention = self.attention_heads.forward_with_explicit_queries(
+            memory, queries,
+        )
+        local = self.dropout(self.mlp(local))
+        if return_att:
+            return local, attention
+        return local
+
 
 class MultiHeadAttention(nn.Module):
     ''' Multi-Head Attention module '''
@@ -214,3 +227,26 @@ class MultiHeadAttention(nn.Module):
         base, base_attention = attend(base_query)
         local, local_attention = attend(local_query)
         return base[:, 0], local, base_attention, local_attention
+
+    def forward_with_explicit_queries(self, x, queries):
+        """Attend with [B,N,H,Dk] queries without reading the base query."""
+        batch, steps, channels = x.shape
+        if queries.ndim != 4 or queries.shape[0] != batch:
+            raise ValueError("explicit queries must be [B,N,H,Dk]")
+        if queries.shape[2:] != (self.n_head, self.d_k):
+            raise ValueError("explicit query dimensions do not match attention")
+        query = queries.transpose(1, 2)
+        key = self.key(x).view(
+            batch, steps, self.n_head, self.d_k,
+        ).transpose(1, 2)
+        value = x.view(
+            batch, steps, self.n_head, channels // self.n_head,
+        ).transpose(1, 2)
+        attention = self.dropout(self.softmax(
+            (query @ key.transpose(-2, -1)) / self.temperature
+        ))
+        output = attention @ value
+        output = output.transpose(1, 2).contiguous().view(
+            batch, query.shape[2], channels,
+        )
+        return output, attention

@@ -87,7 +87,10 @@ def add_model_arguments(parser):
     )
     parser.add_argument(
         '--shape-injection', dest='shape_injection', default='current_query',
-        choices=['current_query', 'direct_query', 'late_fusion', 'local_query'],
+        choices=[
+            'current_query', 'direct_query', 'late_fusion',
+            'local_query', 'local_query_only',
+        ],
     )
     parser.add_argument(
         '--structure-shift-mode', dest='structure_shift_mode', default='none',
@@ -163,18 +166,22 @@ def structure_usage_manifest(config):
         'shape_evidence_dim': evidence_dim,
         'shape_align_weight': config.shape_align_weight,
     }
-    if config.shape_injection == 'local_query':
+    if config.shape_injection in ('local_query', 'local_query_only'):
         manifest.update({
             'structure_shift_mode': getattr(config, 'structure_shift_mode', 'none'),
             'local_structure_token_dim': int(config.shapelet_count),
             'local_structure_windows': (
                 candidates_per_scale * len(config.shape_window_scales)
             ),
-            'local_query': 'base_plus_local_delta',
+            'local_query': (
+                'structure_only' if config.shape_injection == 'local_query_only'
+                else 'base_plus_local_delta'
+            ),
             'shared_temporal_memory': True,
             'shared_ltae_mlp': True,
-            'structure_gamma_max': .5,
         })
+        if config.shape_injection == 'local_query':
+            manifest['structure_gamma_max'] = .5
     return manifest
 
 
@@ -220,6 +227,14 @@ def main(config):
                     "shared_temporal_memory=true|shared_ltae_mlp=true|"
                     f"gamma_max=0.5|shape_align_weight={config.shape_align_weight:g}"
                 )
+            elif config.shape_injection == 'local_query_only':
+                print(
+                    "STRUCTURE_QUERY_ONLY_CONFIG|"
+                    "local_token=anchor_cosine_16|windows=8|"
+                    "query=structure_only|base_query_used=false|"
+                    "shared_temporal_memory=true|shared_ltae_mlp=true|"
+                    f"structure_shift_mode={config.structure_shift_mode}"
+                )
             print(
                 "STRUCTURE_USAGE_CONFIG|"
                 f"representation={usage['shape_representation']}|"
@@ -230,7 +245,9 @@ def main(config):
             shape_da_mode = getattr(config, 'shape_da_mode', 'batch_align')
             manifest = {
                 'method': (
-                    'local_structure_query_shift'
+                    'structure_query_only'
+                    if config.shape_injection == 'local_query_only'
+                    else 'local_structure_query_shift'
                     if config.shape_injection == 'local_query'
                     else 'discriminative_shapelet_source_prototype_alignment'
                     if shape_da_mode == 'source_prototype'

@@ -33,9 +33,12 @@ class PseStructureProtoLTae(nn.Module):
     ):
         super().__init__()
         if shape_representation == "current" and shape_injection not in (
-            "current_query", "local_query",
+            "current_query", "local_query", "local_query_only",
         ):
-            raise ValueError("current representation requires current_query or local_query injection")
+            raise ValueError(
+                "current representation requires current_query, local_query, "
+                "or local_query_only injection"
+            )
         if shape_representation == "sorted_profile" and shape_injection not in (
             "direct_query", "late_fusion",
         ):
@@ -90,15 +93,19 @@ class PseStructureProtoLTae(nn.Module):
                 evidence_dim, mlp3[-1], bias=False,
             )
             nn.init.zeros_(self.late_fusion_projection.weight)
-        if shape_injection == "local_query":
+        if shape_injection in ("local_query", "local_query_only"):
             self.local_query_projection = nn.Linear(
                 int(shapelet_count), n_head * d_k, bias=False,
             )
-            nn.init.zeros_(self.local_query_projection.weight)
+            if shape_injection == "local_query":
+                nn.init.zeros_(self.local_query_projection.weight)
+            else:
+                nn.init.xavier_uniform_(self.local_query_projection.weight)
             self.local_order_scorer = nn.Conv1d(
                 mlp3[-1], 1, kernel_size=3, padding=1,
             )
-            self.raw_structure_gamma = nn.Parameter(torch.logit(torch.tensor(.2)))
+            if shape_injection == "local_query":
+                self.raw_structure_gamma = nn.Parameter(torch.logit(torch.tensor(.2)))
             self.local_query_heads = int(n_head)
             self.local_query_dim = int(d_k)
         self.shape_dim = shape_dim
@@ -124,7 +131,7 @@ class PseStructureProtoLTae(nn.Module):
         )
 
     def prepare_structure(self, prepared, positions, temporal_shift=0):
-        if self.shape_injection == "local_query":
+        if self.shape_injection in ("local_query", "local_query_only"):
             return self.prepare_structure_from_context(
                 self.prepare_structure_context(prepared, positions), temporal_shift,
             )
@@ -147,6 +154,12 @@ class PseStructureProtoLTae(nn.Module):
         if self.shape_injection != "local_query":
             raise AttributeError("structure gamma is only defined for local_query")
         return .5 * torch.sigmoid(self.raw_structure_gamma)
+
+    def _project_local_queries(self, similarity):
+        batch, windows, _ = similarity.shape
+        return self.local_query_projection(similarity).view(
+            batch, windows, self.local_query_heads, self.local_query_dim,
+        )
 
     def _encode_instance(
         self, prepared, shifted_positions, structure, return_details=False,
@@ -171,10 +184,22 @@ class PseStructureProtoLTae(nn.Module):
             instance = temporal + self.late_fusion_projection(normalized)
             return (instance, {}) if return_details else instance
         similarity = structure["shapelet_similarity"]
-        batch, windows, _ = similarity.shape
-        correction = self.local_query_projection(similarity).view(
-            batch, windows, self.local_query_heads, self.local_query_dim,
-        )
+        correction = self._project_local_queries(similarity)
+        if self.shape_injection == "local_query_only":
+            local = self.temporal_encoder.forward_with_explicit_queries(
+                prepared, shifted_positions, correction,
+            )
+            attention = torch.softmax(
+                self.local_order_scorer(local.transpose(1, 2)).squeeze(1), dim=1,
+            )
+            instance = (attention.unsqueeze(-1) * local).sum(1)
+            details = {
+                "local_query": correction,
+                "local_structure_readout": local,
+                "structure_attention": attention,
+                "structure_feature": instance,
+            }
+            return (instance, details) if return_details else instance
         temporal, local = self.temporal_encoder.forward_with_local_queries(
             prepared, shifted_positions, correction,
         )
@@ -197,6 +222,8 @@ class PseStructureProtoLTae(nn.Module):
         return (instance, details) if return_details else instance
 
     def structure_usage_diagnostics(self, output):
+        if self.shape_injection == "local_query_only":
+            return {}
         if self.shape_injection == "local_query":
             base_norm = output["base_instance_feature"].norm(dim=-1).clamp_min(1e-12)
             residual_norm = (
