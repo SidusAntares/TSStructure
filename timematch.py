@@ -526,6 +526,21 @@ def _classify_prepared(
 
 
 def _classify_shift_grid(model, prepared, positions, shifts):
+    if (
+        getattr(model, "structure_shift_mode", "none") == "timematch"
+        and hasattr(model, "prepare_structure_context")
+        and hasattr(model, "prepare_structure_from_context")
+    ):
+        context = model.prepare_structure_context(prepared, positions)
+        return torch.stack([
+            _classify_prepared(
+                model, prepared, positions, temporal_shift=shift,
+                prepared_structure=model.prepare_structure_from_context(
+                    context, temporal_shift=shift,
+                ),
+            )
+            for shift in shifts
+        ], dim=1)
     structure = (
         model.prepare_structure(prepared, positions)
         if hasattr(model, "prepare_structure") else None
@@ -1228,7 +1243,8 @@ def _train_structure_proto_timematch(
                 "shape_concentration_mean": concentration.mean(),
                 "shape_concentration_std": concentration.std(unbiased=False),
             }
-            values.update(student.structure_usage_diagnostics(source_output))
+            usage_diagnostics = student.structure_usage_diagnostics(source_output)
+            values.update(usage_diagnostics)
             if shape_da_mode == "source_prototype":
                 pairwise = _shape_prototype_pairwise_stats(shape_prototype_bank)
                 values.update({
@@ -1257,7 +1273,11 @@ def _train_structure_proto_timematch(
             for name, value in values.items():
                 epoch_sums[name] += float(value)
             if global_step % config.log_step == 0:
-                metrics = {**values, "loss_total": loss.detach()}
+                metrics = {
+                    name: value for name, value in values.items()
+                    if name not in usage_diagnostics
+                }
+                metrics["loss_total"] = loss.detach()
                 for name, value in metrics.items():
                     writer.add_scalar(f"train/{name}", value, global_step)
                 print("STRUCTURE_V2CLEAN_DA|" + "|".join(

@@ -87,7 +87,11 @@ def add_model_arguments(parser):
     )
     parser.add_argument(
         '--shape-injection', dest='shape_injection', default='current_query',
-        choices=['current_query', 'direct_query', 'late_fusion'],
+        choices=['current_query', 'direct_query', 'late_fusion', 'local_query'],
+    )
+    parser.add_argument(
+        '--structure-shift-mode', dest='structure_shift_mode', default='none',
+        choices=['none', 'timematch'],
     )
     parser.add_argument('--shape-target-weight', dest='shape_target_weight', default=.05, type=float)
     parser.add_argument('--shape-align-weight', dest='shape_align_weight', default=.05, type=float)
@@ -137,6 +141,7 @@ def create_model(config):
             fourier_period_days=config.fourier_period_days,
             shape_representation=config.shape_representation,
             shape_injection=config.shape_injection,
+            structure_shift_mode=config.structure_shift_mode,
         )
         return model
     raise NotImplementedError(config.model)
@@ -152,12 +157,25 @@ def structure_usage_manifest(config):
         else int(config.shapelet_count) * candidates_per_scale
         * len(config.shape_window_scales)
     )
-    return {
+    manifest = {
         'shape_representation': config.shape_representation,
         'shape_injection': config.shape_injection,
         'shape_evidence_dim': evidence_dim,
         'shape_align_weight': config.shape_align_weight,
     }
+    if config.shape_injection == 'local_query':
+        manifest.update({
+            'structure_shift_mode': getattr(config, 'structure_shift_mode', 'none'),
+            'local_structure_token_dim': int(config.shapelet_count),
+            'local_structure_windows': (
+                candidates_per_scale * len(config.shape_window_scales)
+            ),
+            'local_query': 'base_plus_local_delta',
+            'shared_temporal_memory': True,
+            'shared_ltae_mlp': True,
+            'structure_gamma_max': .5,
+        })
+    return manifest
 
 
 def main(config):
@@ -194,6 +212,14 @@ def main(config):
         model = create_model(config)
         if isinstance(model, PseStructureProtoLTae):
             usage = structure_usage_manifest(config)
+            if config.shape_injection == 'local_query':
+                print(
+                    "LOCAL_STRUCTURE_QUERY_CONFIG|"
+                    f"structure_shift_mode={config.structure_shift_mode}|"
+                    "windows=8|anchors=16|query=base_plus_local_delta|"
+                    "shared_temporal_memory=true|shared_ltae_mlp=true|"
+                    f"gamma_max=0.5|shape_align_weight={config.shape_align_weight:g}"
+                )
             print(
                 "STRUCTURE_USAGE_CONFIG|"
                 f"representation={usage['shape_representation']}|"
@@ -204,7 +230,9 @@ def main(config):
             shape_da_mode = getattr(config, 'shape_da_mode', 'batch_align')
             manifest = {
                 'method': (
-                    'discriminative_shapelet_source_prototype_alignment'
+                    'local_structure_query_shift'
+                    if config.shape_injection == 'local_query'
+                    else 'discriminative_shapelet_source_prototype_alignment'
                     if shape_da_mode == 'source_prototype'
                     else 'discriminative_shapelet_alignment_v2_clean'
                 ),

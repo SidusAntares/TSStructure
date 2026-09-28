@@ -649,6 +649,8 @@ def _structure_usage_projection(model):
     if projection is None:
         projection = getattr(model, "late_fusion_projection", None)
     if projection is None:
+        projection = getattr(model, "local_query_projection", None)
+    if projection is None:
         raise RuntimeError("structure model has no active query or late-fusion projection")
     return projection
 

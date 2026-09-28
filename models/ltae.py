@@ -12,6 +12,7 @@ code: github.com/jadore801120/attention-is-all-you-need-pytorch
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import copy
 
@@ -99,6 +100,30 @@ class LTAE(nn.Module):
         else:
             return enc_output
 
+    def forward_with_local_queries(
+        self, x, positions, local_query_corrections, return_att=False,
+    ):
+        """Read one shared temporal memory with the base and local queries."""
+        if self.inconv is not None:
+            x = self.inconv(x)
+        memory = x + self.positional_enc(positions + self.max_temporal_shift)
+        base, local, base_attn, local_attn = (
+            self.attention_heads.forward_with_local_queries(
+                memory, local_query_corrections,
+            )
+        )
+        base = self.mlp(base)
+        local = self.mlp(local)
+        if self.training and self.dropout.p:
+            dropout_mask = F.dropout(
+                torch.ones_like(base), p=self.dropout.p, training=True,
+            )
+            base = base * dropout_mask
+            local = local * dropout_mask[:, None]
+        if return_att:
+            return base, local, base_attn, local_attn
+        return base, local
+
 
 class MultiHeadAttention(nn.Module):
     ''' Multi-Head Attention module '''
@@ -142,3 +167,50 @@ class MultiHeadAttention(nn.Module):
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, C)
         return y, att
+
+    def forward_with_local_queries(self, x, local_query_corrections):
+        """Apply base and per-window queries to one set of projected keys/values."""
+        batch, steps, channels = x.shape
+        if local_query_corrections.ndim != 4:
+            raise ValueError("local query corrections must be [B,N,H,Dk]")
+        if (
+            local_query_corrections.shape[0] != batch
+            or local_query_corrections.shape[2:] != (self.n_head, self.d_k)
+        ):
+            raise ValueError("local query correction dimensions do not match attention")
+        base_query = self.query[None, :, None, :].expand(batch, -1, -1, -1)
+        local_query = base_query + local_query_corrections.transpose(1, 2)
+        key = self.key(x).view(
+            batch, steps, self.n_head, self.d_k,
+        ).transpose(1, 2)
+        value = x.view(
+            batch, steps, self.n_head, channels // self.n_head,
+        ).transpose(1, 2)
+
+        def attend(query):
+            attention = self.softmax(
+                (query @ key.transpose(-2, -1)) / self.temperature
+            )
+            if self.training and self.dropout.p:
+                attention = attention * attention_dropout_mask.expand(
+                    -1, -1, query.shape[2], -1,
+                )
+            output = attention @ value
+            output = output.transpose(1, 2).contiguous().view(
+                batch, query.shape[2], channels,
+            )
+            return output, attention
+
+        attention_dropout_mask = (
+            F.dropout(
+                torch.ones(
+                    batch, self.n_head, 1, steps,
+                    device=x.device, dtype=x.dtype,
+                ),
+                p=self.dropout.p, training=True,
+            )
+            if self.training and self.dropout.p else None
+        )
+        base, base_attention = attend(base_query)
+        local, local_attention = attend(local_query)
+        return base[:, 0], local, base_attention, local_attention

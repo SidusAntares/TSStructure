@@ -29,10 +29,13 @@ class PseStructureProtoLTae(nn.Module):
         shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
         fourier_num_modes=13, fourier_reg=1e-3, fourier_period_days=365.,
         shape_representation="current", shape_injection="current_query",
+        structure_shift_mode="none",
     ):
         super().__init__()
-        if shape_representation == "current" and shape_injection != "current_query":
-            raise ValueError("current representation requires current_query injection")
+        if shape_representation == "current" and shape_injection not in (
+            "current_query", "local_query",
+        ):
+            raise ValueError("current representation requires current_query or local_query injection")
         if shape_representation == "sorted_profile" and shape_injection not in (
             "direct_query", "late_fusion",
         ):
@@ -43,6 +46,9 @@ class PseStructureProtoLTae(nn.Module):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
         self.shape_injection = shape_injection
+        if structure_shift_mode not in ("none", "timematch"):
+            raise ValueError("structure_shift_mode must be none or timematch")
+        self.structure_shift_mode = structure_shift_mode
         spatial_mlp2 = deepcopy(mlp2)
         if with_extra:
             spatial_mlp2[0] += extra_size
@@ -84,6 +90,17 @@ class PseStructureProtoLTae(nn.Module):
                 evidence_dim, mlp3[-1], bias=False,
             )
             nn.init.zeros_(self.late_fusion_projection.weight)
+        if shape_injection == "local_query":
+            self.local_query_projection = nn.Linear(
+                int(shapelet_count), n_head * d_k, bias=False,
+            )
+            nn.init.zeros_(self.local_query_projection.weight)
+            self.local_order_scorer = nn.Conv1d(
+                mlp3[-1], 1, kernel_size=3, padding=1,
+            )
+            self.raw_structure_gamma = nn.Parameter(torch.logit(torch.tensor(.2)))
+            self.local_query_heads = int(n_head)
+            self.local_query_dim = int(d_k)
         self.shape_dim = shape_dim
         self.shape_evidence_dim = evidence_dim
         self.instance_dim = mlp3[-1]
@@ -94,7 +111,23 @@ class PseStructureProtoLTae(nn.Module):
     def prepare_temporal_features(self, spatial_feats, positions):
         return spatial_feats
 
-    def prepare_structure(self, prepared, positions):
+    def prepare_structure_context(self, prepared, positions):
+        return self.structure_branch.prepare_context(prepared, positions)
+
+    def prepare_structure_from_context(self, context, temporal_shift=0):
+        structure_shift = (
+            temporal_shift if self.structure_shift_mode == "timematch" else 0
+        )
+        return self.structure_branch.forward_from_context(
+            context, temporal_shift=structure_shift,
+            include_legacy_query=self.shape_injection == "current_query",
+        )
+
+    def prepare_structure(self, prepared, positions, temporal_shift=0):
+        if self.shape_injection == "local_query":
+            return self.prepare_structure_from_context(
+                self.prepare_structure_context(prepared, positions), temporal_shift,
+            )
         return self.structure_branch(
             prepared, positions,
             include_legacy_query=self.shape_injection == "current_query",
@@ -109,24 +142,70 @@ class PseStructureProtoLTae(nn.Module):
     def _parameter_free_layer_norm(evidence):
         return F.layer_norm(evidence, evidence.shape[-1:])
 
-    def _encode_instance(self, prepared, shifted_positions, structure):
+    @property
+    def structure_gamma(self):
+        if self.shape_injection != "local_query":
+            raise AttributeError("structure gamma is only defined for local_query")
+        return .5 * torch.sigmoid(self.raw_structure_gamma)
+
+    def _encode_instance(
+        self, prepared, shifted_positions, structure, return_details=False,
+    ):
         evidence = self._shape_evidence(structure)
         if self.shape_injection == "current_query":
-            return self.temporal_encoder(
+            instance = self.temporal_encoder(
                 prepared, shifted_positions,
                 external_query=structure["shape_class_token"],
             )
+            return (instance, {}) if return_details else instance
         normalized = self._parameter_free_layer_norm(evidence)
         if self.shape_injection == "direct_query":
-            return self.temporal_encoder(
+            instance = self.temporal_encoder(
                 prepared, shifted_positions, external_query=normalized,
             )
-        temporal = self.temporal_encoder(
-            prepared, shifted_positions, external_query=None,
+            return (instance, {}) if return_details else instance
+        if self.shape_injection == "late_fusion":
+            temporal = self.temporal_encoder(
+                prepared, shifted_positions, external_query=None,
+            )
+            instance = temporal + self.late_fusion_projection(normalized)
+            return (instance, {}) if return_details else instance
+        similarity = structure["shapelet_similarity"]
+        batch, windows, _ = similarity.shape
+        correction = self.local_query_projection(similarity).view(
+            batch, windows, self.local_query_heads, self.local_query_dim,
         )
-        return temporal + self.late_fusion_projection(normalized)
+        temporal, local = self.temporal_encoder.forward_with_local_queries(
+            prepared, shifted_positions, correction,
+        )
+        residual = local - temporal[:, None]
+        attention = torch.softmax(
+            self.local_order_scorer(residual.transpose(1, 2)).squeeze(1), dim=1,
+        )
+        structure_feature = (attention.unsqueeze(-1) * residual).sum(1)
+        gamma = self.structure_gamma
+        instance = temporal + gamma * structure_feature
+        details = {
+            "base_instance_feature": temporal,
+            "local_query_correction": correction,
+            "local_structure_readout": local,
+            "structure_residual": residual,
+            "structure_attention": attention,
+            "structure_feature": structure_feature,
+            "structure_gamma": gamma,
+        }
+        return (instance, details) if return_details else instance
 
     def structure_usage_diagnostics(self, output):
+        if self.shape_injection == "local_query":
+            base_norm = output["base_instance_feature"].norm(dim=-1).clamp_min(1e-12)
+            residual_norm = (
+                output["structure_gamma"] * output["structure_feature"]
+            ).norm(dim=-1)
+            return {
+                "gamma": output["structure_gamma"],
+                "structure_residual_norm_ratio": (residual_norm / base_norm).mean(),
+            }
         if self.shape_representation != "sorted_profile":
             return {}
         diagnostics = {
@@ -145,7 +224,7 @@ class PseStructureProtoLTae(nn.Module):
     ):
         shifted_positions = positions + temporal_shift
         structure = (
-            self.prepare_structure(prepared, positions)
+            self.prepare_structure(prepared, positions, temporal_shift)
             if prepared_structure is None else prepared_structure
         )
         instance = self._encode_instance(prepared, shifted_positions, structure)
@@ -161,9 +240,11 @@ class PseStructureProtoLTae(nn.Module):
         del collect_diagnostics
         spatial = self.spatial_encoder(pixels, mask, extra)
         shifted_positions = positions + temporal_shift
-        structure = self.prepare_structure(spatial, positions)
+        structure = self.prepare_structure(spatial, positions, temporal_shift)
         evidence = self._shape_evidence(structure)
-        instance = self._encode_instance(spatial, shifted_positions, structure)
+        instance, usage = self._encode_instance(
+            spatial, shifted_positions, structure, return_details=True,
+        )
         logits = self.decoder(instance)
         if return_dict:
             return {
@@ -171,6 +252,7 @@ class PseStructureProtoLTae(nn.Module):
                 "shape_logits": self.shape_classifier(evidence),
                 "shape_evidence": evidence,
                 "instance_feature": instance,
+                **usage,
                 **structure,
             }
         if return_feats:

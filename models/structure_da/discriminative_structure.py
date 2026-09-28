@@ -59,12 +59,45 @@ class FourierStructureExposer(nn.Module):
         )
         return torch.matmul(matrix.unsqueeze(0), coefficients).real
 
-    def forward(self, features, positions):
+    def analyze(self, features, positions):
         coefficients, diagnostics = self.analyzer(features, positions)
         if torch.any(diagnostics["solver_info"] != 0):
             raise FloatingPointError("non-finite Fourier solve in structure-shapelet training")
         if not torch.isfinite(coefficients).all():
             raise FloatingPointError("non-finite Fourier coefficients in structure-shapelet training")
+        return coefficients
+
+    def synthesize_shifted(self, coefficients, temporal_shift=0):
+        batch = coefficients.shape[0]
+        shift = torch.as_tensor(
+            temporal_shift, device=coefficients.device,
+            dtype=self.canonical_grid.dtype,
+        )
+        if shift.ndim == 0:
+            shift = shift.reshape(1, 1).expand(batch, 1)
+        elif shift.ndim == 1:
+            if shift.numel() == 1:
+                shift = shift.reshape(1, 1).expand(batch, 1)
+            elif shift.numel() == batch:
+                shift = shift[:, None]
+            else:
+                raise ValueError("temporal shift vector must match batch size")
+        elif shift.shape != (batch, 1):
+            raise ValueError("temporal shift must be scalar, [B], or [B,1]")
+        grid = self.canonical_grid.to(
+            device=coefficients.device, dtype=shift.dtype,
+        )[None].expand(batch, -1)
+        exposed = (
+            self.synthesize_canonical(coefficients)
+            if torch.count_nonzero(shift) == 0
+            else self.synthesizer(coefficients, grid - shift)
+        )
+        if not torch.isfinite(exposed).all():
+            raise FloatingPointError("non-finite Fourier reconstruction in structure-shapelet training")
+        return exposed, grid
+
+    def forward(self, features, positions):
+        coefficients = self.analyze(features, positions)
         grid = self.canonical_grid.to(device=features.device, dtype=features.dtype)
         grid = grid.unsqueeze(0).expand(features.shape[0], -1)
         exposed = self.synthesize_canonical(coefficients)
@@ -445,8 +478,15 @@ class DiscriminativeStructureBranch(nn.Module):
             return {**details, "strength": details["response"], "rich_response": rich}
         return rich
 
-    def forward(self, features, positions, include_legacy_query=True):
-        exposed, grid = self.exposer(features, positions)
+    def prepare_context(self, features, positions):
+        return {"coefficients": self.exposer.analyze(features, positions)}
+
+    def forward_from_context(
+        self, context, temporal_shift=0, include_legacy_query=True,
+    ):
+        exposed, grid = self.exposer.synthesize_shifted(
+            context["coefficients"], temporal_shift,
+        )
         window_groups, scales = self.window_extractor(exposed)
         encoded = [
             self.token_generator(windows, return_encoded_components=True)
@@ -477,3 +517,12 @@ class DiscriminativeStructureBranch(nn.Module):
             "exposed_curve": exposed,
             "exposed_grid": grid,
         }
+
+    def forward(
+        self, features, positions, include_legacy_query=True, temporal_shift=0,
+    ):
+        return self.forward_from_context(
+            self.prepare_context(features, positions),
+            temporal_shift=temporal_shift,
+            include_legacy_query=include_legacy_query,
+        )
