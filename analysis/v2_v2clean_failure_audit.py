@@ -391,6 +391,19 @@ def _key_values(line):
     }
 
 
+def integer_day_shift(value):
+    """Restore a logged/checkpoint shift without promoting embedding indices to float."""
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            raise ValueError("temporal shift must be one integer day value")
+        value = value.detach().cpu().item()
+    number = float(value)
+    rounded = round(number)
+    if not np.isfinite(number) or not np.isclose(number, rounded, atol=1e-6, rtol=0):
+        raise ValueError(f"temporal shift must be an integer day value, got {value}")
+    return int(rounded)
+
+
 def parse_training_timeline(path, method):
     text = Path(path).read_text(encoding="utf-8", errors="replace")
     marker = "[UDA START]" if method == "v2" else "[V2-CLEAN UDA START]"
@@ -400,12 +413,14 @@ def parse_training_timeline(path, method):
     pseudo_losses = defaultdict(list)
     current_epoch = None
     initial_match = re.search(r"INITIAL_SHIFT\|[^\n]*shift_days=([-+0-9.]+)", text)
-    initial_shift = float(initial_match.group(1)) if initial_match else float("nan")
+    initial_shift = integer_day_shift(initial_match.group(1)) if initial_match else 0
     for line in text.splitlines():
         if line.startswith("EPOCH_SHIFT|"):
             values = _key_values(line)
             current_epoch = int(values["epoch"])
-            rows[current_epoch]["selected_shift"] = float(values["target_to_source_days"])
+            rows[current_epoch]["selected_shift"] = integer_day_shift(
+                values["target_to_source_days"]
+            )
         elif line.startswith(("STRUCTURE_PROTO_DA|", "STRUCTURE_V2CLEAN_DA|")):
             values = _key_values(line)
             if current_epoch is not None and "loss_pseudo_target" in values:
@@ -459,7 +474,7 @@ def _checkpoint_audit(
     datasets, split = build_audit_datasets(
         config, source_name, target_name, data_root, int(config.seed),
     )
-    target_shift = (
+    target_shift = integer_day_shift(
         packet.get("global_temporal_shift", _initial_shift(timeline))
         if stage == "uda_best" else _initial_shift(timeline)
     )

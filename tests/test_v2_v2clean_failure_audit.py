@@ -8,6 +8,7 @@ from analysis.v2_v2clean_failure_audit import (
     audit_representation,
     extract_representations,
     leave_one_out_centroid_predictions,
+    integer_day_shift,
     pseudo_quality,
     parse_training_timeline,
     source_zscore,
@@ -104,6 +105,16 @@ def test_timeline_labels_shape_agreement_without_claiming_gt_accuracy(tmp_path):
     assert rows[0]["shape_vs_pseudo_accuracy"] == pytest.approx(.7)
     assert "target_pseudo_accuracy" not in rows[0]
     assert rows[1]["best_validation_epoch"] is True
+
+
+def test_logged_shift_is_restored_as_integer_embedding_offset():
+    positions = torch.tensor([[10, 20]], dtype=torch.long)
+    shift = integer_day_shift(-5.0)
+    shifted = positions + shift
+    assert isinstance(shift, int)
+    assert shifted.dtype == torch.long
+    with pytest.raises(ValueError, match="integer day"):
+        integer_day_shift(-5.25)
 
 
 def test_launcher_has_exact_four_jobs_and_no_training_commands():
