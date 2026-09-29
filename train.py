@@ -31,11 +31,16 @@ from models.structure_da.discriminative_structure import (
     initialize_shapelet_dictionary_from_tokens,
 )
 from methods.structure_da.prototype_losses import (
-    compose_structure_v4_source_loss,
+    compose_minority_source_loss,
     ensure_finite_structure_loss,
     log_shape_health,
+    minority_class_weights,
+    prototype_ramp,
     shapelet_diversity_loss,
+    support_aware_prototype_compactness,
+    weighted_focal_loss,
 )
+from models.structure_da.prototype_bank import ClassPrototypeBank
 from timematch import add_shift_estimation_arguments, train_timematch
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
 from utils import label_utils
@@ -105,6 +110,11 @@ def add_model_arguments(parser):
     parser.add_argument('--proto-init-epoch', dest='proto_init_epoch', default=1, type=int)
     parser.add_argument('--proto-ramp-start', dest='proto_ramp_start', default=.1, type=float)
     parser.add_argument('--proto-ramp-epochs', dest='proto_ramp_epochs', default=5, type=int)
+    parser.add_argument(
+        '--source-minority-mode', dest='source_minority_mode', default='base',
+        choices=['base', 'weighted', 'weighted_proto'],
+        help='standalone source-only minority treatment; ignored by TimeMatch',
+    )
     return parser
 
 
@@ -254,6 +264,7 @@ def main(config):
                     else 'discriminative_shapelet_alignment_v2_clean'
                 ),
                 'shape_da_mode': shape_da_mode,
+                'source_minority_mode': getattr(config, 'source_minority_mode', 'base'),
             }
             if shape_da_mode == 'source_prototype':
                 manifest.update({
@@ -605,6 +616,38 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
     data_loader = create_train_loader(dataset, config.batch_size, config.num_workers)
     print(f'training dataset: {dataset_name}, n={len(dataset)}, batches={len(data_loader)}')
 
+    minority_mode = (
+        getattr(config, 'source_minority_mode', 'base') if structure_proto else 'base'
+    )
+    if config.train_on_target and minority_mode != 'base':
+        raise ValueError('source minority modes are only valid for source training')
+    class_weights = None
+    support_weights = None
+    compact_bank = None
+    if structure_proto and minority_mode != 'base':
+        class_counts = np.bincount(
+            np.asarray(dataset.get_labels(), dtype=np.int64),
+            minlength=config.num_classes,
+        )
+        if (class_counts <= 0).any():
+            raise RuntimeError(
+                f'source minority mode requires every class, counts={class_counts.tolist()}'
+            )
+        count_tensor = torch.as_tensor(class_counts, device=device, dtype=torch.float32)
+        class_weights = minority_class_weights(count_tensor)
+        support_weights = (count_tensor / count_tensor.max()).sqrt().clamp(.25, 1.)
+        print(
+            'SOURCE_MINORITY_CONFIG|'
+            f'mode={minority_mode}|counts=' + ','.join(map(str, class_counts.tolist()))
+            + '|weights=' + ','.join(f'{float(value):.6f}' for value in class_weights)
+            + '|support_rho=' + ','.join(f'{float(value):.6f}' for value in support_weights)
+        )
+        if minority_mode == 'weighted_proto':
+            compact_bank = ClassPrototypeBank(
+                config.num_classes, model.shape_classifier.in_features,
+                momentum=config.proto_momentum,
+            ).to(device)
+
     if (
         structure_proto
         and not config.train_on_target
@@ -629,6 +672,12 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
         shape_source_loss_sum = 0.
         shape_source_correct = 0
         shape_source_count = 0
+        proto_compact_sum = 0.
+        proto_valid_sum = 0
+        cls_source_sum = diversity_sum = total_source_sum = 0.
+        compact_ramp = prototype_ramp(
+            epoch, config.proto_ramp_epochs, config.proto_ramp_start,
+        )
 
         progress_bar = tqdm(
             enumerate(data_loader),
@@ -646,15 +695,32 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             if structure_proto:
                 structured = model(pixels, mask, positions, extra, return_dict=True)
                 outputs = structured["logits"]
-                loss_cls = criterion(outputs, targets)
+                loss_cls = (
+                    weighted_focal_loss(
+                        outputs, targets, class_weights,
+                        gamma=config.focal_loss_gamma,
+                    ) if minority_mode != 'base' else criterion(outputs, targets)
+                )
                 loss_shape_source = criterion(structured["shape_logits"], targets)
                 loss_diversity = shapelet_diversity_loss(
                     model.structure_branch.shapelet_dictionary.anchors,
                     config.shapelet_diversity_margin,
                 )
-                loss = compose_structure_v4_source_loss(
+                compactness = (
+                    support_aware_prototype_compactness(
+                        structured["shapelet_response"], targets,
+                        compact_bank, support_weights,
+                    ) if compact_bank is not None else {
+                        "loss": outputs.sum() * 0, "valid_classes": 0,
+                    }
+                )
+                loss_proto_compact = compactness["loss"]
+                loss = compose_minority_source_loss(
                     loss_cls, loss_shape_source, loss_diversity,
-                    config.shape_class_weight, config.shapelet_diversity_weight,
+                    loss_proto_compact, mode=minority_mode,
+                    prototype_ramp_value=compact_ramp, prototype_weight=.05,
+                    shape_weight=config.shape_class_weight,
+                    diversity_weight=config.shapelet_diversity_weight,
                 )
             else:
                 outputs = model.forward(pixels, mask, positions, extra)
@@ -680,12 +746,21 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 )
             optimizer.step()
             if structure_proto:
+                if compact_bank is not None:
+                    compact_bank.update_source(
+                        structured["shapelet_response"].detach(), targets,
+                    )
                 batch_count = int(targets.shape[0])
                 shape_source_loss_sum += float(loss_shape_source.detach()) * batch_count
                 shape_source_correct += int(
                     (structured["shape_logits"].detach().argmax(1) == targets).sum()
                 )
                 shape_source_count += batch_count
+                proto_compact_sum += float(loss_proto_compact.detach())
+                proto_valid_sum += int(compactness["valid_classes"])
+                cls_source_sum += float(loss_cls.detach()) * batch_count
+                diversity_sum += float(loss_diversity.detach())
+                total_source_sum += float(loss.detach()) * batch_count
             scheduler.step()
 
             loss_meter.update(loss.item(), n=config.batch_size)
@@ -699,6 +774,9 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     writer.add_scalar("train/loss_cls_source", loss_cls.detach(), global_step + step)
                     writer.add_scalar("train/loss_shape_source", loss_shape_source.detach(), global_step + step)
                     writer.add_scalar("train/loss_shapelet_diversity", loss_diversity.detach(), global_step + step)
+                    if compact_bank is not None:
+                        writer.add_scalar("train/loss_proto_compact", loss_proto_compact.detach(), global_step + step)
+                        writer.add_scalar("train/prototype_ramp", compact_ramp, global_step + step)
 
         progress_bar.close()
 
@@ -712,6 +790,26 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 f"loss={shape_source_loss:.6f}|accuracy={shape_source_accuracy:.6f}|"
                 f"samples={shape_source_count}"
             )
+            if compact_bank is not None:
+                print(
+                    'SOURCE_PROTO_COMPACT_EPOCH|'
+                    f'epoch={epoch}|loss_proto_compact={proto_compact_sum / max(len(data_loader), 1):.6f}|'
+                    f'prototype_ramp={compact_ramp:.6f}|'
+                    f'initialized={int(compact_bank.initialized.sum())}|'
+                    f'updates={int(compact_bank.update_count.sum())}|'
+                    f'valid_class_batches={proto_valid_sum}'
+                )
+            if minority_mode != 'base':
+                print(
+                    'SOURCE_MINORITY_EPOCH|'
+                    f'epoch={epoch}|mode={minority_mode}|'
+                    f'loss_cls_source={cls_source_sum / max(shape_source_count, 1):.6f}|'
+                    f'loss_shape_source={shape_source_loss:.6f}|'
+                    f'loss_shapelet_diversity={diversity_sum / max(len(data_loader), 1):.6f}|'
+                    f'loss_proto_compact={proto_compact_sum / max(len(data_loader), 1):.6f}|'
+                    f'prototype_ramp={compact_ramp:.6f}|'
+                    f'loss_total={total_source_sum / max(shape_source_count, 1):.6f}'
+                )
 
         model.eval()
         previous_best = best_f1
@@ -724,6 +822,8 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 'config': vars(config),
                 'best_f1': best_f1,
             }
+            if compact_bank is not None:
+                checkpoint['source_compact_prototype_bank'] = compact_bank.state_dict()
             torch.save(checkpoint, os.path.join(config.fold_dir, 'checkpoint_last.pt'))
             if best_f1 > previous_best or not os.path.isfile(best_model_path):
                 torch.save(checkpoint, best_model_path)

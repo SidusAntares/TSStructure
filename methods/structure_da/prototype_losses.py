@@ -32,6 +32,79 @@ def shapelet_diversity_loss(anchors, margin=.5):
     return F.relu(similarity[upper[0], upper[1]] - margin).square().mean()
 
 
+def minority_class_weights(counts):
+    """Inverse-square-root source weights with the frozen two-stage normalization."""
+    counts = torch.as_tensor(counts)
+    if counts.ndim != 1 or counts.numel() == 0 or (counts <= 0).any():
+        raise ValueError("source class counts must be a positive 1D tensor")
+    weights = counts.to(dtype=torch.float32).rsqrt()
+    weights = (weights / weights.mean()).clamp(.5, 2.)
+    return weights / weights.mean()
+
+
+def weighted_focal_loss(logits, labels, class_weights, gamma=1.):
+    """Existing focal definition with a label-weighted normalized reduction."""
+    labels = labels.long()
+    log_probability = F.log_softmax(logits, dim=1)
+    log_true = log_probability.gather(1, labels[:, None]).squeeze(1)
+    focal = -(1. - log_true.exp()).pow(float(gamma)) * log_true
+    sample_weights = torch.as_tensor(
+        class_weights, device=logits.device, dtype=logits.dtype,
+    )[labels]
+    return (sample_weights * focal).sum() / sample_weights.sum().clamp_min(1e-12)
+
+
+def support_aware_prototype_compactness(
+    features, labels, prototype_bank, support_weights,
+):
+    """Macro class-center compactness against detached source EMA prototypes."""
+    features = F.normalize(features, dim=-1)
+    labels = labels.long()
+    support_weights = torch.as_tensor(
+        support_weights, device=features.device, dtype=features.dtype,
+    )
+    losses, weights, valid_classes = [], [], []
+    for class_id in torch.unique(labels, sorted=True).tolist():
+        if not bool(prototype_bank.initialized[class_id]):
+            continue
+        selected = labels == class_id
+        prototype = prototype_bank.prototypes[class_id].detach()
+        class_loss = 1. - F.cosine_similarity(
+            features[selected], prototype[None], dim=-1,
+        ).mean()
+        losses.append(class_loss)
+        weights.append(support_weights[class_id])
+        valid_classes.append(class_id)
+    if not losses:
+        return {
+            "loss": features.sum() * 0,
+            "valid_classes": 0,
+            "class_ids": labels.new_empty(0),
+        }
+    losses = torch.stack(losses)
+    weights = torch.stack(weights)
+    return {
+        "loss": (weights * losses).sum() / weights.sum().clamp_min(1e-12),
+        "valid_classes": len(valid_classes),
+        "class_ids": labels.new_tensor(valid_classes),
+    }
+
+
+def compose_minority_source_loss(
+    classification, source_shape, diversity, prototype_compactness,
+    mode="base", prototype_ramp_value=1., prototype_weight=.05,
+    shape_weight=.1, diversity_weight=.01,
+):
+    total = compose_structure_v4_source_loss(
+        classification, source_shape, diversity, shape_weight, diversity_weight,
+    )
+    if mode == "weighted_proto":
+        total = total + prototype_ramp_value * prototype_weight * prototype_compactness
+    elif mode not in ("base", "weighted"):
+        raise ValueError(f"unknown source minority mode: {mode}")
+    return total
+
+
 def shapelet_data_support_loss(source_shape_tokens, anchors, temperature=.1):
     if temperature <= 0:
         raise ValueError("shapelet shaping temperature must be positive")
