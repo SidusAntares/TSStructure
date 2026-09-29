@@ -14,6 +14,7 @@ from analysis.structure_representation_chain_audit import (
     common_class_names,
     compose_chain_representations,
     fit_source_probe,
+    pixel_budget_batches,
     remap_to_classes,
     target_oracle_probe,
     write_csv,
@@ -175,6 +176,21 @@ def test_anchor_coverage_and_margin_are_aggregated_exactly():
     assert row["std_anchor_margin"] == pytest.approx(np.std([.5, .1, .5, .1]))
 
 
+def test_pixel_budget_batches_prevent_padding_memory_explosion():
+    pixel_counts = [64] * 128 + [4096] * 4
+    batches = pixel_budget_batches(
+        pixel_counts, max_batch_size=128, pixel_budget=8192,
+    )
+
+    flattened = [index for batch in batches for index in batch]
+    assert sorted(flattened) == list(range(len(pixel_counts)))
+    assert len(flattened) == len(set(flattened))
+    for batch in batches:
+        padded_pixels = len(batch) * max(pixel_counts[index] for index in batch)
+        assert padded_pixels <= 8192
+    assert max(len(batch) for batch in batches if pixel_counts[batch[0]] == 4096) == 2
+
+
 @pytest.mark.parametrize(
     "fields,required",
     [
@@ -215,3 +231,5 @@ def test_launcher_is_two_task_source_only_dry_run():
     assert "/uda/" not in source.lower()
     assert "uda_checkpoint" not in source.lower()
     assert "DRY_RUN" in source
+    assert 'PIXEL_BUDGET="${PIXEL_BUDGET:-8192}"' in source
+    assert '--pixel-budget "$PIXEL_BUDGET"' in source

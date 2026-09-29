@@ -8,6 +8,7 @@ CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-outputs/structure_proto_v2clean_4tasks_seed1
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/structure_representation_chain_audit_seed1}"
 LOG_ROOT="${LOG_ROOT:-logs/structure_representation_chain_audit_seed1}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+PIXEL_BUDGET="${PIXEL_BUDGET:-8192}"
 DRY_RUN="${DRY_RUN:-0}"
 
 FR2_CHECKPOINT="$CHECKPOINT_ROOT/source_FR2_seed1/fold_0/model.pt"
@@ -29,7 +30,7 @@ run_task() {
   local gpu="$1" task="$2"
   local log_file="$LOG_ROOT/${task}.log"
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo "REP_CHAIN_PLAN|gpu=${gpu}|task=${task}|checkpoint_root=${CHECKPOINT_ROOT}|output_root=${OUTPUT_ROOT}"
+    echo "REP_CHAIN_PLAN|gpu=${gpu}|task=${task}|pixel_budget=${PIXEL_BUDGET}|checkpoint_root=${CHECKPOINT_ROOT}|output_root=${OUTPUT_ROOT}"
     return 0
   fi
   CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u \
@@ -38,6 +39,7 @@ run_task() {
     --data-root "$DATA_ROOT" \
     --checkpoint-root "$CHECKPOINT_ROOT" \
     --output-root "$OUTPUT_ROOT" \
+    --pixel-budget "$PIXEL_BUDGET" \
     --device cuda --seed 1 \
     > "$log_file" 2>&1
 }

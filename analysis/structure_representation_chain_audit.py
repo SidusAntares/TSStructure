@@ -343,10 +343,37 @@ def _pad_pixel_collate(samples):
     }
 
 
-def deterministic_loader(dataset, batch_size, num_workers):
+def pixel_budget_batches(pixel_counts, max_batch_size, pixel_budget):
+    """Build deterministic padded batches bounded by batch*max_pixels."""
+    max_batch_size = int(max_batch_size)
+    pixel_budget = int(pixel_budget)
+    if max_batch_size < 1 or pixel_budget < 1:
+        raise ValueError("max batch size and pixel budget must be positive")
+    counts = [int(value) for value in pixel_counts]
+    if any(value < 1 for value in counts):
+        raise ValueError("every parcel must contain at least one pixel")
+    order = sorted(range(len(counts)), key=lambda index: (counts[index], index))
+    batches, current = [], []
+    for index in order:
+        candidate_size = len(current) + 1
+        padded_pixels = candidate_size * counts[index]
+        if current and (
+            candidate_size > max_batch_size or padded_pixels > pixel_budget
+        ):
+            batches.append(current)
+            current = [index]
+        else:
+            current.append(index)
+    if current:
+        batches.append(current)
+    return batches
+
+
+def deterministic_loader(dataset, batch_size, num_workers, pixel_budget=8192):
     shapes = dataset.get_shapes()
-    order = sorted(range(len(shapes)), key=lambda index: (shapes[index][2], index))
-    batches = [order[start:start + batch_size] for start in range(0, len(order), batch_size)]
+    batches = pixel_budget_batches(
+        [shape[2] for shape in shapes], batch_size, pixel_budget,
+    )
     return torch.utils.data.DataLoader(
         dataset, batch_sampler=batches, num_workers=int(num_workers),
         collate_fn=_pad_pixel_collate, pin_memory=torch.cuda.is_available(),
@@ -406,10 +433,14 @@ def build_audit_datasets(config, source_name, target_name, data_root, seed):
 
 
 @torch.no_grad()
-def extract_dataset(model, dataset, batch_size, num_workers, device):
+def extract_dataset(
+    model, dataset, batch_size, num_workers, device, pixel_budget=8192,
+):
     collected = {name: [] for name in REPRESENTATIONS}
     similarities, labels = [], []
-    for batch in deterministic_loader(dataset, batch_size, num_workers):
+    for batch in deterministic_loader(
+        dataset, batch_size, num_workers, pixel_budget=pixel_budget,
+    ):
         pixels = batch["pixels"].to(device, non_blocking=True)
         valid = batch["valid_pixels"].to(device, non_blocking=True)
         positions = batch["positions"].to(device, non_blocking=True)
@@ -554,6 +585,7 @@ def run_task(args):
     extracted = {
         name: extract_dataset(
             model, dataset, args.batch_size, args.num_workers, device,
+            pixel_budget=args.pixel_budget,
         ) for name, dataset in datasets.items()
     }
     common = resolve_common_classes(args.checkpoint_root, args.data_root)
@@ -600,6 +632,7 @@ def run_task(args):
             "linear": "StandardScaler+RidgeClassifier(alpha=1.0,class_weight=balanced)",
             "target_oracle_cv_max_folds": 5,
             "knn": "cosine,k=5,L2-normalized",
+            "full_pixel_batch_budget": args.pixel_budget,
         },
         "test_split_accessed": False,
         "uda_checkpoint_used": False,
@@ -707,6 +740,10 @@ def build_parser():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--pixel-budget", type=int, default=8192,
+        help="Maximum padded parcel pixels per extraction batch.",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--code-version", default=CODE_VERSION)
     return parser
