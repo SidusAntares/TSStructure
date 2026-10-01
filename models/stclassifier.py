@@ -45,7 +45,9 @@ class PseStructureProtoLTae(nn.Module):
             raise ValueError(
                 "sorted_profile representation requires direct_query or late_fusion injection"
             )
-        if shape_representation not in ("current", "sorted_profile"):
+        if shape_representation == "set_response" and shape_injection != "current_query":
+            raise ValueError("set_response representation requires current_query injection")
+        if shape_representation not in ("current", "sorted_profile", "set_response"):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
         self.shape_injection = shape_injection
@@ -66,15 +68,18 @@ class PseStructureProtoLTae(nn.Module):
             window_scales=tuple(shape_window_scales), window_stride=shape_window_stride,
             shapelet_count=shapelet_count, shapelet_beta=shapelet_beta,
             shape_resample_length=shape_resample_length,
+            shape_representation=shape_representation,
         )
         candidates_per_scale = (64 + int(shape_window_stride) - 1) // int(shape_window_stride)
         sorted_profile_dim = (
             int(shapelet_count) * candidates_per_scale * len(tuple(shape_window_scales))
         )
-        evidence_dim = (
-            2 * int(shapelet_count)
-            if shape_representation == "current" else sorted_profile_dim
-        )
+        if shape_representation == "current":
+            evidence_dim = 2 * int(shapelet_count)
+        elif shape_representation == "set_response":
+            evidence_dim = 32
+        else:
+            evidence_dim = sorted_profile_dim
         external_query_dim = (
             shape_dim if shape_injection == "current_query"
             else evidence_dim if shape_injection == "direct_query"
@@ -141,7 +146,7 @@ class PseStructureProtoLTae(nn.Module):
         )
 
     def _shape_evidence(self, structure):
-        if self.shape_representation == "current":
+        if self.shape_representation in ("current", "set_response"):
             return structure["shapelet_response"]
         return structure["sorted_anchor_profile"]
 

@@ -446,8 +446,12 @@ class DiscriminativeStructureBranch(nn.Module):
         self, channels, shape_dim=128, num_modes=13, grid_points=64,
         period_days=365.0, reg=1e-3, window_scales=(24,), window_stride=8,
         shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
+        shape_representation="current",
     ):
         super().__init__()
+        if shape_representation not in ("current", "sorted_profile", "set_response"):
+            raise ValueError(f"unknown shape representation: {shape_representation}")
+        self.shape_representation = shape_representation
         self.exposer = FourierStructureExposer(num_modes, grid_points, period_days, reg)
         self.window_extractor = MultiScaleWindowExtractor(
             window_scales, window_stride, grid_points=grid_points,
@@ -456,7 +460,13 @@ class DiscriminativeStructureBranch(nn.Module):
             channels, shape_dim, resample_length=shape_resample_length,
         )
         self.shapelet_dictionary = ShapeletDictionary(shape_dim, shapelet_count, shapelet_beta)
-        response_dim = 2 * shapelet_count
+        if shape_representation == "set_response":
+            self.window_set_encoder = nn.Sequential(
+                nn.Linear(shapelet_count, 64), nn.GELU(), nn.Linear(64, 32),
+            )
+            response_dim = 32
+        else:
+            response_dim = 2 * shapelet_count
         self.response_to_query = nn.Sequential(
             nn.Linear(response_dim, 64), nn.GELU(),
             nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
@@ -477,6 +487,26 @@ class DiscriminativeStructureBranch(nn.Module):
         if return_details:
             return {**details, "strength": details["response"], "rich_response": rich}
         return rich
+
+    def compose_set_response(self, similarity, candidate_mask):
+        if self.shape_representation != "set_response":
+            raise RuntimeError("set response is only available in set_response mode")
+        if similarity.ndim != 3:
+            raise ValueError("similarity must be [B,N,M]")
+        candidate_mask = torch.as_tensor(
+            candidate_mask, dtype=torch.bool, device=similarity.device,
+        )
+        if candidate_mask.ndim == 1:
+            candidate_mask = candidate_mask.unsqueeze(0).expand(similarity.shape[0], -1)
+        if candidate_mask.shape != similarity.shape[:2]:
+            raise ValueError("candidate_mask must be [N] or [B,N]")
+        valid_count = candidate_mask.sum(dim=1, keepdim=True)
+        if not (valid_count > 0).all():
+            raise ValueError("every sample must retain at least one candidate")
+        encoded = self.window_set_encoder(similarity)
+        return (
+            encoded * candidate_mask.unsqueeze(-1).to(encoded.dtype)
+        ).sum(dim=1) / valid_count.to(encoded.dtype)
 
     def prepare_context(self, features, positions):
         return {"coefficients": self.exposer.analyze(features, positions)}
@@ -499,8 +529,12 @@ class DiscriminativeStructureBranch(nn.Module):
         ], dim=1)
         details = self.shapelet_dictionary.compute_response(tokens, return_details=True)
         strength = details["response"]
-        response = self.compose_rich_response(details)
-        concentration = response[:, strength.shape[1]:]
+        rich_response = self.compose_rich_response(details)
+        concentration = rich_response[:, strength.shape[1]:]
+        response = (
+            self.compose_set_response(details["similarity"], details["candidate_mask"])
+            if self.shape_representation == "set_response" else rich_response
+        )
         profile = sorted_anchor_profile(details["similarity"])
         return {
             "shape_tokens": tokens,

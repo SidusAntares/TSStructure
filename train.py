@@ -88,7 +88,7 @@ def add_model_arguments(parser):
     parser.add_argument('--shape-class-weight', dest='shape_class_weight', default=.1, type=float)
     parser.add_argument(
         '--shape-representation', dest='shape_representation', default='current',
-        choices=['current', 'sorted_profile'],
+        choices=['current', 'sorted_profile', 'set_response'],
     )
     parser.add_argument(
         '--shape-injection', dest='shape_injection', default='current_query',
@@ -164,12 +164,15 @@ def structure_usage_manifest(config):
     candidates_per_scale = (
         64 + int(config.shape_window_stride) - 1
     ) // int(config.shape_window_stride)
-    evidence_dim = (
-        2 * int(config.shapelet_count)
-        if config.shape_representation == 'current'
-        else int(config.shapelet_count) * candidates_per_scale
-        * len(config.shape_window_scales)
-    )
+    if config.shape_representation == 'current':
+        evidence_dim = 2 * int(config.shapelet_count)
+    elif config.shape_representation == 'set_response':
+        evidence_dim = 32
+    else:
+        evidence_dim = (
+            int(config.shapelet_count) * candidates_per_scale
+            * len(config.shape_window_scales)
+        )
     manifest = {
         'shape_representation': config.shape_representation,
         'shape_injection': config.shape_injection,
