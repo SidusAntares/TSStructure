@@ -28,35 +28,42 @@ if str(ROOT) not in sys.path:
 from models.structure_da.discriminative_structure import normalized_candidate_concentration
 
 
-CODE_VERSION = "0503bd6b02d7b0de8908c43ae0866b5b1acefae4"
+CODE_VERSION = "working-tree"
 DOMAINS = {
     "AT1": "austria/33UVP/2017",
     "DK1": "denmark/32VNH/2017",
+    "FR1": "france/30TXT/2017",
     "FR2": "france/31TCJ/2017",
 }
 TASKS = {
-    "FR2_DK1": ("FR2", "DK1"),
     "AT1_DK1": ("AT1", "DK1"),
+    "FR1_FR2": ("FR1", "FR2"),
+    "FR2_DK1": ("FR2", "DK1"),
+    "DK1_AT1": ("DK1", "AT1"),
 }
+VARIANTS = ("current", "set_response")
 REPRESENTATIONS = (
-    "fourier_flat",
-    "shape_token_flat",
-    "anchor_ordered",
-    "anchor_sorted",
-    "shape_strength",
     "shape_response",
-    "qshape",
+    "shape_query_feature",
+    "query_delta",
 )
 REPRESENTATION_FIELDS = (
-    "task", "class_protocol", "representation", "feature_dim",
+    "variant", "task", "class_protocol", "representation", "feature_dim",
+    "effective_rank",
     "source_val_macro_f1", "target_oracle_macro_f1",
     "source_to_target_macro_f1", "source_to_target_knn_macro_f1",
 )
 REPRESENTATION_PER_CLASS_FIELDS = (
-    "task", "class_protocol", "representation", "class",
+    "variant", "task", "class_protocol", "representation", "class",
     "source_support", "target_support", "source_val_f1",
     "target_oracle_f1", "source_to_target_f1",
     "source_to_target_knn_f1",
+)
+REPRESENTATION_GEOMETRY_FIELDS = (
+    "variant", "task", "class_protocol", "representation", "class",
+    "source_class_radius", "target_class_radius",
+    "same_class_source_distance", "nearest_wrong_source_distance",
+    "cross_domain_margin",
 )
 ANCHOR_COVERAGE_FIELDS = (
     "task", "class_protocol", "domain", "class", "support",
@@ -116,20 +123,41 @@ def compose_chain_representations(
     }
 
 
+@torch.no_grad()
+def extract_representation_stages(model, structure):
+    response = structure["shapelet_response"]
+    query_feature = structure["shape_class_token"]
+    if query_feature is None:
+        raise RuntimeError("current-query audit requires shape_class_token")
+    projection = model.temporal_encoder.attention_heads.external_query_projection
+    if projection is None:
+        raise RuntimeError("current-query audit requires external_query_projection")
+    return {
+        "shape_response": response.detach(),
+        "shape_query_feature": query_feature.detach(),
+        "query_delta": projection(query_feature).flatten(1).detach(),
+    }
+
+
+def effective_rank(features, eps=1e-12):
+    matrix = torch.as_tensor(features, dtype=torch.float32)
+    singular = torch.linalg.svdvals(matrix)
+    probability = singular / singular.sum().clamp_min(float(eps))
+    return float(torch.exp(-(
+        probability * probability.clamp_min(float(eps)).log()
+    ).sum()))
+
+
 def extract_chain_batch(model, pixels, valid_pixels, positions, extra):
     spatial = model.spatial_encoder(pixels, valid_pixels, extra)
-    branch = model.structure_branch
-    fourier, grid = branch.exposer(spatial, positions)
-    window_groups, scales = branch.window_extractor(fourier)
-    tokens = torch.cat(
-        [branch.token_generator(windows) for windows in window_groups], dim=1,
+    structure = model.prepare_structure(spatial, positions)
+    representations = extract_representation_stages(model, structure)
+    return (
+        representations,
+        structure["shapelet_similarity"],
+        structure["exposed_grid"],
+        structure["shape_scales"],
     )
-    similarity = branch.shapelet_dictionary.compute_similarity(tokens)
-    representations = compose_chain_representations(
-        fourier, tokens, similarity, branch.response_to_query,
-        beta=branch.shapelet_dictionary.beta,
-    )
-    return representations, similarity, grid, scales
 
 
 def audit_split_indices(
@@ -380,13 +408,36 @@ def deterministic_loader(dataset, batch_size, num_workers, pixel_budget=8192):
     )
 
 
-def load_source_model(checkpoint, device):
+def normalize_checkpoint_config(saved_config, expected_variant):
+    """Adapt legacy current-response metadata without relaxing model strict-load."""
+    values = dict(saved_config)
+    saved_variant = values.get("shape_representation")
+    if saved_variant is None:
+        if expected_variant != "current":
+            raise ValueError(
+                "checkpoint config missing shape_representation; only legacy "
+                "current-response checkpoints may omit it"
+            )
+        values["shape_representation"] = "current"
+    elif saved_variant != expected_variant:
+        raise ValueError(
+            f"checkpoint representation={saved_variant} does not match "
+            f"variant={expected_variant}"
+        )
+    values.setdefault("shape_injection", "current_query")
+    values.setdefault("structure_shift_mode", "none")
+    return values
+
+
+def load_source_model(checkpoint, device, expected_variant):
     from train import create_model
 
     packet = torch.load(checkpoint, map_location=device, weights_only=False)
     if not isinstance(packet.get("config"), dict):
         raise ValueError(f"checkpoint config missing: {checkpoint}")
-    config = SimpleNamespace(**packet["config"])
+    config = SimpleNamespace(**normalize_checkpoint_config(
+        packet["config"], expected_variant,
+    ))
     model = create_model(config)
     model.load_state_dict(packet["state_dict"], strict=True)
     return model.to(device).eval(), config
@@ -474,19 +525,22 @@ def available_target_classes(data_root, target_name, candidates, combine=False):
 
 def resolve_common_classes(checkpoint_root, data_root):
     packets = {}
-    for source in ("AT1", "FR2"):
+    for source in DOMAINS:
         checkpoint = (
             Path(checkpoint_root) / f"source_{source}_seed1" / "fold_0" / "model.pt"
         )
         if not checkpoint.is_file():
             raise FileNotFoundError(f"source checkpoint not found: {checkpoint.resolve()}")
         packets[source] = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    at1 = list(packets["AT1"]["config"]["classes"])
-    fr2 = list(packets["FR2"]["config"]["classes"])
-    candidates = sorted(set(at1) & set(fr2))
+    candidates = sorted(set.intersection(*(
+        set(packet["config"]["classes"]) for packet in packets.values()
+    )))
     combine = bool(packets["AT1"]["config"].get("combine_spring_and_winter", False))
-    dk1 = available_target_classes(data_root, DOMAINS["DK1"], candidates, combine)
-    return common_class_names(at1, fr2, dk1)
+    available = [
+        set(available_target_classes(data_root, dataset, candidates, combine))
+        for dataset in DOMAINS.values()
+    ]
+    return sorted(set(candidates).intersection(*available))
 
 
 def _protocol_arrays(extracted, original_classes, selected_classes):
@@ -509,12 +563,60 @@ def _protocol_arrays(extracted, original_classes, selected_classes):
     return {"representations": remapped, "similarity": similarity, "labels": remapped_labels}
 
 
+def representation_geometry_rows(
+    variant, task, protocol, representation, class_names,
+    source_features, source_labels, target_features, target_labels,
+):
+    source = F.normalize(torch.as_tensor(source_features, dtype=torch.float32), dim=-1)
+    target = F.normalize(torch.as_tensor(target_features, dtype=torch.float32), dim=-1)
+    source_labels = torch.as_tensor(source_labels, dtype=torch.long)
+    target_labels = torch.as_tensor(target_labels, dtype=torch.long)
+    source_centroids = {}
+    target_centroids = {}
+    for class_id in range(len(class_names)):
+        source_selected = source[source_labels == class_id]
+        target_selected = target[target_labels == class_id]
+        if source_selected.numel() and target_selected.numel():
+            source_centroids[class_id] = F.normalize(
+                source_selected.mean(0), dim=0,
+            )
+            target_centroids[class_id] = F.normalize(
+                target_selected.mean(0), dim=0,
+            )
+    rows = []
+    for class_id, class_name in enumerate(class_names):
+        if class_id not in source_centroids or class_id not in target_centroids:
+            continue
+        source_selected = source[source_labels == class_id]
+        target_selected = target[target_labels == class_id]
+        source_center = source_centroids[class_id]
+        target_center = target_centroids[class_id]
+        source_radius = (1. - source_selected @ source_center).mean()
+        target_radius = (1. - target_selected @ target_center).mean()
+        same_distance = 1. - target_center @ source_center
+        wrong = [
+            1. - target_center @ center
+            for other, center in source_centroids.items() if other != class_id
+        ]
+        nearest_wrong = torch.stack(wrong).min() if wrong else same_distance.new_tensor(float("nan"))
+        rows.append({
+            "variant": variant, "task": task, "class_protocol": protocol,
+            "representation": representation, "class": class_name,
+            "source_class_radius": float(source_radius),
+            "target_class_radius": float(target_radius),
+            "same_class_source_distance": float(same_distance),
+            "nearest_wrong_source_distance": float(nearest_wrong),
+            "cross_domain_margin": float(nearest_wrong - same_distance),
+        })
+    return rows
+
+
 def evaluate_protocol(
-    task, protocol, class_names, source_train, source_val, target_val,
+    variant, task, protocol, class_names, source_train, source_val, target_val,
     seed, knn_device,
 ):
     class_ids = np.arange(len(class_names), dtype=np.int64)
-    metrics_rows, class_rows = [], []
+    metrics_rows, class_rows, geometry_rows = [], [], []
     source_support = np.bincount(source_val["labels"], minlength=len(class_names))
     target_support = np.bincount(target_val["labels"], minlength=len(class_names))
     for representation in REPRESENTATIONS:
@@ -534,10 +636,15 @@ def evaluate_protocol(
             device=knn_device,
         )
         knn_per_class = _per_class_f1(target_val["labels"], knn_prediction, class_ids)
+        rank_features = np.concatenate((
+            source_val["representations"][representation],
+            target_val["representations"][representation],
+        ), axis=0)
         metrics_rows.append({
-            "task": task, "class_protocol": protocol,
+            "variant": variant, "task": task, "class_protocol": protocol,
             "representation": representation,
             "feature_dim": int(source_train["representations"][representation].shape[1]),
+            "effective_rank": effective_rank(rank_features),
             "source_val_macro_f1": source["source_val_macro_f1"],
             "target_oracle_macro_f1": oracle["macro_f1"],
             "source_to_target_macro_f1": source["source_to_target_macro_f1"],
@@ -545,7 +652,7 @@ def evaluate_protocol(
         })
         for class_id, class_name in enumerate(class_names):
             class_rows.append({
-                "task": task, "class_protocol": protocol,
+                "variant": variant, "task": task, "class_protocol": protocol,
                 "representation": representation, "class": class_name,
                 "source_support": int(source_support[class_id]),
                 "target_support": int(target_support[class_id]),
@@ -554,6 +661,11 @@ def evaluate_protocol(
                 "source_to_target_f1": source["source_to_target_per_class_f1"][class_id],
                 "source_to_target_knn_f1": knn_per_class[class_id],
             })
+        geometry_rows.extend(representation_geometry_rows(
+            variant, task, protocol, representation, class_names,
+            source_val["representations"][representation], source_val["labels"],
+            target_val["representations"][representation], target_val["labels"],
+        ))
     coverage = []
     coverage.extend(anchor_coverage_rows(
         task, protocol, "source", source_val["similarity"],
@@ -563,7 +675,7 @@ def evaluate_protocol(
         task, protocol, "target", target_val["similarity"],
         target_val["labels"], class_names,
     ))
-    return metrics_rows, class_rows, coverage
+    return metrics_rows, class_rows, geometry_rows, coverage
 
 
 def checkpoint_for(checkpoint_root, source):
@@ -578,7 +690,7 @@ def run_task(args):
         raise FileNotFoundError(f"source checkpoint not found: {checkpoint.resolve()}")
     seed_all(args.seed)
     device = torch.device(args.device)
-    model, config = load_source_model(checkpoint, device)
+    model, config = load_source_model(checkpoint, device, args.variant)
     datasets, split = build_audit_datasets(
         config, source_name, target_name, args.data_root, args.seed,
     )
@@ -593,30 +705,37 @@ def run_task(args):
         "task_native": list(config.classes),
         "common_classes": common,
     }
-    metric_rows, class_rows, coverage_rows = [], [], []
+    metric_rows, class_rows, geometry_rows, coverage_rows = [], [], [], []
     for protocol, classes in protocols.items():
         prepared = {
             name: _protocol_arrays(values, config.classes, classes)
             for name, values in extracted.items()
         }
-        metrics, per_class, coverage = evaluate_protocol(
-            args.task, protocol, classes,
+        metrics, per_class, geometry, coverage = evaluate_protocol(
+            args.variant, args.task, protocol, classes,
             prepared["source_train"], prepared["source_val"],
             prepared["target_val"], args.seed, args.device,
         )
         metric_rows.extend(metrics)
         class_rows.extend(per_class)
+        geometry_rows.extend(geometry)
         coverage_rows.extend(coverage)
-    task_root = Path(args.output_root) / args.task
+    task_root = Path(args.output_root) / args.variant / args.task
     write_csv(task_root / "representation_metrics.csv", metric_rows, REPRESENTATION_FIELDS)
     write_csv(
         task_root / "representation_per_class.csv", class_rows,
         REPRESENTATION_PER_CLASS_FIELDS,
     )
+    write_csv(
+        task_root / "representation_geometry.csv", geometry_rows,
+        REPRESENTATION_GEOMETRY_FIELDS,
+    )
     write_csv(task_root / "anchor_coverage.csv", coverage_rows, ANCHOR_COVERAGE_FIELDS)
     manifest = {
         "commit": args.code_version,
         "checkpoint": str(checkpoint),
+        "variant": args.variant,
+        "task": args.task,
         "seed": args.seed,
         "source": source_name,
         "target": target_name,
@@ -624,6 +743,14 @@ def run_task(args):
         "common_classes": common,
         "split_counts": {name: len(indices) for name, indices in split.items()},
         "representations": list(REPRESENTATIONS),
+        "representation_stages": [{
+            "variant": args.variant,
+            "checkpoint": str(checkpoint),
+            "task": args.task,
+            "representation_stage": stage,
+            "test_split_accessed": False,
+            "uda_checkpoint_used": False,
+        } for stage in REPRESENTATIONS],
         "feature_dimensions": {
             name: int(extracted["source_train"]["representations"][name].shape[1])
             for name in REPRESENTATIONS
@@ -636,6 +763,7 @@ def run_task(args):
         },
         "test_split_accessed": False,
         "uda_checkpoint_used": False,
+        "effective_rank_scope": "source_val+target_val",
         "anchor_coverage_source_split": "source_val",
         "anchor_coverage_target_split": "target_val",
     }
@@ -650,7 +778,7 @@ def _print_summary(metrics, per_class, coverage):
     print("REP_CHAIN_SUMMARY")
     for row in metrics:
         print(
-            f"task={row['task']}|protocol={row['class_protocol']}|"
+            f"variant={row['variant']}|task={row['task']}|protocol={row['class_protocol']}|"
             f"representation={row['representation']}|"
             f"source_f1={row['source_val_macro_f1']}|"
             f"target_oracle_f1={row['target_oracle_macro_f1']}|"
@@ -689,26 +817,35 @@ def _print_summary(metrics, per_class, coverage):
 
 def merge_outputs(args):
     output_root = Path(args.output_root)
-    metrics, per_class, coverage, manifests = [], [], [], {}
-    for task in TASKS:
-        task_root = output_root / task
-        required = (
-            task_root / "representation_metrics.csv",
-            task_root / "representation_per_class.csv",
-            task_root / "anchor_coverage.csv",
-            task_root / "audit_manifest.json",
-        )
-        missing = [str(path) for path in required if not path.is_file()]
-        if missing:
-            raise FileNotFoundError("incomplete audit output: " + ", ".join(missing))
-        metrics.extend(read_csv(required[0]))
-        per_class.extend(read_csv(required[1]))
-        coverage.extend(read_csv(required[2]))
-        manifests[task] = json.loads(required[3].read_text(encoding="utf-8"))
+    metrics, per_class, geometry, coverage, manifests = [], [], [], [], {}
+    for variant in VARIANTS:
+        for task in TASKS:
+            task_root = output_root / variant / task
+            required = (
+                task_root / "representation_metrics.csv",
+                task_root / "representation_per_class.csv",
+                task_root / "representation_geometry.csv",
+                task_root / "anchor_coverage.csv",
+                task_root / "audit_manifest.json",
+            )
+            missing = [str(path) for path in required if not path.is_file()]
+            if missing:
+                raise FileNotFoundError("incomplete audit output: " + ", ".join(missing))
+            metrics.extend(read_csv(required[0]))
+            per_class.extend(read_csv(required[1]))
+            geometry.extend(read_csv(required[2]))
+            coverage.extend(read_csv(required[3]))
+            manifests[f"{variant}:{task}"] = json.loads(
+                required[4].read_text(encoding="utf-8")
+            )
     write_csv(output_root / "representation_metrics.csv", metrics, REPRESENTATION_FIELDS)
     write_csv(
         output_root / "representation_per_class.csv", per_class,
         REPRESENTATION_PER_CLASS_FIELDS,
+    )
+    write_csv(
+        output_root / "representation_geometry.csv", geometry,
+        REPRESENTATION_GEOMETRY_FIELDS,
     )
     write_csv(output_root / "anchor_coverage.csv", coverage, ANCHOR_COVERAGE_FIELDS)
     (output_root / "audit_manifest.json").write_text(
@@ -716,10 +853,28 @@ def merge_outputs(args):
             "commit": args.code_version,
             "seed": args.seed,
             "tasks": manifests,
+            "variants": list(VARIANTS),
+            "representation_stages": list(REPRESENTATIONS),
             "test_split_accessed": False,
             "uda_checkpoint_used": False,
         }, indent=2),
         encoding="utf-8",
+    )
+    summary = [
+        "# Structure Response to Query Chain Audit",
+        "",
+        "| Variant | Task | Protocol | Stage | Dim | Effective rank | Source val F1 | Target oracle F1 | Source→target F1 | kNN F1 |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in metrics:
+        summary.append(
+            f"| {row['variant']} | {row['task']} | {row['class_protocol']} | "
+            f"{row['representation']} | {row['feature_dim']} | {row['effective_rank']} | "
+            f"{row['source_val_macro_f1']} | {row['target_oracle_macro_f1']} | "
+            f"{row['source_to_target_macro_f1']} | {row['source_to_target_knn_macro_f1']} |"
+        )
+    (output_root / "summary.md").write_text(
+        "\n".join(summary) + "\n", encoding="utf-8",
     )
     _print_summary(metrics, per_class, coverage)
 
@@ -727,6 +882,7 @@ def merge_outputs(args):
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=tuple(TASKS))
+    parser.add_argument("--variant", choices=VARIANTS)
     parser.add_argument("--merge", action="store_true")
     parser.add_argument("--data-root", default="/data/user/dataset/timematch_data")
     parser.add_argument(
@@ -735,7 +891,7 @@ def build_parser():
     )
     parser.add_argument(
         "--output-root",
-        default="outputs/structure_representation_chain_audit_seed1",
+        default="outputs/structure_response_query_chain_audit_seed1",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=128)
@@ -753,10 +909,10 @@ def main():
     args = build_parser().parse_args()
     if args.merge:
         merge_outputs(args)
-    elif args.task:
+    elif args.task and args.variant:
         run_task(args)
     else:
-        raise SystemExit("one of --task or --merge is required")
+        raise SystemExit("use --merge or provide both --task and --variant")
 
 
 if __name__ == "__main__":

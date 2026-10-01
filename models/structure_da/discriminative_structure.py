@@ -449,7 +449,9 @@ class DiscriminativeStructureBranch(nn.Module):
         shape_representation="current",
     ):
         super().__init__()
-        if shape_representation not in ("current", "sorted_profile", "set_response"):
+        if shape_representation not in (
+            "current", "sorted_profile", "set_response", "residual_response",
+        ):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
         self.exposer = FourierStructureExposer(num_modes, grid_points, period_days, reg)
@@ -467,6 +469,10 @@ class DiscriminativeStructureBranch(nn.Module):
             response_dim = 32
         else:
             response_dim = 2 * shapelet_count
+        if shape_representation == "residual_response":
+            self.anchor_context_weight = nn.Parameter(
+                torch.zeros(shapelet_count, shapelet_count)
+            )
         self.response_to_query = nn.Sequential(
             nn.Linear(response_dim, 64), nn.GELU(),
             nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
@@ -508,6 +514,38 @@ class DiscriminativeStructureBranch(nn.Module):
             encoded * candidate_mask.unsqueeze(-1).to(encoded.dtype)
         ).sum(dim=1) / valid_count.to(encoded.dtype)
 
+    def contextualize_similarity(self, similarity):
+        if self.shape_representation != "residual_response":
+            raise RuntimeError(
+                "contextual similarity is only available in residual_response mode"
+            )
+        if similarity.ndim != 3:
+            raise ValueError("similarity must be [B,N,M]")
+        count = similarity.shape[-1]
+        if self.anchor_context_weight.shape != (count, count):
+            raise ValueError("similarity anchor dimension does not match context weight")
+        off_diagonal = 1. - torch.eye(
+            count, dtype=similarity.dtype, device=similarity.device,
+        )
+        weight = self.anchor_context_weight * off_diagonal
+        modulation = torch.tanh(similarity @ weight.T)
+        return similarity * (1. + modulation), modulation
+
+    def _residual_response_details(self, details):
+        contextual, modulation = self.contextualize_similarity(details["similarity"])
+        scores = (self.shapelet_dictionary.beta * contextual).masked_fill(
+            ~details["candidate_mask"].unsqueeze(-1), -torch.inf,
+        )
+        weights = torch.softmax(scores, dim=1)
+        strength = (weights * contextual).sum(dim=1)
+        return {
+            **details,
+            "response": strength,
+            "weights": weights,
+            "contextual_similarity": contextual,
+            "modulation": modulation,
+        }
+
     def prepare_context(self, features, positions):
         return {"coefficients": self.exposer.analyze(features, positions)}
 
@@ -528,15 +566,19 @@ class DiscriminativeStructureBranch(nn.Module):
             for value in encoded
         ], dim=1)
         details = self.shapelet_dictionary.compute_response(tokens, return_details=True)
-        strength = details["response"]
-        rich_response = self.compose_rich_response(details)
+        response_details = (
+            self._residual_response_details(details)
+            if self.shape_representation == "residual_response" else details
+        )
+        strength = response_details["response"]
+        rich_response = self.compose_rich_response(response_details)
         concentration = rich_response[:, strength.shape[1]:]
         response = (
             self.compose_set_response(details["similarity"], details["candidate_mask"])
             if self.shape_representation == "set_response" else rich_response
         )
         profile = sorted_anchor_profile(details["similarity"])
-        return {
+        result = {
             "shape_tokens": tokens,
             "shapelet_similarity": details["similarity"],
             "shapelet_strength": strength,
@@ -551,6 +593,12 @@ class DiscriminativeStructureBranch(nn.Module):
             "exposed_curve": exposed,
             "exposed_grid": grid,
         }
+        if self.shape_representation == "residual_response":
+            result.update({
+                "shapelet_context_score": response_details["contextual_similarity"],
+                "shapelet_modulation": response_details["modulation"],
+            })
+        return result
 
     def forward(
         self, features, positions, include_legacy_query=True, temporal_shift=0,

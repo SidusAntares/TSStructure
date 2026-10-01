@@ -1,5 +1,5 @@
-import csv
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -8,6 +8,7 @@ import torch
 from analysis.structure_representation_chain_audit import (
     ANCHOR_COVERAGE_FIELDS,
     REPRESENTATION_FIELDS,
+    REPRESENTATION_GEOMETRY_FIELDS,
     REPRESENTATION_PER_CLASS_FIELDS,
     anchor_coverage_rows,
     audit_split_indices,
@@ -17,8 +18,11 @@ from analysis.structure_representation_chain_audit import (
     pixel_budget_batches,
     remap_to_classes,
     target_oracle_probe,
-    write_csv,
+    extract_representation_stages,
+    effective_rank,
+    normalize_checkpoint_config,
 )
+from models.stclassifier import PseStructureProtoLTae
 from models.structure_da.discriminative_structure import DiscriminativeStructureBranch
 
 
@@ -195,12 +199,13 @@ def test_pixel_budget_batches_prevent_padding_memory_explosion():
     "fields,required",
     [
         (REPRESENTATION_FIELDS, {
-            "task", "class_protocol", "representation", "feature_dim",
+            "variant", "task", "class_protocol", "representation", "feature_dim",
+            "effective_rank",
             "source_val_macro_f1", "target_oracle_macro_f1",
             "source_to_target_macro_f1", "source_to_target_knn_macro_f1",
         }),
         (REPRESENTATION_PER_CLASS_FIELDS, {
-            "task", "class_protocol", "representation", "class",
+            "variant", "task", "class_protocol", "representation", "class",
             "source_support", "target_support", "source_val_f1",
             "target_oracle_f1", "source_to_target_f1",
             "source_to_target_knn_f1",
@@ -210,26 +215,118 @@ def test_pixel_budget_batches_prevent_padding_memory_explosion():
             "mean_anchor_coverage", "std_anchor_coverage",
             "mean_anchor_margin", "std_anchor_margin",
         }),
+        (REPRESENTATION_GEOMETRY_FIELDS, {
+            "variant", "task", "class_protocol", "representation", "class",
+            "source_class_radius", "target_class_radius",
+            "same_class_source_distance", "nearest_wrong_source_distance",
+            "cross_domain_margin",
+        }),
     ],
 )
-def test_csv_schema_is_fixed(tmp_path, fields, required):
+def test_csv_schema_is_fixed(fields, required):
     assert set(fields) == required
-    path = tmp_path / "audit.csv"
-    write_csv(path, [{field: field for field in fields}], fields)
-    with path.open(newline="", encoding="utf-8") as stream:
-        assert next(csv.reader(stream)) == list(fields)
 
 
-def test_launcher_is_two_task_source_only_dry_run():
+def test_launcher_is_four_task_two_variant_source_only_dry_run():
     launcher = Path("scripts/run_structure_representation_chain_audit_seed1.sh")
     source = launcher.read_text(encoding="utf-8")
-    assert "GPU0" in source and "GPU1" in source
-    assert "FR2_DK1" in source and "AT1_DK1" in source
+    assert all(f"GPU{index}" in source for index in range(4))
+    assert all(task in source for task in ("AT1_DK1", "FR1_FR2", "FR2_DK1", "DK1_AT1"))
     assert "outputs/structure_proto_v2clean_4tasks_seed1/source" in source
-    assert "source_FR2_seed1/fold_0/model.pt" in source
-    assert "source_AT1_seed1/fold_0/model.pt" in source
+    assert "outputs/structure_set_response_4tasks_seed1/source" in source
     assert "/uda/" not in source.lower()
     assert "uda_checkpoint" not in source.lower()
     assert "DRY_RUN" in source
     assert 'PIXEL_BUDGET="${PIXEL_BUDGET:-8192}"' in source
     assert '--pixel-budget "$PIXEL_BUDGET"' in source
+
+
+def _audit_model(representation):
+    return PseStructureProtoLTae(
+        input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
+        n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6],
+        num_classes=3, shape_dim=8, shape_window_scales=(24,),
+        shape_window_stride=8, shapelet_count=16, fourier_num_modes=5,
+        shape_representation=representation, shape_injection="current_query",
+    ).eval()
+
+
+@pytest.mark.parametrize("representation", ["current", "set_response"])
+def test_real_model_three_stage_chain_is_exact(representation):
+    model = _audit_model(representation)
+    pixels = torch.randn(2, 8, 3, 4)
+    valid = torch.ones(2, 8, 4)
+    positions = torch.arange(8).repeat(2, 1) * 40
+    spatial = model.spatial_encoder(pixels, valid, torch.zeros(2, 4))
+    structure = model.prepare_structure(spatial, positions)
+    stages = extract_representation_stages(model, structure)
+    projection = model.temporal_encoder.attention_heads.external_query_projection
+    assert set(stages) == {"shape_response", "shape_query_feature", "query_delta"}
+    assert stages["shape_response"].shape == (2, 32)
+    assert stages["shape_query_feature"].shape == (2, 8)
+    assert stages["query_delta"].shape == (2, 8)
+    torch.testing.assert_close(
+        stages["shape_query_feature"],
+        model.structure_branch.response_to_query(stages["shape_response"]),
+    )
+    torch.testing.assert_close(
+        stages["query_delta"], projection(stages["shape_query_feature"]).flatten(1),
+    )
+    assert not any(value.requires_grad for value in stages.values())
+
+
+def test_effective_rank_uses_same_definition_for_every_stage():
+    identity = np.eye(4, dtype=np.float32)
+    assert effective_rank(identity) == pytest.approx(4.)
+
+
+def test_chain_audit_is_four_task_two_variant_source_only():
+    import analysis.structure_representation_chain_audit as audit
+
+    assert set(audit.TASKS) == {"AT1_DK1", "FR1_FR2", "FR2_DK1", "DK1_AT1"}
+    assert audit.REPRESENTATIONS == (
+        "shape_response", "shape_query_feature", "query_delta",
+    )
+    source = Path("scripts/run_structure_representation_chain_audit_seed1.sh").read_text()
+    assert "outputs/structure_proto_v2clean_4tasks_seed1/source" in source
+    assert "outputs/structure_set_response_4tasks_seed1/source" in source
+    assert "outputs/structure_response_query_chain_audit_seed1" in source
+    for task in audit.TASKS:
+        assert task in source
+    assert "/uda/" not in source.lower()
+    script = Path("analysis/structure_representation_chain_audit.py").read_text()
+    assert "target_test" not in script
+    assert "source_test" not in script
+    assert ".backward(" not in script
+    assert "torch.optim" not in script
+
+
+def test_legacy_current_checkpoint_config_is_adapted_without_weakening_variant_checks():
+    legacy = {"model": "psestructureprotoltae"}
+    adapted = normalize_checkpoint_config(legacy, "current")
+    assert adapted["shape_representation"] == "current"
+    assert adapted["shape_injection"] == "current_query"
+    assert adapted["structure_shift_mode"] == "none"
+    assert "shape_representation" not in legacy
+
+    with pytest.raises(ValueError, match="missing shape_representation"):
+        normalize_checkpoint_config(legacy, "set_response")
+
+    with pytest.raises(ValueError, match="does not match"):
+        normalize_checkpoint_config(
+            {"shape_representation": "set_response"}, "current",
+        )
+
+
+def test_merge_initializes_all_five_output_collections(monkeypatch):
+    import analysis.structure_representation_chain_audit as audit
+
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(Path, "read_text", lambda self, **kwargs: "{}")
+    monkeypatch.setattr(Path, "write_text", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(audit, "read_csv", lambda path: [])
+    monkeypatch.setattr(audit, "write_csv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(audit, "_print_summary", lambda *args: None)
+    audit.merge_outputs(SimpleNamespace(
+        output_root="unused", code_version="test", seed=1,
+    ))

@@ -47,7 +47,11 @@ class PseStructureProtoLTae(nn.Module):
             )
         if shape_representation == "set_response" and shape_injection != "current_query":
             raise ValueError("set_response representation requires current_query injection")
-        if shape_representation not in ("current", "sorted_profile", "set_response"):
+        if shape_representation == "residual_response" and shape_injection != "current_query":
+            raise ValueError("residual_response representation requires current_query injection")
+        if shape_representation not in (
+            "current", "sorted_profile", "set_response", "residual_response",
+        ):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
         self.shape_injection = shape_injection
@@ -74,7 +78,7 @@ class PseStructureProtoLTae(nn.Module):
         sorted_profile_dim = (
             int(shapelet_count) * candidates_per_scale * len(tuple(shape_window_scales))
         )
-        if shape_representation == "current":
+        if shape_representation in ("current", "residual_response"):
             evidence_dim = 2 * int(shapelet_count)
         elif shape_representation == "set_response":
             evidence_dim = 32
@@ -146,7 +150,7 @@ class PseStructureProtoLTae(nn.Module):
         )
 
     def _shape_evidence(self, structure):
-        if self.shape_representation in ("current", "set_response"):
+        if self.shape_representation in ("current", "set_response", "residual_response"):
             return structure["shapelet_response"]
         return structure["sorted_anchor_profile"]
 
@@ -237,6 +241,18 @@ class PseStructureProtoLTae(nn.Module):
             return {
                 "gamma": output["structure_gamma"],
                 "structure_residual_norm_ratio": (residual_norm / base_norm).mean(),
+            }
+        if self.shape_representation == "residual_response":
+            modulation = output["shapelet_modulation"]
+            similarity = output["shapelet_similarity"]
+            contextual = output["shapelet_context_score"]
+            return {
+                "mean_abs_modulation": modulation.abs().mean(),
+                "max_abs_modulation": modulation.abs().max(),
+                "relative_context_correction": (
+                    (contextual - similarity).norm()
+                    / similarity.norm().clamp_min(1e-12)
+                ),
             }
         if self.shape_representation != "sorted_profile":
             return {}
