@@ -32,12 +32,19 @@ class PseStructureProtoLTae(nn.Module):
         structure_shift_mode="none",
     ):
         super().__init__()
-        if shape_representation == "current" and shape_injection not in (
-            "current_query", "local_query", "local_query_only",
+        if (
+            shape_injection == "direct_response_query"
+            and shape_representation != "current"
         ):
             raise ValueError(
-                "current representation requires current_query, local_query, "
-                "or local_query_only injection"
+                "direct_response_query injection requires current representation"
+            )
+        if shape_representation == "current" and shape_injection not in (
+            "current_query", "direct_response_query", "local_query", "local_query_only",
+        ):
+            raise ValueError(
+                "current representation requires current_query, direct_response_query, "
+                "local_query, or local_query_only injection"
             )
         if shape_representation == "sorted_profile" and shape_injection not in (
             "direct_query", "late_fusion",
@@ -86,7 +93,9 @@ class PseStructureProtoLTae(nn.Module):
             evidence_dim = sorted_profile_dim
         external_query_dim = (
             shape_dim if shape_injection == "current_query"
-            else evidence_dim if shape_injection == "direct_query"
+            else evidence_dim if shape_injection in (
+                "direct_query", "direct_response_query",
+            )
             else None
         )
         self.temporal_encoder = LTAE(
@@ -178,6 +187,11 @@ class PseStructureProtoLTae(nn.Module):
             instance = self.temporal_encoder(
                 prepared, shifted_positions,
                 external_query=structure["shape_class_token"],
+            )
+            return (instance, {}) if return_details else instance
+        if self.shape_injection == "direct_response_query":
+            instance = self.temporal_encoder(
+                prepared, shifted_positions, external_query=evidence,
             )
             return (instance, {}) if return_details else instance
         normalized = self._parameter_free_layer_norm(evidence)

@@ -8,14 +8,15 @@ GPU3="${GPU3:-3}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 CURRENT_ROOT="${CURRENT_ROOT:-outputs/structure_proto_v2clean_4tasks_seed1/source}"
 SET_ROOT="${SET_ROOT:-outputs/structure_set_response_4tasks_seed1/source}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/structure_response_query_chain_audit_seed1}"
-LOG_ROOT="${LOG_ROOT:-logs/structure_response_query_chain_audit_seed1}"
+RESIDUAL_ROOT="${RESIDUAL_ROOT:-outputs/structure_residual_response_4tasks_seed1/source}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/structure_response_query_chain_audit_3variants_seed1}"
+LOG_ROOT="${LOG_ROOT:-logs/structure_response_query_chain_audit_3variants_seed1}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 PIXEL_BUDGET="${PIXEL_BUDGET:-8192}"
 DRY_RUN="${DRY_RUN:-0}"
 
 if [[ "$DRY_RUN" != "1" ]]; then
-  for variant_root in "$CURRENT_ROOT" "$SET_ROOT"; do
+  for variant_root in "$CURRENT_ROOT" "$SET_ROOT" "$RESIDUAL_ROOT"; do
     for source in AT1 FR1 FR2 DK1; do
       checkpoint="$variant_root/source_${source}_seed1/fold_0/model.pt"
       if [[ ! -f "$checkpoint" ]]; then
@@ -51,6 +52,7 @@ run_task() {
   local gpu="$1" task="$2"
   run_variant_task "$gpu" current "$task" "$CURRENT_ROOT"
   run_variant_task "$gpu" set_response "$task" "$SET_ROOT"
+  run_variant_task "$gpu" residual_response "$task" "$RESIDUAL_ROOT"
 }
 
 if [[ "$DRY_RUN" == "1" ]]; then

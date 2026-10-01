@@ -93,7 +93,7 @@ def add_model_arguments(parser):
     parser.add_argument(
         '--shape-injection', dest='shape_injection', default='current_query',
         choices=[
-            'current_query', 'direct_query', 'late_fusion',
+            'current_query', 'direct_response_query', 'direct_query', 'late_fusion',
             'local_query', 'local_query_only',
         ],
     )
@@ -179,6 +179,11 @@ def structure_usage_manifest(config):
         'shape_evidence_dim': evidence_dim,
         'shape_align_weight': config.shape_align_weight,
     }
+    if config.shape_injection == 'direct_response_query':
+        manifest.update({
+            'external_query_dim': evidence_dim,
+            'response_to_query_bypassed': True,
+        })
     if config.shape_injection in ('local_query', 'local_query_only'):
         manifest.update({
             'structure_shift_mode': getattr(config, 'structure_shift_mode', 'none'),

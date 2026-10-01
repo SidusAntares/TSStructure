@@ -41,7 +41,7 @@ TASKS = {
     "FR2_DK1": ("FR2", "DK1"),
     "DK1_AT1": ("DK1", "AT1"),
 }
-VARIANTS = ("current", "set_response")
+VARIANTS = ("current", "set_response", "residual_response")
 REPRESENTATIONS = (
     "shape_response",
     "shape_query_feature",
@@ -891,7 +891,7 @@ def build_parser():
     )
     parser.add_argument(
         "--output-root",
-        default="outputs/structure_response_query_chain_audit_seed1",
+        default="outputs/structure_response_query_chain_audit_3variants_seed1",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=128)

@@ -227,13 +227,15 @@ def test_csv_schema_is_fixed(fields, required):
     assert set(fields) == required
 
 
-def test_launcher_is_four_task_two_variant_source_only_dry_run():
+def test_launcher_is_four_task_three_variant_source_only_dry_run():
     launcher = Path("scripts/run_structure_representation_chain_audit_seed1.sh")
     source = launcher.read_text(encoding="utf-8")
     assert all(f"GPU{index}" in source for index in range(4))
     assert all(task in source for task in ("AT1_DK1", "FR1_FR2", "FR2_DK1", "DK1_AT1"))
     assert "outputs/structure_proto_v2clean_4tasks_seed1/source" in source
     assert "outputs/structure_set_response_4tasks_seed1/source" in source
+    assert "outputs/structure_residual_response_4tasks_seed1/source" in source
+    assert "outputs/structure_response_query_chain_audit_3variants_seed1" in source
     assert "/uda/" not in source.lower()
     assert "uda_checkpoint" not in source.lower()
     assert "DRY_RUN" in source
@@ -251,7 +253,9 @@ def _audit_model(representation):
     ).eval()
 
 
-@pytest.mark.parametrize("representation", ["current", "set_response"])
+@pytest.mark.parametrize(
+    "representation", ["current", "set_response", "residual_response"],
+)
 def test_real_model_three_stage_chain_is_exact(representation):
     model = _audit_model(representation)
     pixels = torch.randn(2, 8, 3, 4)
@@ -280,17 +284,19 @@ def test_effective_rank_uses_same_definition_for_every_stage():
     assert effective_rank(identity) == pytest.approx(4.)
 
 
-def test_chain_audit_is_four_task_two_variant_source_only():
+def test_chain_audit_is_four_task_three_variant_source_only():
     import analysis.structure_representation_chain_audit as audit
 
     assert set(audit.TASKS) == {"AT1_DK1", "FR1_FR2", "FR2_DK1", "DK1_AT1"}
+    assert audit.VARIANTS == ("current", "set_response", "residual_response")
     assert audit.REPRESENTATIONS == (
         "shape_response", "shape_query_feature", "query_delta",
     )
     source = Path("scripts/run_structure_representation_chain_audit_seed1.sh").read_text()
     assert "outputs/structure_proto_v2clean_4tasks_seed1/source" in source
     assert "outputs/structure_set_response_4tasks_seed1/source" in source
-    assert "outputs/structure_response_query_chain_audit_seed1" in source
+    assert "outputs/structure_residual_response_4tasks_seed1/source" in source
+    assert "outputs/structure_response_query_chain_audit_3variants_seed1" in source
     for task in audit.TASKS:
         assert task in source
     assert "/uda/" not in source.lower()
