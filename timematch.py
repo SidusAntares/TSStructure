@@ -203,15 +203,47 @@ def target_supervision_labels(pseudo_pred, target_gt, oracle=False):
     return target_gt if oracle else pseudo_pred
 
 
+def select_shape_alignment_feature(response, view="full", shapelet_count=16):
+    if view == "full":
+        return response
+    if view == "none":
+        return None
+    shapelet_count = int(shapelet_count)
+    if shapelet_count <= 0 or response.shape[-1] < 2 * shapelet_count:
+        raise ValueError(
+            "shape alignment component view requires strength+concentration response"
+        )
+    if view == "strength":
+        return response[:, :shapelet_count]
+    if view == "concentration":
+        return response[:, shapelet_count:2 * shapelet_count]
+    raise ValueError(f"unknown shape alignment view: {view}")
+
+
 def compute_shape_da_alignment(
     mode, source_output, source_labels, target_output, target_labels,
     confidence, trusted_mask, pseudo_threshold, prototype_bank=None,
-    prototype_agreement=None,
+    prototype_agreement=None, alignment_view="full", shapelet_count=16,
 ):
     if mode == "batch_align":
+        source_features = select_shape_alignment_feature(
+            source_output["shapelet_response"], alignment_view, shapelet_count,
+        )
+        target_features = select_shape_alignment_feature(
+            target_output["shapelet_response"], alignment_view, shapelet_count,
+        )
+        if source_features is None:
+            zero = target_output["shapelet_response"].sum() * 0.
+            return {
+                "total_loss": zero, "global_loss": zero,
+                "relative_loss": zero, "center_gap": zero.detach(),
+                "valid_classes": 0,
+                "mean_class_reliability": zero.detach(),
+                "class_ids": target_labels.new_empty(0),
+            }
         return class_relative_domain_alignment(
-            source_output["shapelet_response"], source_labels,
-            target_output["shapelet_response"][trusted_mask],
+            source_features, source_labels,
+            target_features[trusted_mask],
             target_labels[trusted_mask], confidence[trusted_mask],
             pseudo_threshold, distance="mse",
             min_target_support=2, support_saturation=4,
@@ -1473,6 +1505,8 @@ def _train_structure_proto_timematch(
                     confidence, trusted_mask, config.pseudo_threshold,
                     prototype_bank=shape_prototype_bank,
                     prototype_agreement=proto_agree_mask,
+                    alignment_view=config.shape_alignment_view,
+                    shapelet_count=config.shapelet_count,
                 )
             loss = compose_structure_v2clean_da_loss(
                 loss_cls_source, loss_pseudo_target, loss_shape_source,

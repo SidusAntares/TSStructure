@@ -264,8 +264,19 @@ def main(config):
             shape_alignment_label_source = getattr(
                 config, 'shape_alignment_label_source', 'pseudo',
             )
+            shape_alignment_view = getattr(config, 'shape_alignment_view', 'full')
+            alignment_feature_dim = {
+                'full': 2 * config.shapelet_count,
+                'strength': config.shapelet_count,
+                'concentration': config.shapelet_count,
+                'none': 0,
+            }[shape_alignment_view]
             oracle_alignment_diagnostic = (
                 shape_alignment_label_source == 'oracle'
+            )
+            target_gt_used = bool(
+                oracle_alignment_diagnostic
+                or getattr(config, 'oracle_pseudo_labels', False)
             )
             if oracle_alignment_diagnostic:
                 print(
@@ -276,6 +287,12 @@ def main(config):
                     "target_gt_used_for_pseudo_loss=false|"
                     "target_gt_used_for_trusted_mask=false"
                 )
+            print(
+                "SHAPE_ALIGNMENT_VIEW|"
+                f"view={shape_alignment_view}|"
+                f"alignment_feature_dim={alignment_feature_dim}|"
+                f"target_gt_used={str(target_gt_used).lower()}"
+            )
             manifest = {
                 'method': (
                     'structure_query_only'
@@ -294,6 +311,9 @@ def main(config):
                 'source_minority_mode': getattr(config, 'source_minority_mode', 'base'),
                 'oracle_alignment_diagnostic': oracle_alignment_diagnostic,
                 'shape_alignment_label_source': shape_alignment_label_source,
+                'shape_alignment_view': shape_alignment_view,
+                'alignment_feature_dim': alignment_feature_dim,
+                'target_gt_used': target_gt_used,
                 'target_gt_usage': (
                     'shape_alignment_class_only'
                     if oracle_alignment_diagnostic else 'none'
@@ -1083,6 +1103,10 @@ if __name__ == '__main__':
     timematch.add_argument(
         "--shape-alignment-label-source", dest="shape_alignment_label_source",
         choices=["pseudo", "oracle"], default="pseudo",
+    )
+    timematch.add_argument(
+        "--shape-alignment-view", dest="shape_alignment_view",
+        choices=["full", "strength", "concentration", "none"], default="full",
     )
     timematch.add_argument("--local-support-k", dest="local_support_k", default=5, type=int)
     timematch.add_argument(
