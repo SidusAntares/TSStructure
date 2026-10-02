@@ -269,6 +269,8 @@ def main(config):
                     if config.shape_injection == 'local_query'
                     else 'discriminative_shapelet_source_prototype_alignment'
                     if shape_da_mode == 'source_prototype'
+                    else 'discriminative_shapelet_boundary_support'
+                    if shape_da_mode == 'boundary_support'
                     else 'discriminative_shapelet_alignment_v2_clean'
                 ),
                 'shape_da_mode': shape_da_mode,
@@ -282,6 +284,13 @@ def main(config):
                     'shape_prototype_target_update': False,
                     'target_alignment': 'prototype_consistent_class_center',
                     'prototype_alignment_weight': config.shape_align_weight,
+                })
+            elif shape_da_mode == 'boundary_support':
+                manifest.update({
+                    'shape_alignment': 'boundary_discrepancy',
+                    'boundary_classifier_feature_dim': 2 * config.shapelet_count,
+                    'boundary_target_supervision': False,
+                    'boundary_auxiliary_inference': False,
                 })
             else:
                 manifest['shape_alignment'] = 'batch_class_relative'
@@ -1034,7 +1043,7 @@ if __name__ == '__main__':
     )
     timematch.add_argument(
         "--shape-da-mode", dest="shape_da_mode", default="batch_align",
-        choices=["batch_align", "source_prototype"],
+        choices=["batch_align", "source_prototype", "boundary_support"],
     )
     timematch.add_argument("--pseudo-base-ratio", dest="pseudo_base_ratio", default=.5, type=float)
     timematch.add_argument("--pseudo-balance-power", dest="pseudo_balance_power", default=.5, type=float)

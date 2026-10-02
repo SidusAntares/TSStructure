@@ -50,6 +50,97 @@ from methods.structure_da.prototype_losses import (
 from models.structure_da.prototype_bank import ClassFeatureMemory, ClassPrototypeBank
 
 
+def validate_boundary_support_config(config):
+    if getattr(config, "shape_da_mode", "batch_align") != "boundary_support":
+        return
+    required = {
+        "model": "psestructureprotoltae",
+        "shape_representation": "current",
+        "shape_injection": "current_query",
+    }
+    invalid = {
+        name: getattr(config, name, None)
+        for name, expected in required.items()
+        if getattr(config, name, None) != expected
+    }
+    if invalid:
+        raise ValueError(
+            "boundary_support requires model=psestructureprotoltae, "
+            "shape_representation=current, shape_injection=current_query; "
+            f"invalid={invalid}"
+        )
+
+
+def initialize_boundary_classifiers(source_classifier, seed, noise_scale=1e-3):
+    """Copy the source shape head twice and reproducibly break symmetry."""
+    classifier_1 = deepcopy(source_classifier)
+    classifier_2 = deepcopy(source_classifier)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    with torch.no_grad():
+        for parameter in classifier_2.parameters():
+            noise = torch.randn(
+                parameter.shape, generator=generator, dtype=parameter.dtype,
+                device="cpu",
+            ).to(parameter.device)
+            parameter.add_(float(noise_scale) * noise)
+    return classifier_1, classifier_2
+
+
+def _boundary_probabilities(features, classifier_1, classifier_2, detach_heads=False):
+    if detach_heads:
+        logits_1 = F.linear(
+            features, classifier_1.weight.detach(),
+            classifier_1.bias.detach() if classifier_1.bias is not None else None,
+        )
+        logits_2 = F.linear(
+            features, classifier_2.weight.detach(),
+            classifier_2.bias.detach() if classifier_2.bias is not None else None,
+        )
+    else:
+        logits_1, logits_2 = classifier_1(features), classifier_2(features)
+    return F.softmax(logits_1, dim=1), F.softmax(logits_2, dim=1), logits_1, logits_2
+
+
+def boundary_classifier_objective(
+    classifier_1, classifier_2, source_response, source_labels,
+    target_response, criterion,
+):
+    """Step A: train auxiliary heads on detached source/target responses."""
+    source = source_response.detach()
+    target = target_response.detach()
+    _, _, source_logits_1, source_logits_2 = _boundary_probabilities(
+        source, classifier_1, classifier_2,
+    )
+    target_p1, target_p2, _, _ = _boundary_probabilities(
+        target, classifier_1, classifier_2,
+    )
+    source_loss = .5 * (
+        criterion(source_logits_1, source_labels)
+        + criterion(source_logits_2, source_labels)
+    )
+    target_discrepancy = (target_p1 - target_p2).abs().mean()
+    return {
+        "loss": source_loss - target_discrepancy,
+        "source_loss": source_loss,
+        "target_discrepancy": target_discrepancy,
+        "source_accuracy_1": (
+            source_logits_1.detach().argmax(1) == source_labels
+        ).float().mean(),
+        "source_accuracy_2": (
+            source_logits_2.detach().argmax(1) == source_labels
+        ).float().mean(),
+    }
+
+
+def boundary_generator_discrepancy(target_response, classifier_1, classifier_2):
+    """Step B: minimize target discrepancy without updating auxiliary heads."""
+    probabilities_1, probabilities_2, _, _ = _boundary_probabilities(
+        target_response, classifier_1, classifier_2, detach_heads=True,
+    )
+    return (probabilities_1 - probabilities_2).abs().mean()
+
+
 def target_supervision_labels(pseudo_pred, target_gt, oracle=False):
     """Choose training labels without changing teacher acceptance decisions."""
     if pseudo_pred.shape != target_gt.shape:
@@ -1031,10 +1122,11 @@ def _train_structure_proto_timematch(
             "structure prototype TimeMatch requires identical canonical window indexing; "
             "set --with_shift_aug false"
         )
+    shape_da_mode = getattr(config, "shape_da_mode", "batch_align")
+    validate_boundary_support_config(config)
     source_loader, target_loader_no_aug, target_loader = get_data_loaders(
         splits, config, config.balance_source,
     )
-    shape_da_mode = getattr(config, "shape_da_mode", "batch_align")
     checkpoint_path = os.path.join(config.weights, f"fold_{fold_num}", "model.pt")
     student.load_state_dict(
         torch.load(checkpoint_path, weights_only=False)["state_dict"], strict=True,
@@ -1043,6 +1135,14 @@ def _train_structure_proto_timematch(
     student.to(device)
     teacher = deepcopy(student).to(device)
     teacher.eval()
+    boundary_classifier_1 = boundary_classifier_2 = None
+    boundary_optimizer = boundary_scheduler = None
+    if shape_da_mode == "boundary_support":
+        boundary_classifier_1, boundary_classifier_2 = initialize_boundary_classifiers(
+            student.shape_classifier, config.seed,
+        )
+        boundary_classifier_1.to(device).train()
+        boundary_classifier_2.to(device).train()
     shape_prototype_bank = None
     if shape_da_mode == "source_prototype":
         shape_prototype_bank = ClassPrototypeBank(
@@ -1062,6 +1162,15 @@ def _train_structure_proto_timematch(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=total_steps, eta_min=0,
     )
+    if shape_da_mode == "boundary_support":
+        boundary_optimizer = torch.optim.Adam(
+            list(boundary_classifier_1.parameters())
+            + list(boundary_classifier_2.parameters()),
+            lr=config.lr, weight_decay=config.weight_decay,
+        )
+        boundary_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            boundary_optimizer, T_max=total_steps, eta_min=0,
+        )
     source_iter, target_iter = iter(cycle(source_loader)), iter(cycle(target_loader))
     initial_shift, class_distribution, initial_diagnostics = _initialize_timematch_shift(
         teacher, target_loader_no_aug, device, config,
@@ -1188,14 +1297,34 @@ def _train_structure_proto_timematch(
                 student.structure_branch.shapelet_dictionary.anchors,
                 config.shapelet_diversity_margin,
             )
-            shape_alignment = compute_shape_da_alignment(
-                shape_da_mode, source_output, source_labels,
-                target_output,
-                pseudo if shape_da_mode == "source_prototype" else training_target_labels,
-                confidence, trusted_mask, config.pseudo_threshold,
-                prototype_bank=shape_prototype_bank,
-                prototype_agreement=proto_agree_mask,
-            )
+            boundary_objective = None
+            if shape_da_mode == "boundary_support":
+                optimizer.zero_grad(set_to_none=True)
+                boundary_optimizer.zero_grad(set_to_none=True)
+                boundary_objective = boundary_classifier_objective(
+                    boundary_classifier_1, boundary_classifier_2,
+                    source_output["shapelet_response"], source_labels,
+                    target_output["shapelet_response"], criterion,
+                )
+                ensure_finite_structure_loss(boundary_objective["loss"])
+                boundary_objective["loss"].backward()
+                if any(parameter.grad is not None for parameter in student.parameters()):
+                    raise RuntimeError("boundary classifier step leaked gradient to student")
+                boundary_optimizer.step()
+                boundary_scheduler.step()
+                shape_alignment = {"total_loss": boundary_generator_discrepancy(
+                    target_output["shapelet_response"],
+                    boundary_classifier_1, boundary_classifier_2,
+                )}
+            else:
+                shape_alignment = compute_shape_da_alignment(
+                    shape_da_mode, source_output, source_labels,
+                    target_output,
+                    pseudo if shape_da_mode == "source_prototype" else training_target_labels,
+                    confidence, trusted_mask, config.pseudo_threshold,
+                    prototype_bank=shape_prototype_bank,
+                    prototype_agreement=proto_agree_mask,
+                )
             loss = compose_structure_v2clean_da_loss(
                 loss_cls_source, loss_pseudo_target, loss_shape_source,
                 loss_diversity, shape_alignment["total_loss"], target_ramp,
@@ -1259,6 +1388,14 @@ def _train_structure_proto_timematch(
                     "source_proto_pairwise_cos_max": source_output["logits"].new_tensor(
                         pairwise["max"]
                     ),
+                })
+            elif shape_da_mode == "boundary_support":
+                values.update({
+                    "loss_boundary_discrepancy": shape_alignment["total_loss"].detach(),
+                    "loss_boundary_aux_source": boundary_objective["source_loss"].detach(),
+                    "boundary_aux_source_acc_1": boundary_objective["source_accuracy_1"],
+                    "boundary_aux_source_acc_2": boundary_objective["source_accuracy_2"],
+                    "boundary_target_discrepancy": shape_alignment["total_loss"].detach(),
                 })
             else:
                 values.update({
@@ -1361,6 +1498,13 @@ def _train_structure_proto_timematch(
         }
         if shape_prototype_bank is not None:
             checkpoint["shape_prototype_bank"] = shape_prototype_bank.state_dict()
+        if shape_da_mode == "boundary_support":
+            checkpoint["boundary_classifier_1_state_dict"] = (
+                boundary_classifier_1.state_dict()
+            )
+            checkpoint["boundary_classifier_2_state_dict"] = (
+                boundary_classifier_2.state_dict()
+            )
         torch.save(checkpoint, os.path.join(config.fold_dir, "checkpoint_last.pt"))
         if best_f1 > previous_best or not os.path.isfile(best_model_path):
             torch.save(checkpoint, best_model_path)
