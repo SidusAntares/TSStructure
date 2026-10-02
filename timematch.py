@@ -97,6 +97,35 @@ def validate_local_support_config(config):
         raise ValueError("local_support_temperature must be positive")
 
 
+def validate_shape_alignment_label_source(config):
+    label_source = getattr(config, "shape_alignment_label_source", "pseudo")
+    if label_source not in ("pseudo", "oracle"):
+        raise ValueError(f"unknown shape alignment label source: {label_source}")
+    if label_source != "oracle":
+        return
+    if getattr(config, "shape_da_mode", "batch_align") not in (
+        "batch_align", "local_support",
+    ):
+        raise ValueError(
+            "shape_alignment_label_source=oracle is only valid for "
+            "batch_align or local_support"
+        )
+    if getattr(config, "oracle_pseudo_labels", False):
+        raise ValueError(
+            "shape_alignment_label_source=oracle requires oracle_pseudo_labels=false"
+        )
+
+
+def select_shape_alignment_labels(pseudo, target_gt, label_source="pseudo"):
+    if pseudo.shape != target_gt.shape:
+        raise ValueError("pseudo labels and target GT must align")
+    if label_source == "pseudo":
+        return pseudo
+    if label_source == "oracle":
+        return target_gt
+    raise ValueError(f"unknown shape alignment label source: {label_source}")
+
+
 def initialize_boundary_classifiers(source_classifier, seed, noise_scale=1e-3):
     """Copy the source shape head twice and reproducibly break symmetry."""
     classifier_1 = deepcopy(source_classifier)
@@ -1213,6 +1242,7 @@ def _train_structure_proto_timematch(
     shape_da_mode = getattr(config, "shape_da_mode", "batch_align")
     validate_boundary_support_config(config)
     validate_local_support_config(config)
+    validate_shape_alignment_label_source(config)
     source_loader, target_loader_no_aug, target_loader = get_data_loaders(
         splits, config, config.balance_source,
     )
@@ -1360,6 +1390,10 @@ def _train_structure_proto_timematch(
                 pseudo, target_gt,
                 oracle=getattr(config, "oracle_pseudo_labels", False),
             )
+            alignment_target_labels = select_shape_alignment_labels(
+                pseudo, target_gt,
+                getattr(config, "shape_alignment_label_source", "pseudo"),
+            )
             pseudo_statistics = accepted_pseudo_statistics(
                 pseudo, target_gt, trusted_mask, config.num_classes,
             )
@@ -1424,7 +1458,7 @@ def _train_structure_proto_timematch(
                 )}
             elif shape_da_mode == "local_support":
                 shape_alignment = class_local_support_alignment(
-                    target_output["shapelet_response"], pseudo, confidence,
+                    target_output["shapelet_response"], alignment_target_labels, confidence,
                     trusted_mask, source_shape_bank,
                     k=config.local_support_k,
                     temperature=config.local_support_temperature,
@@ -1435,7 +1469,7 @@ def _train_structure_proto_timematch(
                 shape_alignment = compute_shape_da_alignment(
                     shape_da_mode, source_output, source_labels,
                     target_output,
-                    pseudo if shape_da_mode == "source_prototype" else training_target_labels,
+                    alignment_target_labels,
                     confidence, trusted_mask, config.pseudo_threshold,
                     prototype_bank=shape_prototype_bank,
                     prototype_agreement=proto_agree_mask,

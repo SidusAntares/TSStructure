@@ -261,6 +261,21 @@ def main(config):
                 f"shape_align_weight={usage['shape_align_weight']:g}"
             )
             shape_da_mode = getattr(config, 'shape_da_mode', 'batch_align')
+            shape_alignment_label_source = getattr(
+                config, 'shape_alignment_label_source', 'pseudo',
+            )
+            oracle_alignment_diagnostic = (
+                shape_alignment_label_source == 'oracle'
+            )
+            if oracle_alignment_diagnostic:
+                print(
+                    "ORACLE_ALIGNMENT_DIAGNOSTIC=true|"
+                    "shape_alignment_label_source=oracle|"
+                    f"oracle_pseudo_labels={str(getattr(config, 'oracle_pseudo_labels', False)).lower()}|"
+                    "target_gt_used_for=shape_alignment_class_only|"
+                    "target_gt_used_for_pseudo_loss=false|"
+                    "target_gt_used_for_trusted_mask=false"
+                )
             manifest = {
                 'method': (
                     'structure_query_only'
@@ -277,6 +292,14 @@ def main(config):
                 ),
                 'shape_da_mode': shape_da_mode,
                 'source_minority_mode': getattr(config, 'source_minority_mode', 'base'),
+                'oracle_alignment_diagnostic': oracle_alignment_diagnostic,
+                'shape_alignment_label_source': shape_alignment_label_source,
+                'target_gt_usage': (
+                    'shape_alignment_class_only'
+                    if oracle_alignment_diagnostic else 'none'
+                ),
+                'teacher_controls_trusted_mask': True,
+                'oracle_pseudo_labels': getattr(config, 'oracle_pseudo_labels', False),
             }
             if shape_da_mode == 'source_prototype':
                 manifest.update({
@@ -1056,6 +1079,10 @@ if __name__ == '__main__':
     timematch.add_argument(
         "--shape-da-mode", dest="shape_da_mode", default="batch_align",
         choices=["batch_align", "source_prototype", "boundary_support", "local_support"],
+    )
+    timematch.add_argument(
+        "--shape-alignment-label-source", dest="shape_alignment_label_source",
+        choices=["pseudo", "oracle"], default="pseudo",
     )
     timematch.add_argument("--local-support-k", dest="local_support_k", default=5, type=int)
     timematch.add_argument(
