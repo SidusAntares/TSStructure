@@ -271,6 +271,8 @@ def main(config):
                     if shape_da_mode == 'source_prototype'
                     else 'discriminative_shapelet_boundary_support'
                     if shape_da_mode == 'boundary_support'
+                    else 'discriminative_shapelet_local_support'
+                    if shape_da_mode == 'local_support'
                     else 'discriminative_shapelet_alignment_v2_clean'
                 ),
                 'shape_da_mode': shape_da_mode,
@@ -291,6 +293,16 @@ def main(config):
                     'boundary_classifier_feature_dim': 2 * config.shapelet_count,
                     'boundary_target_supervision': False,
                     'boundary_auxiliary_inference': False,
+                })
+            elif shape_da_mode == 'local_support':
+                manifest.update({
+                    'shape_alignment': 'class_conditional_local_support',
+                    'local_support_k': config.local_support_k,
+                    'local_support_temperature': config.local_support_temperature,
+                    'source_bank_refresh': 'every_epoch',
+                    'source_bank_fixed_within_epoch': True,
+                    'source_bank_detached': True,
+                    'target_gt_used': False,
                 })
             else:
                 manifest['shape_alignment'] = 'batch_class_relative'
@@ -1043,7 +1055,12 @@ if __name__ == '__main__':
     )
     timematch.add_argument(
         "--shape-da-mode", dest="shape_da_mode", default="batch_align",
-        choices=["batch_align", "source_prototype", "boundary_support"],
+        choices=["batch_align", "source_prototype", "boundary_support", "local_support"],
+    )
+    timematch.add_argument("--local-support-k", dest="local_support_k", default=5, type=int)
+    timematch.add_argument(
+        "--local-support-temperature", dest="local_support_temperature",
+        default=.1, type=float,
     )
     timematch.add_argument("--pseudo-base-ratio", dest="pseudo_base_ratio", default=.5, type=float)
     timematch.add_argument("--pseudo-balance-power", dest="pseudo_balance_power", default=.5, type=float)

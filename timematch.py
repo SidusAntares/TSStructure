@@ -24,6 +24,7 @@ from methods.structure_da.prototype_losses import (
     accumulate_class_feature_sums,
     centroid_alignment_summary,
     class_balanced_shape_pseudo_loss,
+    class_local_support_alignment,
     class_relative_domain_alignment,
     memory_class_balanced_shape_pseudo_loss,
     memory_class_relative_domain_alignment,
@@ -69,6 +70,31 @@ def validate_boundary_support_config(config):
             "shape_representation=current, shape_injection=current_query; "
             f"invalid={invalid}"
         )
+
+
+def validate_local_support_config(config):
+    if getattr(config, "shape_da_mode", "batch_align") != "local_support":
+        return
+    required = {
+        "model": "psestructureprotoltae",
+        "shape_representation": "current",
+        "shape_injection": "current_query",
+    }
+    invalid = {
+        name: getattr(config, name, None)
+        for name, expected in required.items()
+        if getattr(config, name, None) != expected
+    }
+    if invalid:
+        raise ValueError(
+            "local_support requires model=psestructureprotoltae, "
+            "shape_representation=current, shape_injection=current_query; "
+            f"invalid={invalid}"
+        )
+    if int(getattr(config, "local_support_k", 5)) <= 0:
+        raise ValueError("local_support_k must be positive")
+    if float(getattr(config, "local_support_temperature", .1)) <= 0:
+        raise ValueError("local_support_temperature must be positive")
 
 
 def initialize_boundary_classifiers(source_classifier, seed, noise_scale=1e-3):
@@ -235,6 +261,68 @@ def initialize_shape_prototype_bank_from_source(
         f"pairwise_cos_max={diagnostics['pairwise_cos_max']:.6f}"
     )
     return diagnostics
+
+
+def build_source_shape_response_bank(model, source_loader, device, seed):
+    """Replay the complete source train set into a detached class response bank."""
+    python_rng = random.getstate()
+    numpy_rng = np.random.get_state()
+    torch_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    was_training = model.training
+    features_by_class = defaultdict(list)
+    bank_loader = data.DataLoader(
+        source_loader.dataset,
+        num_workers=source_loader.num_workers,
+        pin_memory=getattr(source_loader, "pin_memory", True),
+        batch_size=source_loader.batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+    try:
+        random.seed(int(seed))
+        np.random.seed(int(seed))
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+        model.eval()
+        with torch.no_grad():
+            for sample in bank_loader:
+                pixels, mask, positions, extra = to_cuda(sample, device)
+                output = model.forward_with_temporal_shift(
+                    pixels, mask, positions, extra,
+                    temporal_shift=0, return_dict=True,
+                )
+                response = F.normalize(
+                    output["shapelet_response"].detach(), dim=-1,
+                )
+                labels = sample["label"].to(
+                    response.device, non_blocking=True,
+                ).long()
+                for class_id in torch.unique(labels, sorted=True).tolist():
+                    features_by_class[int(class_id)].append(
+                        response[labels == class_id].detach()
+                    )
+        bank = {
+            class_id: torch.cat(parts, dim=0).detach()
+            for class_id, parts in sorted(features_by_class.items())
+        }
+    finally:
+        model.train(was_training)
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+        torch.set_rng_state(torch_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+    supports = [int(values.shape[0]) for values in bank.values()]
+    if not supports:
+        raise RuntimeError("local support source bank is empty")
+    return bank, {
+        "samples": sum(supports),
+        "classes": len(supports),
+        "min_class_support": min(supports),
+        "max_class_support": max(supports),
+    }
 
 
 @torch.no_grad()
@@ -1124,6 +1212,7 @@ def _train_structure_proto_timematch(
         )
     shape_da_mode = getattr(config, "shape_da_mode", "batch_align")
     validate_boundary_support_config(config)
+    validate_local_support_config(config)
     source_loader, target_loader_no_aug, target_loader = get_data_loaders(
         splits, config, config.balance_source,
     )
@@ -1199,6 +1288,23 @@ def _train_structure_proto_timematch(
         source_to_target_shift = (
             -target_to_source_shift if getattr(config, "shift_source", True) else 0
         )
+        source_shape_bank = None
+        if shape_da_mode == "local_support":
+            source_shape_bank, bank_diagnostics = build_source_shape_response_bank(
+                student, source_loader, device, config.seed,
+            )
+            if bank_diagnostics["classes"] != config.num_classes:
+                missing = sorted(set(range(config.num_classes)) - set(source_shape_bank))
+                raise RuntimeError(
+                    f"local support source bank missing classes: {missing}"
+                )
+            print(
+                "LOCAL_SUPPORT_BANK|"
+                f"epoch={epoch}|samples={bank_diagnostics['samples']}|"
+                f"classes={bank_diagnostics['classes']}|"
+                f"min_class_support={bank_diagnostics['min_class_support']}|"
+                f"max_class_support={bank_diagnostics['max_class_support']}"
+            )
         student.train()
         teacher.eval()
         epoch_sums = defaultdict(float)
@@ -1316,6 +1422,15 @@ def _train_structure_proto_timematch(
                     target_output["shapelet_response"],
                     boundary_classifier_1, boundary_classifier_2,
                 )}
+            elif shape_da_mode == "local_support":
+                shape_alignment = class_local_support_alignment(
+                    target_output["shapelet_response"], pseudo, confidence,
+                    trusted_mask, source_shape_bank,
+                    k=config.local_support_k,
+                    temperature=config.local_support_temperature,
+                    pseudo_threshold=config.pseudo_threshold,
+                    min_target_support=2, support_saturation=4,
+                )
             else:
                 shape_alignment = compute_shape_da_alignment(
                     shape_da_mode, source_output, source_labels,
@@ -1396,6 +1511,17 @@ def _train_structure_proto_timematch(
                     "boundary_aux_source_acc_1": boundary_objective["source_accuracy_1"],
                     "boundary_aux_source_acc_2": boundary_objective["source_accuracy_2"],
                     "boundary_target_discrepancy": shape_alignment["total_loss"].detach(),
+                })
+            elif shape_da_mode == "local_support":
+                values.update({
+                    "loss_local_support": shape_alignment["total_loss"].detach(),
+                    "local_support_valid_classes": source_output["logits"].new_tensor(
+                        shape_alignment["valid_classes"]
+                    ),
+                    "local_support_valid_targets": source_output["logits"].new_tensor(
+                        shape_alignment["valid_targets"]
+                    ),
+                    "local_support_mean_knn_cos": shape_alignment["mean_knn_cos"],
                 })
             else:
                 values.update({

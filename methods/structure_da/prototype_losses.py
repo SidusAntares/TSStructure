@@ -234,6 +234,86 @@ def source_prototype_center_alignment(
     }
 
 
+def class_local_support_alignment(
+    target_features, target_pseudo, target_confidence, trusted_mask,
+    source_bank, k=5, temperature=.1, pseudo_threshold=.9,
+    min_target_support=2, support_saturation=4, eps=1e-12,
+):
+    """Align trusted target responses to detached, class-local source support."""
+    if not (
+        target_features.shape[0] == target_pseudo.shape[0]
+        == target_confidence.shape[0] == trusted_mask.shape[0]
+    ):
+        raise ValueError("target features, pseudo labels, confidence, and mask must align")
+    if int(k) <= 0:
+        raise ValueError("local support k must be positive")
+    if float(temperature) <= 0:
+        raise ValueError("local support temperature must be positive")
+
+    zero = target_features.sum() * 0.
+    normalized_live = F.normalize(target_features, dim=-1)
+    normalized_query = normalized_live.detach()
+    confidence_weights = (
+        (target_confidence - pseudo_threshold) / max(1. - pseudo_threshold, eps)
+    ).clamp(0., 1.)
+    class_losses, reliabilities, selected_similarities = [], [], []
+    diagnostic_prototypes, diagnostic_k = [], []
+    valid_targets = 0
+
+    for class_id in torch.unique(target_pseudo[trusted_mask], sorted=True).tolist():
+        selected = trusted_mask.bool() & (target_pseudo.long() == int(class_id))
+        support = int(selected.sum())
+        bank = source_bank.get(int(class_id))
+        if support < int(min_target_support) or bank is None or bank.shape[0] == 0:
+            continue
+        bank = F.normalize(bank.detach(), dim=-1)
+        k_effective = min(int(k), int(bank.shape[0]))
+        similarity = normalized_query[selected] @ bank.T
+        top_similarity, top_indices = similarity.topk(k_effective, dim=1)
+        neighbor_weights = F.softmax(top_similarity / float(temperature), dim=1)
+        neighbors = bank[top_indices]
+        local_prototype = F.normalize(
+            (neighbor_weights[..., None] * neighbors).sum(dim=1), dim=-1,
+        ).detach()
+        sample_losses = 1. - F.cosine_similarity(
+            normalized_live[selected], local_prototype, dim=-1,
+        )
+        weights = confidence_weights[selected]
+        class_loss = (weights * sample_losses).sum() / weights.sum().clamp_min(eps)
+        reliability = min(1., support / float(support_saturation)) * weights.mean()
+        class_losses.append(class_loss)
+        reliabilities.append(reliability)
+        selected_similarities.append(top_similarity.detach().reshape(-1))
+        diagnostic_prototypes.append(local_prototype)
+        diagnostic_k.append(torch.full(
+            (support,), k_effective, device=target_features.device,
+            dtype=torch.long,
+        ))
+        valid_targets += support
+
+    if not class_losses:
+        return {
+            "total_loss": zero,
+            "valid_classes": 0,
+            "valid_targets": 0,
+            "mean_knn_cos": zero.detach(),
+            "local_prototypes": target_features.new_empty((0, target_features.shape[-1])).detach(),
+            "k_effective": target_pseudo.new_empty(0),
+        }
+    class_losses = torch.stack(class_losses)
+    reliabilities = torch.stack(reliabilities)
+    return {
+        "total_loss": (
+            reliabilities * class_losses
+        ).sum() / reliabilities.sum().clamp_min(eps),
+        "valid_classes": len(class_losses),
+        "valid_targets": valid_targets,
+        "mean_knn_cos": torch.cat(selected_similarities).mean(),
+        "local_prototypes": torch.cat(diagnostic_prototypes, dim=0),
+        "k_effective": torch.cat(diagnostic_k, dim=0),
+    }
+
+
 @torch.no_grad()
 def accumulate_class_feature_sums(class_sums, class_counts, features, labels):
     normalized = F.normalize(features.detach(), dim=-1)

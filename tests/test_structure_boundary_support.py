@@ -20,7 +20,10 @@ def _config(**overrides):
 
 def test_parser_accepts_boundary_support_and_existing_modes_remain():
     source = Path("train.py").read_text(encoding="utf-8")
-    assert 'choices=["batch_align", "source_prototype", "boundary_support"]' in source
+    assert (
+        'choices=["batch_align", "source_prototype", "boundary_support", "local_support"]'
+        in source
+    )
 
 
 @pytest.mark.parametrize("field,value", [
