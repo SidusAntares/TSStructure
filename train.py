@@ -6,6 +6,7 @@ import json
 import os
 import pickle as pkl
 import random
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -229,11 +230,42 @@ def structure_usage_manifest(config):
     return manifest
 
 
+def protocol_manifest(method):
+    if method != 'timematch':
+        return {}
+    return {
+        'uda_model_selection': 'final_epoch',
+        'uda_test_checkpoint': 'checkpoint_last.pt',
+        'validation_best_checkpoint': 'checkpoint_best.pt',
+        'target_validation_used_for_test_selection': False,
+    }
+
+
+def resolve_test_checkpoint(method, fold_dir):
+    fold_dir = Path(fold_dir)
+    if method == 'timematch':
+        final_path = fold_dir / 'checkpoint_last.pt'
+        if final_path.is_file():
+            return final_path, 'final_epoch'
+        return fold_dir / 'model.pt', 'final_epoch_legacy_fallback'
+    return fold_dir / 'model.pt', 'validation_selected'
+
+
+def result_artifact_names(method, target_name):
+    marker = 'final_' if method == 'timematch' else ''
+    return {
+        'metrics': f'test_metrics_{marker}{target_name}.json',
+        'report': f'class_report_{marker}{target_name}.txt',
+        'confusion': f'conf_mat_{marker}{target_name}.pkl',
+    }
+
+
 def main(config):
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     device = torch.device(config.device)
+    method = getattr(config, 'method', None)
 
     indices, _ = prepare_data_protocol(config)
     folds = create_train_val_test_folds(
@@ -410,8 +442,18 @@ def main(config):
                         'pseudo_min_class_count': getattr(config, 'pseudo_min_class_count', 4),
             })
             manifest.update(structure_usage_manifest(config))
+            manifest.update(protocol_manifest(method))
             with open(os.path.join(config.fold_dir, 'manifest.json'), 'w') as stream:
                 json.dump(manifest, stream, indent=2)
+        if method == 'timematch':
+            protocol_path = Path(config.fold_dir) / 'manifest.json'
+            protocol = {}
+            if protocol_path.is_file():
+                protocol = json.loads(protocol_path.read_text(encoding='utf-8'))
+            protocol.update(protocol_manifest(config.method))
+            protocol_path.write_text(
+                json.dumps(protocol, indent=2), encoding='utf-8',
+            )
         
         model.to(config.device)
 
@@ -430,22 +472,27 @@ def main(config):
 
             from torch.utils.tensorboard import SummaryWriter
             writer = SummaryWriter(log_dir=f'{config.tensorboard_log_dir}_fold{fold_num}', purge_step=0)
-            if config.method == 'timematch':
+            if method == 'timematch':
                 train_timematch(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
-            elif config.method == 'dann':
+            elif method == 'dann':
                 train_dann(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
-            elif config.method == 'mmd':
+            elif method == 'mmd':
                 train_mmd(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
-            elif config.method == 'jumbot':
+            elif method == 'jumbot':
                 train_jumbot(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
-            elif config.method == 'alda':
+            elif method == 'alda':
                 train_alda(model, config, writer, val_loader, device, best_model_path, fold_num, splits)
             else:
                 train_supervised(model, config, writer, splits, val_loader, device, best_model_path)
 
-        print('Restoring best model weights for testing...')
-
-        state_dict = torch.load(best_model_path, weights_only=False)['state_dict']
+        test_checkpoint, test_policy = resolve_test_checkpoint(
+            method, config.fold_dir,
+        )
+        print(
+            f"TEST_CHECKPOINT|method={method or 'supervised'}|"
+            f"policy={test_policy}|path={test_checkpoint}"
+        )
+        state_dict = torch.load(test_checkpoint, weights_only=False)['state_dict']
         model.load_state_dict(state_dict)
         test_metrics = evaluation(
             model,
@@ -967,23 +1014,25 @@ def save_results(metrics, config):
     conf_mat = metrics.pop('confusion_matrix')
     class_report = metrics.pop('classification_report')
     target_name = str(config.target).replace('/', '_')
+    names = result_artifact_names(getattr(config, 'method', None), target_name)
 
-    with open(os.path.join(out_dir, f'test_metrics_{target_name}.json'), 'w') as outfile:
+    with open(os.path.join(out_dir, names['metrics']), 'w') as outfile:
         json.dump(metrics, outfile, indent=4)
-    with open(os.path.join(out_dir, f'class_report_{target_name}.txt'), 'w') as outfile:
+    with open(os.path.join(out_dir, names['report']), 'w') as outfile:
         outfile.write(str(class_report))
-    pkl.dump(conf_mat, open(os.path.join(out_dir, f'conf_mat_{target_name}.pkl'), 'wb'))
+    pkl.dump(conf_mat, open(os.path.join(out_dir, names['confusion']), 'wb'))
 def overall_performance(config):
     overall_metrics = defaultdict(list)
     target_name = str(config.target).replace("/", "_")
 
     cms = []
+    names = result_artifact_names(getattr(config, 'method', None), target_name)
     for fold in range(config.num_folds):
         fold_dir = os.path.join(config.output_dir, f'fold_{fold}')
-        test_metrics = json.load(open(os.path.join(fold_dir, f'test_metrics_{target_name}.json')))
+        test_metrics = json.load(open(os.path.join(fold_dir, names['metrics'])))
         for metric, value in test_metrics.items():
             overall_metrics[metric].append(value)
-        cm = pkl.load(open(os.path.join(fold_dir, f'conf_mat_{target_name}.pkl'), 'rb'))
+        cm = pkl.load(open(os.path.join(fold_dir, names['confusion']), 'rb'))
         cms.append(cm)
 
     for i,row in enumerate(np.mean(cms, axis=0)):
