@@ -391,10 +391,26 @@ def test_launcher_has_strict_three_round_barriers_and_four_task_mapping():
     ).read_text()
     assert source.index("run_source \"$GPU0\"") < source.index("run_p \"$GPU0\"")
     assert source.index("run_p \"$GPU0\"") < source.index("run_e \"$GPU0\"")
-    for command in ("run_source", "run_p", "run_e"):
-        assert f'{command} "$GPU0" AT1' in source
-        assert f'{command} "$GPU1" FR1' in source
-        assert f'{command} "$GPU2" FR2' in source
-        assert f'{command} "$GPU3" DK1' in source
-    assert source.count("wait \"$pid\" ||") == 3
+    assert 'run_source "$GPU0" FR1' in source
+    assert 'run_source "$GPU1" DK1' in source
+    assert 'run_source "$GPU2" FR2' in source
+    assert 'run_source "$GPU3" AT1' in source
+    assert 'run_e "$GPU0" AT1' in source
+    assert 'run_e "$GPU1" FR2' in source
+    assert 'run_e "$GPU2" DK1' in source
+    assert 'run_e "$GPU3" FR1' in source
+    assert source.count("wait \"$pid\" ||") == 1
+
+
+def test_launcher_run_round_e_skips_source_and_p_with_checkpoint_preflight():
+    source = Path(
+        "scripts/run_structure_phase_equivariance_4tasks_4gpu_seed1.sh"
+    ).read_text()
+    assert 'RUN_ROUND="${RUN_ROUND:-SOURCE_E}"' in source
+    assert 'case "$RUN_ROUND" in' in source
+    assert 'E) run_e_round ;;' in source
+    assert 'SOURCE_E) run_source_round; run_e_round ;;' in source
+    assert 'ALL) run_source_round; run_p_round; run_e_round ;;' in source
+    assert 'require_source_checkpoints' in source
+    assert 'ROUND_START|round=E' in source
 

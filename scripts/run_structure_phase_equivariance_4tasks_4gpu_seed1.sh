@@ -2,6 +2,7 @@
 set -euo pipefail
 
 GPU0="${GPU0:-0}"; GPU1="${GPU1:-1}"; GPU2="${GPU2:-2}"; GPU3="${GPU3:-3}"
+RUN_ROUND="${RUN_ROUND:-SOURCE_E}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 P_ROOT="${P_ROOT:-outputs/structure_phase_moment_4tasks_seed1}"
@@ -87,27 +88,60 @@ run_e() {
     --shape-equivariance-max-shift 60 > "$E_LOG/E_${task}.log" 2>&1
 }
 
-# The explicit blocks make round barriers and GPU ownership auditable.
-run_source "$GPU0" AT1 "$AT1" & P0=$!
-run_source "$GPU1" FR1 "$FR1" & P1=$!
-run_source "$GPU2" FR2 "$FR2" & P2=$!
-run_source "$GPU3" DK1 "$DK1" & P3=$!
-STATUS=0
-for pid in "$P0" "$P1" "$P2" "$P3"; do wait "$pid" || STATUS=1; done
-if (( STATUS != 0 )); then echo "ERROR: source round failed"; exit 1; fi
+wait_round() {
+  local name="$1" status=0 pid
+  shift
+  for pid in "$@"; do wait "$pid" || status=1; done
+  if (( status != 0 )); then echo "ERROR: ${name} round failed"; exit 1; fi
+  echo "ROUND_FINISHED|round=${name}"
+}
 
-run_p "$GPU0" AT1 "$AT1" DK1 "$DK1" & P0=$!
-run_p "$GPU1" FR1 "$FR1" FR2 "$FR2" & P1=$!
-run_p "$GPU2" FR2 "$FR2" DK1 "$DK1" & P2=$!
-run_p "$GPU3" DK1 "$DK1" AT1 "$AT1" & P3=$!
-STATUS=0
-for pid in "$P0" "$P1" "$P2" "$P3"; do wait "$pid" || STATUS=1; done
-if (( STATUS != 0 )); then echo "ERROR: P round failed"; exit 1; fi
+require_source_checkpoints() {
+  local alias checkpoint missing=0
+  for alias in AT1 FR1 FR2 DK1; do
+    checkpoint="$P_SOURCE_ROOT/source_${alias}_seed1/fold_0/model.pt"
+    if [[ ! -f "$checkpoint" ]]; then
+      echo "MISSING_SOURCE_CHECKPOINT|path=$checkpoint" >&2
+      missing=1
+    fi
+  done
+  if (( missing != 0 )); then exit 1; fi
+}
 
-run_e "$GPU0" AT1 "$AT1" DK1 "$DK1" & P0=$!
-run_e "$GPU1" FR1 "$FR1" FR2 "$FR2" & P1=$!
-run_e "$GPU2" FR2 "$FR2" DK1 "$DK1" & P2=$!
-run_e "$GPU3" DK1 "$DK1" AT1 "$AT1" & P3=$!
-STATUS=0
-for pid in "$P0" "$P1" "$P2" "$P3"; do wait "$pid" || STATUS=1; done
-if (( STATUS != 0 )); then echo "ERROR: E round failed"; exit 1; fi
+run_source_round() {
+  echo "ROUND_START|round=SOURCE"
+  run_source "$GPU0" FR1 "$FR1" & P0=$!
+  run_source "$GPU1" DK1 "$DK1" & P1=$!
+  run_source "$GPU2" FR2 "$FR2" & P2=$!
+  run_source "$GPU3" AT1 "$AT1" & P3=$!
+  wait_round SOURCE "$P0" "$P1" "$P2" "$P3"
+}
+
+run_p_round() {
+  require_source_checkpoints
+  echo "ROUND_START|round=P"
+  run_p "$GPU0" AT1 "$AT1" DK1 "$DK1" & P0=$!
+  run_p "$GPU1" FR1 "$FR1" FR2 "$FR2" & P1=$!
+  run_p "$GPU2" FR2 "$FR2" DK1 "$DK1" & P2=$!
+  run_p "$GPU3" DK1 "$DK1" AT1 "$AT1" & P3=$!
+  wait_round P "$P0" "$P1" "$P2" "$P3"
+}
+
+run_e_round() {
+  require_source_checkpoints
+  echo "ROUND_START|round=E"
+  run_e "$GPU0" AT1 "$AT1" DK1 "$DK1" & P0=$!
+  run_e "$GPU1" FR2 "$FR2" DK1 "$DK1" & P1=$!
+  run_e "$GPU2" DK1 "$DK1" AT1 "$AT1" & P2=$!
+  run_e "$GPU3" FR1 "$FR1" FR2 "$FR2" & P3=$!
+  wait_round E "$P0" "$P1" "$P2" "$P3"
+}
+
+case "$RUN_ROUND" in
+  SOURCE) run_source_round ;;
+  P) run_p_round ;;
+  E) run_e_round ;;
+  SOURCE_E) run_source_round; run_e_round ;;
+  ALL) run_source_round; run_p_round; run_e_round ;;
+  *) echo "ERROR: RUN_ROUND must be SOURCE_E, ALL, SOURCE, P, or E; got $RUN_ROUND" >&2; exit 2 ;;
+esac
