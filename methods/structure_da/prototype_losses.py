@@ -408,14 +408,18 @@ def compose_structure_v5_da_loss(
 def compose_structure_v2clean_da_loss(
     classification, pseudo_target, source_shape, diversity, shape_alignment,
     ramp=1., trade_off=2., shape_weight=.1, diversity_weight=.01,
-    shape_align_weight=.05,
+    shape_align_weight=.05, shape_equivariance=None,
+    shape_equivariance_weight=0.,
 ):
     """V2-Clean: TimeMatch plus source shape and the selected DA alignment."""
-    return (
+    total = (
         classification + trade_off * pseudo_target
         + shape_weight * source_shape + diversity_weight * diversity
         + ramp * shape_align_weight * shape_alignment
     )
+    if shape_equivariance is not None:
+        total = total + ramp * shape_equivariance_weight * shape_equivariance
+    return total
 
 
 def masked_pseudo_classification_loss(logits, pseudo_labels, pseudo_mask, criterion):

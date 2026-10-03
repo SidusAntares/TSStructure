@@ -451,6 +451,7 @@ class DiscriminativeStructureBranch(nn.Module):
         super().__init__()
         if shape_representation not in (
             "current", "sorted_profile", "set_response", "residual_response",
+            "phase_moment",
         ):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
@@ -467,6 +468,8 @@ class DiscriminativeStructureBranch(nn.Module):
                 nn.Linear(shapelet_count, 64), nn.GELU(), nn.Linear(64, 32),
             )
             response_dim = 32
+        elif shape_representation == "phase_moment":
+            response_dim = 6 * shapelet_count
         else:
             response_dim = 2 * shapelet_count
         if shape_representation == "residual_response":
@@ -546,16 +549,58 @@ class DiscriminativeStructureBranch(nn.Module):
             "modulation": modulation,
         }
 
+    def compose_phase_moments(self, weights, centers, phase_shift=0):
+        """Return k=1,2 circular occurrence moments in fixed cos/sin block order."""
+        batch, candidates, _ = weights.shape
+        centers = torch.as_tensor(
+            centers, device=weights.device, dtype=weights.dtype,
+        )
+        if centers.shape != (candidates,):
+            raise ValueError("window centers must align with candidate weights")
+        shift = torch.as_tensor(
+            phase_shift, device=weights.device, dtype=weights.dtype,
+        )
+        if shift.ndim == 0:
+            shift = shift.expand(batch)
+        elif shift.ndim == 2 and shift.shape == (batch, 1):
+            shift = shift[:, 0]
+        elif shift.ndim != 1 or shift.shape[0] not in (1, batch):
+            raise ValueError("phase shift must be scalar, [B], or [B,1]")
+        if shift.shape[0] == 1:
+            shift = shift.expand(batch)
+        center_days = (
+            centers * self.exposer.period_days / self.window_extractor.grid_points
+        )
+        theta = 2. * torch.pi * (
+            center_days[None] + shift[:, None]
+        ) / self.exposer.period_days
+        blocks = []
+        for harmonic in (1, 2):
+            blocks.extend((
+                (weights * torch.cos(harmonic * theta).unsqueeze(-1)).sum(1),
+                (weights * torch.sin(harmonic * theta).unsqueeze(-1)).sum(1),
+            ))
+        return torch.cat(blocks, dim=-1)
+
     def prepare_context(self, features, positions):
         return {"coefficients": self.exposer.analyze(features, positions)}
 
     def forward_from_context(
-        self, context, temporal_shift=0, include_legacy_query=True,
+        self, context, structure_aug_shift=0, phase_shift=0,
+        include_legacy_query=True, temporal_shift=None,
     ):
+        if temporal_shift is not None:
+            structure_aug_shift = temporal_shift
         exposed, grid = self.exposer.synthesize_shifted(
-            context["coefficients"], temporal_shift,
+            context["coefficients"], structure_aug_shift,
         )
-        window_groups, scales = self.window_extractor(exposed)
+        if self.shape_representation == "phase_moment":
+            window_groups, scales, centers = self.window_extractor(
+                exposed, return_centers=True,
+            )
+        else:
+            window_groups, scales = self.window_extractor(exposed)
+            centers = None
         encoded = [
             self.token_generator(windows, return_encoded_components=True)
             for windows in window_groups
@@ -573,10 +618,18 @@ class DiscriminativeStructureBranch(nn.Module):
         strength = response_details["response"]
         rich_response = self.compose_rich_response(response_details)
         concentration = rich_response[:, strength.shape[1]:]
-        response = (
-            self.compose_set_response(details["similarity"], details["candidate_mask"])
-            if self.shape_representation == "set_response" else rich_response
-        )
+        phase_moments = None
+        if self.shape_representation == "set_response":
+            response = self.compose_set_response(
+                details["similarity"], details["candidate_mask"],
+            )
+        elif self.shape_representation == "phase_moment":
+            phase_moments = self.compose_phase_moments(
+                response_details["weights"], centers, phase_shift,
+            )
+            response = torch.cat((rich_response, phase_moments), dim=-1)
+        else:
+            response = rich_response
         profile = sorted_anchor_profile(details["similarity"])
         result = {
             "shape_tokens": tokens,
@@ -598,13 +651,17 @@ class DiscriminativeStructureBranch(nn.Module):
                 "shapelet_context_score": response_details["contextual_similarity"],
                 "shapelet_modulation": response_details["modulation"],
             })
+        if phase_moments is not None:
+            result["shapelet_phase_moments"] = phase_moments
         return result
 
     def forward(
-        self, features, positions, include_legacy_query=True, temporal_shift=0,
+        self, features, positions, include_legacy_query=True,
+        temporal_shift=0, phase_shift=0,
     ):
         return self.forward_from_context(
             self.prepare_context(features, positions),
-            temporal_shift=temporal_shift,
+            structure_aug_shift=temporal_shift,
+            phase_shift=phase_shift,
             include_legacy_query=include_legacy_query,
         )

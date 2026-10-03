@@ -49,6 +49,48 @@ from methods.structure_da.prototype_losses import (
     update_instance_bank,
 )
 from models.structure_da.prototype_bank import ClassFeatureMemory, ClassPrototypeBank
+from methods.structure_da.phase_equivariance import (
+    phase_equivariance_loss,
+    sample_structure_aug_shifts,
+)
+
+
+def forward_target_phase_equivariance(
+    student, pixels, mask, positions, extra, max_shift,
+):
+    """Run E on all target-strong samples without labels or pseudo selections."""
+    delta = sample_structure_aug_shifts(
+        pixels.shape[0], max_shift, pixels.device,
+    )
+    output, base, shifted = student.forward_phase_equivariance_target(
+        pixels, mask, positions, extra, structure_aug_shift=delta,
+    )
+    losses = phase_equivariance_loss(
+        base, shifted, delta,
+        shapelet_count=student.structure_branch.shapelet_dictionary.anchors.shape[0],
+        harmonics=(1, 2),
+        period_days=student.structure_branch.exposer.period_days,
+    )
+    return output, losses, delta
+
+
+def validate_phase_equivariance_config(config):
+    if getattr(config, "shape_representation", "current") != "phase_moment":
+        if float(getattr(config, "shape_equivariance_weight", 0.)) > 0:
+            raise ValueError("shape equivariance requires phase_moment representation")
+        return
+    if (
+        getattr(config, "shape_alignment_view", "full") != "none"
+        or float(getattr(config, "shape_align_weight", .05)) != 0.
+    ):
+        raise ValueError("phase_moment experiments require explicit shape alignment off")
+    if getattr(config, "structure_shift_mode", "none") != "none":
+        raise ValueError("phase_moment TimeMatch requires structure_shift_mode=none")
+    if (
+        float(getattr(config, "shape_equivariance_weight", 0.)) > 0
+        and int(getattr(config, "shape_equivariance_max_shift", 60)) < 1
+    ):
+        raise ValueError("shape equivariance max shift must be positive")
 
 
 def validate_boundary_support_config(config):
@@ -1275,6 +1317,10 @@ def _train_structure_proto_timematch(
     validate_boundary_support_config(config)
     validate_local_support_config(config)
     validate_shape_alignment_label_source(config)
+    validate_phase_equivariance_config(config)
+    shape_equivariance_weight = float(
+        getattr(config, "shape_equivariance_weight", 0.)
+    )
     source_loader, target_loader_no_aug, target_loader = get_data_loaders(
         splits, config, config.balance_source,
     )
@@ -1457,7 +1503,22 @@ def _train_structure_proto_timematch(
                 return_dict=True,
             )
             pt, mt, tt, et = to_cuda(target_strong, device)
-            target_output = student(pt, mt, tt, et, return_dict=True)
+            if shape_equivariance_weight > 0:
+                target_output, equivariance, structure_aug_shift = (
+                    forward_target_phase_equivariance(
+                        student, pt, mt, tt, et,
+                        max_shift=config.shape_equivariance_max_shift,
+                    )
+                )
+            else:
+                target_output = student(pt, mt, tt, et, return_dict=True)
+                zero_equivariance = target_output["shapelet_response"].sum() * 0.
+                equivariance = {
+                    "total_loss": zero_equivariance,
+                    "occurrence_loss": zero_equivariance,
+                    "phase_loss": zero_equivariance,
+                }
+                structure_aug_shift = None
 
             loss_cls_source = criterion(source_output["logits"], source_labels)
             loss_pseudo_target = masked_pseudo_classification_loss(
@@ -1514,6 +1575,8 @@ def _train_structure_proto_timematch(
                 config.trade_off,
                 config.shape_class_weight, config.shapelet_diversity_weight,
                 config.shape_align_weight,
+                shape_equivariance=equivariance["total_loss"],
+                shape_equivariance_weight=shape_equivariance_weight,
             )
 
             optimizer.zero_grad()
@@ -1557,6 +1620,13 @@ def _train_structure_proto_timematch(
             }
             usage_diagnostics = student.structure_usage_diagnostics(source_output)
             values.update(usage_diagnostics)
+            if shape_equivariance_weight > 0:
+                values.update({
+                    "loss_shape_equivariance": equivariance["total_loss"].detach(),
+                    "loss_shape_equiv_occ": equivariance["occurrence_loss"].detach(),
+                    "loss_shape_equiv_phase": equivariance["phase_loss"].detach(),
+                    "equiv_shift_abs_mean": structure_aug_shift.float().abs().mean(),
+                })
             if shape_da_mode == "source_prototype":
                 pairwise = _shape_prototype_pairwise_stats(shape_prototype_bank)
                 values.update({

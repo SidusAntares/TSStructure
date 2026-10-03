@@ -88,7 +88,10 @@ def add_model_arguments(parser):
     parser.add_argument('--shape-class-weight', dest='shape_class_weight', default=.1, type=float)
     parser.add_argument(
         '--shape-representation', dest='shape_representation', default='current',
-        choices=['current', 'sorted_profile', 'set_response', 'residual_response'],
+        choices=[
+            'current', 'sorted_profile', 'set_response', 'residual_response',
+            'phase_moment',
+        ],
     )
     parser.add_argument(
         '--shape-injection', dest='shape_injection', default='current_query',
@@ -166,6 +169,8 @@ def structure_usage_manifest(config):
     ) // int(config.shape_window_stride)
     if config.shape_representation in ('current', 'residual_response'):
         evidence_dim = 2 * int(config.shapelet_count)
+    elif config.shape_representation == 'phase_moment':
+        evidence_dim = 6 * int(config.shapelet_count)
     elif config.shape_representation == 'set_response':
         evidence_dim = 32
     else:
@@ -179,6 +184,27 @@ def structure_usage_manifest(config):
         'shape_evidence_dim': evidence_dim,
         'shape_align_weight': config.shape_align_weight,
     }
+    if config.shape_representation == 'phase_moment':
+        manifest.update({
+            'shapelet_response': 'strength+concentration+phase_moments_k1_k2',
+            'shape_response_dim': evidence_dim,
+            'phase_harmonics': [1, 2],
+            'phase_period_days': 365,
+            'occurrence_phase': True,
+            'structure_shift_mode': getattr(config, 'structure_shift_mode', 'none'),
+            'explicit_shape_alignment': False,
+            'shape_equivariance': bool(
+                getattr(config, 'shape_equivariance_weight', 0.) > 0
+            ),
+            'shape_equivariance_weight': float(
+                getattr(config, 'shape_equivariance_weight', 0.)
+            ),
+            'shape_equivariance_max_shift': int(
+                getattr(config, 'shape_equivariance_max_shift', 60)
+            ),
+            'equivariance_uses_target_labels': False,
+            'equivariance_uses_pseudo_labels': False,
+        })
     if config.shape_injection == 'direct_response_query':
         manifest.update({
             'external_query_dim': evidence_dim,
@@ -1123,6 +1149,14 @@ if __name__ == '__main__':
     timematch.add_argument('--shared-adv-weight', dest='shared_adv_weight', default=.1, type=float)
     timematch.add_argument('--private-domain-weight', dest='private_domain_weight', default=.1, type=float)
     timematch.add_argument('--separation-weight', dest='separation_weight', default=.01, type=float)
+    timematch.add_argument(
+        '--shape-equivariance-weight', dest='shape_equivariance_weight',
+        default=0., type=float,
+    )
+    timematch.add_argument(
+        '--shape-equivariance-max-shift', dest='shape_equivariance_max_shift',
+        default=60, type=int,
+    )
     timematch.add_argument("--estimate_shift", type=bool_flag, default=True, help='whether to account for temporal shift')
     timematch.add_argument('--epochs', default=20, type=int, help='Number of epochs per fold')
     timematch.add_argument("--steps_per_epoch", type=int, default=500, help='n steps per epoch')

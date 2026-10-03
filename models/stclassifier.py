@@ -56,8 +56,11 @@ class PseStructureProtoLTae(nn.Module):
             raise ValueError("set_response representation requires current_query injection")
         if shape_representation == "residual_response" and shape_injection != "current_query":
             raise ValueError("residual_response representation requires current_query injection")
+        if shape_representation == "phase_moment" and shape_injection != "current_query":
+            raise ValueError("phase_moment representation requires current_query injection")
         if shape_representation not in (
             "current", "sorted_profile", "set_response", "residual_response",
+            "phase_moment",
         ):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
@@ -87,6 +90,8 @@ class PseStructureProtoLTae(nn.Module):
         )
         if shape_representation in ("current", "residual_response"):
             evidence_dim = 2 * int(shapelet_count)
+        elif shape_representation == "phase_moment":
+            evidence_dim = 6 * int(shapelet_count)
         elif shape_representation == "set_response":
             evidence_dim = 32
         else:
@@ -139,17 +144,28 @@ class PseStructureProtoLTae(nn.Module):
     def prepare_structure_context(self, prepared, positions):
         return self.structure_branch.prepare_context(prepared, positions)
 
-    def prepare_structure_from_context(self, context, temporal_shift=0):
-        structure_shift = (
-            temporal_shift if self.structure_shift_mode == "timematch" else 0
-        )
+    def prepare_structure_from_context(
+        self, context, temporal_shift=0, structure_aug_shift=None, phase_shift=None,
+    ):
+        if self.shape_representation == "phase_moment":
+            structure_shift = 0 if structure_aug_shift is None else structure_aug_shift
+            calendar_shift = temporal_shift if phase_shift is None else phase_shift
+        else:
+            structure_shift = (
+                temporal_shift if self.structure_shift_mode == "timematch" else 0
+            ) if structure_aug_shift is None else structure_aug_shift
+            calendar_shift = 0 if phase_shift is None else phase_shift
         return self.structure_branch.forward_from_context(
-            context, temporal_shift=structure_shift,
+            context, structure_aug_shift=structure_shift,
+            phase_shift=calendar_shift,
             include_legacy_query=self.shape_injection == "current_query",
         )
 
     def prepare_structure(self, prepared, positions, temporal_shift=0):
-        if self.shape_injection in ("local_query", "local_query_only"):
+        if (
+            self.shape_injection in ("local_query", "local_query_only")
+            or self.shape_representation == "phase_moment"
+        ):
             return self.prepare_structure_from_context(
                 self.prepare_structure_context(prepared, positions), temporal_shift,
             )
@@ -159,7 +175,9 @@ class PseStructureProtoLTae(nn.Module):
         )
 
     def _shape_evidence(self, structure):
-        if self.shape_representation in ("current", "set_response", "residual_response"):
+        if self.shape_representation in (
+            "current", "set_response", "residual_response", "phase_moment",
+        ):
             return structure["shapelet_response"]
         return structure["sorted_anchor_profile"]
 
@@ -268,6 +286,15 @@ class PseStructureProtoLTae(nn.Module):
                     / similarity.norm().clamp_min(1e-12)
                 ),
             }
+        if self.shape_representation == "phase_moment":
+            moments = output["shapelet_phase_moments"]
+            count = moments.shape[-1] // 4
+            blocks = moments.reshape(moments.shape[0], 2, 2, count)
+            magnitude = blocks.square().sum(dim=2).sqrt()
+            return {
+                "phase_k1_mean_magnitude": magnitude[:, 0].mean(),
+                "phase_k2_mean_magnitude": magnitude[:, 1].mean(),
+            }
         if self.shape_representation != "sorted_profile":
             return {}
         diagnostics = {
@@ -295,6 +322,39 @@ class PseStructureProtoLTae(nn.Module):
             return logits, instance
         return logits
 
+    def _output_from_prepared_structure(
+        self, prepared, shifted_positions, structure,
+    ):
+        evidence = self._shape_evidence(structure)
+        instance, usage = self._encode_instance(
+            prepared, shifted_positions, structure, return_details=True,
+        )
+        return {
+            "logits": self.decoder(instance),
+            "shape_logits": self.shape_classifier(evidence),
+            "shape_evidence": evidence,
+            "instance_feature": instance,
+            **usage,
+            **structure,
+        }
+
+    def forward_phase_equivariance_target(
+        self, pixels, mask, positions, extra, structure_aug_shift,
+    ):
+        """Share one spatial feature and Fourier context across E's three consumers."""
+        if self.shape_representation != "phase_moment":
+            raise RuntimeError("phase equivariance requires phase_moment representation")
+        spatial = self.spatial_encoder(pixels, mask, extra)
+        context = self.prepare_structure_context(spatial, positions)
+        base = self.prepare_structure_from_context(
+            context, structure_aug_shift=0, phase_shift=0,
+        )
+        shifted = self.prepare_structure_from_context(
+            context, structure_aug_shift=structure_aug_shift, phase_shift=0,
+        )
+        output = self._output_from_prepared_structure(spatial, positions, base)
+        return output, base, shifted
+
     def forward_with_temporal_shift(
         self, pixels, mask, positions, extra, temporal_shift=0,
         return_feats=False, return_dict=False, collect_diagnostics=False,
@@ -303,23 +363,14 @@ class PseStructureProtoLTae(nn.Module):
         spatial = self.spatial_encoder(pixels, mask, extra)
         shifted_positions = positions + temporal_shift
         structure = self.prepare_structure(spatial, positions, temporal_shift)
-        evidence = self._shape_evidence(structure)
-        instance, usage = self._encode_instance(
-            spatial, shifted_positions, structure, return_details=True,
+        output = self._output_from_prepared_structure(
+            spatial, shifted_positions, structure,
         )
-        logits = self.decoder(instance)
         if return_dict:
-            return {
-                "logits": logits,
-                "shape_logits": self.shape_classifier(evidence),
-                "shape_evidence": evidence,
-                "instance_feature": instance,
-                **usage,
-                **structure,
-            }
+            return output
         if return_feats:
-            return logits, instance
-        return logits
+            return output["logits"], output["instance_feature"]
+        return output["logits"]
 
     def forward(self, pixels, mask, positions, extra, return_feats=False, return_dict=False):
         return self.forward_with_temporal_shift(
