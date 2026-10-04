@@ -37,6 +37,19 @@ from methods.structure_da.prototype_losses import (
 )
 
 
+def save_timematch_checkpoint(
+    checkpoint, fold_dir, model_path, validation_best=False, final_epoch=False,
+):
+    """Persist explicit TimeMatch last, validation-best, and final roles."""
+    fold_dir = os.fspath(fold_dir)
+    model_path = os.fspath(model_path)
+    torch.save(checkpoint, os.path.join(fold_dir, "checkpoint_last.pt"))
+    if validation_best:
+        torch.save(checkpoint, os.path.join(fold_dir, "checkpoint_best.pt"))
+    if final_epoch:
+        torch.save(checkpoint, model_path)
+
+
 def _new_epoch_structure_stats():
     return {"instance_cos": []}
 
@@ -626,10 +639,16 @@ def _train_structure_proto_timematch(
             "config": vars(config),
             "best_f1": best_f1,
         }
-        torch.save(checkpoint, os.path.join(config.fold_dir, "checkpoint_last.pt"))
-        if best_f1 > previous_best or not os.path.isfile(best_model_path):
-            torch.save(checkpoint, best_model_path)
-            torch.save(checkpoint, os.path.join(config.fold_dir, "checkpoint_best.pt"))
+        save_timematch_checkpoint(
+            checkpoint, config.fold_dir, best_model_path,
+            validation_best=(
+                best_f1 > previous_best
+                or not os.path.isfile(os.path.join(config.fold_dir, "checkpoint_best.pt"))
+            ),
+        )
+    save_timematch_checkpoint(
+        checkpoint, config.fold_dir, best_model_path, final_epoch=True,
+    )
 
 
 def train_timematch(student, config, writer, val_loader, device, best_model_path, fold_num, splits):
@@ -774,10 +793,16 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             "best_f1": best_f1,
         }
         fold_dir = getattr(config, "fold_dir", os.path.dirname(best_model_path) or ".")
-        torch.save(checkpoint, os.path.join(fold_dir, "checkpoint_last.pt"))
-        if best_f1 > previous_best or not os.path.isfile(best_model_path):
-            torch.save(checkpoint, best_model_path)
-            torch.save(checkpoint, os.path.join(fold_dir, "checkpoint_best.pt"))
+        save_timematch_checkpoint(
+            checkpoint, fold_dir, best_model_path,
+            validation_best=(
+                best_f1 > previous_best
+                or not os.path.isfile(os.path.join(fold_dir, "checkpoint_best.pt"))
+            ),
+        )
+    save_timematch_checkpoint(
+        checkpoint, fold_dir, best_model_path, final_epoch=True,
+    )
 
 
 def estimate_class_distribution(labels, num_classes):
