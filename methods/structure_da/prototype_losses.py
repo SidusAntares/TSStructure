@@ -830,12 +830,25 @@ def shape_health_snapshot(model, outputs):
         "shape_response_effective_rank": float(effective_rank),
         "shape_token_std": float(tokens.std(unbiased=False)),
         "shape_token_norm": float(tokens.norm(dim=-1).mean()),
-        "shape_raw_encoder_param_norm": _parameter_l2_norm(branch.token_generator.raw_encoder),
-        "shape_diff_encoder_param_norm": _parameter_l2_norm(branch.token_generator.diff_encoder),
-        "shape_fusion_param_norm": _parameter_l2_norm(branch.token_generator.fusion),
         "shape_anchor_param_norm": float(branch.shapelet_dictionary.anchors.detach().float().norm()),
         "shape_query_projection_norm": _parameter_l2_norm(query_projection),
     }
+    if hasattr(branch.token_generator, "raw_encoder"):
+        values.update({
+            "shape_raw_encoder_param_norm": _parameter_l2_norm(
+                branch.token_generator.raw_encoder
+            ),
+            "shape_diff_encoder_param_norm": _parameter_l2_norm(
+                branch.token_generator.diff_encoder
+            ),
+            "shape_fusion_param_norm": _parameter_l2_norm(
+                branch.token_generator.fusion
+            ),
+        })
+    if hasattr(branch.token_generator, "state_encoder"):
+        values["shape_state_encoder_param_norm"] = _parameter_l2_norm(
+            branch.token_generator.state_encoder
+        )
     if "shapelet_strength" in outputs:
         values["shape_strength_std"] = float(
             outputs["shapelet_strength"].detach().float()

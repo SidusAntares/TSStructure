@@ -91,7 +91,7 @@ def add_model_arguments(parser):
         '--shape-representation', dest='shape_representation', default='current',
         choices=[
             'current', 'sorted_profile', 'set_response', 'residual_response',
-            'phase_moment',
+            'phase_moment', 'state_org',
         ],
     )
     parser.add_argument(
@@ -174,6 +174,8 @@ def structure_usage_manifest(config):
         evidence_dim = 6 * int(config.shapelet_count)
     elif config.shape_representation == 'set_response':
         evidence_dim = 32
+    elif config.shape_representation == 'state_org':
+        evidence_dim = int(config.shapelet_count) + 32
     else:
         evidence_dim = (
             int(config.shapelet_count) * candidates_per_scale
@@ -205,6 +207,17 @@ def structure_usage_manifest(config):
             ),
             'equivariance_uses_target_labels': False,
             'equivariance_uses_pseudo_labels': False,
+        })
+    elif config.shape_representation == 'state_org':
+        manifest.update({
+            'shapelet_response': 'presence+relative_organization',
+            'shape_response_dim': evidence_dim,
+            'organization_dim': 32,
+            'state_token': 'standardized_state+physical_time_derivative',
+            'state_temporal_resampling': False,
+            'shape_concentration': False,
+            'occurrence_phase': False,
+            'explicit_shape_alignment': False,
         })
     if config.shape_injection == 'direct_response_query':
         manifest.update({

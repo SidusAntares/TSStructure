@@ -1620,7 +1620,6 @@ def _train_structure_proto_timematch(
             source_shape_correct += int(
                 (source_output["shape_logits"].detach().argmax(1) == source_labels).sum()
             )
-            concentration = source_output["shapelet_concentration"].detach().float()
             singular = torch.linalg.svdvals(
                 source_output["shapelet_response"].detach().float()
             )
@@ -1634,9 +1633,13 @@ def _train_structure_proto_timematch(
                 "loss_shape_source": loss_shape_source.detach(),
                 "loss_shapelet_diversity": loss_diversity.detach(),
                 "shape_response_effective_rank": response_rank,
-                "shape_concentration_mean": concentration.mean(),
-                "shape_concentration_std": concentration.std(unbiased=False),
             }
+            if "shapelet_concentration" in source_output:
+                concentration = source_output["shapelet_concentration"].detach().float()
+                values.update({
+                    "shape_concentration_mean": concentration.mean(),
+                    "shape_concentration_std": concentration.std(unbiased=False),
+                })
             usage_diagnostics = student.structure_usage_diagnostics(source_output)
             values.update(usage_diagnostics)
             if shape_equivariance_weight > 0:

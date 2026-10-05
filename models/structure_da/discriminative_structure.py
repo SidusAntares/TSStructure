@@ -262,6 +262,52 @@ class ShapeTokenGenerator(nn.Module):
         return token
 
 
+class StateShapeTokenGenerator(nn.Module):
+    """Encode standardized local state and its physical-time derivative."""
+
+    def __init__(
+        self, channels, shape_dim=128, period_days=365., grid_points=64,
+        eps=1e-6,
+    ):
+        super().__init__()
+        self.eps = float(eps)
+        self.delta_t = float(period_days) / int(grid_points)
+        self.state_encoder = _VariableLengthTemporalEncoder(
+            2 * int(channels), int(shape_dim),
+        )
+
+    def standardized_state(self, windows, mask=None):
+        if windows.ndim != 4:
+            raise ValueError("state windows must be [B,N,T,C]")
+        if mask is None:
+            mask = torch.ones(
+                windows.shape[:3], dtype=torch.bool, device=windows.device,
+            )
+        else:
+            mask = torch.as_tensor(mask, dtype=torch.bool, device=windows.device)
+        if mask.shape != windows.shape[:3]:
+            raise ValueError("state window mask must be [B,N,T]")
+        weights = mask.to(windows.dtype).unsqueeze(-1)
+        count = weights.sum(2).clamp_min(1.)
+        mean = (windows * weights).sum(2) / count
+        centered = windows - mean.unsqueeze(2)
+        variance = (centered.square() * weights).sum(2) / count
+        standardized = centered / torch.sqrt(
+            variance.clamp_min(0.).unsqueeze(2) + self.eps
+        )
+        standardized = standardized * weights
+        derivative = torch.zeros_like(standardized)
+        derivative[:, :, 1:] = (
+            standardized[:, :, 1:] - standardized[:, :, :-1]
+        ) / self.delta_t
+        derivative = derivative * weights
+        return torch.cat((standardized, derivative), dim=-1), mask
+
+    def forward(self, windows, mask=None):
+        state, mask = self.standardized_state(windows, mask)
+        return self.state_encoder(state, mask)
+
+
 def normalized_candidate_concentration(weights, candidate_mask=None, eps=1e-12):
     """Return one minus candidate entropy, normalized by valid candidate count."""
     if weights.ndim != 3:
@@ -451,7 +497,7 @@ class DiscriminativeStructureBranch(nn.Module):
         super().__init__()
         if shape_representation not in (
             "current", "sorted_profile", "set_response", "residual_response",
-            "phase_moment",
+            "phase_moment", "state_org",
         ):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
@@ -459,11 +505,32 @@ class DiscriminativeStructureBranch(nn.Module):
         self.window_extractor = MultiScaleWindowExtractor(
             window_scales, window_stride, grid_points=grid_points,
         )
-        self.token_generator = ShapeTokenGenerator(
-            channels, shape_dim, resample_length=shape_resample_length,
+        self.token_generator = (
+            StateShapeTokenGenerator(
+                channels, shape_dim, period_days=period_days,
+                grid_points=grid_points,
+            )
+            if shape_representation == "state_org"
+            else ShapeTokenGenerator(
+                channels, shape_dim, resample_length=shape_resample_length,
+            )
         )
         self.shapelet_dictionary = ShapeletDictionary(shape_dim, shapelet_count, shapelet_beta)
-        if shape_representation == "set_response":
+        if shape_representation == "state_org":
+            self.organization_encoder = nn.Sequential(
+                nn.Conv1d(
+                    shapelet_count, 32, kernel_size=3, padding=1,
+                    padding_mode="circular",
+                ),
+                nn.GELU(),
+                nn.Conv1d(
+                    32, 32, kernel_size=3, padding=1,
+                    padding_mode="circular",
+                ),
+                nn.GELU(),
+            )
+            response_dim = shapelet_count + 32
+        elif shape_representation == "set_response":
             self.window_set_encoder = nn.Sequential(
                 nn.Linear(shapelet_count, 64), nn.GELU(), nn.Linear(64, 32),
             )
@@ -476,9 +543,11 @@ class DiscriminativeStructureBranch(nn.Module):
             self.anchor_context_weight = nn.Parameter(
                 torch.zeros(shapelet_count, shapelet_count)
             )
-        self.response_to_query = nn.Sequential(
-            nn.Linear(response_dim, 64), nn.GELU(),
-            nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
+        self.response_to_query = (
+            None if shape_representation == "state_org" else nn.Sequential(
+                nn.Linear(response_dim, 64), nn.GELU(),
+                nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
+            )
         )
 
     def compose_rich_response(self, details):
@@ -516,6 +585,56 @@ class DiscriminativeStructureBranch(nn.Module):
         return (
             encoded * candidate_mask.unsqueeze(-1).to(encoded.dtype)
         ).sum(dim=1) / valid_count.to(encoded.dtype)
+
+    def compose_state_org_response(self, similarity, candidate_mask=None):
+        if self.shape_representation != "state_org":
+            raise RuntimeError("state organization is only available in state_org mode")
+        if similarity.ndim != 3:
+            raise ValueError("similarity must be [B,N,M]")
+        if similarity.shape[-1] != self.shapelet_dictionary.anchors.shape[0]:
+            raise ValueError("similarity anchor dimension does not match dictionary")
+        if candidate_mask is None:
+            candidate_mask = torch.ones(
+                similarity.shape[:2], dtype=torch.bool, device=similarity.device,
+            )
+        else:
+            candidate_mask = torch.as_tensor(
+                candidate_mask, dtype=torch.bool, device=similarity.device,
+            )
+            if candidate_mask.ndim == 1:
+                candidate_mask = candidate_mask.unsqueeze(0).expand(
+                    similarity.shape[0], -1,
+                )
+        if candidate_mask.shape != similarity.shape[:2]:
+            raise ValueError("candidate_mask must be [N] or [B,N]")
+        valid_count = candidate_mask.sum(1, keepdim=True)
+        if not (valid_count > 0).all():
+            raise ValueError("every sample must retain at least one candidate")
+        presence_weights = torch.softmax(
+            (self.shapelet_dictionary.beta * similarity).masked_fill(
+                ~candidate_mask.unsqueeze(-1), -torch.inf,
+            ),
+            dim=1,
+        )
+        presence = (presence_weights * similarity).sum(1)
+        state_distribution = torch.softmax(
+            self.shapelet_dictionary.beta * similarity, dim=-1,
+        )
+        organization_sequence = self.organization_encoder(
+            state_distribution.transpose(1, 2)
+        ).transpose(1, 2)
+        organization = (
+            organization_sequence
+            * candidate_mask.unsqueeze(-1).to(organization_sequence.dtype)
+        ).sum(1) / valid_count.to(organization_sequence.dtype)
+        response = torch.cat((presence, organization), dim=-1)
+        return {
+            "presence": presence,
+            "presence_weights": presence_weights,
+            "state_distribution": state_distribution,
+            "organization": organization,
+            "shapelet_response": response,
+        }
 
     def contextualize_similarity(self, similarity):
         if self.shape_representation != "residual_response":
@@ -601,15 +720,42 @@ class DiscriminativeStructureBranch(nn.Module):
         else:
             window_groups, scales = self.window_extractor(exposed)
             centers = None
-        encoded = [
-            self.token_generator(windows, return_encoded_components=True)
-            for windows in window_groups
-        ]
-        tokens = torch.cat([value["shape_token"] for value in encoded], dim=1)
-        stats_tokens = torch.cat([
-            torch.cat((value["mean_encoded"], value["std_encoded"]), dim=-1)
-            for value in encoded
-        ], dim=1)
+        if self.shape_representation == "state_org":
+            tokens = torch.cat([
+                self.token_generator(windows) for windows in window_groups
+            ], dim=1)
+            stats_tokens = None
+        else:
+            encoded = [
+                self.token_generator(windows, return_encoded_components=True)
+                for windows in window_groups
+            ]
+            tokens = torch.cat([value["shape_token"] for value in encoded], dim=1)
+            stats_tokens = torch.cat([
+                torch.cat((value["mean_encoded"], value["std_encoded"]), dim=-1)
+                for value in encoded
+            ], dim=1)
+        if self.shape_representation == "state_org":
+            similarity = self.shapelet_dictionary.compute_similarity(tokens)
+            candidate_mask = torch.ones(
+                similarity.shape[:2], dtype=torch.bool, device=similarity.device,
+            )
+            state = self.compose_state_org_response(
+                similarity, candidate_mask,
+            )
+            return {
+                "shape_tokens": tokens,
+                "shapelet_similarity": similarity,
+                "shapelet_strength": state["presence"],
+                "shapelet_presence": state["presence"],
+                "state_distribution": state["state_distribution"],
+                "shape_organization": state["organization"],
+                "shapelet_response": state["shapelet_response"],
+                "shape_class_token": None,
+                "shape_scales": scales,
+                "exposed_curve": exposed,
+                "exposed_grid": grid,
+            }
         details = self.shapelet_dictionary.compute_response(tokens, return_details=True)
         response_details = (
             self._residual_response_details(details)

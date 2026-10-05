@@ -34,10 +34,10 @@ class PseStructureProtoLTae(nn.Module):
         super().__init__()
         if (
             shape_injection == "direct_response_query"
-            and shape_representation != "current"
+            and shape_representation not in ("current", "state_org")
         ):
             raise ValueError(
-                "direct_response_query injection requires current representation"
+                "direct_response_query injection requires current or state_org representation"
             )
         if shape_representation == "current" and shape_injection not in (
             "current_query", "direct_response_query", "local_query", "local_query_only",
@@ -58,9 +58,11 @@ class PseStructureProtoLTae(nn.Module):
             raise ValueError("residual_response representation requires current_query injection")
         if shape_representation == "phase_moment" and shape_injection != "current_query":
             raise ValueError("phase_moment representation requires current_query injection")
+        if shape_representation == "state_org" and shape_injection != "direct_response_query":
+            raise ValueError("state_org representation requires direct_response_query injection")
         if shape_representation not in (
             "current", "sorted_profile", "set_response", "residual_response",
-            "phase_moment",
+            "phase_moment", "state_org",
         ):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
@@ -94,6 +96,8 @@ class PseStructureProtoLTae(nn.Module):
             evidence_dim = 6 * int(shapelet_count)
         elif shape_representation == "set_response":
             evidence_dim = 32
+        elif shape_representation == "state_org":
+            evidence_dim = int(shapelet_count) + 32
         else:
             evidence_dim = sorted_profile_dim
         external_query_dim = (
@@ -110,6 +114,8 @@ class PseStructureProtoLTae(nn.Module):
             external_query_dim=external_query_dim,
         )
         self.decoder = get_decoder(mlp4, num_classes)
+        if shape_representation == "state_org":
+            self.shape_response_norm = nn.LayerNorm(evidence_dim)
         self.shape_classifier = nn.Linear(evidence_dim, num_classes)
         if shape_injection == "late_fusion":
             self.late_fusion_projection = nn.Linear(
@@ -177,8 +183,13 @@ class PseStructureProtoLTae(nn.Module):
     def _shape_evidence(self, structure):
         if self.shape_representation in (
             "current", "set_response", "residual_response", "phase_moment",
+            "state_org",
         ):
-            return structure["shapelet_response"]
+            evidence = structure["shapelet_response"]
+            return (
+                self.shape_response_norm(evidence)
+                if self.shape_representation == "state_org" else evidence
+            )
         return structure["sorted_anchor_profile"]
 
     @staticmethod
