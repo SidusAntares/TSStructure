@@ -93,3 +93,21 @@ def test_phase_final_summary_has_four_tasks_and_required_columns():
         "P_old_bestval_test_macro_f1", "E_old_bestval_test_macro_f1",
     )
 
+
+def test_v2clean_e_rerun_preflights_phase_and_keeps_master_summary_only():
+    launcher = Path(
+        "scripts/run_v2clean_e_final_4tasks_4gpu_seed1.sh"
+    ).read_text(encoding="utf-8")
+    assert "PREFLIGHT_FAILED|missing_cli=" in launcher
+    assert 'train.py --help' in launcher
+    assert 'train.py timematch --help' in launcher
+    assert "--shape-representation" in launcher
+    assert "--shape-equivariance-weight" in launcher
+    assert "RUN_ROUND=SOURCE" in launcher
+    assert "RUN_ROUND=E" in launcher
+    assert "RUN_ROUND=SOURCE_E" not in launcher
+    assert launcher.count("> /dev/null 2>&1") == 3
+    assert "ROUND_FAILED|round=V2CLEAN|logs=$V2_LOG" in launcher
+    assert "ROUND_FAILED|round=E_SOURCE|logs=$E_LOG" in launcher
+    assert "ROUND_FAILED|round=E_UDA|logs=$E_LOG" in launcher
+
