@@ -166,9 +166,9 @@ def _datasets(config, source, target, data_root, seed):
 
 
 def _loader(dataset, batch_size):
-    return torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=False, num_workers=0,
-    )
+    from analysis.structure_representation_chain_audit import deterministic_loader
+
+    return deterministic_loader(dataset, batch_size, num_workers=0)
 
 
 def _move(batch, device):

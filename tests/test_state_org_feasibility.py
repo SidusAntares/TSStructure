@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from analysis.state_org_feasibility_audit import (
+    _loader,
     organization_counterfactuals,
     query_counterfactuals,
     rule_labels,
@@ -31,6 +32,34 @@ def _batch(batch=3):
     mask = torch.ones(batch, 10, 4)
     positions = torch.arange(10).repeat(batch, 1) * 30
     return pixels, mask, positions, torch.zeros(batch, 4)
+
+
+class _VariablePixelDataset(torch.utils.data.Dataset):
+    def __init__(self):
+        self.pixel_counts = (3, 5)
+
+    def __len__(self):
+        return len(self.pixel_counts)
+
+    def __getitem__(self, index):
+        pixels = self.pixel_counts[index]
+        return {
+            "pixels": torch.ones(4, 2, pixels),
+            "valid_pixels": torch.ones(4, pixels),
+            "positions": torch.arange(4),
+            "extra": torch.zeros(4),
+            "label": torch.tensor(index),
+        }
+
+    def get_shapes(self):
+        return [(4, 2, pixels) for pixels in self.pixel_counts]
+
+
+def test_audit_loader_pads_variable_pixel_parcels():
+    batch = next(iter(_loader(_VariablePixelDataset(), batch_size=2)))
+    assert batch["pixels"].shape == (2, 4, 2, 5)
+    assert batch["valid_pixels"].shape == (2, 4, 5)
+    assert torch.count_nonzero(batch["valid_pixels"][0, :, 3:]) == 0
 
 
 def test_query_counterfactual_is_linear_after_one_shared_layer_norm():
