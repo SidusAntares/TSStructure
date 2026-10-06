@@ -821,7 +821,11 @@ def shape_health_snapshot(model, outputs):
     effective_rank = torch.exp(
         -(probabilities * probabilities.clamp_min(1e-12).log()).sum()
     )
-    branch = model.structure_branch
+    reference = getattr(model, "_frozen_state_org_reference", None)
+    branch = (
+        reference.structure_branch if reference is not None
+        else model.structure_branch
+    )
     query_projection = _structure_usage_projection(model)
     values = {
         "shape_response_std_mean": float(response_std.mean()),

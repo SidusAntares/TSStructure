@@ -19,20 +19,27 @@ from models.structure_da.discriminative_structure import DiscriminativeStructure
 class FrozenStateOrgReference(nn.Module):
     """Source checkpoint measurement basis kept outside the UDA optimizer."""
 
-    def __init__(self, spatial_encoder, structure_branch, response_norm):
+    def __init__(
+        self, spatial_encoder, structure_branch, response_norm,
+        trainable_anchors=False,
+    ):
         super().__init__()
         self.spatial_encoder = deepcopy(spatial_encoder)
         self.structure_branch = deepcopy(structure_branch)
         self.shape_response_norm = deepcopy(response_norm)
         self.requires_grad_(False)
+        self.structure_branch.shapelet_dictionary.anchors.requires_grad_(
+            bool(trainable_anchors)
+        )
         self.eval()
 
     @classmethod
-    def from_source_model(cls, model):
+    def from_source_model(cls, model, trainable_anchors=False):
         if getattr(model, "shape_representation", None) != "state_org":
             raise ValueError("frozen source basis requires state_org")
         return cls(
             model.spatial_encoder, model.structure_branch, model.shape_response_norm,
+            trainable_anchors=trainable_anchors,
         )
 
     def train(self, mode=True):
@@ -45,6 +52,13 @@ class FrozenStateOrgReference(nn.Module):
             spatial, positions, include_legacy_query=False,
         )
         return self.shape_response_norm(structure["shapelet_response"])
+
+    def forward_with_details(self, pixels, mask, positions, extra):
+        spatial = self.spatial_encoder(pixels, mask, extra)
+        structure = self.structure_branch(
+            spatial, positions, include_legacy_query=False,
+        )
+        return self.shape_response_norm(structure["shapelet_response"]), structure
 
 
 class PseStructureProtoLTae(nn.Module):
@@ -60,7 +74,7 @@ class PseStructureProtoLTae(nn.Module):
         shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
         fourier_num_modes=13, fourier_reg=1e-3, fourier_period_days=365.,
         shape_representation="current", shape_injection="current_query",
-        structure_shift_mode="none",
+        structure_shift_mode="none", state_org_readout="full",
     ):
         super().__init__()
         if (
@@ -116,6 +130,7 @@ class PseStructureProtoLTae(nn.Module):
             shapelet_count=shapelet_count, shapelet_beta=shapelet_beta,
             shape_resample_length=shape_resample_length,
             shape_representation=shape_representation,
+            state_org_readout=state_org_readout,
         )
         candidates_per_scale = (64 + int(shape_window_stride) - 1) // int(shape_window_stride)
         sorted_profile_dim = (
@@ -171,6 +186,7 @@ class PseStructureProtoLTae(nn.Module):
         self.shape_dim = shape_dim
         self.shape_evidence_dim = evidence_dim
         self.instance_dim = mlp3[-1]
+        self.state_org_readout = state_org_readout
 
     def configure_state_org_query(self, query_view="full", query_scale=1., reference=None):
         if self.shape_representation != "state_org":
@@ -453,6 +469,7 @@ class PseStructureProtoLTae(nn.Module):
         self, pixels, mask, positions, extra, temporal_shift=0,
         return_feats=False, return_dict=False, collect_diagnostics=False,
         detach_structure_query=False, query_view=None, query_scale=None,
+        structure_anchor_grad=False,
     ):
         del collect_diagnostics
         if detach_structure_query and self.shape_representation != "state_org":
@@ -464,14 +481,25 @@ class PseStructureProtoLTae(nn.Module):
         )
         reference = getattr(self, "_frozen_state_org_reference", None)
         if reference is not None:
-            with torch.no_grad():
-                evidence = reference(pixels, mask, positions, extra)
+            if structure_anchor_grad:
+                evidence, reference_structure = reference.forward_with_details(
+                    pixels, mask, positions, extra,
+                )
+            else:
+                with torch.no_grad():
+                    evidence, reference_structure = reference.forward_with_details(
+                        pixels, mask, positions, extra,
+                    )
             output = self.forward_with_external_shape_evidence(
                 pixels, mask, positions, extra, evidence,
                 temporal_shift=temporal_shift, query_view=query_view,
                 query_scale=query_scale,
                 detach_projected_query_correction=detach_structure_query,
             )
+            output.update({
+                key: value for key, value in reference_structure.items()
+                if key not in output
+            })
             if return_dict:
                 return output
             if return_feats:

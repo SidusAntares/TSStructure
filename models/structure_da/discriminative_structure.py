@@ -492,7 +492,7 @@ class DiscriminativeStructureBranch(nn.Module):
         self, channels, shape_dim=128, num_modes=13, grid_points=64,
         period_days=365.0, reg=1e-3, window_scales=(24,), window_stride=8,
         shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
-        shape_representation="current",
+        shape_representation="current", state_org_readout="full",
     ):
         super().__init__()
         if shape_representation not in (
@@ -501,6 +501,11 @@ class DiscriminativeStructureBranch(nn.Module):
         ):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
+        if state_org_readout not in ("full", "composition", "presence"):
+            raise ValueError("state_org_readout must be full, composition, or presence")
+        if shape_representation != "state_org" and state_org_readout != "full":
+            raise ValueError("non-full state_org_readout requires state_org representation")
+        self.state_org_readout = state_org_readout
         self.exposer = FourierStructureExposer(num_modes, grid_points, period_days, reg)
         self.window_extractor = MultiScaleWindowExtractor(
             window_scales, window_stride, grid_points=grid_points,
@@ -516,7 +521,7 @@ class DiscriminativeStructureBranch(nn.Module):
             )
         )
         self.shapelet_dictionary = ShapeletDictionary(shape_dim, shapelet_count, shapelet_beta)
-        if shape_representation == "state_org":
+        if shape_representation == "state_org" and state_org_readout == "full":
             self.organization_encoder = nn.Sequential(
                 nn.Conv1d(
                     shapelet_count, 32, kernel_size=3, padding=1,
@@ -529,6 +534,14 @@ class DiscriminativeStructureBranch(nn.Module):
                 ),
                 nn.GELU(),
             )
+            response_dim = shapelet_count + 32
+        elif shape_representation == "state_org" and state_org_readout == "composition":
+            self.composition_encoder = nn.Sequential(
+                nn.Linear(shapelet_count, 96), nn.GELU(),
+                nn.Linear(96, 32), nn.GELU(),
+            )
+            response_dim = shapelet_count + 32
+        elif shape_representation == "state_org":
             response_dim = shapelet_count + 32
         elif shape_representation == "set_response":
             self.window_set_encoder = nn.Sequential(
@@ -620,13 +633,22 @@ class DiscriminativeStructureBranch(nn.Module):
         state_distribution = torch.softmax(
             self.shapelet_dictionary.beta * similarity, dim=-1,
         )
-        organization_sequence = self.organization_encoder(
-            state_distribution.transpose(1, 2)
-        ).transpose(1, 2)
-        organization = (
-            organization_sequence
-            * candidate_mask.unsqueeze(-1).to(organization_sequence.dtype)
-        ).sum(1) / valid_count.to(organization_sequence.dtype)
+        if self.state_org_readout == "full":
+            organization_sequence = self.organization_encoder(
+                state_distribution.transpose(1, 2)
+            ).transpose(1, 2)
+            organization = (
+                organization_sequence
+                * candidate_mask.unsqueeze(-1).to(organization_sequence.dtype)
+            ).sum(1) / valid_count.to(organization_sequence.dtype)
+        elif self.state_org_readout == "composition":
+            composition_sequence = self.composition_encoder(state_distribution)
+            organization = (
+                composition_sequence
+                * candidate_mask.unsqueeze(-1).to(composition_sequence.dtype)
+            ).sum(1) / valid_count.to(composition_sequence.dtype)
+        else:
+            organization = similarity.new_zeros(similarity.shape[0], 32)
         response = torch.cat((presence, organization), dim=-1)
         return {
             "presence": presence,

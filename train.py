@@ -105,6 +105,10 @@ def add_model_arguments(parser):
         '--structure-shift-mode', dest='structure_shift_mode', default='none',
         choices=['none', 'timematch'],
     )
+    parser.add_argument(
+        '--state-org-readout', dest='state_org_readout', default='full',
+        choices=['full', 'composition', 'presence'],
+    )
     parser.add_argument('--shape-target-weight', dest='shape_target_weight', default=.05, type=float)
     parser.add_argument('--shape-align-weight', dest='shape_align_weight', default=.05, type=float)
     parser.add_argument('--stats-align-weight', dest='stats_align_weight', default=.02, type=float)
@@ -159,6 +163,7 @@ def create_model(config):
             shape_representation=config.shape_representation,
             shape_injection=config.shape_injection,
             structure_shift_mode=config.structure_shift_mode,
+            state_org_readout=getattr(config, 'state_org_readout', 'full'),
         )
         return model
     raise NotImplementedError(config.model)
@@ -209,8 +214,9 @@ def structure_usage_manifest(config):
             'equivariance_uses_pseudo_labels': False,
         })
     elif config.shape_representation == 'state_org':
+        readout = getattr(config, 'state_org_readout', 'full')
         manifest.update({
-            'shapelet_response': 'presence+relative_organization',
+            'shapelet_response': f'presence+{readout}',
             'shape_response_dim': evidence_dim,
             'organization_dim': 32,
             'state_token': 'standardized_state+physical_time_derivative',
@@ -221,6 +227,11 @@ def structure_usage_manifest(config):
             'structure_basis_mode': getattr(config, 'structure_basis_mode', 'adaptive'),
             'state_org_query_view': getattr(config, 'state_org_query_view', 'full'),
             'shape_query_scale': float(getattr(config, 'shape_query_scale', 1.)),
+            'state_org_readout': readout,
+            'freeze_state_org_query': bool(
+                getattr(config, 'freeze_state_org_query', False)
+            ),
+            'uda_anchor_update': getattr(config, 'uda_anchor_update', 'none'),
         })
     if config.shape_injection == 'direct_response_query':
         manifest.update({
@@ -836,8 +847,10 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
         proto_compact_sum = 0.
         proto_valid_sum = 0
         cls_source_sum = diversity_sum = total_source_sum = 0.
-        compact_ramp = prototype_ramp(
-            epoch, config.proto_ramp_epochs, config.proto_ramp_start,
+        compact_ramp = (
+            prototype_ramp(
+                epoch, config.proto_ramp_epochs, config.proto_ramp_start,
+            ) if compact_bank is not None else 0.
         )
 
         progress_bar = tqdm(
@@ -1258,6 +1271,15 @@ if __name__ == '__main__':
         '--state-org-query-view', default='full', choices=['full', 'presence'],
     )
     timematch.add_argument('--shape-query-scale', default=1., type=float)
+    timematch.add_argument(
+        '--freeze-state-org-query', default=False, type=bool_flag,
+        help='freeze the LTAE master query and external state-org query projection',
+    )
+    timematch.add_argument(
+        '--uda-anchor-update', default='none',
+        choices=['none', 'fixed', 'source', 'target', 'shared'],
+        help='audit-only source-reference anchor gradient routing',
+    )
 
     cfg = parser.parse_args()
 

@@ -1,6 +1,7 @@
 from collections import Counter
 from copy import deepcopy
 from collections import defaultdict
+import csv
 import os
 import random
 
@@ -8,6 +9,7 @@ import numpy as np
 import sklearn.metrics
 import torch
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 from torch.utils import data
 from torch.utils.data.sampler import WeightedRandomSampler
 from torchvision import transforms
@@ -68,6 +70,53 @@ def save_timematch_checkpoint(
         torch.save(checkpoint, model_path)
 
 
+def anchor_gradient_enabled(mode, domain):
+    if mode not in ("fixed", "source", "target", "shared"):
+        raise ValueError("anchor update mode must be fixed, source, target, or shared")
+    if domain not in ("source", "target"):
+        raise ValueError("anchor gradient domain must be source or target")
+    return mode == "shared" or mode == domain
+
+
+@torch.no_grad()
+def update_reference_anchor_ema(student_reference, teacher_reference, decay):
+    student_anchor = student_reference.structure_branch.shapelet_dictionary.anchors
+    teacher_anchor = teacher_reference.structure_branch.shapelet_dictionary.anchors
+    teacher_anchor.mul_(float(decay)).add_(student_anchor, alpha=1. - float(decay))
+
+
+@torch.no_grad()
+def anchor_identity_diagnostics(initial, current):
+    initial = F.normalize(initial.detach().float(), dim=-1)
+    current = F.normalize(current.detach().float(), dim=-1)
+    cosine = current @ initial.T
+    rows, columns = linear_sum_assignment(-cosine.cpu().numpy())
+    rows = torch.as_tensor(rows, device=cosine.device)
+    columns = torch.as_tensor(columns, device=cosine.device)
+    matched = cosine[rows, columns]
+    pairwise = current @ current.T
+    mask = ~torch.eye(current.shape[0], dtype=torch.bool, device=current.device)
+    off_diagonal = pairwise[mask]
+    return {
+        "diag_cos": float(cosine.diag().mean()),
+        "matched_cos_mean": float(matched.mean()),
+        "matched_cos_min": float(matched.min()),
+        "identity_match_fraction": float((rows == columns).float().mean()),
+        "anchor_pairwise_cos_mean": float(off_diagonal.mean()),
+        "anchor_pairwise_cos_max": float(off_diagonal.max()),
+    }
+
+
+def append_anchor_dynamics(path, row):
+    path = os.fspath(path)
+    exists = os.path.isfile(path)
+    with open(path, "a", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(row))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def forward_target_phase_equivariance(
     student, pixels, mask, positions, extra, max_shift,
 ):
@@ -115,19 +164,34 @@ def configure_structure_specific_training(model, freeze=False):
     modules = {
         "structure_branch.token_generator": model.structure_branch.token_generator,
         "structure_branch.shapelet_dictionary": model.structure_branch.shapelet_dictionary,
-        "structure_branch.organization_encoder": model.structure_branch.organization_encoder,
         "shape_response_norm": model.shape_response_norm,
         "temporal_encoder.attention_heads.external_query_projection": (
             model.temporal_encoder.attention_heads.external_query_projection
         ),
         "shape_classifier": model.shape_classifier,
     }
+    for name in ("organization_encoder", "composition_encoder"):
+        if hasattr(model.structure_branch, name):
+            modules[f"structure_branch.{name}"] = getattr(model.structure_branch, name)
     frozen = []
     for prefix, module in modules.items():
         for name, parameter in module.named_parameters():
             parameter.requires_grad_(False)
             frozen.append((f"{prefix}.{name}", parameter))
     return frozen
+
+
+def configure_state_org_query_training(model, freeze=False):
+    if not freeze:
+        return []
+    if getattr(model, "shape_representation", None) != "state_org":
+        raise ValueError("state-org query freezing requires state_org")
+    parameters = [model.temporal_encoder.attention_heads.query]
+    projection = model.temporal_encoder.attention_heads.external_query_projection
+    parameters.extend(projection.parameters())
+    for parameter in parameters:
+        parameter.requires_grad_(False)
+    return parameters
 
 
 def validate_boundary_support_config(config):
@@ -1393,8 +1457,14 @@ def _train_structure_proto_timematch(
     structure_basis_mode = getattr(config, "structure_basis_mode", "adaptive")
     query_view = getattr(config, "state_org_query_view", "full")
     query_scale = float(getattr(config, "shape_query_scale", 1.))
+    freeze_state_org_query = bool(getattr(config, "freeze_state_org_query", False))
+    anchor_update_mode = getattr(config, "uda_anchor_update", "none")
     if structure_basis_mode not in ("adaptive", "frozen_source"):
         raise ValueError("structure basis mode must be adaptive or frozen_source")
+    if anchor_update_mode not in ("none", "fixed", "source", "target", "shared"):
+        raise ValueError("invalid UDA anchor update mode")
+    if anchor_update_mode != "none" and structure_basis_mode != "frozen_source":
+        raise ValueError("anchor update audit requires frozen_source structural basis")
     if query_view not in ("full", "presence"):
         raise ValueError("state-org query view must be full or presence")
     if (
@@ -1403,7 +1473,9 @@ def _train_structure_proto_timematch(
     ) and getattr(config, "shape_representation", None) != "state_org":
         raise ValueError("hierarchical structure controls require state_org")
     frozen_reference = (
-        FrozenStateOrgReference.from_source_model(student).to(device)
+        FrozenStateOrgReference.from_source_model(
+            student, trainable_anchors=anchor_update_mode not in ("none", "fixed"),
+        ).to(device)
         if structure_basis_mode == "frozen_source" else None
     )
     frozen_structure = configure_structure_specific_training(
@@ -1415,6 +1487,14 @@ def _train_structure_proto_timematch(
             "pse_trainable=true|representation_frozen=false|"
             f"parameter_tensors={len(frozen_structure)}"
         )
+    frozen_query = configure_state_org_query_training(
+        student, freeze=freeze_state_org_query,
+    )
+    if freeze_state_org_query:
+        print(
+            "STATE_ORG_QUERY_FREEZE|master_query=true|"
+            f"external_projection=true|parameter_tensors={len(frozen_query)}"
+        )
     print(
         "STATE_ORG_CAUSAL_CONFIG|"
         f"uda_shape_class_weight={uda_shape_class_weight:.6f}|"
@@ -1422,13 +1502,20 @@ def _train_structure_proto_timematch(
         f"freeze_structure_specific={str(freeze_structure_specific).lower()}"
     )
     teacher = deepcopy(student).to(device)
+    teacher_reference = (
+        deepcopy(frozen_reference).to(device) if frozen_reference is not None else None
+    )
+    if teacher_reference is not None:
+        teacher_reference.requires_grad_(False)
     student.configure_state_org_query(query_view, query_scale, frozen_reference)
-    teacher.configure_state_org_query(query_view, query_scale, frozen_reference)
+    teacher.configure_state_org_query(query_view, query_scale, teacher_reference)
     teacher.eval()
     print(
         "STRUCTURE_BASIS|"
         f"mode={structure_basis_mode}|reference_checkpoint={checkpoint_path}|"
-        f"query_view={query_view}|query_scale={query_scale:.6f}"
+        f"query_view={query_view}|query_scale={query_scale:.6f}|"
+        f"freeze_query={str(freeze_state_org_query).lower()}|"
+        f"anchor_update={anchor_update_mode}"
     )
     boundary_classifier_1 = boundary_classifier_2 = None
     boundary_optimizer = boundary_scheduler = None
@@ -1450,8 +1537,16 @@ def _train_structure_proto_timematch(
         FocalLoss(gamma=config.focal_loss_gamma)
         if config.use_focal_loss else torch.nn.CrossEntropyLoss()
     )
+    optimizer_parameters = [
+        parameter for parameter in student.parameters() if parameter.requires_grad
+    ]
+    if frozen_reference is not None:
+        optimizer_parameters.extend(
+            parameter for parameter in frozen_reference.parameters()
+            if parameter.requires_grad
+        )
     optimizer = torch.optim.Adam(
-        (parameter for parameter in student.parameters() if parameter.requires_grad),
+        optimizer_parameters,
         lr=config.lr, weight_decay=config.weight_decay,
     )
     total_steps = config.epochs * config.steps_per_epoch
@@ -1483,6 +1578,10 @@ def _train_structure_proto_timematch(
         min_ratio=getattr(config, "pseudo_min_ratio", .2),
         max_ratio=getattr(config, "pseudo_max_ratio", .8),
         min_class_count=getattr(config, "pseudo_min_class_count", 4),
+    )
+    initial_reference_anchors = (
+        frozen_reference.structure_branch.shapelet_dictionary.anchors.detach().clone()
+        if anchor_update_mode != "none" else None
     )
     for epoch in range(config.epochs):
         target_ramp = prototype_ramp(
@@ -1600,6 +1699,10 @@ def _train_structure_proto_timematch(
             source_output = student.forward_with_temporal_shift(
                 ps, ms, ts, es, temporal_shift=source_to_target_shift,
                 return_dict=True,
+                structure_anchor_grad=(
+                    anchor_update_mode != "none"
+                    and anchor_gradient_enabled(anchor_update_mode, "source")
+                ),
             )
             pt, mt, tt, et = to_cuda(target_strong, device)
             if shape_equivariance_weight > 0:
@@ -1613,6 +1716,10 @@ def _train_structure_proto_timematch(
                 target_output = student.forward_with_temporal_shift(
                     pt, mt, tt, et, return_dict=True,
                     detach_structure_query=detach_target_structure,
+                    structure_anchor_grad=(
+                        anchor_update_mode != "none"
+                        and anchor_gradient_enabled(anchor_update_mode, "target")
+                    ),
                 )
                 zero_equivariance = target_output["shapelet_response"].sum() * 0.
                 equivariance = {
@@ -1690,7 +1797,7 @@ def _train_structure_proto_timematch(
             if epoch_step == 0:
                 log_shape_health(writer, epoch, student, source_output)
             torch.nn.utils.clip_grad_norm_(
-                student.parameters(), max_norm=5., error_if_nonfinite=True,
+                optimizer_parameters, max_norm=5., error_if_nonfinite=True,
             )
             optimizer.step()
             if shape_da_mode == "source_prototype":
@@ -1699,6 +1806,10 @@ def _train_structure_proto_timematch(
                 )
             scheduler.step()
             update_ema_variables(student, teacher, config.ema_decay)
+            if anchor_update_mode not in ("none", "fixed"):
+                update_reference_anchor_ema(
+                    frozen_reference, teacher_reference, config.ema_decay,
+                )
 
             source_count = int(source_labels.shape[0])
             target_count = int(pseudo.shape[0])
@@ -1726,6 +1837,14 @@ def _train_structure_proto_timematch(
                     "shape_concentration_mean": concentration.mean(),
                     "shape_concentration_std": concentration.std(unbiased=False),
                 })
+            if "shapelet_similarity" in source_output:
+                values["source_anchor_coverage"] = (
+                    source_output["shapelet_similarity"].detach().max(-1).values.mean()
+                )
+            if "shapelet_similarity" in target_output:
+                values["target_anchor_coverage"] = (
+                    target_output["shapelet_similarity"].detach().max(-1).values.mean()
+                )
             usage_diagnostics = student.structure_usage_diagnostics(source_output)
             values.update(usage_diagnostics)
             if shape_equivariance_weight > 0:
@@ -1806,6 +1925,22 @@ def _train_structure_proto_timematch(
             "accepted_pseudo_count": pseudo_accepted,
             "source_shape_accuracy": source_shape_correct / max(source_samples, 1),
         })
+        if anchor_update_mode != "none":
+            anchors = frozen_reference.structure_branch.shapelet_dictionary.anchors
+            dynamics = {
+                "epoch": epoch,
+                "mode": anchor_update_mode,
+                **anchor_identity_diagnostics(initial_reference_anchors, anchors),
+                "source_coverage": epoch_values.get("source_anchor_coverage", float("nan")),
+                "target_coverage": epoch_values.get("target_anchor_coverage", float("nan")),
+            }
+            append_anchor_dynamics(
+                os.path.join(config.fold_dir, "anchor_dynamics.csv"), dynamics,
+            )
+            epoch_values.update({
+                f"anchor_{name}": value for name, value in dynamics.items()
+                if name not in ("epoch", "mode")
+            })
         if shape_da_mode == "source_prototype":
             epoch_values.update({
                 "prototype_align_ramp": target_ramp,
@@ -1868,6 +2003,11 @@ def _train_structure_proto_timematch(
             "config": vars(config),
             "best_f1": best_f1,
         }
+        if frozen_reference is not None:
+            checkpoint["state_org_reference_state_dict"] = frozen_reference.state_dict()
+            checkpoint["teacher_state_org_reference_state_dict"] = (
+                teacher_reference.state_dict()
+            )
         if shape_prototype_bank is not None:
             checkpoint["shape_prototype_bank"] = shape_prototype_bank.state_dict()
         if shape_da_mode == "boundary_support":
