@@ -210,13 +210,17 @@ def _per_class(labels, prediction, class_count):
     )
 
 
-def _probe(train_x, train_y, test_x, test_y, class_count, seed):
-    estimator = Pipeline([
+def _probe_estimator(seed):
+    return Pipeline([
         ("scale", StandardScaler()),
         ("classifier", LogisticRegression(
-            class_weight="balanced", random_state=int(seed), max_iter=1000,
+            class_weight="balanced", random_state=int(seed), max_iter=5000,
         )),
     ])
+
+
+def _probe(train_x, train_y, test_x, test_y, class_count, seed):
+    estimator = _probe_estimator(seed)
     estimator.fit(train_x, train_y)
     prediction = estimator.predict(test_x)
     return _macro(test_y, prediction, class_count), _per_class(

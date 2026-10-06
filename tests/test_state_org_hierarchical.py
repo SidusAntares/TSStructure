@@ -64,6 +64,22 @@ def test_frozen_reference_is_immutable_while_student_main_path_trains():
     assert not torch.allclose(adaptive_before, adaptive_after)
 
 
+def test_frozen_external_output_health_snapshot_allows_missing_shape_tokens():
+    from methods.structure_da.prototype_losses import shape_health_snapshot
+    from models.stclassifier import FrozenStateOrgReference
+
+    model = _model().eval()
+    reference = FrozenStateOrgReference.from_source_model(model).eval()
+    batch = _batch()
+    output = model.forward_with_external_shape_evidence(
+        *batch, shape_evidence=reference(*batch),
+    )
+    assert "shape_tokens" not in output
+    snapshot = shape_health_snapshot(model, output)
+    assert "shape_response_effective_rank" in snapshot
+    assert "shape_token_std" not in snapshot
+
+
 def test_presence_mask_is_after_shared_norm_and_query_scale_is_post_projection():
     torch.manual_seed(703)
     model = _model().eval()
@@ -127,6 +143,14 @@ def test_peak_final_drop_uses_same_scale_validation_history():
     assert result["best_val"] == .76
     assert result["final_val"] == .73
     assert result["peak_final_drop"] == pytest.approx(.03)
+
+
+def test_organization_probe_uses_scaled_high_iteration_estimator():
+    from analysis.state_org_feasibility_audit import _probe_estimator
+
+    estimator = _probe_estimator(17)
+    assert estimator.named_steps["scale"].__class__.__name__ == "StandardScaler"
+    assert estimator.named_steps["classifier"].max_iter >= 5000
 
 
 def test_hierarchical_launcher_contract():

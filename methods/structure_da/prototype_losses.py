@@ -815,7 +815,6 @@ def _structure_usage_projection(model):
 @torch.no_grad()
 def shape_health_snapshot(model, outputs):
     response = outputs["shapelet_response"].detach().float()
-    tokens = outputs["shape_tokens"].detach().float()
     response_std = response.std(dim=0, unbiased=False)
     singular_values = torch.linalg.svdvals(response)
     probabilities = singular_values / singular_values.sum().clamp_min(1e-12)
@@ -828,11 +827,15 @@ def shape_health_snapshot(model, outputs):
         "shape_response_std_mean": float(response_std.mean()),
         "shape_response_std_min": float(response_std.min()),
         "shape_response_effective_rank": float(effective_rank),
-        "shape_token_std": float(tokens.std(unbiased=False)),
-        "shape_token_norm": float(tokens.norm(dim=-1).mean()),
         "shape_anchor_param_norm": float(branch.shapelet_dictionary.anchors.detach().float().norm()),
         "shape_query_projection_norm": _parameter_l2_norm(query_projection),
     }
+    if "shape_tokens" in outputs:
+        tokens = outputs["shape_tokens"].detach().float()
+        values.update({
+            "shape_token_std": float(tokens.std(unbiased=False)),
+            "shape_token_norm": float(tokens.norm(dim=-1).mean()),
+        })
     if hasattr(branch.token_generator, "raw_encoder"):
         values.update({
             "shape_raw_encoder_param_norm": _parameter_l2_norm(

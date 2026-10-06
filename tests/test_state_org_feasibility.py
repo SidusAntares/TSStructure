@@ -183,6 +183,6 @@ def test_frozen_audit_is_read_only_and_uses_fixed_logistic_probe():
     assert "optimizer" not in source.lower()
     assert 'class_weight="balanced"' in source
     assert "random_state=int(seed)" in source
-    assert "max_iter=1000" in source
+    assert "max_iter=5000" in source
     assert '"teacher_state_dict"' in source
     assert '"target_test_labels_used_for_training": False' in source
