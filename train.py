@@ -218,6 +218,9 @@ def structure_usage_manifest(config):
             'shape_concentration': False,
             'occurrence_phase': False,
             'explicit_shape_alignment': False,
+            'structure_basis_mode': getattr(config, 'structure_basis_mode', 'adaptive'),
+            'state_org_query_view': getattr(config, 'state_org_query_view', 'full'),
+            'shape_query_scale': float(getattr(config, 'shape_query_scale', 1.)),
         })
     if config.shape_injection == 'direct_response_query':
         manifest.update({
@@ -1247,6 +1250,14 @@ if __name__ == '__main__':
         default=False, type=bool_flag,
         help='freeze state_org-only modules while leaving shared PSE trainable',
     )
+    timematch.add_argument(
+        '--structure-basis-mode', default='adaptive',
+        choices=['adaptive', 'frozen_source'],
+    )
+    timematch.add_argument(
+        '--state-org-query-view', default='full', choices=['full', 'presence'],
+    )
+    timematch.add_argument('--shape-query-scale', default=1., type=float)
 
     cfg = parser.parse_args()
 

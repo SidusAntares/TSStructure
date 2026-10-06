@@ -88,7 +88,7 @@ class LTAE(nn.Module):
 
     def forward(
         self, x, positions, return_att=False, external_query=None,
-        detach_external_query_correction=False,
+        detach_external_query_correction=False, query_scale=1.,
     ):
         if self.inconv is not None:
             x = self.inconv(x)
@@ -97,6 +97,7 @@ class LTAE(nn.Module):
         enc_output, attn = self.attention_heads(
             enc_output, external_query=external_query,
             detach_external_query_correction=detach_external_query_correction,
+            query_scale=query_scale,
         )
 
         enc_output = self.dropout(self.mlp(enc_output))
@@ -170,6 +171,7 @@ class MultiHeadAttention(nn.Module):
 
     def forward(
         self, x, external_query=None, detach_external_query_correction=False,
+        query_scale=1.,
     ):
         # Slightly more efficient re-implementation of LTAE
         B, T, C = x.size()
@@ -178,6 +180,7 @@ class MultiHeadAttention(nn.Module):
             if self.external_query_projection is None:
                 raise ValueError("this LTAE was not configured for an external query")
             q_shape = self.external_query_projection(external_query)
+            q_shape = float(query_scale) * q_shape
             if detach_external_query_correction:
                 q_shape = q_shape.detach()
             q = q + q_shape.view(B, self.n_head, 1, self.d_k)

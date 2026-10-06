@@ -16,6 +16,37 @@ from models.tae import TemporalAttentionEncoder
 from models.structure_da.discriminative_structure import DiscriminativeStructureBranch
 
 
+class FrozenStateOrgReference(nn.Module):
+    """Source checkpoint measurement basis kept outside the UDA optimizer."""
+
+    def __init__(self, spatial_encoder, structure_branch, response_norm):
+        super().__init__()
+        self.spatial_encoder = deepcopy(spatial_encoder)
+        self.structure_branch = deepcopy(structure_branch)
+        self.shape_response_norm = deepcopy(response_norm)
+        self.requires_grad_(False)
+        self.eval()
+
+    @classmethod
+    def from_source_model(cls, model):
+        if getattr(model, "shape_representation", None) != "state_org":
+            raise ValueError("frozen source basis requires state_org")
+        return cls(
+            model.spatial_encoder, model.structure_branch, model.shape_response_norm,
+        )
+
+    def train(self, mode=True):
+        super().train(False)
+        return self
+
+    def forward(self, pixels, mask, positions, extra):
+        spatial = self.spatial_encoder(pixels, mask, extra)
+        structure = self.structure_branch(
+            spatial, positions, include_legacy_query=False,
+        )
+        return self.shape_response_norm(structure["shapelet_response"])
+
+
 class PseStructureProtoLTae(nn.Module):
     """PSE classifier with discriminative Fourier structure as the LTAE query."""
 
@@ -141,6 +172,16 @@ class PseStructureProtoLTae(nn.Module):
         self.shape_evidence_dim = evidence_dim
         self.instance_dim = mlp3[-1]
 
+    def configure_state_org_query(self, query_view="full", query_scale=1., reference=None):
+        if self.shape_representation != "state_org":
+            if query_view != "full" or float(query_scale) != 1. or reference is not None:
+                raise ValueError("state-org query controls require state_org")
+            return
+        self.select_state_org_query(torch.zeros(1, self.shape_evidence_dim), query_view)
+        object.__setattr__(self, "_state_org_query_view", query_view)
+        object.__setattr__(self, "_shape_query_scale", float(query_scale))
+        object.__setattr__(self, "_frozen_state_org_reference", reference)
+
     def get_temporal_encoders(self):
         return (self.temporal_encoder,)
 
@@ -210,7 +251,7 @@ class PseStructureProtoLTae(nn.Module):
 
     def _encode_instance(
         self, prepared, shifted_positions, structure, return_details=False,
-        detach_structure_query=False,
+        detach_structure_query=False, query_view="full", query_scale=1.,
     ):
         evidence = self._shape_evidence(structure)
         if self.shape_injection == "current_query":
@@ -220,9 +261,11 @@ class PseStructureProtoLTae(nn.Module):
             )
             return (instance, {}) if return_details else instance
         if self.shape_injection == "direct_response_query":
+            evidence = self.select_state_org_query(evidence, query_view)
             instance = self.temporal_encoder(
                 prepared, shifted_positions, external_query=evidence,
                 detach_external_query_correction=detach_structure_query,
+                query_scale=query_scale,
             )
             return (instance, {}) if return_details else instance
         normalized = self._parameter_free_layer_norm(evidence)
@@ -337,11 +380,13 @@ class PseStructureProtoLTae(nn.Module):
 
     def _output_from_prepared_structure(
         self, prepared, shifted_positions, structure, detach_structure_query=False,
+        query_view="full", query_scale=1.,
     ):
         evidence = self._shape_evidence(structure)
         instance, usage = self._encode_instance(
             prepared, shifted_positions, structure, return_details=True,
             detach_structure_query=detach_structure_query,
+            query_view=query_view, query_scale=query_scale,
         )
         return {
             "logits": self.decoder(instance),
@@ -350,6 +395,41 @@ class PseStructureProtoLTae(nn.Module):
             "instance_feature": instance,
             **usage,
             **structure,
+        }
+
+    def select_state_org_query(self, normalized_evidence, query_view="full"):
+        if query_view not in ("full", "presence"):
+            raise ValueError("state-org query view must be full or presence")
+        if query_view == "full":
+            return normalized_evidence
+        if self.shape_representation != "state_org":
+            raise ValueError("presence query view requires state_org")
+        count = self.structure_branch.shapelet_dictionary.anchors.shape[0]
+        return torch.cat((
+            normalized_evidence[:, :count],
+            torch.zeros_like(normalized_evidence[:, count:]),
+        ), dim=1)
+
+    def forward_with_external_shape_evidence(
+        self, pixels, mask, positions, extra, shape_evidence,
+        temporal_shift=0, query_view="full", query_scale=1.,
+        detach_projected_query_correction=False,
+    ):
+        if self.shape_representation != "state_org":
+            raise ValueError("external shape evidence requires state_org")
+        spatial = self.spatial_encoder(pixels, mask, extra)
+        query = self.select_state_org_query(shape_evidence, query_view)
+        instance = self.temporal_encoder(
+            spatial, positions + temporal_shift, external_query=query,
+            query_scale=query_scale,
+            detach_external_query_correction=detach_projected_query_correction,
+        )
+        return {
+            "logits": self.decoder(instance),
+            "shape_logits": self.shape_classifier(shape_evidence),
+            "shape_evidence": shape_evidence,
+            "shapelet_response": shape_evidence,
+            "instance_feature": instance,
         }
 
     def forward_phase_equivariance_target(
@@ -372,17 +452,38 @@ class PseStructureProtoLTae(nn.Module):
     def forward_with_temporal_shift(
         self, pixels, mask, positions, extra, temporal_shift=0,
         return_feats=False, return_dict=False, collect_diagnostics=False,
-        detach_structure_query=False,
+        detach_structure_query=False, query_view=None, query_scale=None,
     ):
         del collect_diagnostics
         if detach_structure_query and self.shape_representation != "state_org":
             raise ValueError("detach_structure_query is only valid for state_org")
+        query_view = query_view or getattr(self, "_state_org_query_view", "full")
+        query_scale = (
+            getattr(self, "_shape_query_scale", 1.)
+            if query_scale is None else float(query_scale)
+        )
+        reference = getattr(self, "_frozen_state_org_reference", None)
+        if reference is not None:
+            with torch.no_grad():
+                evidence = reference(pixels, mask, positions, extra)
+            output = self.forward_with_external_shape_evidence(
+                pixels, mask, positions, extra, evidence,
+                temporal_shift=temporal_shift, query_view=query_view,
+                query_scale=query_scale,
+                detach_projected_query_correction=detach_structure_query,
+            )
+            if return_dict:
+                return output
+            if return_feats:
+                return output["logits"], output["instance_feature"]
+            return output["logits"]
         spatial = self.spatial_encoder(pixels, mask, extra)
         shifted_positions = positions + temporal_shift
         structure = self.prepare_structure(spatial, positions, temporal_shift)
         output = self._output_from_prepared_structure(
             spatial, shifted_positions, structure,
             detach_structure_query=detach_structure_query,
+            query_view=query_view, query_scale=query_scale,
         )
         if return_dict:
             return output

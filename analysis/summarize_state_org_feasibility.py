@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from analysis.state_org_feasibility_audit import rule_labels
+from analysis.summarize_state_org_hierarchical import validation_history_stats
 
 
 TASKS = ("AT1_DK1", "FR2_DK1", "DK1_AT1")
@@ -59,8 +60,7 @@ def _training_row(root, log_root, baseline_root, task, variant):
     })
     text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
     validation = [_float(value) for value in re.findall(r"Validation result:.*?f1=([0-9.]+)", text)]
-    values["final_val"] = validation[-1] if validation else float("nan")
-    values["peak_final_drop"] = max(validation) - validation[-1] if validation else float("nan")
+    values.update(validation_history_stats(validation))
     tests = re.findall(r"Test result for .*?f1=([0-9.]+)", text)
     values["final_test"] = _float(tests[-1]) if tests else float("nan")
     epochs = re.findall(r"SHAPE_V2CLEAN_EPOCH\|[^\n]+", text)

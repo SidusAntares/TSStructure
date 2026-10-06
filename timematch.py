@@ -16,7 +16,7 @@ from tqdm import tqdm
 from dataset import PixelSetData
 from evaluation import validation
 from models.fourier_reconstruction import BatchedDirectFourierAnalyzer, BatchedDirectFourierSynthesizer
-from models.stclassifier import PseStructureProtoLTae
+from models.stclassifier import FrozenStateOrgReference, PseStructureProtoLTae
 from transforms import Normalize, RandomSamplePixels, RandomSampleTimeSteps, ToTensor, RandomTemporalShift, Identity
 from utils.focal_loss import FocalLoss
 from utils.train_utils import AverageMeter, bool_flag, cycle, progress_bar_disabled, to_cuda
@@ -1390,6 +1390,22 @@ def _train_structure_proto_timematch(
     )
     print(f"STRUCTURE_V2CLEAN_SOURCE_LOAD|checkpoint={checkpoint_path}|strict=true")
     student.to(device)
+    structure_basis_mode = getattr(config, "structure_basis_mode", "adaptive")
+    query_view = getattr(config, "state_org_query_view", "full")
+    query_scale = float(getattr(config, "shape_query_scale", 1.))
+    if structure_basis_mode not in ("adaptive", "frozen_source"):
+        raise ValueError("structure basis mode must be adaptive or frozen_source")
+    if query_view not in ("full", "presence"):
+        raise ValueError("state-org query view must be full or presence")
+    if (
+        structure_basis_mode != "adaptive" or query_view != "full"
+        or query_scale != 1.
+    ) and getattr(config, "shape_representation", None) != "state_org":
+        raise ValueError("hierarchical structure controls require state_org")
+    frozen_reference = (
+        FrozenStateOrgReference.from_source_model(student).to(device)
+        if structure_basis_mode == "frozen_source" else None
+    )
     frozen_structure = configure_structure_specific_training(
         student, freeze=freeze_structure_specific,
     )
@@ -1406,7 +1422,14 @@ def _train_structure_proto_timematch(
         f"freeze_structure_specific={str(freeze_structure_specific).lower()}"
     )
     teacher = deepcopy(student).to(device)
+    student.configure_state_org_query(query_view, query_scale, frozen_reference)
+    teacher.configure_state_org_query(query_view, query_scale, frozen_reference)
     teacher.eval()
+    print(
+        "STRUCTURE_BASIS|"
+        f"mode={structure_basis_mode}|reference_checkpoint={checkpoint_path}|"
+        f"query_view={query_view}|query_scale={query_scale:.6f}"
+    )
     boundary_classifier_1 = boundary_classifier_2 = None
     boundary_optimizer = boundary_scheduler = None
     if shape_da_mode == "boundary_support":
