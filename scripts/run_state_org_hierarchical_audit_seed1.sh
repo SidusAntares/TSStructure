@@ -38,7 +38,8 @@ train_variant() {
 }
 
 run_task() {
-  local gpu="$1" src="$2" src_data="$3" tgt="$4" tgt_data="$5" task="${src}_${tgt}"
+  local gpu="$1" src="$2" src_data="$3" tgt="$4" tgt_data="$5"
+  local task="${src}_${tgt}"
   local source_ckpt="$SOURCE_ROOT/source_${src}_seed1/fold_0/model.pt"
   local old_fold="$OLD_ROOT/uda/${task}_seed1/fold_0"
   test -f "$source_ckpt"; test -f "$old_fold/checkpoint_best.pt"; test -f "$old_fold/checkpoint_last.pt"

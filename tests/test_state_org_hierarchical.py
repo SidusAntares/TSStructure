@@ -140,3 +140,13 @@ def test_hierarchical_launcher_contract():
     assert "--uda-shape-class-weight 0" in text
     assert "analysis/state_org_anchor_basis_audit.py" in text
     assert "analysis/summarize_state_org_hierarchical.py" in text
+
+
+def test_hierarchical_launcher_derives_task_after_local_arguments_are_bound():
+    text = Path("scripts/run_state_org_hierarchical_audit_seed1.sh").read_text()
+    unsafe = (
+        'local gpu="$1" src="$2" src_data="$3" tgt="$4" '
+        'tgt_data="$5" task="${src}_${tgt}"'
+    )
+    assert unsafe not in text
+    assert 'local task="${src}_${tgt}"' in text
