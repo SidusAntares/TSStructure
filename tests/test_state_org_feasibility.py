@@ -97,6 +97,22 @@ def test_organization_roll_is_invariant_and_mean_repeat_preserves_presence():
     )
 
 
+def test_organization_counterfactual_accepts_formal_structure_output():
+    torch.manual_seed(609)
+    model = _model().eval()
+    pixels, mask, positions, extra = _batch(batch=2)
+    with torch.no_grad():
+        spatial = model.spatial_encoder(pixels, mask, extra)
+        structure = model.prepare_structure(spatial, positions, temporal_shift=0)
+        variants = organization_counterfactuals(model, structure)
+    torch.testing.assert_close(
+        variants["original"]["presence"], structure["shapelet_presence"],
+    )
+    torch.testing.assert_close(
+        variants["original"]["organization"], structure["shape_organization"],
+    )
+
+
 def test_detached_projected_target_query_blocks_only_structure_query_gradients():
     torch.manual_seed(613)
     model = _model().train()

@@ -57,7 +57,10 @@ def _encode_organization(branch, distribution):
 def organization_counterfactuals(model, state_details):
     """Re-evaluate organization while keeping the original presence fixed."""
     distribution = state_details["state_distribution"]
-    presence = state_details["presence"]
+    presence_key = (
+        "presence" if "presence" in state_details else "shapelet_presence"
+    )
+    presence = state_details[presence_key]
     variants = {
         "original": distribution,
         "roll_1": torch.roll(distribution, 1, 1),
