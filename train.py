@@ -1232,6 +1232,21 @@ if __name__ == '__main__':
     add_shift_estimation_arguments(timematch)
     timematch.add_argument('--run_validation', default=True, action='store_true', help='whether to run validation each epoch')
     timematch.add_argument("--output_student", type=bool_flag, default=True, help='output student or teacher')
+    timematch.add_argument(
+        '--uda-shape-class-weight', dest='uda_shape_class_weight',
+        default=None, type=float,
+        help='UDA-only source shape coefficient; default uses --shape-class-weight',
+    )
+    timematch.add_argument(
+        '--detach-target-structure', dest='detach_target_structure',
+        default=False, type=bool_flag,
+        help='detach the projected state_org target query correction',
+    )
+    timematch.add_argument(
+        '--freeze-structure-specific', dest='freeze_structure_specific',
+        default=False, type=bool_flag,
+        help='freeze state_org-only modules while leaving shared PSE trainable',
+    )
 
     cfg = parser.parse_args()
 

@@ -210,6 +210,7 @@ class PseStructureProtoLTae(nn.Module):
 
     def _encode_instance(
         self, prepared, shifted_positions, structure, return_details=False,
+        detach_structure_query=False,
     ):
         evidence = self._shape_evidence(structure)
         if self.shape_injection == "current_query":
@@ -221,6 +222,7 @@ class PseStructureProtoLTae(nn.Module):
         if self.shape_injection == "direct_response_query":
             instance = self.temporal_encoder(
                 prepared, shifted_positions, external_query=evidence,
+                detach_external_query_correction=detach_structure_query,
             )
             return (instance, {}) if return_details else instance
         normalized = self._parameter_free_layer_norm(evidence)
@@ -334,11 +336,12 @@ class PseStructureProtoLTae(nn.Module):
         return logits
 
     def _output_from_prepared_structure(
-        self, prepared, shifted_positions, structure,
+        self, prepared, shifted_positions, structure, detach_structure_query=False,
     ):
         evidence = self._shape_evidence(structure)
         instance, usage = self._encode_instance(
             prepared, shifted_positions, structure, return_details=True,
+            detach_structure_query=detach_structure_query,
         )
         return {
             "logits": self.decoder(instance),
@@ -369,13 +372,17 @@ class PseStructureProtoLTae(nn.Module):
     def forward_with_temporal_shift(
         self, pixels, mask, positions, extra, temporal_shift=0,
         return_feats=False, return_dict=False, collect_diagnostics=False,
+        detach_structure_query=False,
     ):
         del collect_diagnostics
+        if detach_structure_query and self.shape_representation != "state_org":
+            raise ValueError("detach_structure_query is only valid for state_org")
         spatial = self.spatial_encoder(pixels, mask, extra)
         shifted_positions = positions + temporal_shift
         structure = self.prepare_structure(spatial, positions, temporal_shift)
         output = self._output_from_prepared_structure(
             spatial, shifted_positions, structure,
+            detach_structure_query=detach_structure_query,
         )
         if return_dict:
             return output

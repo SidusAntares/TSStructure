@@ -106,6 +106,30 @@ def validate_phase_equivariance_config(config):
         raise ValueError("shape equivariance max shift must be positive")
 
 
+def configure_structure_specific_training(model, freeze=False):
+    """Freeze state-org-only modules, never the shared PSE representation."""
+    if not freeze:
+        return []
+    if getattr(model, "shape_representation", None) != "state_org":
+        raise ValueError("freeze_structure_specific is only valid for state_org")
+    modules = {
+        "structure_branch.token_generator": model.structure_branch.token_generator,
+        "structure_branch.shapelet_dictionary": model.structure_branch.shapelet_dictionary,
+        "structure_branch.organization_encoder": model.structure_branch.organization_encoder,
+        "shape_response_norm": model.shape_response_norm,
+        "temporal_encoder.attention_heads.external_query_projection": (
+            model.temporal_encoder.attention_heads.external_query_projection
+        ),
+        "shape_classifier": model.shape_classifier,
+    }
+    frozen = []
+    for prefix, module in modules.items():
+        for name, parameter in module.named_parameters():
+            parameter.requires_grad_(False)
+            frozen.append((f"{prefix}.{name}", parameter))
+    return frozen
+
+
 def validate_boundary_support_config(config):
     if getattr(config, "shape_da_mode", "batch_align") != "boundary_support":
         return
@@ -1337,6 +1361,23 @@ def _train_structure_proto_timematch(
     validate_local_support_config(config)
     validate_shape_alignment_label_source(config)
     validate_phase_equivariance_config(config)
+    detach_target_structure = bool(
+        getattr(config, "detach_target_structure", False)
+    )
+    freeze_structure_specific = bool(
+        getattr(config, "freeze_structure_specific", False)
+    )
+    if (detach_target_structure or freeze_structure_specific) and (
+        getattr(config, "shape_representation", None) != "state_org"
+    ):
+        raise ValueError(
+            "state-org feasibility gradient controls require shape_representation=state_org"
+        )
+    uda_shape_class_weight = getattr(config, "uda_shape_class_weight", None)
+    uda_shape_class_weight = (
+        float(config.shape_class_weight)
+        if uda_shape_class_weight is None else float(uda_shape_class_weight)
+    )
     shape_equivariance_weight = float(
         getattr(config, "shape_equivariance_weight", 0.)
     )
@@ -1349,6 +1390,21 @@ def _train_structure_proto_timematch(
     )
     print(f"STRUCTURE_V2CLEAN_SOURCE_LOAD|checkpoint={checkpoint_path}|strict=true")
     student.to(device)
+    frozen_structure = configure_structure_specific_training(
+        student, freeze=freeze_structure_specific,
+    )
+    if freeze_structure_specific:
+        print(
+            "STATE_ORG_FREEZE|scope=structure_specific_only|"
+            "pse_trainable=true|representation_frozen=false|"
+            f"parameter_tensors={len(frozen_structure)}"
+        )
+    print(
+        "STATE_ORG_CAUSAL_CONFIG|"
+        f"uda_shape_class_weight={uda_shape_class_weight:.6f}|"
+        f"detach_target_structure={str(detach_target_structure).lower()}|"
+        f"freeze_structure_specific={str(freeze_structure_specific).lower()}"
+    )
     teacher = deepcopy(student).to(device)
     teacher.eval()
     boundary_classifier_1 = boundary_classifier_2 = None
@@ -1372,7 +1428,8 @@ def _train_structure_proto_timematch(
         if config.use_focal_loss else torch.nn.CrossEntropyLoss()
     )
     optimizer = torch.optim.Adam(
-        student.parameters(), lr=config.lr, weight_decay=config.weight_decay,
+        (parameter for parameter in student.parameters() if parameter.requires_grad),
+        lr=config.lr, weight_decay=config.weight_decay,
     )
     total_steps = config.epochs * config.steps_per_epoch
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1530,7 +1587,10 @@ def _train_structure_proto_timematch(
                     )
                 )
             else:
-                target_output = student(pt, mt, tt, et, return_dict=True)
+                target_output = student.forward_with_temporal_shift(
+                    pt, mt, tt, et, return_dict=True,
+                    detach_structure_query=detach_target_structure,
+                )
                 zero_equivariance = target_output["shapelet_response"].sum() * 0.
                 equivariance = {
                     "total_loss": zero_equivariance,
@@ -1544,7 +1604,10 @@ def _train_structure_proto_timematch(
                 target_output["logits"], training_target_labels,
                 trusted_mask, criterion,
             )
-            loss_shape_source = criterion(source_output["shape_logits"], source_labels)
+            loss_shape_source = (
+                criterion(source_output["shape_logits"], source_labels)
+                if uda_shape_class_weight > 0 else source_output["shape_logits"].sum() * 0.
+            )
             loss_diversity = shapelet_diversity_loss(
                 student.structure_branch.shapelet_dictionary.anchors,
                 config.shapelet_diversity_margin,
@@ -1592,7 +1655,7 @@ def _train_structure_proto_timematch(
                 loss_cls_source, loss_pseudo_target, loss_shape_source,
                 loss_diversity, shape_alignment["total_loss"], target_ramp,
                 config.trade_off,
-                config.shape_class_weight, config.shapelet_diversity_weight,
+                uda_shape_class_weight, config.shapelet_diversity_weight,
                 config.shape_align_weight,
                 shape_equivariance=equivariance["total_loss"],
                 shape_equivariance_weight=shape_equivariance_weight,
