@@ -44,6 +44,7 @@ class _VariablePixelDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         pixels = self.pixel_counts[index]
         return {
+            "index": torch.tensor(index),
             "pixels": torch.ones(4, 2, pixels),
             "valid_pixels": torch.ones(4, pixels),
             "positions": torch.arange(4),
@@ -60,6 +61,7 @@ def test_audit_loader_pads_variable_pixel_parcels():
     assert batch["pixels"].shape == (2, 4, 2, 5)
     assert batch["valid_pixels"].shape == (2, 4, 5)
     assert torch.count_nonzero(batch["valid_pixels"][0, :, 3:]) == 0
+    torch.testing.assert_close(batch["index"], torch.tensor([0, 1]))
 
 
 def test_query_counterfactual_is_linear_after_one_shared_layer_norm():

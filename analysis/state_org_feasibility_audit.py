@@ -165,10 +165,28 @@ def _datasets(config, source, target, data_root, seed):
     return datasets
 
 
-def _loader(dataset, batch_size):
-    from analysis.structure_representation_chain_audit import deterministic_loader
+def _audit_collate(samples):
+    from analysis.structure_representation_chain_audit import _pad_pixel_collate
 
-    return deterministic_loader(dataset, batch_size, num_workers=0)
+    batch = _pad_pixel_collate(samples)
+    for key in ("index", "parcel_index"):
+        if key in samples[0]:
+            batch[key] = torch.as_tensor(
+                [int(sample[key]) for sample in samples], dtype=torch.long,
+            )
+    return batch
+
+
+def _loader(dataset, batch_size):
+    from analysis.structure_representation_chain_audit import pixel_budget_batches
+
+    batches = pixel_budget_batches(
+        [shape[2] for shape in dataset.get_shapes()], batch_size, 8192,
+    )
+    return torch.utils.data.DataLoader(
+        dataset, batch_sampler=batches, num_workers=0,
+        collate_fn=_audit_collate, pin_memory=torch.cuda.is_available(),
+    )
 
 
 def _move(batch, device):
