@@ -208,3 +208,11 @@ def test_foundation_launcher_contract_and_safe_local_binding():
     assert "--uda-shape-class-weight 0" in text
     assert 'local task="${src}_${tgt}"' in text
     assert 'tgt_data="$5" task="${src}_${tgt}"' not in text
+
+
+def test_foundation_launcher_can_resume_after_completed_source_training():
+    text = Path("scripts/run_state_org_foundation_audit_seed1.sh").read_text()
+    assert 'SKIP_SOURCE="${SKIP_SOURCE:-0}"' in text
+    assert 'if [[ "$SKIP_SOURCE" == "1" ]]' in text
+    assert 'FOUNDATION_SOURCE_REUSE' in text
+    assert 'test -f "$checkpoint"' in text

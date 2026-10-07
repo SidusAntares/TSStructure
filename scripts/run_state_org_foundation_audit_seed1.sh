@@ -3,6 +3,7 @@ set -euo pipefail
 
 GPU0="${GPU0:-0}"; GPU1="${GPU1:-1}"; GPU2="${GPU2:-2}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+SKIP_SOURCE="${SKIP_SOURCE:-0}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 OUT_ROOT="${OUT_ROOT:-outputs/state_org_foundation}"
 LOG_ROOT="${LOG_ROOT:-logs/state_org_foundation}"
@@ -69,9 +70,18 @@ train_uda() {
 run_task() {
   local gpu="$1" src="$2" src_data="$3" tgt="$4" tgt_data="$5"
   local task="${src}_${tgt}"
-  local readout mode
+  local readout mode checkpoint
   for readout in full composition presence; do
-    train_source "$gpu" "$src" "$src_data" "$readout"
+    if [[ "$SKIP_SOURCE" == "1" ]]; then
+      checkpoint="$OUT_ROOT/source/$readout/source_${src}_seed1/fold_0/model.pt"
+      if ! test -f "$checkpoint"; then
+        echo "ERROR: requested source reuse but checkpoint is missing: $checkpoint" >&2
+        return 1
+      fi
+      echo "FOUNDATION_SOURCE_REUSE|gpu=$gpu|source=$src|readout=$readout|checkpoint=$checkpoint"
+    else
+      train_source "$gpu" "$src" "$src_data" "$readout"
+    fi
   done
 
   mkdir -p "$OUT_ROOT/audit/$task" "$LOG_ROOT/$task"
