@@ -21,6 +21,7 @@ from competitors.alda.train_alda import train_alda
 from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
 from evaluation import evaluation, validation
 from models.stclassifier import (
+    FrozenStateOrgReference,
     PseFourierReconLTae,
     PseGru,
     PseLTae,
@@ -232,6 +233,15 @@ def structure_usage_manifest(config):
                 getattr(config, 'freeze_state_org_query', False)
             ),
             'uda_anchor_update': getattr(config, 'uda_anchor_update', 'none'),
+            'anchor_geometric_mode': getattr(
+                config, 'anchor_geometric_mode', 'none'
+            ),
+            'anchor_geometric_step': float(
+                getattr(config, 'anchor_geometric_step', .1)
+            ),
+            'anchor_geometric_token_limit': int(
+                getattr(config, 'anchor_geometric_token_limit', 50000)
+            ),
         })
     if config.shape_injection == 'direct_response_query':
         manifest.update({
@@ -276,6 +286,37 @@ def resolve_test_checkpoint(method, fold_dir):
             return final_path, 'final_epoch'
         return fold_dir / 'model.pt', 'final_epoch_legacy_fallback'
     return fold_dir / 'model.pt', 'validation_selected'
+
+
+def restore_state_org_reference_for_evaluation(model, checkpoint):
+    """Restore an out-of-model frozen source basis for final evaluation."""
+    config = checkpoint.get('config', {})
+    if not isinstance(config, dict):
+        config = vars(config)
+    output_student = bool(config.get('output_student', True))
+    preferred = (
+        'state_org_reference_state_dict'
+        if output_student else 'teacher_state_org_reference_state_dict'
+    )
+    fallback = 'state_org_reference_state_dict'
+    state = checkpoint.get(preferred, checkpoint.get(fallback))
+    if state is None:
+        return None
+    reference = FrozenStateOrgReference.from_source_model(model).to(
+        next(model.parameters()).device
+    )
+    reference.load_state_dict(state, strict=True)
+    reference.eval()
+    model.configure_state_org_query(
+        config.get('state_org_query_view', 'full'),
+        float(config.get('shape_query_scale', 1.)),
+        reference,
+    )
+    print(
+        'TEST_STATE_ORG_REFERENCE|restored=true|'
+        f'checkpoint_key={preferred if preferred in checkpoint else fallback}'
+    )
+    return reference
 
 
 def result_artifact_names(method, target_name):
@@ -519,8 +560,9 @@ def main(config):
             f"TEST_CHECKPOINT|method={method or 'supervised'}|"
             f"policy={test_policy}|path={test_checkpoint}"
         )
-        state_dict = torch.load(test_checkpoint, weights_only=False)['state_dict']
-        model.load_state_dict(state_dict)
+        test_packet = torch.load(test_checkpoint, weights_only=False)
+        model.load_state_dict(test_packet['state_dict'])
+        restore_state_org_reference_for_evaluation(model, test_packet)
         test_metrics = evaluation(
             model,
             test_loader,
@@ -1279,6 +1321,15 @@ if __name__ == '__main__':
         '--uda-anchor-update', default='none',
         choices=['none', 'fixed', 'source', 'target', 'shared'],
         help='audit-only source-reference anchor gradient routing',
+    )
+    timematch.add_argument(
+        '--anchor-geometric-mode', default='none',
+        choices=['none', 'fixed', 'target_ema', 'shared_ema'],
+        help='label-free optimizer-independent source-reference anchor update',
+    )
+    timematch.add_argument('--anchor-geometric-step', default=.1, type=float)
+    timematch.add_argument(
+        '--anchor-geometric-token-limit', default=50000, type=int,
     )
 
     cfg = parser.parse_args()

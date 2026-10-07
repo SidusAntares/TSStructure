@@ -117,6 +117,130 @@ def append_anchor_dynamics(path, row):
         writer.writerow(row)
 
 
+def balanced_geometric_token_banks(source_tokens, target_tokens, limit, seed):
+    """Select equal deterministic source/target token banks without labels."""
+    count = min(int(limit), source_tokens.shape[0], target_tokens.shape[0])
+    if count < 1:
+        raise ValueError("geometric token banks must be non-empty")
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+
+    def select(tokens):
+        indices = torch.randperm(
+            tokens.shape[0], generator=generator, device="cpu",
+        )[:count].to(tokens.device)
+        return tokens.index_select(0, indices)
+
+    return select(source_tokens), select(target_tokens)
+
+
+def _anchor_assignment_statistics(tokens, anchors, beta):
+    tokens = F.normalize(tokens.detach().float(), dim=-1)
+    anchors = F.normalize(anchors.detach().float(), dim=-1)
+    cosine = tokens @ anchors.T
+    assignment = torch.softmax(float(beta) * cosine, dim=-1)
+    support = assignment.sum(0)
+    weighted_sum = assignment.T @ tokens
+    centroid = F.normalize(weighted_sum, dim=-1)
+    entropy = -(
+        assignment * assignment.clamp_min(1e-12).log()
+    ).sum(-1).mean()
+    return {
+        "centroid": centroid, "weighted_sum": weighted_sum,
+        "support": support, "entropy": entropy,
+        "coverage": cosine.max(-1).values.mean(),
+    }
+
+
+@torch.no_grad()
+def geometric_anchor_update(
+    anchors, target_tokens, mode, step, beta, source_tokens=None,
+):
+    """Perform one label-free, optimizer-free anchor centroid update."""
+    if mode not in ("fixed", "target_ema", "shared_ema"):
+        raise ValueError("geometric anchor mode must be fixed, target_ema, or shared_ema")
+    if not 0 <= float(step) <= 1:
+        raise ValueError("anchor geometric step must be in [0,1]")
+    original = F.normalize(anchors.detach().float(), dim=-1)
+    target = _anchor_assignment_statistics(target_tokens, original, beta)
+    source = (
+        _anchor_assignment_statistics(source_tokens, original, beta)
+        if source_tokens is not None else None
+    )
+    if mode == "fixed":
+        # The fixed control must preserve the source checkpoint tensor bit-for-bit;
+        # normalization is only the measurement geometry used above.
+        updated = anchors.detach().float().clone()
+        support = target["support"]
+        step_cosine = 1.
+    elif mode == "target_ema":
+        updated = F.normalize(
+            (1. - float(step)) * original + float(step) * target["centroid"],
+            dim=-1,
+        )
+        support = target["support"]
+        step_cosine = float(F.cosine_similarity(updated, original, dim=-1).mean())
+    else:
+        if source is None:
+            raise ValueError("shared_ema requires source tokens")
+        total_support = source["support"] + target["support"]
+        centroid = F.normalize(
+            source["weighted_sum"] + target["weighted_sum"],
+            dim=-1,
+        )
+        updated = F.normalize(
+            (1. - float(step)) * original + float(step) * centroid, dim=-1,
+        )
+        support = total_support
+        step_cosine = float(F.cosine_similarity(updated, original, dim=-1).mean())
+    diagnostics = {
+        "mean_anchor_step_cosine": step_cosine,
+        "mean_target_assignment_entropy": float(target["entropy"]),
+        "mean_source_assignment_entropy": (
+            float(source["entropy"]) if source is not None else float("nan")
+        ),
+        "min_anchor_effective_support": float(support.min()),
+        "max_anchor_effective_support": float(support.max()),
+        "source_token_coverage": (
+            float(source["coverage"]) if source is not None else float("nan")
+        ),
+        "target_token_coverage": float(target["coverage"]),
+    }
+    return updated.to(dtype=anchors.dtype, device=anchors.device), diagnostics
+
+
+@torch.no_grad()
+def sync_reference_anchors(student_reference, teacher_reference, anchors):
+    """Synchronize geometric anchors exactly; no second teacher EMA."""
+    for reference in (student_reference, teacher_reference):
+        parameter = reference.structure_branch.shapelet_dictionary.anchors
+        parameter.copy_(anchors.to(device=parameter.device, dtype=parameter.dtype))
+
+
+@torch.no_grad()
+def cache_geometric_reference_tokens(reference, loader, device, limit, seed):
+    """Run the frozen structural measurement once and retain no labels."""
+    reservoir = None
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    reference.eval()
+    for sample in loader:
+        pixels, mask, positions, extra = to_cuda(sample, device)
+        _, structure = reference.forward_with_details(
+            pixels, mask, positions, extra,
+        )
+        tokens = F.normalize(
+            structure["shape_tokens"].detach().flatten(0, 1).float(), dim=-1,
+        ).cpu()
+        reservoir = tokens if reservoir is None else torch.cat((reservoir, tokens))
+        if reservoir.shape[0] > int(limit):
+            indices = torch.randperm(
+                reservoir.shape[0], generator=generator,
+            )[:int(limit)]
+            reservoir = reservoir.index_select(0, indices)
+    if reservoir is None or reservoir.shape[0] == 0:
+        raise RuntimeError("geometric token cache is empty")
+    return reservoir.to(device)
+
+
 def forward_target_phase_equivariance(
     student, pixels, mask, positions, extra, max_shift,
 ):
@@ -1459,12 +1583,28 @@ def _train_structure_proto_timematch(
     query_scale = float(getattr(config, "shape_query_scale", 1.))
     freeze_state_org_query = bool(getattr(config, "freeze_state_org_query", False))
     anchor_update_mode = getattr(config, "uda_anchor_update", "none")
+    anchor_geometric_mode = getattr(config, "anchor_geometric_mode", "none")
+    anchor_geometric_step = float(getattr(config, "anchor_geometric_step", .1))
+    anchor_geometric_limit = int(
+        getattr(config, "anchor_geometric_token_limit", 50000)
+    )
     if structure_basis_mode not in ("adaptive", "frozen_source"):
         raise ValueError("structure basis mode must be adaptive or frozen_source")
     if anchor_update_mode not in ("none", "fixed", "source", "target", "shared"):
         raise ValueError("invalid UDA anchor update mode")
     if anchor_update_mode != "none" and structure_basis_mode != "frozen_source":
         raise ValueError("anchor update audit requires frozen_source structural basis")
+    if anchor_geometric_mode not in ("none", "fixed", "target_ema", "shared_ema"):
+        raise ValueError("invalid geometric anchor mode")
+    if anchor_geometric_mode != "none":
+        if anchor_update_mode != "none":
+            raise ValueError("geometric and gradient anchor updates are mutually exclusive")
+        if structure_basis_mode != "frozen_source":
+            raise ValueError("geometric anchor update requires frozen_source basis")
+        if getattr(config, "state_org_readout", "full") != "composition":
+            raise ValueError("geometric anchor update requires composition source readout")
+        if anchor_geometric_limit < 1:
+            raise ValueError("anchor geometric token limit must be positive")
     if query_view not in ("full", "presence"):
         raise ValueError("state-org query view must be full or presence")
     if (
@@ -1515,7 +1655,10 @@ def _train_structure_proto_timematch(
         f"mode={structure_basis_mode}|reference_checkpoint={checkpoint_path}|"
         f"query_view={query_view}|query_scale={query_scale:.6f}|"
         f"freeze_query={str(freeze_state_org_query).lower()}|"
-        f"anchor_update={anchor_update_mode}"
+        f"anchor_update={anchor_update_mode}|"
+        f"anchor_geometric_mode={anchor_geometric_mode}|"
+        f"anchor_geometric_step={anchor_geometric_step:.6f}|"
+        f"anchor_geometric_token_limit={anchor_geometric_limit}"
     )
     boundary_classifier_1 = boundary_classifier_2 = None
     boundary_optimizer = boundary_scheduler = None
@@ -1581,9 +1724,57 @@ def _train_structure_proto_timematch(
     )
     initial_reference_anchors = (
         frozen_reference.structure_branch.shapelet_dictionary.anchors.detach().clone()
-        if anchor_update_mode != "none" else None
+        if anchor_update_mode != "none" or anchor_geometric_mode != "none" else None
     )
+    geometric_source_tokens = geometric_target_tokens = None
+    if anchor_geometric_mode != "none":
+        source_geometric_dataset = deepcopy(source_loader.dataset)
+        source_geometric_dataset.transform = deepcopy(
+            target_loader_no_aug.dataset.transform
+        )
+        source_geometric_loader = data.DataLoader(
+            source_geometric_dataset, batch_size=config.batch_size,
+            shuffle=False, drop_last=False, num_workers=0,
+        )
+        target_geometric_loader = data.DataLoader(
+            target_loader_no_aug.dataset, batch_size=config.batch_size,
+            shuffle=False, drop_last=False, num_workers=0,
+        )
+        geometric_source_tokens = cache_geometric_reference_tokens(
+            frozen_reference, source_geometric_loader, device,
+            anchor_geometric_limit, config.seed,
+        )
+        geometric_target_tokens = cache_geometric_reference_tokens(
+            frozen_reference, target_geometric_loader, device,
+            anchor_geometric_limit, config.seed + 1,
+        )
+        if anchor_geometric_mode == "shared_ema":
+            geometric_source_tokens, geometric_target_tokens = (
+                balanced_geometric_token_banks(
+                    geometric_source_tokens, geometric_target_tokens,
+                    anchor_geometric_limit, config.seed,
+                )
+            )
+        print(
+            "ANCHOR_GEOMETRIC_CACHE|"
+            f"mode={anchor_geometric_mode}|"
+            f"source_tokens={geometric_source_tokens.shape[0]}|"
+            f"target_tokens={geometric_target_tokens.shape[0]}|"
+            "labels_used=false|encoder_replays=1"
+        )
     for epoch in range(config.epochs):
+        geometric_diagnostics = None
+        if anchor_geometric_mode != "none":
+            anchors = frozen_reference.structure_branch.shapelet_dictionary.anchors
+            updated_anchors, geometric_diagnostics = geometric_anchor_update(
+                anchors, geometric_target_tokens, anchor_geometric_mode,
+                anchor_geometric_step,
+                frozen_reference.structure_branch.shapelet_dictionary.beta,
+                source_tokens=geometric_source_tokens,
+            )
+            sync_reference_anchors(
+                frozen_reference, teacher_reference, updated_anchors,
+            )
         target_ramp = prototype_ramp(
             epoch, config.proto_ramp_epochs, config.proto_ramp_start,
         )
@@ -1939,6 +2130,32 @@ def _train_structure_proto_timematch(
             )
             epoch_values.update({
                 f"anchor_{name}": value for name, value in dynamics.items()
+                if name not in ("epoch", "mode")
+            })
+        if anchor_geometric_mode != "none":
+            anchors = frozen_reference.structure_branch.shapelet_dictionary.anchors
+            identity = anchor_identity_diagnostics(
+                initial_reference_anchors, anchors,
+            )
+            dynamics = {
+                "epoch": epoch,
+                "mode": anchor_geometric_mode,
+                "anchor_self_cosine_to_source": identity["diag_cos"],
+                "hungarian_matched_cosine": identity["matched_cos_mean"],
+                "identity_match_fraction": identity["identity_match_fraction"],
+                "pairwise_cos_mean": identity["anchor_pairwise_cos_mean"],
+                "pairwise_cos_max": identity["anchor_pairwise_cos_max"],
+                **geometric_diagnostics,
+            }
+            append_anchor_dynamics(
+                os.path.join(
+                    config.fold_dir, "anchor_geometric_dynamics.csv",
+                ),
+                dynamics,
+            )
+            epoch_values.update({
+                f"anchor_geometric_{name}": value
+                for name, value in dynamics.items()
                 if name not in ("epoch", "mode")
             })
         if shape_da_mode == "source_prototype":

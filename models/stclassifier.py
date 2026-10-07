@@ -215,7 +215,10 @@ class PseStructureProtoLTae(nn.Module):
             calendar_shift = temporal_shift if phase_shift is None else phase_shift
         else:
             structure_shift = (
-                temporal_shift if self.structure_shift_mode == "timematch" else 0
+                temporal_shift
+                if self.shape_representation == "state_org"
+                or self.structure_shift_mode == "timematch"
+                else 0
             ) if structure_aug_shift is None else structure_aug_shift
             calendar_shift = 0 if phase_shift is None else phase_shift
         return self.structure_branch.forward_from_context(
