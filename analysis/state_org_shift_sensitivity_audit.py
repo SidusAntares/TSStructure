@@ -97,7 +97,12 @@ def _batch_shift(labels, shift):
 
 
 def _shift_positions(positions, shift):
-    return positions + (shift[:, None] if torch.is_tensor(shift) else shift)
+    if torch.is_tensor(shift):
+        shift = shift.to(device=positions.device).round().to(dtype=positions.dtype)
+        shift = shift[:, None]
+    else:
+        shift = int(round(float(shift)))
+    return positions + shift
 
 
 def _shifted_structure(model, context, shift):

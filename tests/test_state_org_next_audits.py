@@ -82,6 +82,17 @@ def test_oracle_shift_selector_uses_only_provided_validation_scores():
     }
 
 
+def test_shifted_ltae_positions_remain_integer_indices():
+    from analysis.state_org_shift_sensitivity_audit import _shift_positions
+
+    positions = torch.tensor([[3, 8], [10, 20]], dtype=torch.long)
+    shifted = _shift_positions(positions, torch.tensor([2., -4.]))
+    assert shifted.dtype == torch.long
+    torch.testing.assert_close(
+        shifted, torch.tensor([[5, 10], [6, 16]], dtype=torch.long),
+    )
+
+
 def test_raw_and_soft_assignment_are_exact_and_presence_is_shared():
     from analysis.state_org_assignment_audit import assignment_views
 
