@@ -108,7 +108,7 @@ def add_model_arguments(parser):
     )
     parser.add_argument(
         '--state-org-readout', dest='state_org_readout', default='full',
-        choices=['full', 'composition', 'presence'],
+        choices=['full', 'composition', 'presence', 'reliable_composition'],
     )
     parser.add_argument('--shape-target-weight', dest='shape_target_weight', default=.05, type=float)
     parser.add_argument('--shape-align-weight', dest='shape_align_weight', default=.05, type=float)
@@ -229,6 +229,15 @@ def structure_usage_manifest(config):
             'state_org_query_view': getattr(config, 'state_org_query_view', 'full'),
             'shape_query_scale': float(getattr(config, 'shape_query_scale', 1.)),
             'state_org_readout': readout,
+            'reliable_composition': readout == 'reliable_composition',
+            'reliable_calibration': (
+                'source_only_running_q75_iqr_ema'
+                if readout == 'reliable_composition' else 'none'
+            ),
+            'reliable_calibration_tau_init': 0.,
+            'reliable_calibration_scale_init': 1.,
+            'reliable_calibration_momentum': .9,
+            'reliable_calibration_min_scale': .05,
             'freeze_state_org_query': bool(
                 getattr(config, 'freeze_state_org_query', False)
             ),
@@ -1299,6 +1308,11 @@ if __name__ == '__main__':
         '--detach-target-structure', dest='detach_target_structure',
         default=False, type=bool_flag,
         help='detach the projected state_org target query correction',
+    )
+    timematch.add_argument(
+        '--target-structure-detach-epochs',
+        dest='target_structure_detach_epochs', default=0, type=int,
+        help='detach projected target structure query for the first N UDA epochs',
     )
     timematch.add_argument(
         '--freeze-structure-specific', dest='freeze_structure_specific',

@@ -501,8 +501,13 @@ class DiscriminativeStructureBranch(nn.Module):
         ):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
-        if state_org_readout not in ("full", "composition", "presence"):
-            raise ValueError("state_org_readout must be full, composition, or presence")
+        if state_org_readout not in (
+            "full", "composition", "presence", "reliable_composition",
+        ):
+            raise ValueError(
+                "state_org_readout must be full, composition, presence, "
+                "or reliable_composition"
+            )
         if shape_representation != "state_org" and state_org_readout != "full":
             raise ValueError("non-full state_org_readout requires state_org representation")
         self.state_org_readout = state_org_readout
@@ -540,6 +545,23 @@ class DiscriminativeStructureBranch(nn.Module):
                 nn.Linear(shapelet_count, 96), nn.GELU(),
                 nn.Linear(96, 32), nn.GELU(),
             )
+            response_dim = shapelet_count + 32
+        elif (
+            shape_representation == "state_org"
+            and state_org_readout == "reliable_composition"
+        ):
+            self.reliable_composition_encoder = nn.Sequential(
+                nn.Linear(shapelet_count, 96), nn.GELU(),
+                nn.Linear(96, 32), nn.GELU(),
+            )
+            self.register_buffer("reliable_tau", torch.zeros(shapelet_count))
+            self.register_buffer("reliable_scale", torch.ones(shapelet_count))
+            self.register_buffer(
+                "reliable_calibration_updates", torch.zeros((), dtype=torch.long),
+            )
+            self.reliable_calibration_momentum = .9
+            self.reliable_calibration_min_scale = .05
+            self.reliable_calibration_update_enabled = True
             response_dim = shapelet_count + 32
         elif shape_representation == "state_org":
             response_dim = shapelet_count + 32
@@ -623,13 +645,19 @@ class DiscriminativeStructureBranch(nn.Module):
         valid_count = candidate_mask.sum(1, keepdim=True)
         if not (valid_count > 0).all():
             raise ValueError("every sample must retain at least one candidate")
-        presence_weights = torch.softmax(
-            (self.shapelet_dictionary.beta * similarity).masked_fill(
-                ~candidate_mask.unsqueeze(-1), -torch.inf,
-            ),
-            dim=1,
-        )
-        presence = (presence_weights * similarity).sum(1)
+        if self.state_org_readout == "reliable_composition":
+            presence, presence_weights, local_presence = (
+                self._reliable_presence(similarity, candidate_mask)
+            )
+        else:
+            presence_weights = torch.softmax(
+                (self.shapelet_dictionary.beta * similarity).masked_fill(
+                    ~candidate_mask.unsqueeze(-1), -torch.inf,
+                ),
+                dim=1,
+            )
+            presence = (presence_weights * similarity).sum(1)
+            local_presence = None
         state_distribution = torch.softmax(
             self.shapelet_dictionary.beta * similarity, dim=-1,
         )
@@ -647,16 +675,90 @@ class DiscriminativeStructureBranch(nn.Module):
                 composition_sequence
                 * candidate_mask.unsqueeze(-1).to(composition_sequence.dtype)
             ).sum(1) / valid_count.to(composition_sequence.dtype)
+        elif self.state_org_readout == "reliable_composition":
+            if self.training and self.reliable_calibration_update_enabled:
+                self.update_reliable_calibration(similarity, candidate_mask)
+            scale = self.reliable_scale.clamp_min(
+                self.reliable_calibration_min_scale
+            )
+            support_gate = torch.sigmoid(
+                (similarity - self.reliable_tau) / scale
+            ) * candidate_mask.unsqueeze(-1).to(similarity.dtype)
+            reliable_composition = (
+                support_gate * state_distribution
+            ).sum(1) / valid_count.to(similarity.dtype)
+            unmatched = 1. - reliable_composition.sum(-1)
+            organization = self.reliable_composition_encoder(
+                reliable_composition
+            )
         else:
             organization = similarity.new_zeros(similarity.shape[0], 32)
         response = torch.cat((presence, organization), dim=-1)
-        return {
+        result = {
             "presence": presence,
             "presence_weights": presence_weights,
             "state_distribution": state_distribution,
             "organization": organization,
             "shapelet_response": response,
         }
+        if local_presence is not None:
+            result.update({
+                "local_presence": local_presence,
+                "local_presence_weights": presence_weights,
+                "reliable_composition": reliable_composition,
+                "reliable_support_gate": support_gate,
+                "unmatched_composition": unmatched,
+            })
+        return result
+
+    def _reliable_presence(self, similarity, candidate_mask):
+        """Pool 64 candidates as 8 normalized-LME neighborhoods, then smooth-max."""
+        batch, candidates, anchors = similarity.shape
+        group_size = 8
+        if candidates != 64:
+            raise ValueError(
+                "reliable_composition requires exactly 64 circular candidates"
+            )
+        groups = candidates // group_size
+        grouped = similarity.reshape(batch, groups, group_size, anchors)
+        grouped_mask = candidate_mask.reshape(batch, groups, group_size)
+        counts = grouped_mask.sum(2, keepdim=True)
+        if not (counts > 0).all():
+            raise ValueError("each reliable-composition neighborhood needs a candidate")
+        beta = float(self.shapelet_dictionary.beta)
+        scores = (beta * grouped).masked_fill(
+            ~grouped_mask.unsqueeze(-1), -torch.inf,
+        )
+        local = (
+            torch.logsumexp(scores, dim=2)
+            - counts.to(similarity.dtype).log()
+        ) / beta
+        weights = torch.softmax(beta * local, dim=1)
+        return (weights * local).sum(1), weights, local
+
+    @torch.no_grad()
+    def update_reliable_calibration(self, similarity, candidate_mask=None):
+        if self.state_org_readout != "reliable_composition":
+            raise RuntimeError("reliable calibration requires reliable_composition")
+        values = similarity.detach()
+        if candidate_mask is not None:
+            values = values[candidate_mask]
+        else:
+            values = values.reshape(-1, values.shape[-1])
+        if values.ndim != 2 or values.shape[0] == 0:
+            raise ValueError("reliable calibration requires valid source matches")
+        q25 = torch.quantile(values.float(), .25, dim=0).to(self.reliable_tau)
+        q75 = torch.quantile(values.float(), .75, dim=0).to(self.reliable_tau)
+        scale = (q75 - q25).clamp_min(self.reliable_calibration_min_scale)
+        momentum = self.reliable_calibration_momentum
+        self.reliable_tau.mul_(momentum).add_(q75, alpha=1. - momentum)
+        self.reliable_scale.mul_(momentum).add_(scale, alpha=1. - momentum)
+        self.reliable_calibration_updates.add_(1)
+
+    def set_reliable_calibration_updates(self, enabled):
+        if self.state_org_readout != "reliable_composition":
+            return
+        self.reliable_calibration_update_enabled = bool(enabled)
 
     def contextualize_similarity(self, similarity):
         if self.shape_representation != "residual_response":
@@ -777,6 +879,13 @@ class DiscriminativeStructureBranch(nn.Module):
                 "shape_scales": scales,
                 "exposed_curve": exposed,
                 "exposed_grid": grid,
+                **{
+                    key: state[key] for key in (
+                        "local_presence", "local_presence_weights",
+                        "reliable_composition", "reliable_support_gate",
+                        "unmatched_composition",
+                    ) if key in state
+                },
             }
         details = self.shapelet_dictionary.compute_response(tokens, return_details=True)
         response_details = (

@@ -370,6 +370,19 @@ class PseStructureProtoLTae(nn.Module):
                 "phase_k1_mean_magnitude": magnitude[:, 0].mean(),
                 "phase_k2_mean_magnitude": magnitude[:, 1].mean(),
             }
+        if (
+            self.shape_representation == "state_org"
+            and self.state_org_readout == "reliable_composition"
+        ):
+            branch = self.structure_branch
+            return {
+                "unmatched_composition_mean": output[
+                    "unmatched_composition"
+                ].mean(),
+                "reliable_calibration_tau_mean": branch.reliable_tau.mean(),
+                "reliable_calibration_scale_mean": branch.reliable_scale.mean(),
+                "reliable_calibration_updates": branch.reliable_calibration_updates,
+            }
         if self.shape_representation != "sorted_profile":
             return {}
         diagnostics = {

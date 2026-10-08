@@ -70,6 +70,32 @@ def save_timematch_checkpoint(
         torch.save(checkpoint, model_path)
 
 
+def target_structure_detached_for_epoch(config, epoch):
+    """Return whether the projected target structure query is detached this epoch."""
+    staged_epochs = int(getattr(config, "target_structure_detach_epochs", 0))
+    if staged_epochs < 0:
+        raise ValueError("target_structure_detach_epochs must be non-negative")
+    return bool(getattr(config, "detach_target_structure", False)) or int(epoch) < staged_epochs
+
+
+def freeze_reliable_composition_calibration(model):
+    """Freeze source-calibrated reliable-composition buffers for UDA."""
+    branch = model.structure_branch
+    if getattr(branch, "state_org_readout", "full") != "reliable_composition":
+        return None
+    updates = int(branch.reliable_calibration_updates)
+    if updates < 1:
+        raise RuntimeError(
+            "reliable_composition source checkpoint has no source calibration updates"
+        )
+    branch.set_reliable_calibration_updates(False)
+    return {
+        "updates": updates,
+        "tau_mean": float(branch.reliable_tau.mean()),
+        "scale_mean": float(branch.reliable_scale.mean()),
+    }
+
+
 def anchor_gradient_enabled(mode, domain):
     if mode not in ("fixed", "source", "target", "shared"):
         raise ValueError("anchor update mode must be fixed, source, target, or shared")
@@ -1552,10 +1578,20 @@ def _train_structure_proto_timematch(
     detach_target_structure = bool(
         getattr(config, "detach_target_structure", False)
     )
+    target_structure_detach_epochs = int(
+        getattr(config, "target_structure_detach_epochs", 0)
+    )
+    if target_structure_detach_epochs < 0 or target_structure_detach_epochs > config.epochs:
+        raise ValueError(
+            "target_structure_detach_epochs must be between 0 and UDA epochs"
+        )
     freeze_structure_specific = bool(
         getattr(config, "freeze_structure_specific", False)
     )
-    if (detach_target_structure or freeze_structure_specific) and (
+    if (
+        detach_target_structure or target_structure_detach_epochs > 0
+        or freeze_structure_specific
+    ) and (
         getattr(config, "shape_representation", None) != "state_org"
     ):
         raise ValueError(
@@ -1576,6 +1612,15 @@ def _train_structure_proto_timematch(
     student.load_state_dict(
         torch.load(checkpoint_path, weights_only=False)["state_dict"], strict=True,
     )
+    calibration = freeze_reliable_composition_calibration(student)
+    if calibration is not None:
+        print(
+            "RELIABLE_COMPOSITION_CALIBRATION|scope=source_only|"
+            "uda_update=false|"
+            f"updates={calibration['updates']}|"
+            f"tau_mean={calibration['tau_mean']:.6f}|"
+            f"scale_mean={calibration['scale_mean']:.6f}"
+        )
     print(f"STRUCTURE_V2CLEAN_SOURCE_LOAD|checkpoint={checkpoint_path}|strict=true")
     student.to(device)
     structure_basis_mode = getattr(config, "structure_basis_mode", "adaptive")
@@ -1639,6 +1684,7 @@ def _train_structure_proto_timematch(
         "STATE_ORG_CAUSAL_CONFIG|"
         f"uda_shape_class_weight={uda_shape_class_weight:.6f}|"
         f"detach_target_structure={str(detach_target_structure).lower()}|"
+        f"target_structure_detach_epochs={target_structure_detach_epochs}|"
         f"freeze_structure_specific={str(freeze_structure_specific).lower()}"
     )
     teacher = deepcopy(student).to(device)
@@ -1763,6 +1809,15 @@ def _train_structure_proto_timematch(
             "labels_used=false|encoder_replays=1"
         )
     for epoch in range(config.epochs):
+        detach_target_structure_this_epoch = target_structure_detached_for_epoch(
+            config, epoch,
+        )
+        print(
+            "TARGET_STRUCTURE_GRADIENT|"
+            f"epoch={epoch}|open={str(not detach_target_structure_this_epoch).lower()}|"
+            f"detached={str(detach_target_structure_this_epoch).lower()}|"
+            f"detach_epochs={target_structure_detach_epochs}"
+        )
         geometric_diagnostics = None
         if anchor_geometric_mode != "none":
             anchors = frozen_reference.structure_branch.shapelet_dictionary.anchors
@@ -1906,7 +1961,7 @@ def _train_structure_proto_timematch(
             else:
                 target_output = student.forward_with_temporal_shift(
                     pt, mt, tt, et, return_dict=True,
-                    detach_structure_query=detach_target_structure,
+                    detach_structure_query=detach_target_structure_this_epoch,
                     structure_anchor_grad=(
                         anchor_update_mode != "none"
                         and anchor_gradient_enabled(anchor_update_mode, "target")
@@ -2021,7 +2076,19 @@ def _train_structure_proto_timematch(
                 "loss_shape_source": loss_shape_source.detach(),
                 "loss_shapelet_diversity": loss_diversity.detach(),
                 "shape_response_effective_rank": response_rank,
+                "target_structure_gradient_open": source_output["logits"].new_tensor(
+                    float(not detach_target_structure_this_epoch)
+                ),
             }
+            if "unmatched_composition" in source_output:
+                values.update({
+                    "source_unmatched_composition": source_output[
+                        "unmatched_composition"
+                    ].detach().mean(),
+                    "target_unmatched_composition": target_output[
+                        "unmatched_composition"
+                    ].detach().mean(),
+                })
             if "shapelet_concentration" in source_output:
                 concentration = source_output["shapelet_concentration"].detach().float()
                 values.update({
