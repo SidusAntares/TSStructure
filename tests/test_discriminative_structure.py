@@ -77,7 +77,9 @@ def test_multiscale_windows_are_circular_without_padding():
         ])
         assert torch.equal(actual, curve[:, indices])
     assert torch.equal(buffered_scales, scales)
-    assert len(dict(extractor.named_buffers())) == 3
+    assert set(dict(extractor.named_buffers())) == {
+        "indices_0", "indices_1", "indices_2", "scale_ids", "window_centers",
+    }
 
 
 def test_q24_stride8_window_centers_follow_candidate_order():

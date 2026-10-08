@@ -680,7 +680,9 @@ def build_source_shape_response_bank(model, source_loader, device, seed):
 
 
 @torch.no_grad()
-def accepted_pseudo_statistics(pseudo_pred, target_gt, pseudo_mask, num_classes):
+def accepted_pseudo_statistics(
+    pseudo_pred, target_gt, pseudo_mask, num_classes, return_tensors=False,
+):
     """Audit the teacher predictions on the already accepted target subset."""
     if not (pseudo_pred.shape == target_gt.shape == pseudo_mask.shape):
         raise ValueError("pseudo predictions, target GT, and mask must align")
@@ -693,8 +695,19 @@ def accepted_pseudo_statistics(pseudo_pred, target_gt, pseudo_mask, num_classes)
     class_correct = torch.bincount(
         accepted_gt[correct], minlength=num_classes,
     )
-    accepted_count = int(accepted_gt.numel())
-    correct_count = int(correct.sum())
+    accepted_count = pseudo_mask.sum()
+    correct_count = correct.sum()
+    if return_tensors:
+        return {
+            "accepted_count": accepted_count,
+            "correct_count": correct_count,
+            "accuracy": correct_count.float() / accepted_count.clamp_min(1),
+            "class_accepted_count": class_accepted,
+            "class_correct_count": class_correct,
+        }
+    accepted_count, correct_count = torch.stack((
+        accepted_count, correct_count,
+    )).cpu().tolist()
     return {
         "accepted_count": accepted_count,
         "correct_count": correct_count,
@@ -1859,13 +1872,23 @@ def _train_structure_proto_timematch(
             )
         student.train()
         teacher.eval()
-        epoch_sums = defaultdict(float)
-        pseudo_total = raw_pseudo_accepted = pseudo_accepted = pseudo_correct = 0
-        proto_trusted = proto_agreed = proto_agreed_correct = 0
-        class_pseudo_accepted = np.zeros(config.num_classes, dtype=np.int64)
-        class_pseudo_correct = np.zeros(config.num_classes, dtype=np.int64)
-        class_trusted_count = np.zeros(config.num_classes, dtype=np.int64)
-        source_shape_correct = source_samples = 0
+        epoch_sums = {}
+        counter_device = next(student.parameters()).device
+        zero_count = torch.zeros((), dtype=torch.long, device=counter_device)
+        pseudo_total = 0
+        raw_pseudo_accepted = zero_count.clone()
+        pseudo_accepted = zero_count.clone()
+        pseudo_correct = zero_count.clone()
+        proto_trusted = zero_count.clone()
+        proto_agreed = zero_count.clone()
+        proto_agreed_correct = zero_count.clone()
+        class_pseudo_accepted = torch.zeros(
+            config.num_classes, dtype=torch.long, device=counter_device,
+        )
+        class_pseudo_correct = torch.zeros_like(class_pseudo_accepted)
+        class_trusted_count = torch.zeros_like(class_pseudo_accepted)
+        source_shape_correct = zero_count.clone()
+        source_samples = 0
         progress = tqdm(
             range(config.steps_per_epoch),
             desc=f"StructureV2Clean TimeMatch {epoch + 1}/{config.epochs}",
@@ -1918,26 +1941,22 @@ def _train_structure_proto_timematch(
             )
             pseudo_statistics = accepted_pseudo_statistics(
                 pseudo, target_gt, trusted_mask, config.num_classes,
+                return_tensors=True,
             )
             pseudo_total += int(trusted_mask.numel())
-            raw_pseudo_accepted += int(raw_pseudo_mask.sum())
-            pseudo_accepted += int(trusted_mask.sum())
+            raw_pseudo_accepted += raw_pseudo_mask.sum()
+            pseudo_accepted += trusted_mask.sum()
             pseudo_correct += pseudo_statistics["correct_count"]
             if shape_da_mode == "source_prototype":
-                proto_trusted += int(trusted_mask.sum())
-                proto_agreed += int(proto_agree_mask.sum())
-                proto_agreed_correct += int(
+                proto_trusted += trusted_mask.sum()
+                proto_agreed += proto_agree_mask.sum()
+                proto_agreed_correct += (
                     (pseudo[proto_agree_mask] == target_gt[proto_agree_mask]).sum()
                 )
-            class_pseudo_accepted += np.asarray(
-                pseudo_statistics["class_accepted_count"], dtype=np.int64,
-            )
-            class_pseudo_correct += np.asarray(
-                pseudo_statistics["class_correct_count"], dtype=np.int64,
-            )
-            class_trusted_count += np.bincount(
-                pseudo[trusted_mask].detach().cpu().numpy(),
-                minlength=config.num_classes,
+            class_pseudo_accepted += pseudo_statistics["class_accepted_count"]
+            class_pseudo_correct += pseudo_statistics["class_correct_count"]
+            class_trusted_count += torch.bincount(
+                pseudo[trusted_mask], minlength=config.num_classes,
             )
 
             ps, ms, ts, es = to_cuda(source_sample, device)
@@ -2060,7 +2079,7 @@ def _train_structure_proto_timematch(
             source_count = int(source_labels.shape[0])
             target_count = int(pseudo.shape[0])
             source_samples += source_count
-            source_shape_correct += int(
+            source_shape_correct += (
                 (source_output["shape_logits"].detach().argmax(1) == source_labels).sum()
             )
             singular = torch.linalg.svdvals(
@@ -2157,7 +2176,8 @@ def _train_structure_proto_timematch(
                     "shape_align_center_gap": shape_alignment["center_gap"],
                 })
             for name, value in values.items():
-                epoch_sums[name] += float(value)
+                detached = value.detach()
+                epoch_sums[name] = epoch_sums.get(name, 0.) + detached
             if global_step % config.log_step == 0:
                 metrics = {
                     name: value for name, value in values.items()
@@ -2174,7 +2194,23 @@ def _train_structure_proto_timematch(
 
         batches = max(config.steps_per_epoch, 1)
         selection_report = adaptive_selector.finish_epoch()
-        epoch_values = {name: value / batches for name, value in epoch_sums.items()}
+        epoch_values = {
+            name: float((value / batches).cpu())
+            for name, value in epoch_sums.items()
+        }
+        count_values = torch.stack((
+            raw_pseudo_accepted, pseudo_accepted, pseudo_correct,
+            proto_trusted, proto_agreed, proto_agreed_correct,
+            source_shape_correct,
+        )).cpu().tolist()
+        (
+            raw_pseudo_accepted, pseudo_accepted, pseudo_correct,
+            proto_trusted, proto_agreed, proto_agreed_correct,
+            source_shape_correct,
+        ) = map(int, count_values)
+        class_pseudo_accepted = class_pseudo_accepted.cpu().numpy()
+        class_pseudo_correct = class_pseudo_correct.cpu().numpy()
+        class_trusted_count = class_trusted_count.cpu().numpy()
         epoch_values.update({
             "pseudo_coverage": pseudo_accepted / max(pseudo_total, 1),
             "raw_pseudo_coverage": raw_pseudo_accepted / max(pseudo_total, 1),

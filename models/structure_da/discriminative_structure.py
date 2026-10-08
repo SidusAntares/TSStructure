@@ -119,6 +119,7 @@ class MultiScaleWindowExtractor(nn.Module):
         self.scales = scales
         self.stride = int(stride)
         self.grid_points = int(grid_points)
+        scale_ids, centers = [], []
         for index, scale in enumerate(scales):
             starts = torch.arange(0, self.grid_points, self.stride)
             offsets = torch.arange(scale)
@@ -127,6 +128,14 @@ class MultiScaleWindowExtractor(nn.Module):
                 (starts[:, None] + offsets[None, :]) % self.grid_points,
                 persistent=False,
             )
+            scale_ids.append(torch.full((starts.numel(),), scale, dtype=torch.long))
+            centers.append((starts.float() + (scale - 1) / 2.) % self.grid_points)
+        self.register_buffer(
+            "scale_ids", torch.cat(scale_ids), persistent=False,
+        )
+        self.register_buffer(
+            "window_centers", torch.cat(centers), persistent=False,
+        )
 
     def forward(self, curve, return_centers=False):
         if curve.ndim != 3:
@@ -136,21 +145,17 @@ class MultiScaleWindowExtractor(nn.Module):
             raise ValueError(
                 f"expected exposed curve length {self.grid_points}, got {points}"
             )
-        windows, scale_ids, centers = [], [], []
-        for index, scale in enumerate(self.scales):
+        windows = []
+        for index, _ in enumerate(self.scales):
             indices = getattr(self, f"indices_{index}")
             windows.append(curve[:, indices])
-            scale_ids.extend([scale] * indices.shape[0])
-            starts = torch.arange(
-                0, self.grid_points, self.stride,
-                device=curve.device, dtype=curve.dtype,
-            )
-            centers.append((starts + (scale - 1) / 2.) % self.grid_points)
         if not windows:
             raise ValueError("no window scale fits the exposed curve")
-        scales = torch.tensor(scale_ids, device=curve.device)
+        scales = self.scale_ids.to(device=curve.device)
         if return_centers:
-            return windows, scales, torch.cat(centers)
+            return windows, scales, self.window_centers.to(
+                device=curve.device, dtype=curve.dtype,
+            )
         return windows, scales
 
 
@@ -559,6 +564,9 @@ class DiscriminativeStructureBranch(nn.Module):
             self.register_buffer(
                 "reliable_calibration_updates", torch.zeros((), dtype=torch.long),
             )
+            self.register_buffer(
+                "reliable_quantiles", torch.tensor((.25, .75)), persistent=False,
+            )
             self.reliable_calibration_momentum = .9
             self.reliable_calibration_min_scale = .05
             self.reliable_calibration_update_enabled = True
@@ -628,7 +636,8 @@ class DiscriminativeStructureBranch(nn.Module):
             raise ValueError("similarity must be [B,N,M]")
         if similarity.shape[-1] != self.shapelet_dictionary.anchors.shape[0]:
             raise ValueError("similarity anchor dimension does not match dictionary")
-        if candidate_mask is None:
+        all_candidates_valid = candidate_mask is None
+        if all_candidates_valid:
             candidate_mask = torch.ones(
                 similarity.shape[:2], dtype=torch.bool, device=similarity.device,
             )
@@ -677,7 +686,9 @@ class DiscriminativeStructureBranch(nn.Module):
             ).sum(1) / valid_count.to(composition_sequence.dtype)
         elif self.state_org_readout == "reliable_composition":
             if self.training and self.reliable_calibration_update_enabled:
-                self.update_reliable_calibration(similarity, candidate_mask)
+                self.update_reliable_calibration(
+                    similarity, None if all_candidates_valid else candidate_mask,
+                )
             scale = self.reliable_scale.clamp_min(
                 self.reliable_calibration_min_scale
             )
@@ -747,8 +758,9 @@ class DiscriminativeStructureBranch(nn.Module):
             values = values.reshape(-1, values.shape[-1])
         if values.ndim != 2 or values.shape[0] == 0:
             raise ValueError("reliable calibration requires valid source matches")
-        q25 = torch.quantile(values.float(), .25, dim=0).to(self.reliable_tau)
-        q75 = torch.quantile(values.float(), .75, dim=0).to(self.reliable_tau)
+        q25, q75 = torch.quantile(
+            values.float(), self.reliable_quantiles, dim=0,
+        ).to(self.reliable_tau).unbind(0)
         scale = (q75 - q25).clamp_min(self.reliable_calibration_min_scale)
         momentum = self.reliable_calibration_momentum
         self.reliable_tau.mul_(momentum).add_(q75, alpha=1. - momentum)
@@ -861,11 +873,8 @@ class DiscriminativeStructureBranch(nn.Module):
             ], dim=1)
         if self.shape_representation == "state_org":
             similarity = self.shapelet_dictionary.compute_similarity(tokens)
-            candidate_mask = torch.ones(
-                similarity.shape[:2], dtype=torch.bool, device=similarity.device,
-            )
             state = self.compose_state_org_response(
-                similarity, candidate_mask,
+                similarity, None,
             )
             return {
                 "shape_tokens": tokens,

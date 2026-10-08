@@ -1,11 +1,13 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from models.stclassifier import PseStructureProtoLTae
 from models.structure_da.discriminative_structure import DiscriminativeStructureBranch
+from models.structure_da.discriminative_structure import MultiScaleWindowExtractor
 
 
 def _branch():
@@ -96,6 +98,76 @@ def test_source_calibration_buffers_save_load_and_freeze_for_uda():
     ))
 
 
+def test_calibration_uses_one_joint_quantile_and_matches_legacy_rule(monkeypatch):
+    branch = _branch().train()
+    values = torch.linspace(-1.25, 1.75, 3 * 64 * 16).reshape(3, 64, 16)
+    flat = values.reshape(-1, 16).float()
+    legacy_q25 = torch.quantile(flat, .25, dim=0)
+    legacy_q75 = torch.quantile(flat, .75, dim=0)
+    expected_tau = .1 * legacy_q75
+    expected_scale = .9 * torch.ones(16) + .1 * (
+        legacy_q75 - legacy_q25
+    ).clamp_min(.05)
+
+    original_quantile = torch.quantile
+    calls = []
+
+    def recording_quantile(input_tensor, q, *args, **kwargs):
+        calls.append((input_tensor.shape, torch.as_tensor(q).clone()))
+        return original_quantile(input_tensor, q, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "quantile", recording_quantile)
+    branch.update_reliable_calibration(values)
+    assert len(calls) == 1
+    assert calls[0][0] == (3 * 64, 16)
+    torch.testing.assert_close(calls[0][1], torch.tensor([.25, .75]))
+    torch.testing.assert_close(branch.reliable_tau, expected_tau)
+    torch.testing.assert_close(branch.reliable_scale, expected_scale)
+    branch.eval()
+    result = branch.compose_state_org_response(values)
+    expected_distribution = torch.softmax(5. * values, dim=-1)
+    expected_gate = torch.sigmoid(
+        (values - expected_tau) / expected_scale,
+    )
+    expected_composition = (expected_gate * expected_distribution).mean(1)
+    torch.testing.assert_close(
+        result["reliable_composition"], expected_composition,
+    )
+
+
+def test_pseudo_audit_tensor_mode_keeps_step_statistics_on_device():
+    from timematch import accepted_pseudo_statistics
+
+    pseudo = torch.tensor([0, 1, 2, 1])
+    target = torch.tensor([0, 2, 2, 1])
+    mask = torch.tensor([True, True, False, True])
+    statistics = accepted_pseudo_statistics(
+        pseudo, target, mask, num_classes=3, return_tensors=True,
+    )
+    assert all(torch.is_tensor(value) for value in statistics.values())
+    assert statistics["accepted_count"].item() == 3
+    assert statistics["correct_count"].item() == 2
+    torch.testing.assert_close(
+        statistics["class_accepted_count"], torch.tensor([1, 1, 1]),
+    )
+
+
+def test_window_extractor_does_not_rebuild_scale_or_center_metadata(monkeypatch):
+    extractor = MultiScaleWindowExtractor((24,), stride=1, grid_points=64)
+    curve = torch.randn(2, 64, 8)
+
+    def unexpected_arange(*args, **kwargs):
+        raise AssertionError("window metadata must be cached at construction")
+
+    monkeypatch.setattr(torch, "arange", unexpected_arange)
+    windows, scales = extractor(curve)
+    assert windows[0].shape == (2, 64, 24, 8)
+    assert scales.shape == (64,)
+    _, cached_scales, centers = extractor(curve, return_centers=True)
+    torch.testing.assert_close(cached_scales, scales)
+    assert centers.shape == (64,)
+
+
 def test_timematch_freezes_loaded_source_calibration_for_all_uda_forwards():
     from timematch import freeze_reliable_composition_calibration
 
@@ -162,11 +234,12 @@ def test_target_query_detach_cuts_structure_path_but_preserves_main_pse_path():
         assert open_path[name] is not None and open_path[name].abs().sum() > 0, name
 
 
-def test_launcher_reuses_one_source_checkpoint_for_a_and_b_and_has_fixed_matrix():
-    text = Path("scripts/run_reliable_composition_ab_4tasks_3seeds.sh").read_text()
+def test_launcher_is_seed1_only_and_reuses_one_source_checkpoint_for_a_and_b():
+    text = Path("scripts/run_reliable_composition_ab_seed1.sh").read_text()
     for task in ("AT1_DK1", "FR1_FR2", "FR2_DK1", "DK1_AT1"):
         assert task in text
-    assert "for seed in 1 2 3" in text
+    assert "seed=1" in text
+    assert "seed2" not in text and "seed3" not in text
     assert "--state-org-readout reliable_composition" in text
     assert "--shape-window-stride 1" in text
     assert '--target-structure-detach-epochs "$detach_epochs"' in text
@@ -178,23 +251,50 @@ def test_launcher_reuses_one_source_checkpoint_for_a_and_b_and_has_fixed_matrix(
     assert "--freeze-structure-specific false" in text
     assert "--freeze-state-org-query false" in text
     assert "DRY_RUN" in text and "SKIP_SOURCE" in text
-    assert text.count('train_source "$gpu"') == 1
+    assert 'if [[ "$DRY_RUN" == "1" && "$SKIP_SOURCE" == "1" ]]' in text
+    assert "if (( status != 3 )); then" in text
+    assert text.count('ensure_source "$gpu"') == 1
     assert text.index("train_source") < text.index("run_uda \"$gpu\" A")
     assert text.index("run_uda \"$gpu\" A") < text.index("run_uda \"$gpu\" B")
 
 
-def test_summary_reports_absolute_best_and_final_mean_std_without_historical_gain():
-    from analysis.summarize_reliable_composition_ab import aggregate_results
+def test_summary_reports_seed1_absolute_best_and_final_without_mean_or_gain():
+    from analysis import summarize_reliable_composition_ab as summary
 
     rows = [
-        {"variant": "A", "task": "AT1_DK1", "seed": seed,
+        {"variant": variant, "task": "AT1_DK1", "seed": 1,
          "best_test_macro_f1": best, "final_test_macro_f1": final}
-        for seed, best, final in ((1, .6, .5), (2, .7, .6), (3, .8, .7))
+        for variant, best, final in (("A", .7, .6), ("B", .8, .75))
     ]
-    summary = aggregate_results(rows)
-    assert len(summary) == 2
-    by_stage = {row["stage"]: row for row in summary}
-    assert by_stage["best"]["test_macro_f1_mean"] == pytest.approx(.7)
-    assert by_stage["best"]["test_macro_f1_std"] == pytest.approx(torch.tensor([.6, .7, .8]).std(unbiased=False).item())
-    assert by_stage["final"]["test_macro_f1_mean"] == pytest.approx(.6)
-    assert all("gain" not in key.lower() for row in summary for key in row)
+    result = summary.seed1_results(rows)
+    assert summary.np.arange(3).tolist() == [0, 1, 2]
+    assert len(result) == 2
+    assert {row["seed"] for row in result} == {1}
+    assert all(
+        "mean" not in key.lower() and "std" not in key.lower()
+        and "gain" not in key.lower()
+        for row in result for key in row
+    )
+
+
+def test_checkpoint_status_distinguishes_missing_incomplete_and_complete(tmp_path):
+    from analysis.summarize_reliable_composition_ab import checkpoint_status
+
+    fold = tmp_path / "missing_run" / "fold_0"
+    assert checkpoint_status(fold, "uda") == "missing"
+    fold.mkdir(parents=True)
+    torch.save({"epoch": 19, "config": SimpleNamespace(epochs=20)}, fold / "checkpoint_last.pt")
+    assert checkpoint_status(fold, "uda") == "incomplete"
+    torch.save({"epoch": 7}, fold / "checkpoint_best.pt")
+    assert checkpoint_status(fold, "uda") == "complete"
+
+    source = tmp_path / "source_fold"
+    source.mkdir()
+    torch.save({"epoch": 42, "config": SimpleNamespace(epochs=100)}, source / "model.pt")
+    assert checkpoint_status(source, "source") == "incomplete"
+    torch.save({"epoch": 98, "config": SimpleNamespace(epochs=100)}, source / "checkpoint_last.pt")
+    assert checkpoint_status(source, "source") == "incomplete"
+    torch.save({"epoch": 99, "config": SimpleNamespace(epochs=100)}, source / "checkpoint_last.pt")
+    assert checkpoint_status(source, "source") == "complete"
+    (source / "checkpoint_last.pt").write_bytes(b"not a checkpoint")
+    assert checkpoint_status(source, "source") == "incomplete"

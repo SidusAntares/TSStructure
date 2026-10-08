@@ -19,24 +19,35 @@ if str(ROOT) not in sys.path:
 TASKS = ("AT1_DK1", "FR1_FR2", "FR2_DK1", "DK1_AT1")
 
 
-def aggregate_results(rows):
-    grouped = {}
-    for row in rows:
-        key = (row["variant"], row["task"])
-        grouped.setdefault(key, []).append(row)
-    summary = []
-    for (variant, task), values in sorted(grouped.items()):
-        for stage in ("best", "final"):
-            scores = np.asarray([
-                float(row[f"{stage}_test_macro_f1"]) for row in values
-            ])
-            summary.append({
-                "variant": variant, "task": task, "stage": stage,
-                "seed_count": int(scores.size),
-                "test_macro_f1_mean": float(scores.mean()),
-                "test_macro_f1_std": float(scores.std(ddof=0)),
-            })
-    return summary
+def seed1_results(rows):
+    if any(int(row["seed"]) != 1 for row in rows):
+        raise ValueError("reliable-composition summary accepts seed1 only")
+    return sorted(rows, key=lambda row: (row["task"], row["variant"]))
+
+
+def checkpoint_status(fold, kind):
+    fold = Path(fold)
+    if kind not in ("source", "uda"):
+        raise ValueError("checkpoint kind must be source or uda")
+    if not fold.exists():
+        return "incomplete" if fold.parent.exists() else "missing"
+    required = (
+        (fold / "model.pt", fold / "checkpoint_last.pt") if kind == "source"
+        else (fold / "checkpoint_best.pt", fold / "checkpoint_last.pt")
+    )
+    if not all(path.is_file() for path in required):
+        return "incomplete"
+    final_path = required[1]
+    try:
+        packet = torch.load(final_path, map_location="cpu", weights_only=False)
+        config = packet["config"]
+        epochs = int(
+            config["epochs"] if isinstance(config, dict) else config.epochs
+        )
+        epoch = int(packet["epoch"])
+    except Exception:
+        return "incomplete"
+    return "complete" if epoch == epochs - 1 else "incomplete"
 
 
 def _write_csv(path, rows):
@@ -103,31 +114,36 @@ def summarize(args):
     root = Path(args.root)
     rows = []
     for variant in ("A", "B"):
-        for seed in (1, 2, 3):
-            for task in TASKS:
-                fold = root / variant / f"seed{seed}" / "uda" / f"{task}_seed{seed}" / "fold_0"
-                best_path = fold / "test_metrics_best_audit.json"
-                final_path = fold / "test_metrics_final_audit.json"
-                if not best_path.is_file() or not final_path.is_file():
-                    print(
-                        f"MISSING|variant={variant}|task={task}|seed={seed}|"
-                        f"best={best_path}|final={final_path}"
-                    )
-                    continue
-                best = json.loads(best_path.read_text(encoding="utf-8"))
-                final = json.loads(final_path.read_text(encoding="utf-8"))
-                rows.append({
-                    "variant": variant, "task": task, "seed": seed,
-                    "best_epoch": best["epoch"],
-                    "best_test_macro_f1": best["test_macro_f1"],
-                    "final_epoch": final["epoch"],
-                    "final_test_macro_f1": final["test_macro_f1"],
-                })
+        seed = 1
+        for task in TASKS:
+            fold = root / variant / "seed1" / "uda" / f"{task}_seed1" / "fold_0"
+            best_path = fold / "test_metrics_best_audit.json"
+            final_path = fold / "test_metrics_final_audit.json"
+            if not best_path.is_file() or not final_path.is_file():
+                print(
+                    f"MISSING|variant={variant}|task={task}|seed=1|"
+                    f"best={best_path}|final={final_path}"
+                )
+                continue
+            best = json.loads(best_path.read_text(encoding="utf-8"))
+            final = json.loads(final_path.read_text(encoding="utf-8"))
+            rows.append({
+                "variant": variant, "task": task, "seed": seed,
+                "best_epoch": best["epoch"],
+                "best_test_macro_f1": best["test_macro_f1"],
+                "final_epoch": final["epoch"],
+                "final_test_macro_f1": final["test_macro_f1"],
+            })
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    _write_csv(output / "per_seed_test_macro_f1.csv", rows)
-    _write_csv(output / "three_seed_test_macro_f1.csv", aggregate_results(rows))
+    _write_csv(output / "seed1_test_macro_f1.csv", seed1_results(rows))
     print(f"RELIABLE_COMPOSITION_SUMMARY|runs={len(rows)}|output={output}")
+
+
+def report_checkpoint_status(args):
+    status = checkpoint_status(args.fold, args.kind)
+    print(f"CHECKPOINT_STATUS|kind={args.kind}|status={status}|fold={args.fold}")
+    return {"complete": 0, "missing": 3, "incomplete": 4}[status]
 
 
 def build_parser():
@@ -145,12 +161,20 @@ def build_parser():
         "--output", type=Path,
         default=Path("outputs/reliable_composition_ab/summary"),
     )
+    status = sub.add_parser("checkpoint-status")
+    status.add_argument("--fold", required=True, type=Path)
+    status.add_argument("--kind", required=True, choices=("source", "uda"))
     return parser
 
 
 def main():
     args = build_parser().parse_args()
-    evaluate(args) if args.command == "evaluate" else summarize(args)
+    if args.command == "evaluate":
+        evaluate(args)
+    elif args.command == "summarize":
+        summarize(args)
+    else:
+        raise SystemExit(report_checkpoint_status(args))
 
 
 if __name__ == "__main__":

@@ -28,6 +28,12 @@ execute_logged() {
   fi
 }
 
+checkpoint_status() {
+  local kind="$1" fold="$2" log="$3"
+  "$PYTHON_BIN" -u analysis/summarize_reliable_composition_ab.py \
+    checkpoint-status --kind "$kind" --fold "$fold" >> "$log" 2>&1
+}
+
 train_source() {
   local gpu="$1" src="$2" src_data="$3" seed="$4" log="$5"
   local experiment="source_${src}_seed${seed}"
@@ -47,9 +53,39 @@ train_source() {
     --focal_loss_gamma 1.0 --seq_length 30 --num_pixels 64 --closed_set true \
     --progress_bar off --output_dir "$root" \
     --tensorboard_log_dir "$RUN_ROOT/source/seed${seed}/${src}"
-  if [[ "$DRY_RUN" != "1" ]]; then
-    test -f "$root/$experiment/fold_0/model.pt"
+}
+
+ensure_source() {
+  local gpu="$1" src="$2" src_data="$3" seed="$4" log="$5"
+  local source_root="$OUT_ROOT/source/seed${seed}/source_${src}_seed${seed}"
+  local fold="$source_root/fold_0" status
+  if [[ "$DRY_RUN" == "1" && "$SKIP_SOURCE" == "1" ]]; then
+    echo "RELIABLE_SOURCE_REUSE|gpu=$gpu|source=$src|seed=$seed|checkpoint=$fold/model.pt" | tee -a "$log"
+    return
   fi
+  if [[ "$DRY_RUN" == "1" ]]; then
+    train_source "$gpu" "$src" "$src_data" "$seed" "$log"
+    return
+  fi
+  if checkpoint_status source "$fold" "$log"; then
+    echo "RELIABLE_SOURCE_REUSE|gpu=$gpu|source=$src|seed=$seed|checkpoint=$fold/model.pt" | tee -a "$log"
+    return
+  else
+    status=$?
+  fi
+  if (( status != 3 )); then
+    echo "ERROR: invalid or incomplete source output; refusing overwrite: $fold (status=$status)" | tee -a "$log" >&2
+    return 1
+  fi
+  if [[ "$SKIP_SOURCE" == "1" ]]; then
+    echo "ERROR: complete source checkpoint required by SKIP_SOURCE=1: $fold/model.pt" | tee -a "$log" >&2
+    return 1
+  fi
+  train_source "$gpu" "$src" "$src_data" "$seed" "$log"
+  checkpoint_status source "$fold" "$log" || {
+    echo "ERROR: source training did not produce a complete final checkpoint: $fold" | tee -a "$log" >&2
+    return 1
+  }
 }
 
 evaluate_checkpoint() {
@@ -65,6 +101,21 @@ run_uda() {
   local tgt="$6" tgt_data="$7" seed="$8" source_weights="$9" log="${10}"
   local task="${src}_${tgt}" experiment="${task}_seed${seed}"
   local root="$OUT_ROOT/$variant/seed${seed}/uda"
+  local fold="$root/$experiment/fold_0" status
+  if [[ "$DRY_RUN" != "1" ]]; then
+    if checkpoint_status uda "$fold" "$log"; then
+      echo "RELIABLE_UDA_REUSE|gpu=$gpu|variant=$variant|task=$task|seed=$seed|fold=$fold" | tee -a "$log"
+      evaluate_checkpoint "$gpu" "$fold/checkpoint_best.pt" "$fold/test_metrics_best_audit.json" "$log"
+      evaluate_checkpoint "$gpu" "$fold/checkpoint_last.pt" "$fold/test_metrics_final_audit.json" "$log"
+      return
+    else
+      status=$?
+    fi
+    if (( status != 3 )); then
+      echo "ERROR: invalid or incomplete UDA output; refusing overwrite or implicit resume: $fold (status=$status)" | tee -a "$log" >&2
+      return 1
+    fi
+  fi
   echo "RELIABLE_UDA_START|gpu=$gpu|variant=$variant|task=$task|seed=$seed|detach_epochs=$detach_epochs|source_checkpoint=$source_weights/fold_0/model.pt" | tee -a "$log"
   execute_logged "$gpu" "$log" "$PYTHON_BIN" -u train.py \
     -e "$experiment" --data_root "$DATA_ROOT" --source "$src_data" --target "$tgt_data" \
@@ -91,10 +142,11 @@ run_uda() {
     --freeze-state-org-query false --detach-target-structure false \
     --target-structure-detach-epochs "$detach_epochs"
 
-  local fold="$root/$experiment/fold_0"
   if [[ "$DRY_RUN" != "1" ]]; then
-    test -f "$fold/checkpoint_best.pt"
-    test -f "$fold/checkpoint_last.pt"
+    checkpoint_status uda "$fold" "$log" || {
+      echo "ERROR: UDA training did not produce complete Best and Final checkpoints: $fold" | tee -a "$log" >&2
+      return 1
+    }
   fi
   evaluate_checkpoint "$gpu" "$fold/checkpoint_best.pt" \
     "$fold/test_metrics_best_audit.json" "$log"
@@ -104,25 +156,15 @@ run_uda() {
 
 run_task() {
   local gpu="$1" src="$2" src_data="$3" tgt="$4" tgt_data="$5"
-  local task="${src}_${tgt}"
-  for seed in 1 2 3; do
-    local log_dir="$LOG_ROOT/$task/seed${seed}"
-    local source_root="$OUT_ROOT/source/seed${seed}/source_${src}_seed${seed}"
-    mkdir -p "$log_dir"
-    if [[ "$SKIP_SOURCE" == "1" ]]; then
-      if [[ "$DRY_RUN" != "1" ]] && [[ ! -f "$source_root/fold_0/model.pt" ]]; then
-        echo "ERROR: source checkpoint missing: $source_root/fold_0/model.pt" >&2
-        return 1
-      fi
-      echo "RELIABLE_SOURCE_REUSE|gpu=$gpu|source=$src|seed=$seed|checkpoint=$source_root/fold_0/model.pt" | tee -a "$log_dir/source.log"
-    else
-      train_source "$gpu" "$src" "$src_data" "$seed" "$log_dir/source.log"
-    fi
-    run_uda "$gpu" A 0 "$src" "$src_data" "$tgt" "$tgt_data" "$seed" \
-      "$source_root" "$log_dir/A.log"
-    run_uda "$gpu" B 5 "$src" "$src_data" "$tgt" "$tgt_data" "$seed" \
-      "$source_root" "$log_dir/B.log"
-  done
+  local task="${src}_${tgt}" seed=1
+  local log_dir="$LOG_ROOT/$task/seed1"
+  local source_root="$OUT_ROOT/source/seed1/source_${src}_seed1"
+  mkdir -p "$log_dir"
+  ensure_source "$gpu" "$src" "$src_data" "$seed" "$log_dir/source.log"
+  run_uda "$gpu" A 0 "$src" "$src_data" "$tgt" "$tgt_data" "$seed" \
+    "$source_root" "$log_dir/A.log"
+  run_uda "$gpu" B 5 "$src" "$src_data" "$tgt" "$tgt_data" "$seed" \
+    "$source_root" "$log_dir/B.log"
 }
 
 run_task "$GPU0" AT1 "$AT1" DK1 "$DK1" & P0=$!
@@ -133,7 +175,7 @@ status=0
 wait "$P0" || status=1; wait "$P1" || status=1
 wait "$P2" || status=1; wait "$P3" || status=1
 if (( status != 0 )); then
-  echo "ERROR: reliable-composition A/B worker failed; inspect $LOG_ROOT" >&2
+  echo "ERROR: reliable-composition Seed1 A/B worker failed; inspect $LOG_ROOT" >&2
   exit 1
 fi
 
@@ -144,4 +186,4 @@ else
     --root "$OUT_ROOT" --output "$OUT_ROOT/summary" \
     > "$LOG_ROOT/summary.log" 2>&1
 fi
-echo "RELIABLE_COMPOSITION_AB_FINISHED|output=$OUT_ROOT"
+echo "RELIABLE_COMPOSITION_AB_SEED1_FINISHED|output=$OUT_ROOT"
