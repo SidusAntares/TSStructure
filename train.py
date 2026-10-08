@@ -578,7 +578,6 @@ def main(config):
             device,
             config.classes,
             mode='test',
-            temporal_shift=0,
             progress_bar=getattr(config, "progress_bar", "auto"),
         )
 

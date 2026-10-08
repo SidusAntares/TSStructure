@@ -1,4 +1,5 @@
 from pathlib import Path
+import pickle
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -17,15 +18,15 @@ def test_unified_evaluation_script_is_directly_executable():
     assert "recheck" in result.stdout
 
 
-def test_formal_train_test_explicitly_uses_zero_shift():
+def test_formal_train_test_does_not_override_temporal_shift():
     source = Path("train.py").read_text(encoding="utf-8")
     test_call = source[source.index("test_metrics = evaluation("):]
     test_call = test_call[:test_call.index(")\n\n        print")]
     assert "mode='test'" in test_call
-    assert "temporal_shift=0" in test_call
+    assert "temporal_shift=" not in test_call
 
 
-def test_fixed_test_macro_f1_counts_zero_support_protocol_classes():
+def test_test_macro_f1_uses_original_observed_class_semantics():
     from evaluation import classification_metrics
 
     result = classification_metrics(
@@ -34,9 +35,11 @@ def test_fixed_test_macro_f1_counts_zero_support_protocol_classes():
         class_names=("a", "b", "zero-support"),
         mode="test",
     )
-    # F1(a)=.8, F1(b)=2/3, F1(zero-support)=0.
-    assert result["macro_f1"] == pytest.approx((.8 + 2. / 3.) / 3.)
+    # F1(a)=.8, F1(b)=2/3; the absent class is excluded from the main metric.
+    assert result["macro_f1"] == pytest.approx((.8 + 2. / 3.) / 2.)
     assert result["support"] == [2, 2, 0]
+    assert np.asarray(result["confusion_matrix"]).shape == (3, 3)
+    assert "zero-support" in result["classification_report"]
 
 
 def test_validation_macro_f1_keeps_historical_observed_class_semantics():
@@ -51,7 +54,7 @@ def test_validation_macro_f1_keeps_historical_observed_class_semantics():
     assert result["macro_f1"] == pytest.approx((.8 + 2. / 3.) / 2.)
 
 
-def test_unified_checkpoint_evaluation_forces_zero_shift(monkeypatch):
+def test_unified_checkpoint_evaluation_does_not_override_temporal_shift(monkeypatch):
     from analysis import summarize_reliable_composition_ab as summary
 
     captured = {}
@@ -73,8 +76,23 @@ def test_unified_checkpoint_evaluation_forces_zero_shift(monkeypatch):
         object(), object(), SimpleNamespace(classes=["a", "b"]), "cpu",
     )
     assert captured["mode"] == "test"
-    assert captured["temporal_shift"] == 0
+    assert "temporal_shift" not in captured
     assert result["inference_shift"] == 0
+
+
+def test_confusion_recompute_separates_original_and_fixed_class_macro_f1():
+    from analysis.summarize_reliable_composition_ab import _metrics_from_confusion
+
+    metrics = _metrics_from_confusion(np.array([
+        [2, 0, 0],
+        [1, 1, 0],
+        [0, 0, 0],
+    ]))
+    assert metrics["macro_f1"] == pytest.approx((.8 + 2. / 3.) / 2.)
+    assert metrics["fixed_class_macro_f1"] == pytest.approx(
+        (.8 + 2. / 3.) / 3.
+    )
+    assert metrics["support"].tolist() == [2, 2, 0]
 
 
 def test_official_test_loader_reuses_train_split_and_dataset_factory(monkeypatch):
@@ -134,3 +152,27 @@ def test_verified_confusion_requires_final_protocol_manifest(tmp_path):
         encoding="utf-8",
     )
     assert verified_final_artifacts(fold, "target") == (metrics, confusion)
+
+
+def test_existing_confusion_is_recomputed_with_original_and_fixed_metrics(tmp_path):
+    from analysis.summarize_reliable_composition_ab import _direct_final_result
+
+    fold = tmp_path / "fold_0"
+    fold.mkdir()
+    (fold / "manifest.json").write_text(
+        '{"uda_test_checkpoint":"checkpoint_last.pt",'
+        '"target_validation_used_for_test_selection":false}',
+        encoding="utf-8",
+    )
+    target = "denmark_32VNH_2017"
+    (fold / f"test_metrics_final_{target}.json").write_text("{}", encoding="utf-8")
+    with (fold / f"conf_mat_final_{target}.pkl").open("wb") as stream:
+        pickle.dump(np.array([[2, 0, 0], [1, 1, 0], [0, 0, 0]]), stream)
+
+    result = _direct_final_result(fold, target)
+    assert result["provenance"] == "confusion_recomputed"
+    assert result["test_macro_f1"] == pytest.approx((.8 + 2. / 3.) / 2.)
+    assert result["fixed_class_macro_f1"] == pytest.approx(
+        (.8 + 2. / 3.) / 3.
+    )
+    assert result["support"] == [2, 2, 0]

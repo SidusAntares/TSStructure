@@ -9,10 +9,9 @@ from utils.train_utils import AverageMeter, progress_bar_disabled, to_cuda
 
 
 def classification_metrics(y_true, y_pred, class_names, mode='val'):
-    """Compute classification metrics with a fixed class universe for Test."""
+    """Compute original TimeMatch metrics plus fixed-universe diagnostics."""
     y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
     labels = np.arange(len(class_names))
-    macro_labels = labels if mode == 'test' else None
     precision, recall, per_class_f1, support = (
         sklearn.metrics.precision_recall_fscore_support(
             y_true, y_pred, labels=labels, zero_division=0,
@@ -21,8 +20,7 @@ def classification_metrics(y_true, y_pred, class_names, mode='val'):
     return {
         'accuracy': sklearn.metrics.accuracy_score(y_true, y_pred),
         'macro_f1': sklearn.metrics.f1_score(
-            y_true, y_pred, labels=macro_labels, average='macro',
-            zero_division=0,
+            y_true, y_pred, average='macro', zero_division=0,
         ),
         'weighted_f1': sklearn.metrics.f1_score(
             y_true, y_pred, average='weighted', zero_division=0,

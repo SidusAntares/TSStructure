@@ -128,9 +128,16 @@ def build_official_test_loader(config, data_root, batch_size):
 def evaluate_model_on_official_test(model, test_loader, config, device):
     metrics = official_evaluation(
         model, test_loader, device, config.classes, mode="test",
-        temporal_shift=0,
         progress_bar=getattr(config, "progress_bar", "off"),
     )
+    confusion_metrics = _metrics_from_confusion(metrics["confusion_matrix"])
+    metrics.update({
+        "fixed_class_macro_f1": confusion_metrics["fixed_class_macro_f1"],
+        "per_class_precision": confusion_metrics["per_class_precision"],
+        "per_class_recall": confusion_metrics["per_class_recall"],
+        "per_class_f1": confusion_metrics["per_class_f1"],
+        "support": confusion_metrics["support"],
+    })
     metrics["inference_shift"] = 0
     return metrics
 
@@ -158,6 +165,7 @@ def _metric_result(checkpoint, role, config, packet, metrics, provenance):
         "num_classes": len(class_names),
         "sample_count": int(np.asarray(metrics["support"]).sum()),
         "test_macro_f1": float(metrics["macro_f1"]),
+        "fixed_class_macro_f1": float(metrics["fixed_class_macro_f1"]),
         "accuracy": float(metrics["accuracy"]),
         "class_names": class_names,
         "per_class_precision": np.asarray(
@@ -229,9 +237,13 @@ def _metrics_from_confusion(confusion):
         2. * precision * recall, precision + recall,
         out=np.zeros_like(precision), where=(precision + recall) != 0,
     )
+    observed = (support + predicted) > 0
     total = int(support.sum())
     return {
-        "macro_f1": float(per_class_f1.mean()),
+        "macro_f1": (
+            float(per_class_f1[observed].mean()) if observed.any() else 0.
+        ),
+        "fixed_class_macro_f1": float(per_class_f1.mean()),
         "accuracy": float(true_positive.sum() / total) if total else 0.,
         "confusion_matrix": confusion,
         "per_class_precision": precision,
@@ -330,8 +342,9 @@ def _write_comparison(path, rows):
     lines = [
         "# Unified UDA Final Test evaluation",
         "",
-        "Protocol: checkpoint_last.pt; inference_shift=0; official Test loader; "
-        "fixed class-universe Macro-F1.",
+        "Protocol: checkpoint_last.pt; no test-time shift override; official "
+        "Test loader; original TimeMatch observed-class Macro-F1. Fixed-class "
+        "Macro-F1 is supplemental only.",
         "",
         "| Method | " + " | ".join(TASKS) + " | 4-task Mean |",
         "|---|" + "---:|" * (len(TASKS) + 1),
@@ -385,6 +398,9 @@ def recheck(args):
                 "final_test_macro_f1": (
                     final["test_macro_f1"] if final is not None else ""
                 ),
+                "final_fixed_class_macro_f1": (
+                    final["fixed_class_macro_f1"] if final is not None else ""
+                ),
                 "final_inference_shift": 0,
                 "final_num_classes": final["num_classes"] if final is not None else "",
                 "final_provenance": final["provenance"] if final is not None else "",
@@ -397,6 +413,9 @@ def recheck(args):
                     best["checkpoint_epoch"] if best is not None else ""
                 ),
                 "best_test_macro_f1": best["test_macro_f1"] if best is not None else "",
+                "best_fixed_class_macro_f1": (
+                    best["fixed_class_macro_f1"] if best is not None else ""
+                ),
                 "best_inference_shift": 0,
                 "best_provenance": best["provenance"] if best is not None else "",
                 "best_confusion_matrix": json.dumps(
@@ -440,8 +459,10 @@ def summarize(args):
                 "variant": variant, "task": task, "seed": seed,
                 "best_epoch": best.get("checkpoint_epoch", best.get("epoch")),
                 "best_test_macro_f1": best["test_macro_f1"],
+                "best_fixed_class_macro_f1": best.get("fixed_class_macro_f1", ""),
                 "final_epoch": final.get("checkpoint_epoch", final.get("epoch")),
                 "final_test_macro_f1": final["test_macro_f1"],
+                "final_fixed_class_macro_f1": final.get("fixed_class_macro_f1", ""),
             })
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
