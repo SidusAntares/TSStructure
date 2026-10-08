@@ -578,6 +578,7 @@ def main(config):
             device,
             config.classes,
             mode='test',
+            temporal_shift=0,
             progress_bar=getattr(config, "progress_bar", "auto"),
         )
 
@@ -589,7 +590,7 @@ def main(config):
     overall_performance(config)
 
 
-def prepare_data_protocol(config):
+def prepare_data_protocol(config, write_protocol=True):
     candidate_classes = label_utils.get_classes(
         config.source.split('/')[0],
         combine_spring_and_winter=config.combine_spring_and_winter,
@@ -696,8 +697,9 @@ def prepare_data_protocol(config):
         f"source={config.source}|target={config.target}|"
         f"num_classes={config.num_classes}|classes={','.join(config.classes)}"
     )
-    with open(os.path.join(config.output_dir, "closed_set_protocol.json"), "w") as f:
-        json.dump(protocol, f, indent=4)
+    if write_protocol:
+        with open(os.path.join(config.output_dir, "closed_set_protocol.json"), "w") as f:
+            json.dump(protocol, f, indent=4)
 
     return eligible_indices, protocol
 

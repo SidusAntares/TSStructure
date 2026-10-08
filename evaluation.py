@@ -8,6 +8,42 @@ import sklearn.metrics
 from utils.train_utils import AverageMeter, progress_bar_disabled, to_cuda
 
 
+def classification_metrics(y_true, y_pred, class_names, mode='val'):
+    """Compute classification metrics with a fixed class universe for Test."""
+    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
+    labels = np.arange(len(class_names))
+    macro_labels = labels if mode == 'test' else None
+    precision, recall, per_class_f1, support = (
+        sklearn.metrics.precision_recall_fscore_support(
+            y_true, y_pred, labels=labels, zero_division=0,
+        )
+    )
+    return {
+        'accuracy': sklearn.metrics.accuracy_score(y_true, y_pred),
+        'macro_f1': sklearn.metrics.f1_score(
+            y_true, y_pred, labels=macro_labels, average='macro',
+            zero_division=0,
+        ),
+        'weighted_f1': sklearn.metrics.f1_score(
+            y_true, y_pred, average='weighted', zero_division=0,
+        ),
+        'kappa': sklearn.metrics.cohen_kappa_score(
+            y_true, y_pred, labels=labels.tolist(),
+        ),
+        'classification_report': sklearn.metrics.classification_report(
+            y_true, y_pred, labels=labels, target_names=class_names,
+            zero_division=0,
+        ),
+        'confusion_matrix': sklearn.metrics.confusion_matrix(
+            y_true, y_pred, labels=labels,
+        ),
+        'per_class_precision': precision.tolist(),
+        'per_class_recall': recall.tolist(),
+        'per_class_f1': per_class_f1.tolist(),
+        'support': support.astype(np.int64).tolist(),
+    }
+
+
 def validation(best_f1, best_model_path, config, criterion, device, epoch, model, val_loader, writer, temporal_shift=None):
     val_metrics = evaluation(
         model,
@@ -90,14 +126,7 @@ def evaluation(
 
     y_true, y_pred = np.array(y_true), np.array(y_pred)
 
-    metrics = {
-        'accuracy': sklearn.metrics.accuracy_score(y_true, y_pred),
-        'loss': loss_meter.avg,
-        'macro_f1': sklearn.metrics.f1_score(y_true, y_pred, average='macro', zero_division=0),
-        'weighted_f1': sklearn.metrics.f1_score(y_true, y_pred, average='weighted', zero_division=0),
-        'kappa': sklearn.metrics.cohen_kappa_score(y_true, y_pred, labels=list(range(len(class_names)))),
-        'classification_report': sklearn.metrics.classification_report(y_true, y_pred, labels=list(range(len(class_names))), target_names=class_names, zero_division=0),
-        'confusion_matrix': sklearn.metrics.confusion_matrix(y_true, y_pred, labels=list(range(len(class_names)))),
-   }
+    metrics = classification_metrics(y_true, y_pred, class_names, mode=mode)
+    metrics['loss'] = loss_meter.avg
 
     return metrics
