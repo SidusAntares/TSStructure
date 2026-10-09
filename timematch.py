@@ -269,6 +269,7 @@ def cache_geometric_reference_tokens(reference, loader, device, limit, seed):
 
 def forward_target_phase_equivariance(
     student, pixels, mask, positions, extra, max_shift,
+    detach_structure_query=False,
 ):
     """Run E on all target-strong samples without labels or pseudo selections."""
     delta = sample_structure_aug_shifts(
@@ -276,6 +277,7 @@ def forward_target_phase_equivariance(
     )
     output, base, shifted = student.forward_phase_equivariance_target(
         pixels, mask, positions, extra, structure_aug_shift=delta,
+        detach_structure_query=detach_structure_query,
     )
     losses = phase_equivariance_loss(
         base, shifted, delta,
@@ -1601,14 +1603,26 @@ def _train_structure_proto_timematch(
     freeze_structure_specific = bool(
         getattr(config, "freeze_structure_specific", False)
     )
-    if (
+    detach_controls_enabled = (
         detach_target_structure or target_structure_detach_epochs > 0
-        or freeze_structure_specific
-    ) and (
+    )
+    detach_controls_supported = (
+        getattr(config, "shape_representation", None) == "state_org"
+        and getattr(config, "shape_injection", None) == "direct_response_query"
+    ) or (
+        getattr(config, "shape_representation", None) == "phase_moment"
+        and getattr(config, "shape_injection", None) == "current_query"
+    )
+    if detach_controls_enabled and not detach_controls_supported:
+        raise ValueError(
+            "target structure detach requires state_org + direct_response_query "
+            "or phase_moment + current_query"
+        )
+    if freeze_structure_specific and (
         getattr(config, "shape_representation", None) != "state_org"
     ):
         raise ValueError(
-            "state-org feasibility gradient controls require shape_representation=state_org"
+            "freeze_structure_specific requires shape_representation=state_org"
         )
     uda_shape_class_weight = getattr(config, "uda_shape_class_weight", None)
     uda_shape_class_weight = (
@@ -1975,6 +1989,7 @@ def _train_structure_proto_timematch(
                     forward_target_phase_equivariance(
                         student, pt, mt, tt, et,
                         max_shift=config.shape_equivariance_max_shift,
+                        detach_structure_query=detach_target_structure_this_epoch,
                     )
                 )
             else:

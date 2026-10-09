@@ -17,14 +17,17 @@ def _branch(representation="phase_moment"):
     )
 
 
-def _model(representation="phase_moment"):
+def _model(
+    representation="phase_moment", injection="current_query",
+    phase_query_view="full", stride=8,
+):
     return PseStructureProtoLTae(
         input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
         n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6],
         num_classes=3, shape_dim=8, shape_window_scales=(24,),
-        shape_window_stride=8, shapelet_count=16, fourier_num_modes=5,
-        shape_representation=representation, shape_injection="current_query",
-        structure_shift_mode="none",
+        shape_window_stride=stride, shapelet_count=16, fourier_num_modes=5,
+        shape_representation=representation, shape_injection=injection,
+        structure_shift_mode="none", phase_query_view=phase_query_view,
     )
 
 
@@ -413,4 +416,200 @@ def test_launcher_run_round_e_skips_source_and_p_with_checkpoint_preflight():
     assert 'ALL) run_source_round; run_p_round; run_e_round ;;' in source
     assert 'require_source_checkpoints' in source
     assert 'ROUND_START|round=E' in source
+
+
+def test_phase_current_query_detach_preserves_logits_and_only_blocks_query_path():
+    torch.manual_seed(71)
+    model = _model().eval()
+    with torch.no_grad():
+        model.temporal_encoder.attention_heads.external_query_projection.weight.fill_(.05)
+    pixels = torch.randn(3, 10, 3, 4)
+    mask = torch.ones(3, 10, 4)
+    positions = torch.arange(10).repeat(3, 1) * 30
+    extra = torch.zeros(3, 4)
+    delta = torch.tensor([7., -11., 19.])
+
+    attached, _, _ = model.forward_phase_equivariance_target(
+        pixels, mask, positions, extra, delta, detach_structure_query=False,
+    )
+    detached, _, _ = model.forward_phase_equivariance_target(
+        pixels, mask, positions, extra, delta, detach_structure_query=True,
+    )
+    torch.testing.assert_close(attached["logits"], detached["logits"])
+
+    attached["logits"].square().mean().backward()
+    assert any(parameter.grad is not None for parameter in model.structure_branch.response_to_query.parameters())
+    assert model.temporal_encoder.attention_heads.external_query_projection.weight.grad is not None
+    model.zero_grad(set_to_none=True)
+
+    detached, _, _ = model.forward_phase_equivariance_target(
+        pixels, mask, positions, extra, delta, detach_structure_query=True,
+    )
+    detached["logits"].square().mean().backward()
+    assert all(parameter.grad is None for parameter in model.structure_branch.response_to_query.parameters())
+    assert model.temporal_encoder.attention_heads.external_query_projection.weight.grad is None
+    assert model.temporal_encoder.attention_heads.key.weight.grad is not None
+    assert any(parameter.grad is not None for parameter in model.decoder.parameters())
+
+
+def test_phase_detach5_schedule_opens_after_epoch_four_and_default_is_open():
+    import timematch
+
+    staged = SimpleNamespace(
+        detach_target_structure=False, target_structure_detach_epochs=5,
+    )
+    assert [
+        timematch.target_structure_detached_for_epoch(staged, epoch)
+        for epoch in range(20)
+    ] == [True] * 5 + [False] * 15
+    default = SimpleNamespace(
+        detach_target_structure=False, target_structure_detach_epochs=0,
+    )
+    assert not any(
+        timematch.target_structure_detached_for_epoch(default, epoch)
+        for epoch in range(20)
+    )
+
+
+def test_phase_equivariance_gradient_survives_target_query_detach():
+    from methods.structure_da.phase_equivariance import phase_equivariance_loss
+
+    torch.manual_seed(73)
+    model = _model().train()
+    pixels = torch.randn(4, 10, 3, 4)
+    mask = torch.ones(4, 10, 4)
+    positions = torch.arange(10).repeat(4, 1) * 30
+    extra = torch.zeros(4, 4)
+    delta = torch.tensor([9., -13., 21., -27.])
+    _, base, shifted = model.forward_phase_equivariance_target(
+        pixels, mask, positions, extra, delta, detach_structure_query=True,
+    )
+    loss = phase_equivariance_loss(
+        base, shifted, delta, shapelet_count=16,
+        harmonics=(1, 2), period_days=365.,
+    )["total_loss"]
+    loss.backward()
+    assert model.structure_branch.shapelet_dictionary.anchors.grad is not None
+    assert any(
+        parameter.grad is not None
+        for parameter in model.structure_branch.token_generator.parameters()
+    )
+
+
+def test_phase_source_classification_query_gradient_is_unchanged():
+    torch.manual_seed(79)
+    model = _model().train()
+    with torch.no_grad():
+        model.temporal_encoder.attention_heads.external_query_projection.weight.fill_(.05)
+    pixels = torch.randn(3, 10, 3, 4)
+    mask = torch.ones(3, 10, 4)
+    positions = torch.arange(10).repeat(3, 1) * 30
+    output = model(
+        pixels, mask, positions, torch.zeros(3, 4), return_dict=True,
+    )
+    output["logits"].square().mean().backward()
+    assert any(
+        parameter.grad is not None
+        for parameter in model.structure_branch.response_to_query.parameters()
+    )
+
+
+def test_phase_direct_response_query_uses_full_96d_response_and_backpropagates():
+    torch.manual_seed(83)
+    model = _model(injection="direct_response_query").train()
+    assert model.temporal_encoder.attention_heads.external_query_projection.in_features == 96
+    pixels = torch.randn(2, 10, 3, 4)
+    mask = torch.ones(2, 10, 4)
+    positions = torch.arange(10).repeat(2, 1) * 30
+    output = model(
+        pixels, mask, positions, torch.zeros(2, 4), return_dict=True,
+    )
+    assert output["shapelet_response"].shape == (2, 96)
+    output["logits"].square().mean().backward()
+    assert model.temporal_encoder.attention_heads.external_query_projection.weight.grad is not None
+    assert model.structure_branch.shapelet_dictionary.anchors.grad is not None
+
+
+def test_phase_stride_one_produces_64_circular_candidates():
+    torch.manual_seed(89)
+    model = _model(stride=1).eval()
+    pixels = torch.randn(2, 10, 3, 4)
+    mask = torch.ones(2, 10, 4)
+    positions = torch.arange(10).repeat(2, 1) * 30
+    output = model(
+        pixels, mask, positions, torch.zeros(2, 4), return_dict=True,
+    )
+    assert output["shapelet_similarity"].shape == (2, 64, 16)
+
+
+def test_phase_rich32_masks_only_query_input_and_preserves_full_response():
+    torch.manual_seed(97)
+    model = _model(phase_query_view="rich32").eval()
+    pixels = torch.randn(2, 10, 3, 4)
+    mask = torch.ones(2, 10, 4)
+    positions = torch.arange(10).repeat(2, 1) * 30
+    structure = model.prepare_structure(
+        model.spatial_encoder(pixels, mask, torch.zeros(2, 4)), positions,
+    )
+    response = structure["shapelet_response"]
+    masked = torch.cat((response[:, :32], torch.zeros_like(response[:, 32:])), dim=-1)
+    assert response.shape == (2, 96)
+    assert torch.count_nonzero(response[:, 32:]) > 0
+    torch.testing.assert_close(
+        structure["shape_class_token"],
+        model.structure_branch.response_to_query(masked),
+    )
+
+
+def test_phase_default_query_view_remains_full():
+    torch.manual_seed(101)
+    model = _model().eval()
+    pixels = torch.randn(2, 10, 3, 4)
+    mask = torch.ones(2, 10, 4)
+    positions = torch.arange(10).repeat(2, 1) * 30
+    structure = model.prepare_structure(
+        model.spatial_encoder(pixels, mask, torch.zeros(2, 4)), positions,
+    )
+    torch.testing.assert_close(
+        structure["shape_class_token"],
+        model.structure_branch.response_to_query(structure["shapelet_response"]),
+    )
+
+
+def test_e_cross_source_checkpoints_strict_load_and_uda_forward():
+    variants = (
+        dict(),
+        dict(injection="direct_response_query"),
+        dict(stride=1),
+        dict(phase_query_view="rich32"),
+    )
+    pixels = torch.randn(2, 10, 3, 4)
+    mask = torch.ones(2, 10, 4)
+    positions = torch.arange(10).repeat(2, 1) * 30
+    for options in variants:
+        source = _model(**options)
+        uda = _model(**options)
+        uda.load_state_dict(source.state_dict(), strict=True)
+        output, _, _ = uda.forward_phase_equivariance_target(
+            pixels, mask, positions, torch.zeros(2, 4),
+            torch.tensor([11., -17.]),
+        )
+        assert output["logits"].shape == (2, 3)
+
+
+def test_e_cross_launcher_freezes_four_single_factor_variants():
+    source = Path("scripts/run_structure_e_cross_seed1.sh").read_text()
+    assert 'RUN_ROUND="${RUN_ROUND:-ALL}"' in source
+    assert 'DRY_RUN="${DRY_RUN:-0}"' in source
+    assert '[[ "$variant" == "G" ]] && detach_epochs=5' in source
+    assert '--target-structure-detach-epochs "$detach_epochs"' in source
+    assert source.count("--shape-injection direct_response_query") == 1
+    assert source.count("--shape-window-stride 1") == 1
+    assert source.count("--phase-query-view rich32") == 1
+    assert 'require_source "$E_SOURCE_ROOT/source_FR1_seed1"' in source
+    assert 'require_source "$E_SOURCE_ROOT/source_FR2_seed1"' in source
+    assert '"$path/fold_0/model.pt"' in source
+    assert "experiments/structure_e_cross_seed1" in source
+    assert source.count('run_source "$GPU') == 6
+    assert source.count('run_uda "$GPU') == 8
 

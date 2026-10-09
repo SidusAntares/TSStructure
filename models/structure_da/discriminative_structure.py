@@ -498,6 +498,7 @@ class DiscriminativeStructureBranch(nn.Module):
         period_days=365.0, reg=1e-3, window_scales=(24,), window_stride=8,
         shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
         shape_representation="current", state_org_readout="full",
+        phase_query_view="full",
     ):
         super().__init__()
         if shape_representation not in (
@@ -516,6 +517,11 @@ class DiscriminativeStructureBranch(nn.Module):
         if shape_representation != "state_org" and state_org_readout != "full":
             raise ValueError("non-full state_org_readout requires state_org representation")
         self.state_org_readout = state_org_readout
+        if phase_query_view not in ("full", "rich32"):
+            raise ValueError("phase_query_view must be full or rich32")
+        if phase_query_view == "rich32" and shape_representation != "phase_moment":
+            raise ValueError("rich32 phase query view requires phase_moment")
+        self.phase_query_view = phase_query_view
         self.exposer = FourierStructureExposer(num_modes, grid_points, period_days, reg)
         self.window_extractor = MultiScaleWindowExtractor(
             window_scales, window_stride, grid_points=grid_points,
@@ -917,6 +923,17 @@ class DiscriminativeStructureBranch(nn.Module):
         else:
             response = rich_response
         profile = sorted_anchor_profile(details["similarity"])
+        query_response = response
+        if (
+            self.shape_representation == "phase_moment"
+            and self.phase_query_view == "rich32"
+        ):
+            query_response = torch.cat((
+                response[:, :2 * self.shapelet_dictionary.anchors.shape[0]],
+                torch.zeros_like(
+                    response[:, 2 * self.shapelet_dictionary.anchors.shape[0]:]
+                ),
+            ), dim=-1)
         result = {
             "shape_tokens": tokens,
             "shapelet_similarity": details["similarity"],
@@ -926,7 +943,7 @@ class DiscriminativeStructureBranch(nn.Module):
             "sorted_anchor_profile": profile,
             "shape_stats_feature": stats_tokens.mean(dim=1),
             "shape_class_token": (
-                self.response_to_query(response) if include_legacy_query else None
+                self.response_to_query(query_response) if include_legacy_query else None
             ),
             "shape_scales": scales,
             "exposed_curve": exposed,

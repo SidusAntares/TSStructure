@@ -75,14 +75,16 @@ class PseStructureProtoLTae(nn.Module):
         fourier_num_modes=13, fourier_reg=1e-3, fourier_period_days=365.,
         shape_representation="current", shape_injection="current_query",
         structure_shift_mode="none", state_org_readout="full",
+        phase_query_view="full",
     ):
         super().__init__()
         if (
             shape_injection == "direct_response_query"
-            and shape_representation not in ("current", "state_org")
+            and shape_representation not in ("current", "phase_moment", "state_org")
         ):
             raise ValueError(
-                "direct_response_query injection requires current or state_org representation"
+                "direct_response_query injection requires current, phase_moment, "
+                "or state_org representation"
             )
         if shape_representation == "current" and shape_injection not in (
             "current_query", "direct_response_query", "local_query", "local_query_only",
@@ -101,8 +103,20 @@ class PseStructureProtoLTae(nn.Module):
             raise ValueError("set_response representation requires current_query injection")
         if shape_representation == "residual_response" and shape_injection != "current_query":
             raise ValueError("residual_response representation requires current_query injection")
-        if shape_representation == "phase_moment" and shape_injection != "current_query":
-            raise ValueError("phase_moment representation requires current_query injection")
+        if shape_representation == "phase_moment" and shape_injection not in (
+            "current_query", "direct_response_query",
+        ):
+            raise ValueError(
+                "phase_moment representation requires current_query or "
+                "direct_response_query injection"
+            )
+        if phase_query_view == "rich32" and not (
+            shape_representation == "phase_moment"
+            and shape_injection == "current_query"
+        ):
+            raise ValueError(
+                "rich32 phase query view requires phase_moment + current_query"
+            )
         if shape_representation == "state_org" and shape_injection != "direct_response_query":
             raise ValueError("state_org representation requires direct_response_query injection")
         if shape_representation not in (
@@ -131,6 +145,7 @@ class PseStructureProtoLTae(nn.Module):
             shape_resample_length=shape_resample_length,
             shape_representation=shape_representation,
             state_org_readout=state_org_readout,
+            phase_query_view=phase_query_view,
         )
         candidates_per_scale = (64 + int(shape_window_stride) - 1) // int(shape_window_stride)
         sorted_profile_dim = (
@@ -187,6 +202,7 @@ class PseStructureProtoLTae(nn.Module):
         self.shape_evidence_dim = evidence_dim
         self.instance_dim = mlp3[-1]
         self.state_org_readout = state_org_readout
+        self.phase_query_view = phase_query_view
 
     def configure_state_org_query(self, query_view="full", query_scale=1., reference=None):
         if self.shape_representation != "state_org":
@@ -277,6 +293,7 @@ class PseStructureProtoLTae(nn.Module):
             instance = self.temporal_encoder(
                 prepared, shifted_positions,
                 external_query=structure["shape_class_token"],
+                detach_external_query_correction=detach_structure_query,
             )
             return (instance, {}) if return_details else instance
         if self.shape_injection == "direct_response_query":
@@ -466,6 +483,7 @@ class PseStructureProtoLTae(nn.Module):
 
     def forward_phase_equivariance_target(
         self, pixels, mask, positions, extra, structure_aug_shift,
+        detach_structure_query=False,
     ):
         """Share one spatial feature and Fourier context across E's three consumers."""
         if self.shape_representation != "phase_moment":
@@ -478,7 +496,10 @@ class PseStructureProtoLTae(nn.Module):
         shifted = self.prepare_structure_from_context(
             context, structure_aug_shift=structure_aug_shift, phase_shift=0,
         )
-        output = self._output_from_prepared_structure(spatial, positions, base)
+        output = self._output_from_prepared_structure(
+            spatial, positions, base,
+            detach_structure_query=detach_structure_query,
+        )
         return output, base, shifted
 
     def forward_with_temporal_shift(
@@ -488,8 +509,18 @@ class PseStructureProtoLTae(nn.Module):
         structure_anchor_grad=False,
     ):
         del collect_diagnostics
-        if detach_structure_query and self.shape_representation != "state_org":
-            raise ValueError("detach_structure_query is only valid for state_org")
+        detach_supported = (
+            self.shape_representation == "state_org"
+            and self.shape_injection == "direct_response_query"
+        ) or (
+            self.shape_representation == "phase_moment"
+            and self.shape_injection == "current_query"
+        )
+        if detach_structure_query and not detach_supported:
+            raise ValueError(
+                "detach_structure_query requires state_org + direct_response_query "
+                "or phase_moment + current_query"
+            )
         query_view = query_view or getattr(self, "_state_org_query_view", "full")
         query_scale = (
             getattr(self, "_shape_query_scale", 1.)

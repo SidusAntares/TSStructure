@@ -110,6 +110,10 @@ def add_model_arguments(parser):
         '--state-org-readout', dest='state_org_readout', default='full',
         choices=['full', 'composition', 'presence', 'reliable_composition'],
     )
+    parser.add_argument(
+        '--phase-query-view', dest='phase_query_view', default='full',
+        choices=['full', 'rich32'],
+    )
     parser.add_argument('--shape-target-weight', dest='shape_target_weight', default=.05, type=float)
     parser.add_argument('--shape-align-weight', dest='shape_align_weight', default=.05, type=float)
     parser.add_argument('--stats-align-weight', dest='stats_align_weight', default=.02, type=float)
@@ -165,6 +169,7 @@ def create_model(config):
             shape_injection=config.shape_injection,
             structure_shift_mode=config.structure_shift_mode,
             state_org_readout=getattr(config, 'state_org_readout', 'full'),
+            phase_query_view=getattr(config, 'phase_query_view', 'full'),
         )
         return model
     raise NotImplementedError(config.model)
@@ -213,6 +218,7 @@ def structure_usage_manifest(config):
             ),
             'equivariance_uses_target_labels': False,
             'equivariance_uses_pseudo_labels': False,
+            'phase_query_view': getattr(config, 'phase_query_view', 'full'),
         })
     elif config.shape_representation == 'state_org':
         readout = getattr(config, 'state_org_readout', 'full')
