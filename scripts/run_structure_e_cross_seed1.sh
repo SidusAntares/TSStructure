@@ -14,7 +14,8 @@ SOURCE_ROOT="$OUTPUT_ROOT/source"
 UDA_ROOT="$OUTPUT_ROOT/uda"
 E_SOURCE_ROOT="${E_SOURCE_ROOT:-outputs/structure_phase_moment_4tasks_seed1/source}"
 
-FR1="france/30TXT/2017"; FR2="france/31TCJ/2017"; DK1="denmark/32VNH/2017"
+AT1="austria/33UVP/2017"; DK1="denmark/32VNH/2017"
+FR1="france/30TXT/2017"; FR2="france/31TCJ/2017"
 
 mkdir -p "$SOURCE_ROOT" "$UDA_ROOT" "$LOG_ROOT" "$RUN_ROOT"
 export PYTHONUNBUFFERED=1
@@ -185,9 +186,19 @@ run_uda_round() {
   wait_round UDA_SR "$P0" "$P1" "$P2" "$P3"
 }
 
+run_g_extend_round() {
+  require_source "$E_SOURCE_ROOT/source_AT1_seed1"
+  require_source "$E_SOURCE_ROOT/source_DK1_seed1"
+  echo "ROUND_START|round=G_EXTEND"
+  run_uda "${GPU0}" G AT1 "$AT1" DK1 "$DK1" & P0=$!
+  run_uda "${GPU1}" G DK1 "$DK1" AT1 "$AT1" & P1=$!
+  wait_round G_EXTEND "$P0" "$P1"
+}
+
 case "$RUN_ROUND" in
   SOURCE) run_source_round ;;
   UDA) run_uda_round ;;
+  G_EXTEND) run_g_extend_round ;;
   ALL) run_source_round; run_uda_round ;;
-  *) echo "ERROR: RUN_ROUND must be SOURCE, UDA, or ALL; got $RUN_ROUND" >&2; exit 2 ;;
+  *) echo "ERROR: RUN_ROUND must be SOURCE, UDA, G_EXTEND, or ALL; got $RUN_ROUND" >&2; exit 2 ;;
 esac
