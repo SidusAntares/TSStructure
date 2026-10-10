@@ -34,6 +34,30 @@ def test_epoch_history_keeps_validation_pseudo_and_gradient_state():
     ]
 
 
+def test_history_log_resolution_falls_back_to_legacy_detach5_directory(monkeypatch):
+    from analysis.structure_e_g_validation import resolve_history_log
+
+    cross = Path("cross")
+    legacy = Path("legacy")
+    expected = legacy / "FR1_FR2.log"
+    monkeypatch.setattr(Path, "is_file", lambda path: path == expected)
+    assert resolve_history_log(
+        "G", "FR1_FR2", cross, legacy, Path("e"),
+    ) == expected
+
+
+def test_missing_history_log_is_not_a_checkpoint_or_visualization_blocker():
+    from analysis.structure_e_g_validation import history_rows_or_missing
+
+    rows = history_rows_or_missing(None, "G", "FR1_FR2")
+    assert rows == [{
+        "method": "G", "task": "FR1_FR2", "epoch": "",
+        "validation_macro_f1": "", "accepted_pseudo_count": "",
+        "accepted_pseudo_accuracy": "", "target_query_gradient_open": "",
+        "history_status": "MISSING_LOG",
+    }]
+
+
 def test_prototype_geometry_separates_correct_and_wrong_source_classes():
     from analysis.structure_e_g_validation import prototype_geometry_rows
 

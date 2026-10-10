@@ -207,11 +207,38 @@ def _checkpoint_paths(args, task):
     }
 
 
-def _log_paths(args, task):
-    return {
-        "E": Path(args.e_log_root) / f"E_{task}.log",
-        "G": Path(args.cross_root) / "logs" / f"G_{task}_seed1.log",
-    }
+def resolve_history_log(method, task, cross_log_root, legacy_g_log_root, e_log_root):
+    if method == "E":
+        candidates = (Path(e_log_root) / f"E_{task}.log",)
+    elif method == "G":
+        cross = Path(cross_log_root)
+        legacy = Path(legacy_g_log_root)
+        candidates = (
+            cross / f"G_{task}_seed1.log",
+            legacy / f"G_{task}_seed1.log",
+            legacy / f"G_{task}.log",
+            legacy / f"{task}_seed1.log",
+            legacy / f"{task}.log",
+        )
+    else:
+        raise ValueError(f"unknown method: {method}")
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def history_rows_or_missing(log, method, task):
+    if log is None:
+        return [{
+            "method": method, "task": task, "epoch": "",
+            "validation_macro_f1": "", "accepted_pseudo_count": "",
+            "accepted_pseudo_accuracy": "", "target_query_gradient_open": "",
+            "history_status": "MISSING_LOG",
+        }]
+    rows = parse_epoch_history(
+        Path(log).read_text(encoding="utf-8", errors="replace"), method, task,
+    )
+    for row in rows:
+        row.update({"history_status": "OK", "history_log": str(log)})
+    return rows
 
 
 def _require(paths):
@@ -245,11 +272,15 @@ def _comparison(args, output_root):
                     "recall": result["per_class_recall"][index],
                     "f1": result["per_class_f1"][index],
                 })
-        for method, log in _log_paths(args, task).items():
-            if not log.is_file():
-                raise FileNotFoundError(f"MISSING_LOG|path={log}")
-            rows = parse_epoch_history(log.read_text(encoding="utf-8", errors="replace"), method, task)
-            if method == "G":
+        for method in ("E", "G"):
+            log = resolve_history_log(
+                method, task, Path(args.cross_root) / "logs",
+                args.legacy_g_log_root, args.e_log_root,
+            )
+            rows = history_rows_or_missing(log, method, task)
+            if log is None:
+                print(f"MISSING_LOG|method={method}|task={task}|continuing=true")
+            if method == "G" and log is not None:
                 states = {row["epoch"]: row["target_query_gradient_open"] for row in rows}
                 expected = {epoch: epoch >= 5 for epoch in range(20)}
                 if any(states.get(epoch) != value for epoch, value in expected.items()):
@@ -529,6 +560,10 @@ def build_parser():
     parser.add_argument("--source-root", default="outputs/structure_phase_moment_4tasks_seed1/source")
     parser.add_argument("--e-root", default="outputs/structure_phase_equivariance_4tasks_seed1")
     parser.add_argument("--e-log-root", default="logs/structure_phase_equivariance_4tasks_seed1")
+    parser.add_argument(
+        "--legacy-g-log-root",
+        default="logs/structure_phase_equivariance_detach5_seed1",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
