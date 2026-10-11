@@ -226,7 +226,17 @@ def decompose_linear_margin(estimator, features, true_labels):
     # The reference BLAS dot product and the three block reductions use different
     # summation orders.  Bound their combined IEEE-754 forward error from the
     # actual absolute term sum instead of applying an arbitrary fixed tolerance.
-    epsilon = np.finfo(np.float64).eps
+    calculation_dtypes = (
+        np.asarray(scores).dtype,
+        np.asarray(standardized).dtype,
+        np.asarray(classifier.coef_).dtype,
+        np.asarray(intercept).dtype,
+    )
+    epsilon = max(
+        np.finfo(dtype).eps
+        for dtype in calculation_dtypes
+        if np.issubdtype(dtype, np.floating)
+    )
     operations = terms.shape[1] + len(BLOCKS) + 2
     gamma = operations * epsilon / (1. - operations * epsilon)
     magnitude = np.abs(terms).sum(1) + np.abs(bias) + np.abs(result["margin"])
@@ -423,7 +433,7 @@ def analyze_d2(task, variant, arrays, classes, output):
                     float(reliable_selected.mean()) if selected.any() else float("nan")
                 ),
                 "wrong_source_semantic_rate_among_trusted": (
-                    float(wrong[selected][reliable_selected].mean())
+                    float(wrong[reliable_selected].mean())
                     if reliable_selected.any() else float("nan")
                 ),
             })

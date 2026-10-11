@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -7,7 +8,9 @@ from sklearn.linear_model import RidgeClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+import analysis.diagnose_eg_pair as eg_diagnostic
 from analysis.diagnose_eg_pair import (
+    analyze_d2,
     decompose_linear_margin,
     neutral_query_intervention,
     require_complete_checkpoint,
@@ -19,8 +22,10 @@ from models.stclassifier import PseStructureProtoLTae
 import scripts.run_eg_recheck_pair_seed1 as scheduler
 from scripts.run_eg_recheck_pair_seed1 import (
     INITIAL_GPU_ASSIGNMENT,
+    _quarantine_incomplete,
     build_parser,
     build_job_graph,
+    diagnostic_command,
     paired_uda_config,
     ready_jobs,
     select_gpu,
@@ -155,6 +160,92 @@ def test_d1_reconstruction_uses_roundoff_bound_not_fixed_tolerance():
     ][0]
 
 
+def test_d1_reconstruction_uses_actual_float32_decision_precision():
+    rng = np.random.default_rng(19)
+    features = rng.normal(size=(8, 96)).astype(np.float32)
+    weights = rng.normal(size=(3, 96)).astype(np.float32)
+    intercept = rng.normal(size=3).astype(np.float32)
+
+    class IdentityScaler:
+        @staticmethod
+        def transform(values):
+            return values
+
+    class Float32LinearClassifier:
+        classes_ = np.arange(3)
+        coef_ = weights
+        intercept_ = intercept
+
+        def decision_function(self, values):
+            values = np.asarray(values, dtype=np.float32)
+            return values @ self.coef_.T + self.intercept_
+
+    class Estimator:
+        named_steps = {
+            "scaler": IdentityScaler(), "classifier": Float32LinearClassifier(),
+        }
+
+        def decision_function(self, values):
+            return self.named_steps["classifier"].decision_function(values)
+
+    result = decompose_linear_margin(
+        Estimator(), features, np.arange(len(features)) % 3,
+    )
+    assert result["margin_reconstruction_error"].max() > np.finfo(np.float64).eps
+    assert np.all(
+        result["margin_reconstruction_error"]
+        <= result["margin_reconstruction_bound"]
+    )
+
+
+def test_d2_trusted_wrong_semantic_rate_uses_same_class_window_mask(monkeypatch):
+    rng = np.random.default_rng(23)
+
+    def split(labels, domain, offset):
+        labels = np.asarray(labels, dtype=np.int64)
+        samples, windows = len(labels), 3
+        similarity = rng.normal(size=(samples, windows, 16)).astype(np.float32)
+        similarity[..., 0] += offset
+        weights = np.exp(similarity)
+        weights /= weights.sum(axis=1, keepdims=True)
+        distribution = np.exp(similarity)
+        distribution /= distribution.sum(axis=-1, keepdims=True)
+        return {
+            "label": labels,
+            "domain": domain,
+            "parcel_id": np.arange(samples),
+            "similarity": similarity,
+            "weights": weights,
+            "anchor_distribution": distribution,
+            "response": rng.normal(size=(samples, 96)).astype(np.float32),
+            "window_centers_days": np.arange(windows, dtype=np.float32),
+            "window_curve_norm": rng.normal(size=(samples, windows, 5)).astype(np.float32),
+        }
+
+    arrays = {
+        "source_train": split([0, 0, 1, 1], "source", 0.0),
+        "source_val": split([0, 1, 1], "source", 1.0),
+        "target_val": split([0, 0, 1, 1, 1], "target", 1.0),
+    }
+    output = Path("tests/.eg_d2_output")
+    output.mkdir(exist_ok=True)
+    monkeypatch.setattr(eg_diagnostic, "_plot_d2_examples", lambda *_: None)
+    try:
+        _, _, associations = analyze_d2(
+            "FR1_FR2", "E", arrays, ["class0", "class1"], output,
+        )
+        assert len(associations) == 4
+        assert all(
+            np.isnan(row["wrong_source_semantic_rate_among_trusted"])
+            or 0.0 <= row["wrong_source_semantic_rate_among_trusted"] <= 1.0
+            for row in associations
+        )
+    finally:
+        for path in output.iterdir():
+            path.unlink()
+        output.rmdir()
+
+
 def test_diagnostic_stages_continue_after_one_stage_fails():
     calls = []
 
@@ -236,3 +327,40 @@ def test_resume_does_not_repeat_completed_training_and_balances_fr1():
     retry_all = build_parser().parse_args(["resume", "--retry-failed"])
     assert retry_all.retry_failed is True
     assert retry_all.only_task is None
+
+
+def test_partial_diagnostic_resume_only_retries_failed_stages():
+    root = Path("tests/.eg_partial_resume")
+    diagnostic = root / "diagnostics/E_FR1_FR2"
+    log = root / "logs/DIAG_E_FR1_FR2_seed1.log"
+    diagnostic.mkdir(parents=True, exist_ok=True)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    (diagnostic / "diagnostic_manifest.json").write_text(
+        '{"status":"partial","stage_status":{'
+        '"D1":{"status":"failed"},"D2":{"status":"failed"},'
+        '"D3":{"status":"complete"}}}',
+        encoding="utf-8",
+    )
+    log.write_text("old failure", encoding="utf-8")
+    args = SimpleNamespace(
+        experiment_root=str(root), source_root="source-root",
+        python="python", data_root="data-root", audit_batch_size=64,
+    )
+    job = next(
+        item for item in build_job_graph()
+        if item.key == "diagnostic:E:FR1_FR2"
+    )
+    try:
+        command = diagnostic_command(job, args)
+        stages = command[command.index("--stages") + 1:]
+        assert stages == ["D1", "D2"]
+        _quarantine_incomplete(job, args)
+        assert diagnostic.is_dir()
+        assert (diagnostic / "diagnostic_manifest.json").is_file()
+    finally:
+        for path in sorted(root.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            else:
+                path.rmdir()
+        root.rmdir()

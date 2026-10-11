@@ -171,13 +171,45 @@ def diagnostic_command(job, args):
     checkpoint = Path(args.experiment_root) / "outputs/uda" / f"{job.variant}_{job.task}_seed1/fold_0/checkpoint_last.pt"
     source = source_checkpoint_path(args.source_root, job.task)
     output = Path(args.experiment_root) / "diagnostics" / f"{job.variant}_{job.task}"
-    return [
+    command = [
         args.python, "-u", "analysis/diagnose_eg_pair.py", "--mode", "diagnose",
         "--task", job.task, "--variant", job.variant, "--checkpoint", str(checkpoint),
         "--source-checkpoint", str(source), "--output-dir", str(output),
         "--data-root", args.data_root, "--device", "cuda",
         "--batch-size", str(args.audit_batch_size),
     ]
+    stages = diagnostic_pending_stages(job, args)
+    if stages:
+        command.extend(("--stages", *stages))
+    return command
+
+
+def diagnostic_pending_stages(job, args):
+    if job.kind != "diagnostic":
+        return ()
+    manifest = (
+        Path(args.experiment_root) / "diagnostics"
+        / f"{job.variant}_{job.task}/diagnostic_manifest.json"
+    )
+    if not manifest.is_file():
+        return ("D1", "D2", "D3")
+    try:
+        statuses = json.loads(manifest.read_text(encoding="utf-8")).get(
+            "stage_status", {},
+        )
+    except (OSError, ValueError):
+        return ("D1", "D2", "D3")
+    return tuple(
+        stage for stage in ("D1", "D2", "D3")
+        if statuses.get(stage, {}).get("status") != "complete"
+    )
+
+
+def _partial_diagnostic_resumable(job, args):
+    if job.kind != "diagnostic":
+        return False
+    pending = diagnostic_pending_stages(job, args)
+    return bool(pending) and len(pending) < 3
 
 
 def summary_command(job, args):
@@ -243,7 +275,10 @@ def _artifact_path(job, args):
 
 def _quarantine_incomplete(job, args):
     path = _artifact_path(job, args)
-    if path.exists() and not artifact_complete(job, args):
+    if (
+        path.exists() and not artifact_complete(job, args)
+        and not _partial_diagnostic_resumable(job, args)
+    ):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         destination = path.with_name(f"{path.name}.failed_{stamp}")
         path.rename(destination)
@@ -353,7 +388,10 @@ def run_scheduler(args):
         progressed = False
         for job in ready_jobs(jobs, completed, running):
             if job.key in state.get("failed", {}): continue
-            if _artifact_exists(job, args) and not artifact_complete(job, args):
+            if (
+                _artifact_exists(job, args) and not artifact_complete(job, args)
+                and not _partial_diagnostic_resumable(job, args)
+            ):
                 state.setdefault("failed", {})[job.key] = "incomplete artifact exists; refusing overwrite"
                 _append_event(event_path, {"time": _timestamp(), "job": job.key, "status": "blocked_incomplete"})
                 progressed = True; continue
