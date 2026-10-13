@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import uuid
 
 import numpy as np
@@ -142,3 +144,35 @@ def test_dry_run_declares_eight_unique_scopes_without_training():
     assert len({scope.identity for scope in scopes}) == 8
     assert {scope.stage for scope in scopes} == {"source", "uda_final"}
     assert all("train.py" not in " ".join(scope.command_hint) for scope in scopes)
+
+
+def test_audit_supports_direct_file_execution_from_repository_root():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "analysis/structure_g_response_organization_audit.py",
+            "--help",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_scheduler_uses_module_execution_for_worker_commands():
+    from types import SimpleNamespace
+
+    from scripts.run_structure_g_response_organization_seed1 import _command, planned_scopes
+
+    args = SimpleNamespace(
+        python=sys.executable,
+        output_root=Path("experiments/structure_g_response_organization_seed1"),
+        data_root="/data/user/dataset/timematch_data",
+        batch_size=64,
+        pixel_budget=8192,
+    )
+    command = _command(args, planned_scopes()[0], "extract", Path("cache"))
+
+    assert command[2:4] == ["-m", "analysis.structure_g_response_organization_audit"]

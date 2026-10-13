@@ -13,9 +13,19 @@ import csv
 import hashlib
 import json
 import math
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+
+
+# Support both ``python -m analysis...`` and direct file execution from the
+# repository root.  Direct execution otherwise exposes only ``analysis/`` on
+# sys.path, which makes the absolute ``analysis.*`` imports below fail.
+if __package__ in (None, ""):
+    _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+    if str(_REPOSITORY_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPOSITORY_ROOT))
 
 import numpy as np
 from sklearn.covariance import LedoitWolf

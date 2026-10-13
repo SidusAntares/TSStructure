@@ -45,13 +45,13 @@ def planned_scopes(source_root="outputs/structure_phase_moment_4tasks_seed1/sour
             scopes.append(Scope(
                 identity=f"SRC_{source}", stage="source", task=task, source_alias=source,
                 checkpoint=source_checkpoint, source_checkpoint=source_checkpoint,
-                command_hint=("analysis/structure_g_response_organization_audit.py", "--mode", "extract"),
+                command_hint=("-m", "analysis.structure_g_response_organization_audit", "--mode", "extract"),
             ))
         scopes.append(Scope(
             identity=f"G_{task}", stage="uda_final", task=task, source_alias=source,
             checkpoint=str(Path(g_root) / f"G_{task}_seed1/fold_0/checkpoint_last.pt"),
             source_checkpoint=source_checkpoint,
-            command_hint=("analysis/structure_g_response_organization_audit.py", "--mode", "extract"),
+            command_hint=("-m", "analysis.structure_g_response_organization_audit", "--mode", "extract"),
         ))
     return scopes
 
@@ -95,7 +95,7 @@ def _complete_scope(output_root, scope):
 
 def _command(args, scope, mode, cache):
     command = [
-        args.python, "-u", "analysis/structure_g_response_organization_audit.py",
+        args.python, "-u", "-m", "analysis.structure_g_response_organization_audit",
         "--mode", mode, "--stage", scope.stage, "--scope", scope.identity,
         "--task", scope.task, "--checkpoint", scope.checkpoint,
         "--cache-dir", str(cache), "--output-root", str(args.output_root),
@@ -183,7 +183,7 @@ def run_scheduler(args):
     (args.output_root / "missing_dependencies.json").write_text(
         json.dumps({"missing": missing, "failures": failures}, indent=2), encoding="utf-8",
     )
-    summary = [args.python, "-u", "analysis/structure_g_response_organization_audit.py",
+    summary = [args.python, "-u", "-m", "analysis.structure_g_response_organization_audit",
                "--mode", "summary", "--output-root", str(args.output_root)]
     result = subprocess.run(summary, cwd=ROOT)
     if result.returncode:
