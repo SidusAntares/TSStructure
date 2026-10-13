@@ -148,12 +148,14 @@ def test_checkpoint_status_requires_k2off_and_detach5():
         assert artifact_status(Path("virtual/source"), "source") == "partial"
 
 
-def test_two_gpu_scheduler_has_all_tasks_and_no_baseline_output_overlap():
+def test_four_gpu_scheduler_splits_training_and_diagnostics():
     from scripts.run_structure_g_k2off_seed1 import jobs, build_parser
 
     assert {job.task for job in jobs()} == {"AT1_DK1", "FR1_FR2", "FR2_DK1", "DK1_AT1"}
     args = build_parser().parse_args(["dry-run"])
-    assert len(args.gpus) == 2
+    assert args.gpus == ["0", "1", "2", "3"]
+    assert args.gpus[:2] == ["0", "1"]
+    assert args.gpus[2:] == ["2", "3"]
     assert "g_k2off" in args.root.lower()
 
 
@@ -162,6 +164,7 @@ def test_frozen_audit_missing_cache_is_a_formal_failure():
 
     args = SimpleNamespace(
         cache_root="virtual/missing", mode="run", root=Path("virtual/root"),
+        gpus=["0", "1", "2", "3"],
     )
     with patch.object(Path, "is_dir", return_value=False), patch.object(
         Path, "glob", return_value=[],

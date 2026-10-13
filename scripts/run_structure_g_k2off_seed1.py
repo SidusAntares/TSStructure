@@ -135,9 +135,9 @@ def _run(command, log, gpu, dry_run):
 
 
 def run_frozen_audits(args):
-    """Use existing frozen caches on CPU while the two GPUs remain dedicated to training."""
+    """Run frozen X1/X2 jobs on the two diagnostic GPUs."""
     cache_root = Path(args.cache_root)
-    report_rows = []
+    report_rows, audit_jobs = [], queue.Queue()
     if not cache_root.is_dir():
         message = f"MISSING_CACHE_ROOT|path={cache_root}"
         print(message, flush=True)
@@ -152,24 +152,53 @@ def run_frozen_audits(args):
                 ("X1", "analysis/structure_evidence_increment_audit.py"),
                 ("X2", "analysis/structure_anchor_conflict_audit.py"),
             ):
+                audit_jobs.put((cache, identity, output, kind, script))
+
+    report_lock = threading.Lock()
+
+    def audit_worker(gpu):
+        while True:
+            try:
+                cache, identity, output, kind, script = audit_jobs.get_nowait()
+            except queue.Empty:
+                return
+            try:
                 expected = output / f"{kind}_report.md"
                 if args.mode == "resume" and expected.is_file() and expected.stat().st_size:
-                    print(f"REUSE|kind={kind}|cache={cache}", flush=True); continue
+                    print(f"REUSE|gpu={gpu}|kind={kind}|cache={cache}", flush=True)
+                    continue
                 command = [args.python, "-u", script, "--cache-dir", str(cache),
                            "--output-dir", str(output), "--task", identity.split("_", 1)[-1],
                            "--variant", identity.split("_", 1)[0]]
-                rendered = " ".join(command); print(f"AUDIT_COMMAND|{rendered}", flush=True)
+                rendered = " ".join(command)
+                print(f"AUDIT_COMMAND|gpu={gpu}|{rendered}", flush=True)
                 if args.mode == "dry-run":
                     continue
                 output.mkdir(parents=True, exist_ok=True)
-                env = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONUNBUFFERED="1")
+                env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), PYTHONUNBUFFERED="1")
                 log = args.root / f"logs/{kind}_{identity}.log"
                 with log.open("a", encoding="utf-8") as stream:
-                    result = subprocess.run(command, cwd=ROOT, env=env, stdout=stream, stderr=subprocess.STDOUT)
+                    stream.write(f"AUDIT_GPU|gpu={gpu}\n"); stream.flush()
+                    result = subprocess.run(
+                        command, cwd=ROOT, env=env,
+                        stdout=stream, stderr=subprocess.STDOUT,
+                    )
                 if result.returncode:
-                    report_rows.append(f"FAILED|kind={kind}|cache={cache}|log={log}")
+                    with report_lock:
+                        report_rows.append(f"FAILED|gpu={gpu}|kind={kind}|cache={cache}|log={log}")
                 elif not expected.is_file() or expected.stat().st_size == 0:
-                    report_rows.append(f"MISSING_ARTIFACT|kind={kind}|cache={cache}|path={expected}")
+                    with report_lock:
+                        report_rows.append(f"MISSING_ARTIFACT|gpu={gpu}|kind={kind}|cache={cache}|path={expected}")
+            finally:
+                audit_jobs.task_done()
+
+    _, diagnostic_gpus = gpu_partitions(args)
+    audit_threads = [
+        threading.Thread(target=audit_worker, args=(gpu,), daemon=False)
+        for gpu in diagnostic_gpus
+    ]
+    for thread in audit_threads: thread.start()
+    for thread in audit_threads: thread.join()
     if args.mode != "dry-run":
         for kind in ("X1", "X2"):
             reports = sorted((args.root / "frozen").glob(f"*/{kind}_report.md"))
@@ -317,7 +346,8 @@ def run_scheduler(args):
                 print(f"JOB_FAILED|gpu={gpu}|task={job.task}|error={error}", flush=True)
             finally: pending.task_done()
 
-    threads = [threading.Thread(target=worker, args=(gpu,), daemon=False) for gpu in args.gpus]
+    training_gpus, _ = gpu_partitions(args)
+    threads = [threading.Thread(target=worker, args=(gpu,), daemon=False) for gpu in training_gpus]
     for thread in threads: thread.start()
     for thread in threads: thread.join()
     if audit_thread is not None: audit_thread.join()
@@ -331,7 +361,7 @@ def run_scheduler(args):
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("dry-run", "run", "resume"))
-    parser.add_argument("--gpus", nargs=2, default=("0", "1"))
+    parser.add_argument("--gpus", nargs=4, default=["0", "1", "2", "3"])
     parser.add_argument("--root", default="experiments/structure_g_k2off_seed1")
     parser.add_argument("--data-root", default="/data/user/dataset/timematch_data")
     parser.add_argument("--cache-root", default="experiments/structure_pair_semantics_seed1/cache")
@@ -339,6 +369,12 @@ def build_parser():
     parser.add_argument("--skip-frozen-audits", action="store_true")
     parser.add_argument("--python", default=sys.executable)
     return parser
+
+
+def gpu_partitions(args):
+    if len(args.gpus) != 4:
+        raise ValueError("exactly four GPUs are required: two training and two diagnostics")
+    return tuple(args.gpus[:2]), tuple(args.gpus[2:])
 
 
 if __name__ == "__main__":
