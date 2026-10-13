@@ -498,7 +498,7 @@ class DiscriminativeStructureBranch(nn.Module):
         period_days=365.0, reg=1e-3, window_scales=(24,), window_stride=8,
         shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
         shape_representation="current", state_org_readout="full",
-        phase_query_view="full",
+        phase_query_view="full", shape_phase_k2_enabled=True,
     ):
         super().__init__()
         if shape_representation not in (
@@ -522,6 +522,9 @@ class DiscriminativeStructureBranch(nn.Module):
         if phase_query_view == "rich32" and shape_representation != "phase_moment":
             raise ValueError("rich32 phase query view requires phase_moment")
         self.phase_query_view = phase_query_view
+        if not bool(shape_phase_k2_enabled) and shape_representation != "phase_moment":
+            raise ValueError("shape_phase_k2_enabled=false requires phase_moment")
+        self.shape_phase_k2_enabled = bool(shape_phase_k2_enabled)
         self.exposer = FourierStructureExposer(num_modes, grid_points, period_days, reg)
         self.window_extractor = MultiScaleWindowExtractor(
             window_scales, window_stride, grid_points=grid_points,
@@ -810,8 +813,8 @@ class DiscriminativeStructureBranch(nn.Module):
             "modulation": modulation,
         }
 
-    def compose_phase_moments(self, weights, centers, phase_shift=0):
-        """Return k=1,2 circular occurrence moments in fixed cos/sin block order."""
+    def compose_phase_moments(self, weights, centers, phase_shift=0, harmonics=(1, 2)):
+        """Return selected circular occurrence moments in fixed cos/sin block order."""
         batch, candidates, _ = weights.shape
         centers = torch.as_tensor(
             centers, device=weights.device, dtype=weights.dtype,
@@ -836,7 +839,7 @@ class DiscriminativeStructureBranch(nn.Module):
             center_days[None] + shift[:, None]
         ) / self.exposer.period_days
         blocks = []
-        for harmonic in (1, 2):
+        for harmonic in tuple(int(value) for value in harmonics):
             blocks.extend((
                 (weights * torch.cos(harmonic * theta).unsqueeze(-1)).sum(1),
                 (weights * torch.sin(harmonic * theta).unsqueeze(-1)).sum(1),
@@ -916,9 +919,19 @@ class DiscriminativeStructureBranch(nn.Module):
                 details["similarity"], details["candidate_mask"],
             )
         elif self.shape_representation == "phase_moment":
-            phase_moments = self.compose_phase_moments(
-                response_details["weights"], centers, phase_shift,
-            )
+            if self.shape_phase_k2_enabled:
+                phase_moments = self.compose_phase_moments(
+                    response_details["weights"], centers, phase_shift,
+                    harmonics=(1, 2),
+                )
+            else:
+                k1_moments = self.compose_phase_moments(
+                    response_details["weights"], centers, phase_shift,
+                    harmonics=(1,),
+                )
+                phase_moments = torch.cat((
+                    k1_moments, torch.zeros_like(k1_moments),
+                ), dim=-1)
             response = torch.cat((rich_response, phase_moments), dim=-1)
         else:
             response = rich_response

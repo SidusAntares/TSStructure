@@ -114,6 +114,11 @@ def add_model_arguments(parser):
         '--phase-query-view', dest='phase_query_view', default='full',
         choices=['full', 'rich32'],
     )
+    parser.add_argument(
+        '--shape-phase-k2-enabled', dest='shape_phase_k2_enabled',
+        default=True, type=bool_flag,
+        help='retain the k=2 phase block in phase_moment response and losses',
+    )
     parser.add_argument('--shape-target-weight', dest='shape_target_weight', default=.05, type=float)
     parser.add_argument('--shape-align-weight', dest='shape_align_weight', default=.05, type=float)
     parser.add_argument('--stats-align-weight', dest='stats_align_weight', default=.02, type=float)
@@ -170,6 +175,7 @@ def create_model(config):
             structure_shift_mode=config.structure_shift_mode,
             state_org_readout=getattr(config, 'state_org_readout', 'full'),
             phase_query_view=getattr(config, 'phase_query_view', 'full'),
+            shape_phase_k2_enabled=getattr(config, 'shape_phase_k2_enabled', True),
         )
         return model
     raise NotImplementedError(config.model)
@@ -199,10 +205,15 @@ def structure_usage_manifest(config):
         'shape_align_weight': config.shape_align_weight,
     }
     if config.shape_representation == 'phase_moment':
+        k2_enabled = bool(getattr(config, 'shape_phase_k2_enabled', True))
         manifest.update({
-            'shapelet_response': 'strength+concentration+phase_moments_k1_k2',
+            'shapelet_response': (
+                'strength+concentration+phase_moments_k1_k2'
+                if k2_enabled else 'strength+concentration+phase_moments_k1_zero_k2'
+            ),
             'shape_response_dim': evidence_dim,
-            'phase_harmonics': [1, 2],
+            'phase_harmonics': [1, 2] if k2_enabled else [1],
+            'shape_phase_k2_enabled': k2_enabled,
             'phase_period_days': 365,
             'occurrence_phase': True,
             'structure_shift_mode': getattr(config, 'structure_shift_mode', 'none'),

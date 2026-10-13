@@ -75,7 +75,7 @@ class PseStructureProtoLTae(nn.Module):
         fourier_num_modes=13, fourier_reg=1e-3, fourier_period_days=365.,
         shape_representation="current", shape_injection="current_query",
         structure_shift_mode="none", state_org_readout="full",
-        phase_query_view="full",
+        phase_query_view="full", shape_phase_k2_enabled=True,
     ):
         super().__init__()
         if (
@@ -146,6 +146,7 @@ class PseStructureProtoLTae(nn.Module):
             shape_representation=shape_representation,
             state_org_readout=state_org_readout,
             phase_query_view=phase_query_view,
+            shape_phase_k2_enabled=shape_phase_k2_enabled,
         )
         candidates_per_scale = (64 + int(shape_window_stride) - 1) // int(shape_window_stride)
         sorted_profile_dim = (
@@ -203,6 +204,7 @@ class PseStructureProtoLTae(nn.Module):
         self.instance_dim = mlp3[-1]
         self.state_org_readout = state_org_readout
         self.phase_query_view = phase_query_view
+        self.shape_phase_k2_enabled = bool(shape_phase_k2_enabled)
 
     def configure_state_org_query(self, query_view="full", query_scale=1., reference=None):
         if self.shape_representation != "state_org":

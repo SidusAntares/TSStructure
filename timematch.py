@@ -279,10 +279,23 @@ def forward_target_phase_equivariance(
         pixels, mask, positions, extra, structure_aug_shift=delta,
         detach_structure_query=detach_structure_query,
     )
+    harmonics = (1, 2)
+    loss_base, loss_shifted = base, shifted
+    if not getattr(student, "shape_phase_k2_enabled", True):
+        count = student.structure_branch.shapelet_dictionary.anchors.shape[0]
+        width = 2 * count
+        loss_base = {
+            **base, "shapelet_phase_moments": base["shapelet_phase_moments"][:, :width],
+        }
+        loss_shifted = {
+            **shifted,
+            "shapelet_phase_moments": shifted["shapelet_phase_moments"][:, :width],
+        }
+        harmonics = (1,)
     losses = phase_equivariance_loss(
-        base, shifted, delta,
+        loss_base, loss_shifted, delta,
         shapelet_count=student.structure_branch.shapelet_dictionary.anchors.shape[0],
-        harmonics=(1, 2),
+        harmonics=harmonics,
         period_days=student.structure_branch.exposer.period_days,
     )
     return output, losses, delta
