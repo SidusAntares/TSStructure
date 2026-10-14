@@ -248,8 +248,15 @@ def _run(command, log, gpu, dry_run=False):
         raise RuntimeError(f"command failed with exit={result.returncode}; log={log}")
 
 
-def _require_or_run(args, command, fold, kind, label, gpu, variant=None):
-    status = artifact_status(fold, kind, variant)
+def _require_or_run(
+    args, command, fold, kind, label, gpu, variant=None,
+    prechecked_status=None, verify_after=True,
+):
+    status = (
+        prechecked_status
+        if prechecked_status is not None
+        else artifact_status(fold, kind, variant)
+    )
     if status == "complete":
         if args.mode == "run":
             raise RuntimeError(f"completed artifact exists; use resume: {fold}")
@@ -260,8 +267,12 @@ def _require_or_run(args, command, fold, kind, label, gpu, variant=None):
             f"{kind} artifact is {status}; refusing overwrite and stopping downstream: {fold}"
         )
     _run(command, args.root / f"logs/{label}.log", gpu, args.mode == "dry-run")
-    produced_status = artifact_status(fold, kind, variant)
-    if args.mode != "dry-run" and produced_status != "complete":
+    produced_status = (
+        artifact_status(fold, kind, variant)
+        if verify_after and args.mode != "dry-run"
+        else None
+    )
+    if verify_after and args.mode != "dry-run" and produced_status != "complete":
         raise RuntimeError(
             f"{kind} did not produce a complete compatible artifact: {fold} "
             f"(status={produced_status})"
@@ -593,24 +604,21 @@ def generate_summary(args):
     print(f"SUMMARY_COMPLETE|root={args.root}", flush=True)
 
 
-def run_source_job(args, pipeline, gpu):
+def run_source_job(args, pipeline, gpu, prechecked_status):
     source_fold = source_directory(args, pipeline) / "fold_0"
     _require_or_run(
         args, source_command(args, pipeline), source_fold, "source",
         f"SRC_ORG_{pipeline.source_alias}_seed1", gpu,
+        prechecked_status=prechecked_status, verify_after=False,
     )
 
 
-def run_uda_job(args, pipeline, variant, gpu):
-    source_fold = source_directory(args, pipeline) / "fold_0"
-    if args.mode != "dry-run" and artifact_status(source_fold, "source") != "complete":
-        raise RuntimeError(
-            f"required Source is not complete for {variant}_{pipeline.task}: {source_fold}"
-        )
+def run_uda_job(args, pipeline, variant, gpu, prechecked_status):
     fold = args.root / f"outputs/uda/{variant}_{pipeline.task}_seed1/fold_0"
     _require_or_run(
         args, uda_command(args, pipeline, variant), fold, "uda",
         f"{variant}_{pipeline.task}_seed1", gpu, variant=variant,
+        prechecked_status=prechecked_status, verify_after=False,
     )
     _run_diagnostics(args, pipeline, variant, gpu)
 
@@ -648,16 +656,41 @@ def run_scheduler(args):
     args.root = Path(args.root)
     for relative in ("outputs/source", "outputs/uda", "logs", "runs"):
         (args.root / relative).mkdir(parents=True, exist_ok=True)
+    source_plan = source_assignments(args.gpus)
+    source_status = {}
+    for gpu, pipeline in source_plan:
+        key = f"SRC_ORG_{pipeline.source_alias}_seed1"
+        source_status[key] = (
+            "missing" if args.mode == "dry-run" else artifact_status(
+                source_directory(args, pipeline) / "fold_0", "source",
+            )
+        )
     source_jobs = [
         (
             f"SRC_ORG_{pipeline.source_alias}_seed1",
-            (args, pipeline, gpu),
+            (
+                args, pipeline, gpu,
+                source_status[f"SRC_ORG_{pipeline.source_alias}_seed1"],
+            ),
         )
-        for gpu, pipeline in source_assignments(args.gpus)
+        for gpu, pipeline in source_plan
     ]
     source_failures = _parallel_round("source", source_jobs, run_source_job)
+    if args.mode != "dry-run":
+        for gpu, pipeline in source_plan:
+            key = f"SRC_ORG_{pipeline.source_alias}_seed1"
+            if key in source_failures:
+                continue
+            status = artifact_status(
+                source_directory(args, pipeline) / "fold_0", "source",
+            )
+            if status != "complete":
+                source_failures[key] = (
+                    f"Source post-check failed in scheduler main thread: status={status}"
+                )
 
     uda_jobs = []
+    uda_plan = []
     for gpu, variant, pipeline in uda_assignments(args.gpus):
         source_key = f"SRC_ORG_{pipeline.source_alias}_seed1"
         if source_key in source_failures:
@@ -666,11 +699,28 @@ def run_scheduler(args):
                 f"dependency={source_key}", flush=True,
             )
             continue
+        fold = args.root / f"outputs/uda/{variant}_{pipeline.task}_seed1/fold_0"
+        status = (
+            "missing" if args.mode == "dry-run"
+            else artifact_status(fold, "uda", variant)
+        )
+        uda_plan.append((gpu, variant, pipeline))
         uda_jobs.append((
             f"{variant}_{pipeline.task}_seed1",
-            (args, pipeline, variant, gpu),
+            (args, pipeline, variant, gpu, status),
         ))
     uda_failures = _parallel_round("uda", uda_jobs, run_uda_job)
+    if args.mode != "dry-run":
+        for gpu, variant, pipeline in uda_plan:
+            key = f"{variant}_{pipeline.task}_seed1"
+            if key in uda_failures:
+                continue
+            fold = args.root / f"outputs/uda/{variant}_{pipeline.task}_seed1/fold_0"
+            status = artifact_status(fold, "uda", variant)
+            if status != "complete":
+                uda_failures[key] = (
+                    f"UDA post-check failed in scheduler main thread: status={status}"
+                )
     failures = {**source_failures, **uda_failures}
     if failures:
         raise RuntimeError("class-organization failures: " + json.dumps(failures))

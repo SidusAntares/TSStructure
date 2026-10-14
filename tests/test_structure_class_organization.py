@@ -608,3 +608,33 @@ def test_concurrent_source_status_checks_serialize_checkpoint_loading(monkeypatc
         assert statuses == ["complete", "complete"]
     finally:
         shutil.rmtree(work)
+
+
+def test_scheduler_runs_all_artifact_checks_on_main_thread(monkeypatch):
+    import scripts.run_structure_g_class_org_seed1 as scheduler
+
+    work = Path.cwd() / f".class_org_main_thread_status_{uuid.uuid4().hex}"
+    checks = []
+
+    def main_thread_only_status(*args, **kwargs):
+        checks.append(threading.current_thread() is threading.main_thread())
+        return "complete"
+
+    args = SimpleNamespace(
+        mode="resume", root=work, gpus=["0", "1", "2", "3"],
+        python="python", data_root="/data",
+        diagnostic_batch_size=8, diagnostic_pixel_budget=64,
+        g_baseline_root=work / "baseline",
+        g_baseline_log_root=work / "baseline_logs",
+    )
+    monkeypatch.setattr(scheduler, "artifact_status", main_thread_only_status)
+    monkeypatch.setattr(scheduler, "_run_diagnostics", lambda *unused: None)
+    monkeypatch.setattr(scheduler, "_run", lambda *unused, **kwargs: None)
+    monkeypatch.setattr(scheduler, "generate_summary", lambda *unused: None)
+
+    try:
+        scheduler.run_scheduler(args)
+        assert checks
+        assert all(checks)
+    finally:
+        shutil.rmtree(work)
