@@ -649,7 +649,7 @@ def _checkpoint_shape_logits(checkpoint, response):
         return None
 
 
-def audit_scope(cache_dir, checkpoint, output_dir, scope, stage, task):
+def audit_scope(cache_dir, checkpoint, output_dir, scope, stage, task, variant="G"):
     import torch
     checkpoint_sha = sha256_file(checkpoint)
     manifest = validate_cache_protocol(cache_dir, checkpoint_sha)
@@ -672,6 +672,14 @@ def audit_scope(cache_dir, checkpoint, output_dir, scope, stage, task):
             raise ValueError("checkpoint is not the original G Detach5 configuration")
         if not np.isclose(float(config.get("shape_equivariance_weight", np.nan)), .05):
             raise ValueError("checkpoint Phase Equivariance weight is incompatible")
+        if variant in ("A", "B"):
+            expected = 0.0 if variant == "A" else 0.02
+            actual = float(config.get("class_org_target_weight", np.nan))
+            if not np.isclose(actual, expected):
+                raise ValueError(
+                    f"{variant} class organization weight mismatch: "
+                    f"expected={expected} actual={actual}"
+                )
     if manifest.get("classes") and list(manifest["classes"]) != list(config["classes"]):
         raise ValueError("cache/checkpoint class mapping mismatch")
     raw_classes = manifest.get("classes") or config["classes"]
@@ -786,15 +794,15 @@ def extract_source_cache(checkpoint, cache_dir, data_root, device, batch_size, p
 
 
 def extract_uda_cache(checkpoint, source_checkpoint, cache_dir, task, data_root,
-                      device, batch_size, pixel_budget):
+                      device, batch_size, pixel_budget, variant="G"):
     from analysis.structure_pair_semantics_audit import run_extract
     run_extract(
-        checkpoint, source_checkpoint, cache_dir, task, "G", data_root,
+        checkpoint, source_checkpoint, cache_dir, task, variant, data_root,
         device, batch_size, pixel_budget,
     )
     manifest_path = Path(cache_dir) / "checkpoint_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["anchor_scope"] = f"G:{task}:{manifest['checkpoint_sha256']}"
+    manifest["anchor_scope"] = f"{variant}:{task}:{manifest['checkpoint_sha256']}"
     _atomic_json(manifest_path, manifest)
 
 
@@ -850,6 +858,7 @@ def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("extract", "audit", "summary"), required=True)
     parser.add_argument("--stage", choices=("source", "uda_final"))
+    parser.add_argument("--variant", choices=("G", "A", "B"), default="G")
     parser.add_argument("--scope"); parser.add_argument("--task", choices=tuple(TASKS))
     parser.add_argument("--checkpoint"); parser.add_argument("--source-checkpoint")
     parser.add_argument("--cache-dir"); parser.add_argument("--output-root", required=True)
@@ -873,11 +882,12 @@ def main(argv=None):
             if not args.source_checkpoint:
                 raise ValueError("UDA extraction requires source-checkpoint")
             extract_uda_cache(args.checkpoint, args.source_checkpoint, args.cache_dir, args.task,
-                              args.data_root, args.device, args.batch_size, args.pixel_budget)
+                              args.data_root, args.device, args.batch_size, args.pixel_budget,
+                              variant=args.variant)
     else:
         audit_scope(args.cache_dir, args.checkpoint,
                     Path(args.output_root) / "scopes" / args.scope,
-                    args.scope, args.stage, args.task)
+                    args.scope, args.stage, args.task, variant=args.variant)
 
 
 if __name__ == "__main__":

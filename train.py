@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.backends.cudnn
+from torch.utils import data
 from torchvision.transforms import transforms
 from tqdm import tqdm
 
@@ -18,7 +19,12 @@ from competitors.dann.dann import train_dann
 from competitors.jumbot.jumbot import train_jumbot
 from competitors.mmd.train_mmd import train_mmd
 from competitors.alda.train_alda import train_alda
-from dataset import PixelSetData, create_evaluation_loaders, create_train_loader
+from dataset import (
+    GroupByShapesBatchSampler,
+    PixelSetData,
+    create_evaluation_loaders,
+    create_train_loader,
+)
 from evaluation import evaluation, validation
 from models.stclassifier import (
     FrozenStateOrgReference,
@@ -41,6 +47,12 @@ from methods.structure_da.prototype_losses import (
     shapelet_diversity_loss,
     support_aware_prototype_compactness,
     weighted_focal_loss,
+)
+from methods.structure_da.class_organization_loss import (
+    build_source_organization_reference,
+    class_organization_loss,
+    save_organization_reference,
+    sha256_file,
 )
 from models.structure_da.prototype_bank import ClassPrototypeBank
 from timematch import add_shift_estimation_arguments, train_timematch
@@ -133,6 +145,29 @@ def add_model_arguments(parser):
         choices=['base', 'weighted', 'weighted_proto'],
         help='standalone source-only minority treatment; ignored by TimeMatch',
     )
+    parser.add_argument(
+        '--class-org-source-weight', dest='class_org_source_weight',
+        default=0., type=float,
+    )
+    parser.add_argument(
+        '--class-org-target-weight', dest='class_org_target_weight',
+        default=0., type=float,
+    )
+    parser.add_argument(
+        '--class-org-warmup-epochs', dest='class_org_warmup_epochs',
+        default=10, type=int,
+    )
+    parser.add_argument(
+        '--class-org-target-start-epoch', dest='class_org_target_start_epoch',
+        default=5, type=int,
+    )
+    parser.add_argument(
+        '--class-org-min-support', dest='class_org_min_support',
+        default=8, type=int,
+    )
+    parser.add_argument(
+        '--class-org-reference', dest='class_org_reference', default=None,
+    )
     return parser
 
 
@@ -203,6 +238,21 @@ def structure_usage_manifest(config):
         'shape_injection': config.shape_injection,
         'shape_evidence_dim': evidence_dim,
         'shape_align_weight': config.shape_align_weight,
+        'class_organization_source_weight': float(
+            getattr(config, 'class_org_source_weight', 0.)
+        ),
+        'class_organization_target_weight': float(
+            getattr(config, 'class_org_target_weight', 0.)
+        ),
+        'class_organization_warmup_epochs': int(
+            getattr(config, 'class_org_warmup_epochs', 10)
+        ),
+        'class_organization_target_start_epoch': int(
+            getattr(config, 'class_org_target_start_epoch', 5)
+        ),
+        'class_organization_reference': getattr(
+            config, 'class_org_reference', None
+        ),
     }
     if config.shape_representation == 'phase_moment':
         k2_enabled = bool(getattr(config, 'shape_phase_k2_enabled', True))
@@ -857,6 +907,58 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
     data_loader = create_train_loader(dataset, config.batch_size, config.num_workers)
     print(f'training dataset: {dataset_name}, n={len(dataset)}, batches={len(data_loader)}')
 
+    class_org_source_weight = float(
+        getattr(config, 'class_org_source_weight', 0.)
+    )
+    class_org_warmup_epochs = int(
+        getattr(config, 'class_org_warmup_epochs', 10)
+    )
+    class_org_min_support = int(getattr(config, 'class_org_min_support', 8))
+    if class_org_source_weight < 0:
+        raise ValueError('class organization Source weight must be non-negative')
+    if class_org_warmup_epochs < 0 or class_org_warmup_epochs >= config.epochs:
+        if class_org_source_weight > 0:
+            raise ValueError('class organization warmup must precede the final Source epoch')
+    class_org_enabled = class_org_source_weight > 0
+    if class_org_enabled and (
+        not structure_proto
+        or getattr(config, 'shape_representation', None) != 'phase_moment'
+        or not bool(getattr(config, 'shape_phase_k2_enabled', True))
+        or config.train_on_target
+    ):
+        raise ValueError(
+            'Source class organization requires Source-only phase_moment with K1/K2'
+        )
+    class_org_reference = None
+    class_org_loader = None
+    if class_org_enabled:
+        deterministic_transform = transforms.Compose([
+            Normalize(), ToTensor(),
+        ])
+        deterministic_dataset = PixelSetData(
+            config.data_root,
+            dataset_name,
+            config.classes,
+            deterministic_transform,
+            indices=splits[dataset_name]['train'],
+            closed_set=config.closed_set,
+            combine_spring_and_winter=config.combine_spring_and_winter,
+        )
+        class_org_loader = data.DataLoader(
+            deterministic_dataset,
+            num_workers=config.num_workers,
+            batch_sampler=GroupByShapesBatchSampler(
+                deterministic_dataset, config.batch_size,
+            ),
+        )
+        print(
+            'CLASS_ORG_SOURCE_CONFIG|enabled=true|'
+            f'weight={class_org_source_weight:.6f}|'
+            f'warmup_epochs={class_org_warmup_epochs}|'
+            f'min_support={class_org_min_support}|'
+            'reference_split=source_train|reference_view=deterministic_eval'
+        )
+
     minority_mode = (
         getattr(config, 'source_minority_mode', 'base') if structure_proto else 'base'
     )
@@ -908,6 +1010,31 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
 
     best_f1 = 0
     for epoch in range(config.epochs):
+        if class_org_enabled and epoch == class_org_warmup_epochs:
+            class_org_reference = build_source_organization_reference(
+                model, class_org_loader, device,
+                num_classes=config.num_classes,
+                anchor_count=config.shapelet_count,
+                min_support=class_org_min_support,
+                metadata={
+                    'reference_role': 'source_training_fixed',
+                    'reference_epoch': epoch - 1,
+                    'source_domain': config.source,
+                    'class_ids': list(range(config.num_classes)),
+                    'class_names': list(config.classes),
+                    'source_checkpoint_sha256': None,
+                    'source_org_effective': True,
+                },
+            ).to(device)
+            save_organization_reference(
+                class_org_reference,
+                Path(config.fold_dir) / 'class_organization_reference_training.pt',
+            )
+            print(
+                'CLASS_ORG_REFERENCE|role=source_training_fixed|'
+                f'epoch={epoch - 1}|samples={int(class_org_reference.support.sum())}|'
+                f'active_statistics={int((class_org_reference.weight > 0).sum())}'
+            )
         model.train()
         loss_meter = AverageMeter()
         shape_source_loss_sum = 0.
@@ -916,6 +1043,8 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
         proto_compact_sum = 0.
         proto_valid_sum = 0
         cls_source_sum = diversity_sum = total_source_sum = 0.
+        class_org_source_sum = class_org_weighted_sum = 0.
+        class_org_valid_statistics = 0
         compact_ramp = (
             prototype_ramp(
                 epoch, config.proto_ramp_epochs, config.proto_ramp_start,
@@ -958,12 +1087,34 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     }
                 )
                 loss_proto_compact = compactness["loss"]
-                loss = compose_minority_source_loss(
+                base_loss = compose_minority_source_loss(
                     loss_cls, loss_shape_source, loss_diversity,
                     loss_proto_compact, mode=minority_mode,
                     prototype_ramp_value=compact_ramp, prototype_weight=.05,
                     shape_weight=config.shape_class_weight,
                     diversity_weight=config.shapelet_diversity_weight,
+                )
+                if not class_org_enabled:
+                    organization = {
+                        'loss': outputs.detach().new_zeros(()),
+                        'valid_statistics': 0,
+                    }
+                elif class_org_reference is None:
+                    organization = {
+                        'loss': outputs.sum() * 0., 'valid_statistics': 0,
+                    }
+                else:
+                    organization = class_organization_loss(
+                        structured['shapelet_response'], targets,
+                        class_org_reference,
+                    )
+                loss_class_organization_source = organization['loss']
+                weighted_class_organization_source = (
+                    class_org_source_weight * loss_class_organization_source
+                )
+                loss = (
+                    base_loss + weighted_class_organization_source
+                    if class_org_enabled else base_loss
                 )
             else:
                 outputs = model.forward(pixels, mask, positions, extra)
@@ -1004,6 +1155,15 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 cls_source_sum += float(loss_cls.detach()) * batch_count
                 diversity_sum += float(loss_diversity.detach())
                 total_source_sum += float(loss.detach()) * batch_count
+                class_org_source_sum += float(
+                    loss_class_organization_source.detach()
+                ) * batch_count
+                class_org_weighted_sum += float(
+                    weighted_class_organization_source.detach()
+                ) * batch_count
+                class_org_valid_statistics += int(
+                    torch.as_tensor(organization['valid_statistics']).detach().cpu()
+                )
             scheduler.step()
 
             loss_meter.update(loss.item(), n=config.batch_size)
@@ -1020,6 +1180,15 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     if compact_bank is not None:
                         writer.add_scalar("train/loss_proto_compact", loss_proto_compact.detach(), global_step + step)
                         writer.add_scalar("train/prototype_ramp", compact_ramp, global_step + step)
+                    if class_org_enabled:
+                        writer.add_scalar(
+                            'train/loss_class_organization_source',
+                            loss_class_organization_source.detach(), global_step + step,
+                        )
+                        writer.add_scalar(
+                            'train/loss_class_organization_source_weighted',
+                            weighted_class_organization_source.detach(), global_step + step,
+                        )
 
         progress_bar.close()
 
@@ -1053,6 +1222,24 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     f'prototype_ramp={compact_ramp:.6f}|'
                     f'loss_total={total_source_sum / max(shape_source_count, 1):.6f}'
                 )
+            if class_org_enabled:
+                class_org_mean = class_org_source_sum / max(shape_source_count, 1)
+                class_org_weighted_mean = (
+                    class_org_weighted_sum / max(shape_source_count, 1)
+                )
+                writer.add_scalar('epoch/loss_class_organization_source', class_org_mean, epoch)
+                writer.add_scalar(
+                    'epoch/loss_class_organization_source_weighted',
+                    class_org_weighted_mean, epoch,
+                )
+                print(
+                    'CLASS_ORG_SOURCE_EPOCH|'
+                    f'epoch={epoch}|enabled={str(class_org_reference is not None).lower()}|'
+                    f'loss_raw={class_org_mean:.6f}|'
+                    f'loss_weighted={class_org_weighted_mean:.6f}|'
+                    f'classification_ratio={class_org_weighted_mean / max(cls_source_sum / max(shape_source_count, 1), 1e-12):.6f}|'
+                    f'valid_statistics={class_org_valid_statistics}'
+                )
 
         model.eval()
         previous_best = best_f1
@@ -1071,6 +1258,42 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             if best_f1 > previous_best or not os.path.isfile(best_model_path):
                 torch.save(checkpoint, best_model_path)
                 torch.save(checkpoint, os.path.join(config.fold_dir, 'checkpoint_best.pt'))
+
+    if class_org_enabled:
+        source_best = torch.load(best_model_path, map_location=device, weights_only=False)
+        model.load_state_dict(source_best['state_dict'], strict=True)
+        source_sha256 = sha256_file(best_model_path)
+        source_best_epoch = int(source_best.get('epoch', -1))
+        source_org_effective = source_best_epoch >= class_org_warmup_epochs
+        final_reference = build_source_organization_reference(
+            model, class_org_loader, device,
+            num_classes=config.num_classes,
+            anchor_count=config.shapelet_count,
+            min_support=class_org_min_support,
+            metadata={
+                'reference_role': 'uda_source_best',
+                'reference_epoch': source_best_epoch,
+                'source_domain': config.source,
+                'class_ids': list(range(config.num_classes)),
+                'class_names': list(config.classes),
+                'source_checkpoint_sha256': source_sha256,
+                'source_checkpoint': str(Path(best_model_path).resolve()),
+                'source_org_effective': source_org_effective,
+                'warmup_epochs': class_org_warmup_epochs,
+            },
+        )
+        final_reference_path = (
+            Path(config.fold_dir) / 'class_organization_reference.pt'
+        )
+        save_organization_reference(final_reference, final_reference_path)
+        print(
+            'CLASS_ORG_REFERENCE|role=uda_source_best|'
+            f'checkpoint={Path(best_model_path).resolve()}|sha256={source_sha256}|'
+            f'checkpoint_epoch={source_best_epoch}|'
+            f'source_org_effective={str(source_org_effective).lower()}|'
+            f'active_statistics={int((final_reference.weight > 0).sum())}|'
+            f'path={final_reference_path}'
+        )
 
 
 def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1, test_ratio=0.2):

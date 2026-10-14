@@ -4,6 +4,7 @@ from collections import defaultdict
 import csv
 import os
 import random
+from pathlib import Path
 
 import numpy as np
 import sklearn.metrics
@@ -54,6 +55,10 @@ from models.structure_da.prototype_bank import ClassFeatureMemory, ClassPrototyp
 from methods.structure_da.phase_equivariance import (
     phase_equivariance_loss,
     sample_structure_aug_shifts,
+)
+from methods.structure_da.class_organization_loss import (
+    load_organization_reference,
+    target_organization_objective,
 )
 
 
@@ -1652,6 +1657,52 @@ def _train_structure_proto_timematch(
     student.load_state_dict(
         torch.load(checkpoint_path, weights_only=False)["state_dict"], strict=True,
     )
+    class_org_target_weight = float(
+        getattr(config, "class_org_target_weight", 0.)
+    )
+    class_org_target_start_epoch = int(
+        getattr(config, "class_org_target_start_epoch", 5)
+    )
+    class_org_reference_path = getattr(config, "class_org_reference", None)
+    if class_org_target_weight < 0:
+        raise ValueError("class organization Target weight must be non-negative")
+    if class_org_target_start_epoch < 0 or class_org_target_start_epoch > config.epochs:
+        raise ValueError("class organization Target start epoch is out of range")
+    if class_org_target_weight > 0 and (
+        getattr(config, "shape_representation", None) != "phase_moment"
+        or not bool(getattr(config, "shape_phase_k2_enabled", True))
+    ):
+        raise ValueError(
+            "Target class organization requires phase_moment with K1/K2"
+        )
+    class_org_reference = None
+    if class_org_reference_path:
+        class_org_reference = load_organization_reference(
+            class_org_reference_path,
+            source_checkpoint=checkpoint_path,
+            expected_class_ids=list(range(config.num_classes)),
+            expected_anchor_count=config.shapelet_count,
+            expected_response_dim=6 * config.shapelet_count,
+        ).to(device)
+        class_org_reference.eval()
+        class_org_reference.requires_grad_(False)
+        if not bool(class_org_reference.metadata.get("source_org_effective", False)):
+            raise RuntimeError(
+                "Source Best checkpoint predates class-organization activation"
+            )
+        print(
+            "CLASS_ORG_UDA_REFERENCE|"
+            f"path={Path(class_org_reference_path).resolve()}|"
+            f"source_sha256={class_org_reference.metadata['source_checkpoint_sha256']}|"
+            f"active_statistics={int((class_org_reference.weight > 0).sum())}|"
+            f"target_weight={class_org_target_weight:.6f}|"
+            f"target_start_epoch={class_org_target_start_epoch}|"
+            "target_update=false|target_gt_used=false"
+        )
+    elif class_org_target_weight > 0:
+        raise ValueError(
+            "positive Target class organization weight requires --class-org-reference"
+        )
     calibration = freeze_reliable_composition_calibration(student)
     if calibration is not None:
         print(
@@ -2074,7 +2125,7 @@ def _train_structure_proto_timematch(
                     alignment_view=config.shape_alignment_view,
                     shapelet_count=config.shapelet_count,
                 )
-            loss = compose_structure_v2clean_da_loss(
+            base_loss = compose_structure_v2clean_da_loss(
                 loss_cls_source, loss_pseudo_target, loss_shape_source,
                 loss_diversity, shape_alignment["total_loss"], target_ramp,
                 config.trade_off,
@@ -2082,6 +2133,27 @@ def _train_structure_proto_timematch(
                 config.shape_align_weight,
                 shape_equivariance=equivariance["total_loss"],
                 shape_equivariance_weight=shape_equivariance_weight,
+            )
+            if class_org_target_weight > 0:
+                class_organization_target = target_organization_objective(
+                    target_output["shapelet_response"], pseudo, trusted_mask,
+                    class_org_reference, epoch, class_org_target_weight,
+                    start_epoch=class_org_target_start_epoch,
+                )
+            else:
+                class_organization_target = {
+                    "loss": base_loss.detach().new_zeros(()),
+                    "weighted_loss": base_loss.detach().new_zeros(()),
+                    "effective_weight": 0., "valid_samples": 0,
+                    "valid_statistics": 0,
+                }
+            loss_class_organization_target = class_organization_target["loss"]
+            weighted_class_organization_target = class_organization_target[
+                "weighted_loss"
+            ]
+            loss = (
+                base_loss + weighted_class_organization_target
+                if class_org_target_weight > 0 else base_loss
             )
 
             optimizer.zero_grad()
@@ -2125,6 +2197,23 @@ def _train_structure_proto_timematch(
                 "shape_response_effective_rank": response_rank,
                 "target_structure_gradient_open": source_output["logits"].new_tensor(
                     float(not detach_target_structure_this_epoch)
+                ),
+                "loss_class_organization_target": (
+                    loss_class_organization_target.detach()
+                ),
+                "loss_class_organization_target_weighted": (
+                    weighted_class_organization_target.detach()
+                ),
+                "class_organization_target_weight": source_output["logits"].new_tensor(
+                    class_organization_target["effective_weight"]
+                ),
+                "class_organization_valid_samples": torch.as_tensor(
+                    class_organization_target["valid_samples"],
+                    device=counter_device, dtype=torch.float32,
+                ),
+                "class_organization_valid_statistics": torch.as_tensor(
+                    class_organization_target["valid_statistics"],
+                    device=counter_device, dtype=torch.float32,
                 ),
             }
             if "unmatched_composition" in source_output:
@@ -2247,6 +2336,10 @@ def _train_structure_proto_timematch(
             "accepted_pseudo_count": pseudo_accepted,
             "source_shape_accuracy": source_shape_correct / max(source_samples, 1),
         })
+        epoch_values["class_organization_to_pseudo_ratio"] = (
+            epoch_values.get("loss_class_organization_target_weighted", 0.)
+            / max(epoch_values.get("loss_pseudo_target", 0.), 1e-12)
+        )
         if anchor_update_mode != "none":
             anchors = frozen_reference.structure_branch.shapelet_dictionary.anchors
             dynamics = {
@@ -2351,6 +2444,10 @@ def _train_structure_proto_timematch(
             "config": vars(config),
             "best_f1": best_f1,
         }
+        if class_org_reference is not None:
+            checkpoint["class_organization_reference_metadata"] = dict(
+                class_org_reference.metadata
+            )
         if frozen_reference is not None:
             checkpoint["state_org_reference_state_dict"] = frozen_reference.state_dict()
             checkpoint["teacher_state_org_reference_state_dict"] = (
