@@ -878,6 +878,23 @@ def initialize_shapelet_dictionary_from_source(
     )
     return diagnostics
 
+def create_class_organization_reference_loader(dataset, batch_size):
+    """Build the infrequent deterministic reference loader without worker FDs.
+
+    Source training already owns a multiprocess loader.  Spawning a second set
+    of workers for the full-dataset reference pass can exhaust the per-process
+    file-descriptor limit when several GPU jobs run concurrently.  Reference
+    extraction happens only at the warmup boundary and after Source training,
+    so a single-process loader preserves the exact samples and batching while
+    avoiding another multiprocessing queue/shared-memory pool.
+    """
+    return data.DataLoader(
+        dataset,
+        num_workers=0,
+        batch_sampler=GroupByShapesBatchSampler(dataset, batch_size),
+    )
+
+
 def train_supervised(model, config, writer, splits, val_loader, device, best_model_path):
     model.to(device)
 
@@ -944,19 +961,17 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             closed_set=config.closed_set,
             combine_spring_and_winter=config.combine_spring_and_winter,
         )
-        class_org_loader = data.DataLoader(
+        class_org_loader = create_class_organization_reference_loader(
             deterministic_dataset,
-            num_workers=config.num_workers,
-            batch_sampler=GroupByShapesBatchSampler(
-                deterministic_dataset, config.batch_size,
-            ),
+            config.batch_size,
         )
         print(
             'CLASS_ORG_SOURCE_CONFIG|enabled=true|'
             f'weight={class_org_source_weight:.6f}|'
             f'warmup_epochs={class_org_warmup_epochs}|'
             f'min_support={class_org_min_support}|'
-            'reference_split=source_train|reference_view=deterministic_eval'
+            'reference_split=source_train|reference_view=deterministic_eval|'
+            'reference_num_workers=0'
         )
 
     minority_mode = (

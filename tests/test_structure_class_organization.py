@@ -319,6 +319,30 @@ def test_class_organization_cli_defaults_are_disabled():
     assert config.class_org_target_start_epoch == 5
 
 
+def test_class_organization_reference_loader_is_single_process(monkeypatch):
+    import train
+
+    dataset = torch.utils.data.TensorDataset(torch.arange(6))
+    monkeypatch.setattr(
+        train,
+        "GroupByShapesBatchSampler",
+        lambda data_source, batch_size: torch.utils.data.BatchSampler(
+            torch.utils.data.SequentialSampler(data_source),
+            batch_size=batch_size,
+            drop_last=False,
+        ),
+    )
+
+    loader = train.create_class_organization_reference_loader(
+        dataset,
+        batch_size=2,
+    )
+
+    assert loader.num_workers == 0
+    assert loader.persistent_workers is False
+    assert [batch[0].tolist() for batch in loader] == [[0, 1], [2, 3], [4, 5]]
+
+
 def test_source_and_uda_training_are_wired_to_the_frozen_reference_without_gt():
     import timematch
     import train
