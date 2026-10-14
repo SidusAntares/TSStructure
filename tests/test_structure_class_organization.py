@@ -239,7 +239,12 @@ def test_ab_commands_share_exact_source_checkpoint_and_reference():
 
 
 def test_scheduler_has_two_dependency_pipelines_and_resume_modes():
-    from scripts.run_structure_g_class_org_seed1 import build_parser, pipelines
+    from scripts.run_structure_g_class_org_seed1 import (
+        build_parser,
+        pipelines,
+        source_assignments,
+        uda_assignments,
+    )
 
     planned = pipelines()
     assert [item.task for item in planned] == ["FR1_FR2", "FR2_DK1"]
@@ -248,6 +253,20 @@ def test_scheduler_has_two_dependency_pipelines_and_resume_modes():
     assert parser.parse_args(["dry-run"]).mode == "dry-run"
     assert parser.parse_args(["run"]).mode == "run"
     assert parser.parse_args(["resume"]).mode == "resume"
+    assert parser.parse_args(["dry-run"]).gpus == ["0", "1", "2", "3"]
+
+    gpus = ["0", "1", "2", "3"]
+    source_plan = source_assignments(gpus)
+    assert [(gpu, pipeline.source_alias) for gpu, pipeline in source_plan] == [
+        ("0", "FR1"), ("1", "FR2"),
+    ]
+    uda_plan = uda_assignments(gpus)
+    assert [(gpu, variant, pipeline.task) for gpu, variant, pipeline in uda_plan] == [
+        ("0", "A", "FR2_DK1"),
+        ("1", "A", "FR1_FR2"),
+        ("2", "B", "FR1_FR2"),
+        ("3", "B", "FR2_DK1"),
+    ]
 
 
 def test_organization_loss_reaches_pse_token_encoder_and_anchors():

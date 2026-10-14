@@ -8,7 +8,6 @@ import csv
 import json
 import os
 import pickle
-import queue
 import re
 import subprocess
 import sys
@@ -34,6 +33,32 @@ def pipelines():
     return (
         Pipeline("FR1_FR2", "FR1", "france/30TXT/2017", "FR2", "france/31TCJ/2017"),
         Pipeline("FR2_DK1", "FR2", "france/31TCJ/2017", "DK1", "denmark/32VNH/2017"),
+    )
+
+
+def source_assignments(gpus):
+    """Train the two independent Source models on the first two GPUs."""
+    if len(gpus) != 4:
+        raise ValueError("the class-organization experiment requires exactly four GPUs")
+    by_source = {pipeline.source_alias: pipeline for pipeline in pipelines()}
+    return (
+        (str(gpus[0]), by_source["FR1"]),
+        (str(gpus[1]), by_source["FR2"]),
+    )
+
+
+def uda_assignments(gpus):
+    """Cross the Source-training cards, then occupy all four GPUs for UDA."""
+    if len(gpus) != 4:
+        raise ValueError("the class-organization experiment requires exactly four GPUs")
+    by_task = {pipeline.task: pipeline for pipeline in pipelines()}
+    return (
+        # The FR1 Source card deliberately receives an FR2 UDA task.
+        (str(gpus[0]), "A", by_task["FR2_DK1"]),
+        # The FR2 Source card deliberately receives an FR1 UDA task.
+        (str(gpus[1]), "A", by_task["FR1_FR2"]),
+        (str(gpus[2]), "B", by_task["FR1_FR2"]),
+        (str(gpus[3]), "B", by_task["FR2_DK1"]),
     )
 
 
@@ -552,66 +577,85 @@ def generate_summary(args):
     print(f"SUMMARY_COMPLETE|root={args.root}", flush=True)
 
 
-def run_pipeline(args, pipeline, gpu):
+def run_source_job(args, pipeline, gpu):
     source_fold = source_directory(args, pipeline) / "fold_0"
     _require_or_run(
         args, source_command(args, pipeline), source_fold, "source",
         f"SRC_ORG_{pipeline.source_alias}_seed1", gpu,
     )
-    for variant in ("A", "B"):
-        fold = args.root / f"outputs/uda/{variant}_{pipeline.task}_seed1/fold_0"
-        _require_or_run(
-            args, uda_command(args, pipeline, variant), fold, "uda",
-            f"{variant}_{pipeline.task}_seed1", gpu, variant=variant,
-        )
-    diagnostic_failures = {}
-    for variant in ("A", "B"):
-        try:
-            _run_diagnostics(args, pipeline, variant, gpu)
-        except Exception as error:
-            diagnostic_failures[variant] = str(error)
-    if diagnostic_failures:
+
+
+def run_uda_job(args, pipeline, variant, gpu):
+    source_fold = source_directory(args, pipeline) / "fold_0"
+    if args.mode != "dry-run" and artifact_status(source_fold, "source") != "complete":
         raise RuntimeError(
-            "frozen diagnostic failures: " + json.dumps(diagnostic_failures)
+            f"required Source is not complete for {variant}_{pipeline.task}: {source_fold}"
         )
+    fold = args.root / f"outputs/uda/{variant}_{pipeline.task}_seed1/fold_0"
+    _require_or_run(
+        args, uda_command(args, pipeline, variant), fold, "uda",
+        f"{variant}_{pipeline.task}_seed1", gpu, variant=variant,
+    )
+    _run_diagnostics(args, pipeline, variant, gpu)
+
+
+def _parallel_round(name, jobs, target):
+    failures = {}
+    lock = threading.Lock()
+
+    def worker(key, arguments):
+        started = time.time()
+        try:
+            print(f"JOB_START|round={name}|key={key}", flush=True)
+            target(*arguments)
+            print(
+                f"JOB_DONE|round={name}|key={key}|seconds={time.time() - started:.1f}",
+                flush=True,
+            )
+        except Exception as error:
+            with lock:
+                failures[key] = str(error)
+            print(f"JOB_FAILED|round={name}|key={key}|error={error}", flush=True)
+
+    threads = [
+        threading.Thread(target=worker, args=(key, arguments))
+        for key, arguments in jobs
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return failures
 
 
 def run_scheduler(args):
     args.root = Path(args.root)
     for relative in ("outputs/source", "outputs/uda", "logs", "runs"):
         (args.root / relative).mkdir(parents=True, exist_ok=True)
-    pending = queue.Queue()
-    for pipeline in pipelines():
-        pending.put(pipeline)
-    failures = {}
-    lock = threading.Lock()
+    source_jobs = [
+        (
+            f"SRC_ORG_{pipeline.source_alias}_seed1",
+            (args, pipeline, gpu),
+        )
+        for gpu, pipeline in source_assignments(args.gpus)
+    ]
+    source_failures = _parallel_round("source", source_jobs, run_source_job)
 
-    def worker(gpu):
-        while True:
-            try:
-                pipeline = pending.get_nowait()
-            except queue.Empty:
-                return
-            started = time.time()
-            try:
-                print(f"PIPELINE_START|gpu={gpu}|task={pipeline.task}", flush=True)
-                run_pipeline(args, pipeline, gpu)
-                print(
-                    f"PIPELINE_DONE|gpu={gpu}|task={pipeline.task}|"
-                    f"seconds={time.time() - started:.1f}", flush=True,
-                )
-            except Exception as error:
-                with lock:
-                    failures[pipeline.task] = str(error)
-                print(f"PIPELINE_FAILED|gpu={gpu}|task={pipeline.task}|error={error}", flush=True)
-            finally:
-                pending.task_done()
-
-    threads = [threading.Thread(target=worker, args=(gpu,)) for gpu in args.gpus]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    uda_jobs = []
+    for gpu, variant, pipeline in uda_assignments(args.gpus):
+        source_key = f"SRC_ORG_{pipeline.source_alias}_seed1"
+        if source_key in source_failures:
+            print(
+                f"JOB_BLOCKED|round=uda|key={variant}_{pipeline.task}_seed1|"
+                f"dependency={source_key}", flush=True,
+            )
+            continue
+        uda_jobs.append((
+            f"{variant}_{pipeline.task}_seed1",
+            (args, pipeline, variant, gpu),
+        ))
+    uda_failures = _parallel_round("uda", uda_jobs, run_uda_job)
+    failures = {**source_failures, **uda_failures}
     if failures:
         raise RuntimeError("class-organization failures: " + json.dumps(failures))
     diagnostic_summary = [
@@ -632,7 +676,7 @@ def run_scheduler(args):
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("dry-run", "run", "resume"))
-    parser.add_argument("--gpus", nargs=2, default=["0", "1"])
+    parser.add_argument("--gpus", nargs=4, default=["0", "1", "2", "3"])
     parser.add_argument("--root", type=Path, default=Path("experiments/structure_g_class_org_seed1"))
     parser.add_argument("--data-root", default="/data/user/dataset/timematch_data")
     parser.add_argument("--python", default=sys.executable)
