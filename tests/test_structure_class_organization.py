@@ -3,6 +3,8 @@ import inspect
 import json
 from pathlib import Path
 import shutil
+import threading
+import time
 from types import SimpleNamespace
 import uuid
 
@@ -537,5 +539,72 @@ def test_resume_status_requires_complete_compatible_source_and_uda_artifacts():
         assert artifact_status(uda, "uda", "A") == "incompatible"
         (uda / "model.pt").unlink()
         assert artifact_status(uda, "uda", "B") == "partial"
+    finally:
+        shutil.rmtree(work)
+
+
+def test_concurrent_source_status_checks_serialize_checkpoint_loading(monkeypatch):
+    from methods.structure_da.class_organization_loss import (
+        ClassOrganizationReference, save_organization_reference, sha256_file,
+    )
+    from scripts.run_structure_g_class_org_seed1 import artifact_status
+
+    work = Path.cwd() / f".class_org_concurrent_status_{uuid.uuid4().hex}"
+    original_load = torch.load
+    active_loads = 0
+    active_lock = threading.Lock()
+    start = threading.Barrier(2)
+
+    def guarded_load(*args, **kwargs):
+        nonlocal active_loads
+        with active_lock:
+            if active_loads:
+                raise RuntimeError("concurrent checkpoint loading is unsafe")
+            active_loads += 1
+        try:
+            time.sleep(0.05)
+            return original_load(*args, **kwargs)
+        finally:
+            with active_lock:
+                active_loads -= 1
+
+    def make_source(name):
+        fold = work / name
+        fold.mkdir(parents=True)
+        packet = {
+            "epoch": 99,
+            "config": {
+                "shape_representation": "phase_moment",
+                "classes": ["a", "b"],
+            },
+        }
+        torch.save(packet, fold / "checkpoint_last.pt")
+        torch.save(packet, fold / "model.pt")
+        reference = ClassOrganizationReference(
+            torch.zeros(2, 16, 4), torch.ones(2, 16, 4),
+            torch.ones(2, 16, 4), torch.tensor([8, 8]),
+            {
+                "class_ids": [0, 1], "anchor_count": 16,
+                "response_dim": 96,
+                "source_checkpoint_sha256": sha256_file(fold / "model.pt"),
+                "source_org_effective": True,
+            },
+        )
+        save_organization_reference(reference, fold / "class_organization_reference.pt")
+        save_organization_reference(
+            reference, fold / "class_organization_reference_training.pt",
+        )
+        return fold
+
+    def check(fold):
+        start.wait()
+        return artifact_status(fold, "source")
+
+    try:
+        folds = [make_source("FR1"), make_source("FR2")]
+        monkeypatch.setattr(torch, "load", guarded_load)
+        with __import__("concurrent.futures").futures.ThreadPoolExecutor(2) as pool:
+            statuses = list(pool.map(check, folds))
+        assert statuses == ["complete", "complete"]
     finally:
         shutil.rmtree(work)

@@ -18,6 +18,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_ARTIFACT_STATUS_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -177,7 +178,7 @@ def _config(packet, name, default=None):
     return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
 
 
-def artifact_status(fold, kind, variant=None):
+def _artifact_status_unlocked(fold, kind, variant=None):
     fold = Path(fold)
     if not fold.exists():
         return "missing"
@@ -213,9 +214,20 @@ def artifact_status(fold, kind, variant=None):
                 return "incompatible"
             if int(_config(packet, "target_structure_detach_epochs", -1)) != 5:
                 return "incompatible"
-    except Exception:
+    except Exception as error:
+        print(
+            f"ARTIFACT_CHECK_ERROR|path={fold}|kind={kind}|variant={variant}|"
+            f"error_type={type(error).__name__}|error={error}",
+            flush=True,
+        )
         return "partial"
     return "complete"
+
+
+def artifact_status(fold, kind, variant=None):
+    """Validate serialized artifacts without concurrent torch deserialization."""
+    with _ARTIFACT_STATUS_LOCK:
+        return _artifact_status_unlocked(fold, kind, variant)
 
 
 def _run(command, log, gpu, dry_run=False):
@@ -248,8 +260,12 @@ def _require_or_run(args, command, fold, kind, label, gpu, variant=None):
             f"{kind} artifact is {status}; refusing overwrite and stopping downstream: {fold}"
         )
     _run(command, args.root / f"logs/{label}.log", gpu, args.mode == "dry-run")
-    if args.mode != "dry-run" and artifact_status(fold, kind, variant) != "complete":
-        raise RuntimeError(f"{kind} did not produce a complete compatible artifact: {fold}")
+    produced_status = artifact_status(fold, kind, variant)
+    if args.mode != "dry-run" and produced_status != "complete":
+        raise RuntimeError(
+            f"{kind} did not produce a complete compatible artifact: {fold} "
+            f"(status={produced_status})"
+        )
 
 
 def _run_diagnostics(args, pipeline, variant, gpu):
