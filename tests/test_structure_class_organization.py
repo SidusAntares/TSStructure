@@ -2,7 +2,9 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import runpy
 import shutil
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -638,3 +640,19 @@ def test_scheduler_runs_all_artifact_checks_on_main_thread(monkeypatch):
         assert all(checks)
     finally:
         shutil.rmtree(work)
+
+
+def test_launcher_bootstraps_repository_root_when_executed_by_path():
+    repository_root = Path(__file__).resolve().parents[1]
+    launcher = repository_root / "scripts/run_structure_g_class_org_seed1.py"
+    original_path = list(sys.path)
+    try:
+        sys.path[:] = [
+            entry for entry in sys.path
+            if Path(entry or Path.cwd()).resolve() != repository_root
+        ]
+        assert str(repository_root) not in sys.path
+        runpy.run_path(str(launcher), run_name="class_org_launcher_import_test")
+        assert str(repository_root) in sys.path
+    finally:
+        sys.path[:] = original_path
