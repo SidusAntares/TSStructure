@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from analysis.anchor_matching_calibration_audit import (  # noqa: E402
+    P0R_PROTOCOL_VERSION,
     REQUIRED_OUTPUTS,
     settings_fingerprint,
     sha256_file,
@@ -81,6 +82,7 @@ def artifact_complete(folder, checkpoint, fingerprint):
         and manifest.get("settings_fingerprint") == fingerprint
         and manifest.get("target_data_used") is False
         and manifest.get("training_performed") is False
+        and manifest.get("protocol_version") == P0R_PROTOCOL_VERSION
     )
 
 
@@ -108,6 +110,19 @@ def _run(command, gpu, log):
         raise RuntimeError(f"exit={result.returncode}; log={log}")
 
 
+def _mark_in_progress(folder, checkpoint, fingerprint):
+    folder = Path(folder); folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "checkpoint_manifest.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps({
+        "status": "in_progress", "protocol_version": P0R_PROTOCOL_VERSION,
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "settings_fingerprint": fingerprint,
+        "target_data_used": False, "training_performed": False,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def run_scheduler(args):
     args.output_root = Path(args.output_root)
     plans = planned_sources(args)
@@ -117,7 +132,8 @@ def run_scheduler(args):
             fingerprint = _settings_fingerprint(args, plan)
             print(
                 f"P0_PLAN|gpu={gpu}|source={plan.alias}|domain={plan.domain}|"
-                f"checkpoint={plan.checkpoint}|output={args.output_root / plan.alias}",
+                f"checkpoint={plan.checkpoint}|output={args.output_root / plan.alias}|"
+                f"protocol={P0R_PROTOCOL_VERSION}",
             )
             print("P0_COMMAND|" + " ".join(source_command(args, plan, fingerprint)))
             if not plan.checkpoint.is_file():
@@ -146,10 +162,11 @@ def run_scheduler(args):
                 if args.mode == "resume" and artifact_complete(folder, plan.checkpoint, fingerprint):
                     print(f"P0_REUSE|gpu={gpu}|source={plan.alias}", flush=True)
                     continue
-                if folder.exists() and any(folder.iterdir()):
+                if args.mode != "resume" and folder.exists() and any(folder.iterdir()):
                     raise RuntimeError(
                         f"partial or incompatible output; refusing overwrite: {folder}"
                     )
+                _mark_in_progress(folder, plan.checkpoint, fingerprint)
                 _run(
                     source_command(args, plan, fingerprint), gpu,
                     args.output_root / "logs" / f"{plan.alias}.log",
@@ -173,6 +190,8 @@ def run_scheduler(args):
         args.python, "-u", "-m", "analysis.anchor_matching_calibration_audit",
         "--mode", "summary", "--output-root", str(args.output_root),
     ]
+    if args.previous_root:
+        summary.extend(["--previous-root", str(args.previous_root)])
     subprocess.run(summary, cwd=ROOT, check=True)
     (args.output_root / "scheduler_status.json").write_text(
         json.dumps({"failures": failures}, indent=2, sort_keys=True), encoding="utf-8",
@@ -188,7 +207,8 @@ def build_parser():
     parser.add_argument("--source-root", default="outputs/structure_phase_moment_4tasks_seed1/source")
     for alias in SOURCE_DOMAINS:
         parser.add_argument(f"--checkpoint-{alias.lower()}", default="")
-    parser.add_argument("--output-root", default="experiments/anchor_matching_calibration_seed1")
+    parser.add_argument("--output-root", default="experiments/anchor_matching_calibration_p0r_seed1")
+    parser.add_argument("--previous-root", default="experiments/anchor_matching_calibration_seed1")
     parser.add_argument("--gpus", nargs="+", default=["0", "1", "2", "3"])
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--pixel-budget", type=int, default=8192)
