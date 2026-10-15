@@ -22,17 +22,10 @@ if str(ROOT) not in sys.path:
 from analysis.anchor_matching_calibration_audit import (  # noqa: E402
     P0R_PROTOCOL_VERSION,
     REQUIRED_OUTPUTS,
+    SOURCE_DOMAINS,
     settings_fingerprint,
     sha256_file,
 )
-
-
-SOURCE_DOMAINS = {
-    "AT1": "austria/33UVP/2017",
-    "FR1": "france/30TXT/2017",
-    "FR2": "france/31TCJ/2017",
-    "DK1": "denmark/32VNH/2017",
-}
 
 
 @dataclass(frozen=True)

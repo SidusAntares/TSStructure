@@ -48,11 +48,19 @@ CALIBRATION_PROTOCOL = {
 }
 PERTURBATION_VERSION = "reverse_and_four_contiguous_blocks_v1"
 VIEW_SEED_VERSION = "sha256_seed_domain_parcel_view_v1"
+SOURCE_DOMAINS = {
+    "AT1": "austria/33UVP/2017",
+    "FR1": "france/30TXT/2017",
+    "FR2": "france/31TCJ/2017",
+    "DK1": "denmark/32VNH/2017",
+}
 REQUIRED_OUTPUTS = (
     "matching_distribution.csv",
     "view_repeatability.csv",
     "morphology_counterfactual.csv",
+    "morphology_controls.csv",
     "calibration_candidates.csv",
+    "calibration_validation.csv",
     "anchor_reliability_summary.csv",
     "repeatability_controls.csv",
     "repeatability_baselines.csv",
@@ -503,6 +511,59 @@ def bootstrap_metric_interval(
     return result
 
 
+def bootstrap_metric_difference_interval(
+    labels, candidate_scores, baseline_scores, groups, metric, seed=1,
+    group_classes=None, repeats=None, confidence=None,
+):
+    """Paired full-population parcel bootstrap for a candidate-minus-baseline metric."""
+    labels = np.asarray(labels)
+    candidate_scores = np.asarray(candidate_scores, dtype=np.float64)
+    baseline_scores = np.asarray(baseline_scores, dtype=np.float64)
+    groups = np.asarray(groups)
+    if not (labels.shape == candidate_scores.shape == baseline_scores.shape == groups.shape):
+        raise ValueError("paired metric inputs must align")
+    repeats = CALIBRATION_PROTOCOL["bootstrap_repeats"] if repeats is None else int(repeats)
+    confidence = (
+        CALIBRATION_PROTOCOL["bootstrap_confidence"]
+        if confidence is None else float(confidence)
+    )
+    unique, inverse = np.unique(groups, return_inverse=True)
+    strata = [np.arange(len(unique), dtype=np.int64)]
+    if group_classes is not None:
+        group_classes = np.asarray(group_classes)
+        if group_classes.shape != groups.shape:
+            raise ValueError("group_classes must align with observations")
+        per_group = []
+        for position in range(len(unique)):
+            current = np.unique(group_classes[inverse == position])
+            if len(current) != 1:
+                raise ValueError("each parcel group must have one Source class")
+            per_group.append(current[0])
+        per_group = np.asarray(per_group)
+        strata = [np.flatnonzero(per_group == clazz) for clazz in np.unique(per_group)]
+    point = _metric(labels, candidate_scores, metric) - _metric(labels, baseline_scores, metric)
+    rng = np.random.default_rng(seed)
+    replicas = []
+    for _ in range(repeats):
+        sampled = np.concatenate([
+            rng.choice(positions, size=len(positions), replace=True) for positions in strata
+        ])
+        multiplicity = np.bincount(sampled, minlength=len(unique))
+        weights = multiplicity[inverse]
+        selected = weights > 0
+        if metric in ("auroc", "auprc") and np.unique(labels[selected]).size < 2:
+            continue
+        replicas.append(
+            _metric(labels[selected], candidate_scores[selected], metric, weights[selected])
+            - _metric(labels[selected], baseline_scores[selected], metric, weights[selected])
+        )
+    if not replicas:
+        return float(point), float("nan"), float("nan")
+    alpha = (1. - confidence) / 2.
+    low, high = np.quantile(replicas, [alpha, 1. - alpha])
+    return float(point), float(low), float(high)
+
+
 def assess_joint_reliability(repeatability, morphology):
     if repeatability == "stable" and morphology == "stable":
         return "calibratable"
@@ -533,6 +594,8 @@ def assess_anchor_reliability(repeatability, morphology):
         if not morphology.get("conditional_control_supported", False):
             reasons.append("morphology_proxy_artifact_not_excluded")
         perturbations = morphology.get("perturbations", {})
+        if morphology.get("perturbation_conflict", False):
+            reasons.append("morphology_perturbation_conflict")
         if perturbations and not any(value == "pass" for value in perturbations.values()):
             reasons.append("morphology_no_effective_perturbation")
     repeat_pass = repeatability.get("supported", False) and not any(
@@ -560,7 +623,13 @@ def build_calibration_decision(
         "protocol_version": P0R_PROTOCOL_VERSION,
         "source": source, "checkpoint_sha256": checkpoint_sha,
         "split_fingerprints": {"source_train": train_fingerprint, "source_val": val_fingerprint},
-        "seed": int(seed), "anchors": list(anchors),
+        "seed": int(seed), "anchor_count": len(anchors),
+        "anchor_order": [int(anchor["anchor"]) for anchor in anchors],
+        "evidence_levels": {
+            "repeatability": "parcel_anchor_qmax",
+            "morphology_sensitivity": "window_anchor_q",
+        },
+        "anchors": list(anchors),
         "target_data_used": False, "unified_matching_probability": None,
     }
 
@@ -721,6 +790,29 @@ def _config_dict(raw):
     return dict(raw if isinstance(raw, dict) else vars(raw))
 
 
+def validate_source_checkpoint_config(config, source_alias, seed=1):
+    """Validate that a checkpoint is the requested original G Source model."""
+    if source_alias not in SOURCE_DOMAINS:
+        raise ValueError(f"unknown Source alias: {source_alias}")
+    if getattr(config, "source", None) != SOURCE_DOMAINS[source_alias]:
+        raise ValueError(
+            f"Source domain mismatch for {source_alias}: "
+            f"{getattr(config, 'source', None)}"
+        )
+    if int(getattr(config, "seed", -1)) != int(seed) or int(seed) != 1:
+        raise ValueError("P0-R requires the Seed1 Source checkpoint and Seed1 audit")
+    if getattr(config, "shape_representation", None) != "phase_moment":
+        raise ValueError("P0-R requires original G phase_moment Source checkpoint")
+    if getattr(config, "shape_injection", None) != "current_query":
+        raise ValueError("P0-R requires the original G current_query injection")
+    if int(getattr(config, "shapelet_count", -1)) != 16:
+        raise ValueError("P0-R requires 16 learned Anchors")
+    if not bool(getattr(config, "shape_phase_k2_enabled", True)):
+        raise ValueError("P0-R requires the complete K1/K2 Phase Moment representation")
+    if not getattr(config, "classes", None):
+        raise ValueError("Source checkpoint must contain its frozen closed-set class mapping")
+
+
 def _random_view_transform(config):
     from torchvision.transforms import transforms
     from transforms import Identity, Normalize, RandomSamplePixels, RandomSampleTimeSteps, RandomTemporalShift, ToTensor
@@ -734,7 +826,7 @@ def _random_view_transform(config):
     ])
 
 
-def load_source_runtime(checkpoint, data_root, device, seed=1):
+def load_source_runtime(checkpoint, data_root, device, seed=1, source_alias=None):
     checkpoint = Path(checkpoint); data_root = Path(data_root)
     if not checkpoint.is_file():
         raise FileNotFoundError(f"missing Source checkpoint: {checkpoint}")
@@ -744,16 +836,16 @@ def load_source_runtime(checkpoint, data_root, device, seed=1):
     if "config" not in packet or "state_dict" not in packet:
         raise ValueError("Source checkpoint must contain config and state_dict")
     config = SimpleNamespace(**_config_dict(packet["config"])); config.data_root = str(data_root)
-    if getattr(config, "shape_representation", None) != "phase_moment":
-        raise ValueError("P0 requires original G phase_moment Source checkpoint")
-    if int(getattr(config, "shapelet_count", -1)) != 16:
-        raise ValueError("P0 requires 16 learned Anchors")
+    if source_alias is None:
+        matches = [alias for alias, domain in SOURCE_DOMAINS.items() if domain == config.source]
+        if len(matches) != 1:
+            raise ValueError(f"Source domain is not one of the four P0-R sources: {config.source}")
+        source_alias = matches[0]
+    validate_source_checkpoint_config(config, source_alias, seed)
     model = create_model_from_config(config)
     model.load_state_dict(packet["state_dict"], strict=True)
     model = freeze_for_audit(model.to(device))
     random.seed(int(seed)); np.random.seed(int(seed)); torch.manual_seed(int(seed))
-    if not getattr(config, "classes", None):
-        raise ValueError("Source checkpoint must contain its frozen closed-set class mapping")
     source_protocol_dataset = PixelSetData(
         str(data_root), config.source, list(config.classes), closed_set=True,
         combine_spring_and_winter=bool(config.combine_spring_and_winter),
@@ -1045,18 +1137,49 @@ def _shuffled_repeatability(first, second, starts, scales, seed):
          for b in range(len(starts))]
         for a in range(len(starts))
     ], dtype=np.int8)
+    iou = np.asarray([
+        [circular_window_iou(starts[a], starts[b], scales[a], grid_points, scales[b])
+         for b in range(len(starts))]
+        for a in range(len(starts))
+    ], dtype=np.float32)
     labels_by_repeat = []
+    exact_by_repeat = []
+    iou_by_repeat = []
     first_best = first_similarity.argmax(1)
     for repeat, indices in enumerate(permutations):
         second_best = second_similarity[indices].argmax(1)
         labels_by_repeat.append(np.stack([
             overlap[first_best, second_best], overlap[second_best, first_best],
         ], axis=0))
+        exact_by_repeat.append(np.stack([
+            first_best == second_best, second_best == first_best,
+        ], axis=0))
+        iou_by_repeat.append(np.stack([
+            iou[first_best, second_best], iou[second_best, first_best],
+        ], axis=0))
     return {
         "labels": np.stack(labels_by_repeat, axis=0),
+        "exact": np.stack(exact_by_repeat, axis=0),
+        "iou": np.stack(iou_by_repeat, axis=0),
         "parcel_index": parcels, "class_id": labels,
         "directions": ("view0_to_view1", "view1_to_view0"),
     }
+
+
+def _cluster_mean_interval(values, classes, repeats, seed):
+    values = np.asarray(values, dtype=np.float64)
+    classes = np.asarray(classes)
+    rng = np.random.default_rng(seed)
+    strata = [np.flatnonzero(classes == clazz) for clazz in np.unique(classes)]
+    replicas = []
+    for _ in range(repeats):
+        sampled = np.concatenate([
+            rng.choice(positions, len(positions), replace=True) for positions in strata
+        ])
+        replicas.append(float(values[sampled].mean()))
+    alpha = (1. - CALIBRATION_PROTOCOL["bootstrap_confidence"]) / 2
+    low, high = np.quantile(replicas, [alpha, 1. - alpha])
+    return float(values.mean()), float(low), float(high)
 
 
 def _paired_shuffle_control_rows(paired, shuffled, split, seed):
@@ -1073,39 +1196,68 @@ def _paired_shuffle_control_rows(paired, shuffled, split, seed):
             observed = [row for row in observed if int(row["parcel_index"]) in parcel_position]
             if not observed:
                 continue
-            observed_label = np.asarray([row["label"] for row in observed], dtype=np.float64)
-            control_label = np.asarray([
+            observed_label_all = np.asarray([row["label"] for row in observed], dtype=np.float64)
+            control_label_all = np.asarray([
                 shuffled["labels"][:, direction_index, parcel_position[int(row["parcel_index"])], anchor].mean()
                 for row in observed
             ])
-            effect = observed_label - control_label
-            parcels = np.asarray([row["parcel_index"] for row in observed])
-            classes = np.asarray([row["class_id"] for row in observed])
-            # Compute the paired effect with a full-population, class-stratified
-            # parcel bootstrap; no observation or parcel subsampling is used.
-            rng = np.random.default_rng(seed + 1000 + anchor)
-            if len(np.unique(parcels)) != len(parcels):
+            observed_exact_all = np.asarray([row["exact_match"] for row in observed], dtype=np.float64)
+            control_exact_all = np.asarray([
+                shuffled["exact"][:, direction_index, parcel_position[int(row["parcel_index"])], anchor].mean()
+                for row in observed
+            ])
+            observed_iou_all = np.asarray([row["window_iou"] for row in observed], dtype=np.float64)
+            control_iou_all = np.asarray([
+                shuffled["iou"][:, direction_index, parcel_position[int(row["parcel_index"])], anchor].mean()
+                for row in observed
+            ])
+            parcels_all = np.asarray([row["parcel_index"] for row in observed])
+            classes_all = np.asarray([row["class_id"] for row in observed])
+            if len(np.unique(parcels_all)) != len(parcels_all):
                 raise ValueError("paired repeatability must contain one row per parcel and anchor")
-            strata = [np.flatnonzero(classes == clazz) for clazz in np.unique(classes)]
-            replicated = []
-            for _ in range(CALIBRATION_PROTOCOL["bootstrap_repeats"]):
-                sampled = np.concatenate([
-                    rng.choice(positions, len(positions), replace=True) for positions in strata
-                ])
-                replicated.append(float(effect[sampled].mean()))
-            alpha = (1. - CALIBRATION_PROTOCOL["bootstrap_confidence"]) / 2
-            low, high = np.quantile(replicated, [alpha, 1. - alpha])
-            output.append({
-                "split": split, "anchor": anchor, "direction": direction,
-                "sample_count": len(effect),
-                "paired_repeatability": float(observed_label.mean()),
-                "same_class_shuffled_repeatability": float(control_label.mean()),
-                "paired_minus_shuffled": float(effect.mean()),
-                "paired_minus_shuffled_ci_low": float(low),
-                "paired_minus_shuffled_ci_high": float(high),
-                "shuffle_repeats": CALIBRATION_PROTOCOL["same_class_shuffle_repeats"],
-                "bootstrap_group_count": len(parcels),
-            })
+            scopes = [("ALL", np.ones(len(observed), dtype=bool))]
+            scopes.extend((int(clazz), classes_all == clazz) for clazz in np.unique(classes_all))
+            for scope_index, (class_id, mask) in enumerate(scopes):
+                observed_label = observed_label_all[mask]; control_label = control_label_all[mask]
+                observed_exact = observed_exact_all[mask]; control_exact = control_exact_all[mask]
+                observed_iou = observed_iou_all[mask]; control_iou = control_iou_all[mask]
+                classes = classes_all[mask]; parcels = parcels_all[mask]
+                effect, low, high = _cluster_mean_interval(
+                    observed_label - control_label, classes,
+                    CALIBRATION_PROTOCOL["bootstrap_repeats"],
+                    seed + 1000 + anchor + 10 * scope_index,
+                )
+                exact_effect, exact_low, exact_high = _cluster_mean_interval(
+                    observed_exact - control_exact, classes,
+                    CALIBRATION_PROTOCOL["bootstrap_repeats"],
+                    seed + 2000 + anchor + 10 * scope_index,
+                )
+                iou_effect, iou_low, iou_high = _cluster_mean_interval(
+                    observed_iou - control_iou, classes,
+                    CALIBRATION_PROTOCOL["bootstrap_repeats"],
+                    seed + 3000 + anchor + 10 * scope_index,
+                )
+                output.append({
+                    "split": split, "anchor": anchor, "direction": direction,
+                    "class_id": class_id, "sample_count": len(parcels),
+                    "paired_repeatability": float(observed_label.mean()),
+                    "same_class_shuffled_repeatability": float(control_label.mean()),
+                    "paired_minus_shuffled": effect,
+                    "paired_minus_shuffled_ci_low": low,
+                    "paired_minus_shuffled_ci_high": high,
+                    "paired_exact_match": float(observed_exact.mean()),
+                    "same_class_shuffled_exact_match": float(control_exact.mean()),
+                    "paired_minus_shuffled_exact": exact_effect,
+                    "paired_minus_shuffled_exact_ci_low": exact_low,
+                    "paired_minus_shuffled_exact_ci_high": exact_high,
+                    "paired_window_iou": float(observed_iou.mean()),
+                    "same_class_shuffled_window_iou": float(control_iou.mean()),
+                    "paired_minus_shuffled_iou": iou_effect,
+                    "paired_minus_shuffled_iou_ci_low": iou_low,
+                    "paired_minus_shuffled_iou_ci_high": iou_high,
+                    "shuffle_repeats": CALIBRATION_PROTOCOL["same_class_shuffle_repeats"],
+                    "bootstrap_group_count": len(parcels),
+                })
     return output
 
 
@@ -1150,7 +1302,9 @@ def repeatability_baseline_rows(train_rows, val_rows, anchor, seed):
     windows = sorted({row["source_window"] for row in train})
     train_y = np.asarray([row["label"] for row in train]); val_y = np.asarray([row["label"] for row in val])
     val_groups = np.asarray([row["parcel_index"] for row in val])
+    val_classes = np.asarray([row["class_id"] for row in val])
     output = []
+    scores_by_model = {}
     for name, include_position, include_class, include_q in (
         ("constant", False, False, False), ("position_only", True, False, False),
         ("class_position", True, True, False), ("class_position_qmax", True, True, True),
@@ -1168,6 +1322,7 @@ def repeatability_baseline_rows(train_rows, val_rows, anchor, seed):
             scores, coefficients = _fit_logistic_design(
                 train_x, train_y, val_x, nonnegative_last=include_q,
             )
+        scores_by_model[name] = scores
         row = {
             "anchor": anchor, "model": name, "split": "source_val",
             "train_sample_count": len(train), "sample_count": len(val),
@@ -1178,13 +1333,47 @@ def repeatability_baseline_rows(train_rows, val_rows, anchor, seed):
             try:
                 estimate, low, high = bootstrap_metric_interval(
                     val_y, scores, val_groups, metric, seed=seed + anchor,
-                    group_classes=np.asarray([row_["class_id"] for row_ in val]),
+                    group_classes=val_classes,
                 )
             except ValueError:
                 estimate = low = high = float("nan")
             row.update({metric: estimate, f"{metric}_ci_low": low, f"{metric}_ci_high": high})
         output.append(row)
+    baseline = next(row for row in output if row["model"] == "class_position")
+    augmented = next(row for row in output if row["model"] == "class_position_qmax")
+    augmented["comparison_model"] = "class_position"
+    augmented["auroc_increment"] = float(augmented["auroc"]) - float(baseline["auroc"])
+    augmented["auprc_increment"] = float(augmented["auprc"]) - float(baseline["auprc"])
+    augmented["brier_improvement"] = float(baseline["brier"]) - float(augmented["brier"])
+    augmented["ece_improvement"] = float(baseline["ece"]) - float(augmented["ece"])
+    for metric in ("auroc", "auprc", "brier", "ece"):
+        estimate, low, high = bootstrap_metric_difference_interval(
+            val_y, scores_by_model["class_position_qmax"],
+            scores_by_model["class_position"], val_groups, metric,
+            seed=seed + anchor, group_classes=val_classes,
+        )
+        if metric in ("brier", "ece"):
+            estimate, low, high = -estimate, -high, -low
+            prefix = f"{metric}_improvement"
+        else:
+            prefix = f"{metric}_increment"
+        augmented[prefix] = estimate
+        augmented[f"{prefix}_ci_low"] = low
+        augmented[f"{prefix}_ci_high"] = high
+    augmented["increment_bootstrap_method"] = (
+        "paired_full_population_class_stratified_parcel_bootstrap"
+    )
     return output
+
+
+def calibration_validation_rows(calibration_rows, baseline_rows):
+    """Flatten validation evidence without merging the two proxy probabilities."""
+    rows = [{"record_type": "proxy_calibration", **row} for row in calibration_rows]
+    rows.extend({
+        "record_type": "repeatability_qmax_increment",
+        "evidence": "repeatability", **row,
+    } for row in baseline_rows if row.get("model") == "class_position_qmax")
+    return rows
 
 
 def _morphology_summary(split, view, thresholds, train_edges):
@@ -1248,6 +1437,78 @@ def _cross_view_morphology_all(views, thresholds):
                 "thresholds": np.asarray(thresholds),
             })
     return packets
+
+
+def _safe_correlation(first, second):
+    first = np.asarray(first, dtype=np.float64).reshape(-1)
+    second = np.asarray(second, dtype=np.float64).reshape(-1)
+    if len(first) < 3 or first.std() <= 1e-12 or second.std() <= 1e-12:
+        return float("nan")
+    return float(np.corrcoef(first, second)[0, 1])
+
+
+def morphology_control_rows(train_views, val_views, thresholds):
+    """Compare cross-view perturbation effects with normal view variation.
+
+    All q-band edges are frozen from Source Train. Rows retain Source class,
+    actual calendar window start, and q band so the controlled effect cannot be
+    attributed only to class, fixed seasonal position, or score range.
+    """
+    train_left, train_right = pair_views_by_parcel(*train_views)
+    anchor_count = train_left["similarity"].shape[-1]
+    edges = {
+        anchor: np.quantile(np.concatenate([
+            train_left["similarity"][:, :, anchor].reshape(-1),
+            train_right["similarity"][:, :, anchor].reshape(-1),
+        ]), [0., 1/3, 2/3, 1.])
+        for anchor in range(anchor_count)
+    }
+    output = []
+    for split, packets in (("source_train", train_views), ("source_val", val_views)):
+        left, right = pair_views_by_parcel(*packets)
+        normal = np.abs(left["similarity"] - right["similarity"])
+        for perturbation, key in (
+            ("reverse", "reverse_similarity"),
+            ("block_reorder", "reorder_similarity"),
+        ):
+            for direction, predictor, opposite, changed in (
+                ("view0_to_view1", left["similarity"], right["similarity"], right[key]),
+                ("view1_to_view0", right["similarity"], left["similarity"], left[key]),
+            ):
+                delta = opposite - changed
+                for anchor in range(anchor_count):
+                    bands = np.digitize(
+                        predictor[:, :, anchor], edges[anchor][1:-1], right=True,
+                    )
+                    for clazz in np.unique(left["label"]):
+                        sample_mask = left["label"] == clazz
+                        for window, start in enumerate(left["window_starts"]):
+                            for band, band_name in enumerate(("low", "medium", "high")):
+                                selected = sample_mask & (bands[:, window] == band)
+                                if not selected.any():
+                                    continue
+                                q = predictor[selected, window, anchor]
+                                q_other = opposite[selected, window, anchor]
+                                d = delta[selected, window, anchor]
+                                n = normal[selected, window, anchor]
+                                output.append({
+                                    "split": split, "perturbation": perturbation,
+                                    "direction": direction, "anchor": anchor,
+                                    "class_id": int(clazz), "window_index": window,
+                                    "window_start": int(start), "similarity_band": band_name,
+                                    "sample_count": int(selected.sum()),
+                                    "normal_absolute_change_mean": float(n.mean()),
+                                    "normal_absolute_change_median": float(np.median(n)),
+                                    "controlled_delta_mean": float(d.mean()),
+                                    "controlled_delta_median": float(np.median(d)),
+                                    "controlled_minus_normal_mean": float(d.mean() - n.mean()),
+                                    "proxy_positive_fraction": float(np.mean(d > thresholds[anchor])),
+                                    "symmetric_or_small_change_fraction": float(np.mean(np.abs(d) <= thresholds[anchor])),
+                                    "q_view_correlation": _safe_correlation(q, q_other),
+                                    "q_predictor_opposite_delta_correlation": _safe_correlation(q, d),
+                                    "normal_change_threshold": float(thresholds[anchor]),
+                                })
+    return output
 
 
 def morphology_conditional_control_rows(train_rows, val_rows, seed):
@@ -1329,11 +1590,17 @@ def per_class_evidence_rows(repeat_rows, morphology_rows, split):
                 and row["class_id"] == clazz
             ]
             if selected:
+                scores = np.asarray([row["q"] for row in selected], dtype=np.float64)
                 rows.append({
                     "split": split, "evidence": "repeatability", "anchor": anchor,
                     "class_id": clazz, "sample_count": len(selected),
                     "positive_fraction": float(np.mean([row["label"] for row in selected])),
-                    "score_mean": float(np.mean([row["q"] for row in selected])),
+                    "score_mean": float(scores.mean()),
+                    "score_std": float(scores.std()),
+                    "score_q25": float(np.quantile(scores, .25)),
+                    "score_q50": float(np.quantile(scores, .50)),
+                    "score_q75": float(np.quantile(scores, .75)),
+                    "exact_match_fraction": float(np.mean([row["exact_match"] for row in selected])),
                     "effect_mean": float(np.mean([row["window_iou"] for row in selected])),
                 })
     if morphology_rows:
@@ -1500,12 +1767,22 @@ def _reliability_rows(calibration_rows, baseline_rows, control_rows, morphology_
         increment = float("nan")
         if "class_position" in baseline and "class_position_qmax" in baseline:
             increment = float(baseline["class_position_qmax"]["auprc"]) - float(baseline["class_position"]["auprc"])
-        paired_controls = [row for row in control_rows if row["anchor"] == anchor]
+        paired_controls = [
+            row for row in control_rows
+            if row["anchor"] == anchor and str(row.get("class_id", "ALL")) == "ALL"
+        ]
         morphology_anchor_controls = [row for row in morphology_controls if row["anchor"] == anchor]
         repeatability = {
             "supported": repeatability_status != "unsupported",
             "monotonic_generalizes": repeatability_status == "stable",
-            "baseline_increment_supported": bool(np.isfinite(increment) and increment >= CALIBRATION_PROTOCOL["minimum_baseline_auprc_increment"]),
+            "baseline_increment_supported": bool(
+                np.isfinite(increment)
+                and increment >= CALIBRATION_PROTOCOL["minimum_baseline_auprc_increment"]
+                and np.isfinite(float(baseline.get("class_position_qmax", {}).get(
+                    "auprc_increment_ci_low", float("nan")
+                )))
+                and float(baseline["class_position_qmax"]["auprc_increment_ci_low"]) > 0
+            ),
             "paired_shuffle_effect_supported": bool(
                 paired_controls and all(float(row["paired_minus_shuffled_ci_low"]) > 0 for row in paired_controls)
             ),
@@ -1530,6 +1807,7 @@ def _reliability_rows(calibration_rows, baseline_rows, control_rows, morphology_
                 )
             ),
             "conditional_control_supported": any(value == "pass" for value in perturbation_status.values()),
+            "perturbation_conflict": len(set(perturbation_status.values())) > 1,
             "perturbations": perturbation_status,
         }
         decision = assess_anchor_reliability(repeatability, morphology)
@@ -1610,7 +1888,7 @@ def run_source(args):
     if args.settings_fingerprint and args.settings_fingerprint != fingerprint:
         raise ValueError("scheduler/analysis settings fingerprint mismatch")
     model, config, protocol, splits, datasets = load_source_runtime(
-        args.checkpoint, args.data_root, args.device, args.seed,
+        args.checkpoint, args.data_root, args.device, args.seed, args.source_alias,
     )
     views, split_fingerprints, cache_signature = load_or_extract_views(
         output, model, datasets, config.source, args.seed, args.device,
@@ -1646,8 +1924,14 @@ def run_source(args):
         repeatability_baselines.extend(
             repeatability_baseline_rows(train_repeat, val_repeat, anchor, args.seed)
         )
-    morphology_controls = morphology_conditional_control_rows(
+    morphology_controls = morphology_control_rows(
+        views["source_train"], views["source_val"], thresholds,
+    )
+    morphology_conditional_controls = morphology_conditional_control_rows(
         train_cross, val_cross, args.seed,
+    )
+    calibration_validation = calibration_validation_rows(
+        calibration, repeatability_baselines,
     )
     per_class = (
         per_class_evidence_rows(train_repeat, train_cross, "source_train")
@@ -1681,16 +1965,18 @@ def run_source(args):
     reliability = _reliability_rows(
         calibration, repeatability_baselines,
         [row for row in repeatability_controls if row["split"] == "source_val"],
-        morphology_controls,
+        morphology_conditional_controls,
     )
     _write_csv(output / "matching_distribution.csv", matching)
     _write_csv(output / "view_repeatability.csv", repeatability)
     _write_csv(output / "morphology_counterfactual.csv", morphology)
+    _write_csv(output / "morphology_controls.csv", morphology_controls)
     _write_csv(output / "calibration_candidates.csv", calibration)
+    _write_csv(output / "calibration_validation.csv", calibration_validation)
     _write_csv(output / "anchor_reliability_summary.csv", reliability)
     _write_csv(output / "repeatability_controls.csv", repeatability_controls)
     _write_csv(output / "repeatability_baselines.csv", repeatability_baselines)
-    _write_csv(output / "morphology_conditional_controls.csv", morphology_controls)
+    _write_csv(output / "morphology_conditional_controls.csv", morphology_conditional_controls)
     _write_csv(output / "per_class_evidence.csv", per_class)
     _atomic_json(output / "bootstrap_protocol.json", {
         "protocol_version": P0R_PROTOCOL_VERSION,
@@ -1794,6 +2080,12 @@ def run_source(args):
             if row["status"] == "calibratable"
             and row["morphology"] is not None
         ],
+        "shared_source_only_calibration_required": True,
+        "default_calibrator": None,
+        "note": (
+            "Parcel support and window activation remain separate candidates; "
+            "P0-R does not authorize a unified occurrence probability."
+        ),
     }
     _atomic_json(output / "calibration_decision.json", decision)
     manifest = {
@@ -1803,6 +2095,10 @@ def run_source(args):
         "checkpoint_sha256": checkpoint_sha, "settings_fingerprint": fingerprint,
         "classes": list(config.classes), "protocol": protocol,
         "split_parcel_sha256": split_fingerprints,
+        "split_parcel_ids": {
+            split: [int(value) for value in datasets[split].get_parcel_indices()]
+            for split in ("source_train", "source_val")
+        },
         "sample_counts": {split: len(datasets[split]) for split in ("source_train", "source_val")},
         "calibration_protocol": CALIBRATION_PROTOCOL,
         "morphology_thresholds": thresholds.tolist(),

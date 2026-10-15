@@ -5,6 +5,7 @@ import inspect
 import random
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -13,6 +14,7 @@ import torch
 from analysis.anchor_matching_calibration_audit import (
     CALIBRATION_PROTOCOL,
     P0R_PROTOCOL_VERSION,
+    REQUIRED_OUTPUTS,
     MonotonicCalibration,
     assess_anchor_reliability,
     assess_joint_reliability,
@@ -30,6 +32,7 @@ from analysis.anchor_matching_calibration_audit import (
     freeze_morphology_thresholds,
     freeze_for_audit,
     morphology_proxy_labels,
+    morphology_control_rows,
     pair_views_by_parcel,
     perturb_windows,
     recompute_window_tokens_and_similarity,
@@ -39,6 +42,7 @@ from analysis.anchor_matching_calibration_audit import (
     merge_sources,
     _joint_calibration_bootstrap,
     split_ids_are_disjoint,
+    validate_source_checkpoint_config,
 )
 
 
@@ -319,6 +323,55 @@ def test_qmax_increment_is_measured_against_same_class_position_population():
     assert set(by_name) == {"constant", "position_only", "class_position", "class_position_qmax"}
     assert by_name["class_position_qmax"]["qmax_coefficient"] >= 0
     assert by_name["class_position_qmax"]["auprc"] > by_name["class_position"]["auprc"]
+    assert by_name["class_position_qmax"]["auprc_increment_ci_low"] > 0
+    assert by_name["class_position_qmax"]["increment_bootstrap_method"] == (
+        "paired_full_population_class_stratified_parcel_bootstrap"
+    )
+
+
+def test_time_preference_without_sample_repeatability_has_no_qmax_increment():
+    rng = np.random.default_rng(4)
+    def rows(size):
+        output = []
+        for index in range(size):
+            window = index % 4
+            output.append({
+                "anchor": 0, "direction": "view0_to_view1", "class_id": index % 2,
+                "source_window": window, "parcel_index": index,
+                "q": float(rng.normal()), "label": int(window in (0, 1)),
+            })
+        return output
+    result = repeatability_baseline_rows(rows(240), rows(160), 0, seed=8)
+    by_name = {row["model"]: row for row in result}
+    assert abs(by_name["class_position_qmax"]["auprc"] - by_name["class_position"]["auprc"]) < .05
+    assert "auprc_increment_ci_low" in by_name["class_position_qmax"]
+
+
+def test_morphology_controls_report_normal_and_cross_view_changes_by_stratum():
+    def packet(q, changed, view):
+        return {
+            "similarity": np.asarray(q, dtype=np.float64),
+            "reverse_similarity": np.asarray(changed, dtype=np.float64),
+            "reorder_similarity": np.asarray(changed, dtype=np.float64),
+            "parcel_index": np.array([1, 2]), "label": np.array([0, 1]),
+            "window_starts": np.array([0, 8]), "window_scales": np.array([24, 24]),
+            "view_id": np.array([view, view]), "domain": np.array(["S", "S"]),
+        }
+    first = packet([[[.8], [.2]], [[.7], [.1]]], [[[.1], [.1]], [[.2], [.1]]], 0)
+    second = packet([[[.7], [.3]], [[.6], [.2]]], [[[.2], [.1]], [[.1], [.1]]], 1)
+    rows = morphology_control_rows(
+        (first, second), (first, second), thresholds=np.array([.15]),
+    )
+    assert {row["split"] for row in rows} == {"source_train", "source_val"}
+    assert {row["perturbation"] for row in rows} == {"reverse", "block_reorder"}
+    assert all("normal_absolute_change_mean" in row for row in rows)
+    assert all("controlled_delta_mean" in row for row in rows)
+    assert all("q_predictor_opposite_delta_correlation" in row for row in rows)
+
+
+def test_required_outputs_use_complete_p0r_names():
+    assert "morphology_controls.csv" in REQUIRED_OUTPUTS
+    assert "calibration_validation.csv" in REQUIRED_OUTPUTS
 
 
 def test_runtime_constructs_only_source_splits_for_p0r():
@@ -327,6 +380,33 @@ def test_runtime_constructs_only_source_splits_for_p0r():
     assert "config.target" not in source
     assert '"source_train"' in source and '"source_val"' in source
     assert "return model, config" in source
+
+
+def test_checkpoint_config_requires_original_g_k1_k2_source_and_seed1():
+    config = SimpleNamespace(
+        source="france/30TXT/2017", seed=1, classes=["corn", "wheat"],
+        shape_representation="phase_moment", shape_injection="current_query",
+        shapelet_count=16, shape_phase_k2_enabled=True,
+    )
+    validate_source_checkpoint_config(config, "FR1", seed=1)
+    for field, value, message in (
+        ("source", "denmark/32VNH/2017", "Source domain"),
+        ("seed", 2, "Seed1"),
+        ("shape_phase_k2_enabled", False, "K1/K2"),
+        ("shape_injection", "direct_query", "original G"),
+    ):
+        broken = SimpleNamespace(**vars(config))
+        setattr(broken, field, value)
+        with pytest.raises(ValueError, match=message):
+            validate_source_checkpoint_config(broken, "FR1", seed=1)
+
+
+def test_source_manifest_records_exact_train_and_val_parcel_id_lists():
+    source = inspect.getsource(__import__(
+        "analysis.anchor_matching_calibration_audit", fromlist=["run_source"],
+    ).run_source)
+    assert '"split_parcel_ids"' in source
+    assert 'datasets[split].get_parcel_indices()' in source
 
 
 def test_machine_readable_decision_and_ab_readiness_do_not_invent_defaults():
@@ -390,7 +470,8 @@ def test_launcher_resume_requires_matching_manifest():
     output.mkdir()
     for name in (
         "matching_distribution.csv", "view_repeatability.csv",
-        "morphology_counterfactual.csv", "calibration_candidates.csv",
+        "morphology_counterfactual.csv", "morphology_controls.csv",
+        "calibration_candidates.csv", "calibration_validation.csv",
         "anchor_reliability_summary.csv", "calibration_decision.json",
         "repeatability_controls.csv", "repeatability_baselines.csv",
         "morphology_conditional_controls.csv", "per_class_evidence.csv",
