@@ -128,7 +128,7 @@ def add_model_arguments(parser):
     )
     parser.add_argument(
         '--phase-response-mode', dest='phase_response_mode', default='softmax',
-        choices=['softmax', 'support', 'independent'],
+        choices=['softmax', 'support', 'independent', 'b2'],
         help='phase_moment response readout; softmax preserves historical behavior',
     )
     parser.add_argument(
@@ -288,9 +288,13 @@ def structure_usage_manifest(config):
             'phase_query_view': getattr(config, 'phase_query_view', 'full'),
             'phase_response_mode': getattr(config, 'phase_response_mode', 'softmax'),
             'shape_concentration_semantics': (
-                'window_coverage'
-                if getattr(config, 'phase_response_mode', 'softmax') == 'independent'
-                else 'normalized_window_concentration'
+                'relative_evidence_coverage'
+                if getattr(config, 'phase_response_mode', 'softmax') == 'b2'
+                else (
+                    'window_coverage'
+                    if getattr(config, 'phase_response_mode', 'softmax') == 'independent'
+                    else 'normalized_window_concentration'
+                )
             ),
         })
     elif config.shape_representation == 'state_org':

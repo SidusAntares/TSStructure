@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Four-GPU Source→UDA scheduler for phase-response support/independent A/B."""
+"""Four-GPU Source→UDA scheduler for phase-response A/B/B2 experiments."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import pickle
@@ -26,7 +27,7 @@ TASKS = {
     "FR2_DK1": ("FR2", "france/31TCJ/2017", "DK1", "denmark/32VNH/2017"),
     "DK1_AT1": ("DK1", "denmark/32VNH/2017", "AT1", "austria/33UVP/2017"),
 }
-MODES = {"A": "support", "B": "independent"}
+MODES = {"A": "support", "B": "independent", "B2": "b2"}
 
 
 @dataclass(frozen=True)
@@ -40,10 +41,11 @@ class Job:
     target: str
 
 
-def planned_jobs():
+def planned_jobs(variants=("A", "B")):
     return [
         Job(variant, mode, task, *domains)
-        for variant, mode in MODES.items()
+        for variant in variants
+        for mode in (MODES[variant],)
         for task, domains in TASKS.items()
     ]
 
@@ -174,6 +176,62 @@ def _require_safe_status(status, fold, mode):
         )
 
 
+def validate_frozen_manifest(path):
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"B2 frozen check manifest is required before training: {path}"
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError(f"invalid B2 frozen check manifest: {path}")
+    blocked = [
+        item for item in payload
+        if not item.get("training_allowed", False) or item.get("blockers")
+    ]
+    if blocked:
+        raise RuntimeError(
+            "B2 training blocked by frozen numerical check: "
+            + json.dumps(blocked, sort_keys=True)
+        )
+    expected = {
+        (variant, task, mode)
+        for variant, mode in (("G", "softmax"), ("B", "independent"))
+        for task in TASKS
+    }
+    observed_entries = [
+        (
+            str(item.get("label", "")).split("_", 1)[0],
+            item.get("task"),
+            item.get("trained_response_mode"),
+        )
+        for item in payload
+    ]
+    if len(observed_entries) != len(set(observed_entries)):
+        raise RuntimeError("B2 frozen check manifest contains duplicate entries")
+    observed = set(observed_entries)
+    if observed != expected:
+        raise RuntimeError(
+            "B2 frozen check coverage mismatch: "
+            f"missing={sorted(expected - observed)} "
+            f"unexpected={sorted(observed - expected)}"
+        )
+    for item in payload:
+        checkpoint = Path(item.get("checkpoint", ""))
+        if not checkpoint.is_file():
+            raise RuntimeError(
+                f"B2 frozen checkpoint is missing after audit: {checkpoint}"
+            )
+        digest = hashlib.sha256()
+        with checkpoint.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != item.get("checkpoint_sha256"):
+            raise RuntimeError(
+                f"B2 frozen checkpoint SHA256 changed after audit: {checkpoint}"
+            )
+
+
 def run_job(args, job, gpu):
     source_fold = args.output_root / "outputs/source" / _source_experiment(job) / "fold_0"
     uda_fold = args.output_root / "outputs/uda" / _uda_experiment(job) / "fold_0"
@@ -226,6 +284,7 @@ def _read_final_metrics(fold):
     payload = json.loads(metrics.read_text(encoding="utf-8"))
     with confusion.open("rb") as stream:
         matrix = np.asarray(pickle.load(stream), dtype=np.int64)
+    recomputed = confusion_metrics(matrix)
     support = matrix.sum(1); predicted = matrix.sum(0); tp = np.diag(matrix).astype(float)
     precision = np.divide(tp, predicted, out=np.zeros_like(tp), where=predicted > 0)
     recall = np.divide(tp, support, out=np.zeros_like(tp), where=support > 0)
@@ -238,8 +297,39 @@ def _read_final_metrics(fold):
         packet = torch.load(checkpoint, map_location="cpu", weights_only=False)
         classes = list(_config_value(packet, "classes", ()))
     if len(classes) != len(f1):
-        classes = [f"class_{index}" for index in range(len(f1))]
-    return payload, support, precision, recall, f1, classes
+        raise ValueError(
+            f"checkpoint class mapping length {len(classes)} does not match "
+            f"confusion matrix size {len(f1)}: {checkpoint}"
+        )
+    return payload, support, precision, recall, f1, classes, recomputed
+
+
+def confusion_metrics(matrix):
+    """Return both historical observed-class and fixed-class Macro-F1."""
+    matrix = np.asarray(matrix, dtype=np.int64)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("confusion matrix must be square with the full class order")
+    support = matrix.sum(1)
+    predicted = matrix.sum(0)
+    true_positive = np.diag(matrix).astype(np.float64)
+    precision = np.divide(
+        true_positive, predicted,
+        out=np.zeros_like(true_positive), where=predicted > 0,
+    )
+    recall = np.divide(
+        true_positive, support,
+        out=np.zeros_like(true_positive), where=support > 0,
+    )
+    per_class_f1 = np.divide(
+        2. * precision * recall, precision + recall,
+        out=np.zeros_like(true_positive), where=(precision + recall) > 0,
+    )
+    observed = (support + predicted) > 0
+    return {
+        "observed_macro_f1": float(per_class_f1[observed].mean()) if observed.any() else 0.,
+        "fixed_class_macro_f1": float(per_class_f1.mean()) if len(per_class_f1) else 0.,
+        "class_count": int(len(per_class_f1)),
+    }
 
 
 def _checkpoint_summary(fold):
@@ -281,7 +371,8 @@ def _runtime_seconds(output_root, variant, task):
 
 def summarize_results(args):
     task_rows, class_rows, diagnostic_rows, source_rows = [], [], [], []
-    for job in planned_jobs():
+    jobs = planned_jobs(args.variants)
+    for job in jobs:
         source_fold = args.output_root / "outputs/source" / _source_experiment(job) / "fold_0"
         source_packet = None
         if (source_fold / "model.pt").is_file():
@@ -304,8 +395,20 @@ def summarize_results(args):
         if result is None:
             row.update(status="missing", final_test_macro_f1="")
         else:
-            payload, support, precision, recall, f1, classes = result
-            row.update(status="complete", final_test_macro_f1=payload.get("macro_f1", ""))
+            payload, support, precision, recall, f1, classes, recomputed = result
+            row.update(
+                status="complete",
+                final_test_macro_f1=recomputed["fixed_class_macro_f1"],
+                final_test_macro_f1_json=payload.get("macro_f1", ""),
+                final_observed_macro_f1_from_cm=recomputed["observed_macro_f1"],
+                final_fixed_class_macro_f1=recomputed["fixed_class_macro_f1"],
+                macro_f1_json_minus_observed=(
+                    float(payload.get("macro_f1", 0.))
+                    - recomputed["observed_macro_f1"]
+                ),
+                class_count=recomputed["class_count"],
+                class_order="|".join(classes),
+            )
             for index in range(len(f1)):
                 class_rows.append({
                     "task": job.task, "variant": job.variant, "class_index": index,
@@ -335,8 +438,20 @@ def summarize_results(args):
         if result is None:
             row.update(status="missing", final_test_macro_f1="")
         else:
-            payload, support, precision, recall, f1, classes = result
-            row.update(status="complete", final_test_macro_f1=payload.get("macro_f1", ""))
+            payload, support, precision, recall, f1, classes, recomputed = result
+            row.update(
+                status="complete",
+                final_test_macro_f1=recomputed["fixed_class_macro_f1"],
+                final_test_macro_f1_json=payload.get("macro_f1", ""),
+                final_observed_macro_f1_from_cm=recomputed["observed_macro_f1"],
+                final_fixed_class_macro_f1=recomputed["fixed_class_macro_f1"],
+                macro_f1_json_minus_observed=(
+                    float(payload.get("macro_f1", 0.))
+                    - recomputed["observed_macro_f1"]
+                ),
+                class_count=recomputed["class_count"],
+                class_order="|".join(classes),
+            )
             for index in range(len(f1)):
                 class_rows.append({
                     "task": task, "variant": "G", "class_index": index,
@@ -345,66 +460,152 @@ def summarize_results(args):
                     "recall": recall[index], "f1": f1[index],
                 })
         task_rows.append(row)
+    if "B2" in args.variants and "B" not in args.variants:
+        for task in TASKS:
+            fold = args.b_root / f"B_{task}_seed1/fold_0"
+            result = _read_final_metrics(fold)
+            row = {
+                "task": task, "variant": "B", "mode": "independent",
+                "runtime_seconds": "", **_checkpoint_summary(fold),
+            }
+            if result is None:
+                row.update(status="missing", final_test_macro_f1="")
+            else:
+                payload, support, precision, recall, f1, classes, recomputed = result
+                row.update(
+                    status="complete",
+                    final_test_macro_f1=recomputed["fixed_class_macro_f1"],
+                    final_test_macro_f1_json=payload.get("macro_f1", ""),
+                    final_observed_macro_f1_from_cm=recomputed["observed_macro_f1"],
+                    final_fixed_class_macro_f1=recomputed["fixed_class_macro_f1"],
+                    macro_f1_json_minus_observed=(
+                        float(payload.get("macro_f1", 0.))
+                        - recomputed["observed_macro_f1"]
+                    ),
+                    class_count=recomputed["class_count"],
+                    class_order="|".join(classes),
+                )
+                for index in range(len(f1)):
+                    class_rows.append({
+                        "task": task, "variant": "B", "class_index": index,
+                        "class_name": classes[index], "support": int(support[index]),
+                        "precision": precision[index], "recall": recall[index],
+                        "f1": f1[index],
+                    })
+            task_rows.append(row)
+    for task in TASKS:
+        orders = {
+            row.get("class_order") for row in task_rows
+            if row["task"] == task and row.get("status") == "complete"
+        }
+        if len(orders) > 1:
+            raise RuntimeError(f"class mapping mismatch for {task}: {sorted(orders)}")
     lookup = {(row["task"], row["variant"]): row for row in task_rows}
+    comparison_variants = (
+        ("G", "B", "B2") if "B2" in args.variants else ("G", "A", "B")
+    )
     for task in TASKS:
         scores = {
             variant: lookup[(task, variant)].get("final_test_macro_f1", "")
-            for variant in ("G", "A", "B")
+            for variant in comparison_variants
         }
         if all(value not in (None, "") for value in scores.values()):
-            g, a, b = (float(scores[variant]) for variant in ("G", "A", "B"))
-            lookup[(task, "A")]["delta_vs_g"] = a - g
-            lookup[(task, "B")]["delta_vs_g"] = b - g
-            lookup[(task, "B")]["delta_vs_a"] = b - a
+            baseline, middle, last = (
+                float(scores[variant]) for variant in comparison_variants
+            )
+            lookup[(task, comparison_variants[1])]["delta_vs_g"] = middle - baseline
+            lookup[(task, comparison_variants[2])]["delta_vs_g"] = last - baseline
+            lookup[(task, comparison_variants[2])][
+                f"delta_vs_{comparison_variants[1].lower()}"
+            ] = last - middle
     unique_source = {(row["variant"], row["source"]): row for row in source_rows}.values()
-    _write_csv(args.output_root / "Source_AB_metrics.csv", unique_source)
-    _write_csv(args.output_root / "UDA_AB_4tasks_seed1.csv", task_rows)
+    b2_only = tuple(args.variants) == ("B2",)
+    _write_csv(
+        args.output_root / ("Source_B2_metrics.csv" if b2_only else "Source_AB_metrics.csv"),
+        unique_source,
+    )
+    _write_csv(
+        args.output_root / (
+            "UDA_G_B_B2_4tasks.csv" if b2_only else "UDA_AB_4tasks_seed1.csv"
+        ), task_rows,
+    )
     _write_csv(args.output_root / "per_class_comparison.csv", class_rows)
-    _write_csv(args.output_root / "response_diagnostics.csv", diagnostic_rows)
+    _write_csv(
+        args.output_root / (
+            "B2_response_diagnostics.csv" if b2_only else "response_diagnostics.csv"
+        ), diagnostic_rows,
+    )
     lines = [
-        "# G Response A/B Seed1", "",
-        "Primary metric: final-epoch Student Test Macro-F1. Test is not used for selection.", "",
-        "| Task | G | A | B | A-G | B-G | B-A |",
+        "# G Response Comparison Seed1", "",
+        "Primary metric: final-epoch Student fixed-class Test Macro-F1 recomputed from the full confusion matrix. Test is not used for selection.", "",
+        f"| Task | {comparison_variants[0]} | {comparison_variants[1]} | {comparison_variants[2]} | {comparison_variants[1]}-G | {comparison_variants[2]}-G | {comparison_variants[2]}-{comparison_variants[1]} |",
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for task in TASKS:
         values = {
             variant: lookup[(task, variant)]["final_test_macro_f1"]
-            for variant in ("G", "A", "B")
+            for variant in comparison_variants
         }
         if all(value not in (None, "") for value in values.values()):
-            g, a, b = (float(values[key]) for key in ("G", "A", "B"))
-            cells = (f"{g:.4f}", f"{a:.4f}", f"{b:.4f}",
-                     f"{a-g:+.4f}", f"{b-g:+.4f}", f"{b-a:+.4f}")
+            g, middle, last = (
+                float(values[key]) for key in comparison_variants
+            )
+            cells = (f"{g:.4f}", f"{middle:.4f}", f"{last:.4f}",
+                     f"{middle-g:+.4f}", f"{last-g:+.4f}", f"{last-middle:+.4f}")
         else:
             cells = tuple(
                 "MISSING" if values.get(key) in (None, "") else f"{float(values[key]):.4f}"
-                for key in ("G", "A", "B")
+                for key in comparison_variants
             ) + ("MISSING", "MISSING", "MISSING")
         lines.append(f"| {task} | " + " | ".join(cells) + " |")
     means = {}
-    for variant in ("G", "A", "B"):
+    for variant in comparison_variants:
         values = [lookup[(task, variant)]["final_test_macro_f1"] for task in TASKS]
         means[variant] = (
             float(np.mean([float(value) for value in values]))
             if all(value not in (None, "") for value in values) else None
         )
     if all(value is not None for value in means.values()):
-        g, a, b = means["G"], means["A"], means["B"]
+        g, middle, last = (means[key] for key in comparison_variants)
         lines.append(
-            f"| 4-task mean | {g:.4f} | {a:.4f} | {b:.4f} | "
-            f"{a-g:+.4f} | {b-g:+.4f} | {b-a:+.4f} |"
+            f"| 4-task mean | {g:.4f} | {middle:.4f} | {last:.4f} | "
+            f"{middle-g:+.4f} | {last-g:+.4f} | {last-middle:+.4f} |"
         )
     else:
         lines.append("| 4-task mean | MISSING | MISSING | MISSING | MISSING | MISSING | MISSING |")
+    lines.extend([
+        "", "## Metric protocol audit", "",
+        "| Task | Variant | JSON Macro-F1 | Observed-class CM Macro-F1 | Fixed-class CM Macro-F1 | JSON-Observed |",
+        "|---|---|---:|---:|---:|---:|",
+    ])
+    for row in task_rows:
+        if row.get("status") != "complete":
+            continue
+        lines.append(
+            f"| {row['task']} | {row['variant']} | "
+            f"{float(row['final_test_macro_f1_json']):.6f} | "
+            f"{float(row['final_observed_macro_f1_from_cm']):.6f} | "
+            f"{float(row['final_fixed_class_macro_f1']):.6f} | "
+            f"{float(row['macro_f1_json_minus_observed']):+.3e} |"
+        )
     lines.extend(["", f"G baseline root (read-only): `{args.g_root}`.",
+                  f"B baseline root (read-only): `{args.b_root}`.",
                   "No G baseline training was launched by this scheduler."])
     (args.output_root / "FINAL_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def run_scheduler(args):
-    args.output_root = Path(args.output_root)
-    jobs = planned_jobs()
+    if args.output_root is None:
+        args.output_root = Path(
+            "experiments/structure_b2_seed1"
+            if tuple(args.variants) == ("B2",)
+            else "experiments/structure_g_response_ab_seed1"
+        )
+    else:
+        args.output_root = Path(args.output_root)
+    args.g_root = Path(args.g_root)
+    args.b_root = Path(args.b_root)
+    jobs = planned_jobs(args.variants)
     if args.mode == "dry-run":
         for index, job in enumerate(jobs):
             gpu = args.gpus[index % len(args.gpus)]
@@ -413,6 +614,12 @@ def run_scheduler(args):
             print(f"UDA_PLAN|gpu={gpu}|variant={job.variant}|mode={job.mode}|task={job.task}")
             print("COMMAND|gpu=" + str(gpu) + "|" + " ".join(uda_command(args, job)))
         return
+    if "B2" in args.variants:
+        manifest = (
+            Path(args.frozen_manifest) if args.frozen_manifest
+            else args.output_root / "frozen_check/B2_frozen_manifest.json"
+        )
+        validate_frozen_manifest(manifest)
     if not Path(args.data_root).is_dir():
         raise FileNotFoundError(f"missing data root: {args.data_root}")
     args.output_root.mkdir(parents=True, exist_ok=True)
@@ -455,17 +662,21 @@ def run_scheduler(args):
         json.dumps({"failures": failures}, indent=2, sort_keys=True), encoding="utf-8",
     )
     if failures:
-        raise RuntimeError("G response A/B failures: " + json.dumps(failures))
+        raise RuntimeError("G response experiment failures: " + json.dumps(failures))
 
 
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("dry-run", "run", "resume"))
     parser.add_argument("--data-root", default="/data/user/dataset/timematch_data")
-    parser.add_argument("--output-root", type=Path,
-                        default=Path("experiments/structure_g_response_ab_seed1"))
+    parser.add_argument("--variants", nargs="+", choices=tuple(MODES),
+                        default=("A", "B"))
+    parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--g-root", type=Path,
                         default=Path("experiments/structure_e_cross_seed1/outputs/uda"))
+    parser.add_argument("--b-root", type=Path,
+                        default=Path("experiments/structure_g_response_ab_seed1/outputs/uda"))
+    parser.add_argument("--frozen-manifest", type=Path, default=None)
     parser.add_argument("--gpus", nargs="+", default=("0", "1", "2", "3"))
     parser.add_argument("--python", default=sys.executable)
     return parser

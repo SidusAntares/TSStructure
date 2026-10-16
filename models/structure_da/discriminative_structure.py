@@ -523,9 +523,9 @@ class DiscriminativeStructureBranch(nn.Module):
         if phase_query_view == "rich32" and shape_representation != "phase_moment":
             raise ValueError("rich32 phase query view requires phase_moment")
         self.phase_query_view = phase_query_view
-        if phase_response_mode not in ("softmax", "support", "independent"):
+        if phase_response_mode not in ("softmax", "support", "independent", "b2"):
             raise ValueError(
-                "phase_response_mode must be softmax, support, or independent"
+                "phase_response_mode must be softmax, support, independent, or b2"
             )
         if phase_response_mode != "softmax" and shape_representation != "phase_moment":
             raise ValueError("non-softmax phase response requires phase_moment")
@@ -854,7 +854,7 @@ class DiscriminativeStructureBranch(nn.Module):
             ))
         return torch.cat(blocks, dim=-1)
 
-    def compose_phase_response(self, details, centers, phase_shift=0):
+    def compose_phase_response(self, details, centers, phase_shift=0, mode=None):
         """Build the fixed 6-block phase response for the selected readout."""
         similarity = details["similarity"]
         candidate_mask = torch.as_tensor(
@@ -867,7 +867,9 @@ class DiscriminativeStructureBranch(nn.Module):
         if not candidate_mask.any(1).all():
             raise ValueError("every sample must retain at least one candidate")
 
-        mode = self.phase_response_mode
+        mode = self.phase_response_mode if mode is None else mode
+        if mode not in ("softmax", "support", "independent", "b2"):
+            raise ValueError(f"unsupported phase response mode: {mode}")
         support_gate = (similarity + 1.) / 2.
         masked_gate = support_gate.masked_fill(~candidate_mask.unsqueeze(-1), 0.)
         support = masked_gate.amax(1)
@@ -875,7 +877,30 @@ class DiscriminativeStructureBranch(nn.Module):
             similarity.dtype
         )
 
-        if mode == "independent":
+        relative_evidence = None
+        peak_evidence = None
+        if mode == "b2":
+            valid = candidate_mask.unsqueeze(-1)
+            valid_count = candidate_mask.sum(1, keepdim=True).to(
+                similarity.dtype
+            )
+            q_mean = similarity.masked_fill(~valid, 0.).sum(1) / valid_count
+            relative_evidence = (
+                torch.relu(similarity - q_mean.unsqueeze(1)) / 2.
+            ).masked_fill(~valid, 0.)
+            strength = (
+                similarity.masked_fill(~valid, -torch.inf).amax(1) + 1.
+            ) / 2.
+            concentration = relative_evidence.sum(1) / valid_count
+            peak_evidence = relative_evidence.amax(1)
+            evidence_mass = relative_evidence.sum(1)
+            phase_weights = relative_evidence / evidence_mass.clamp_min(
+                1e-8
+            ).unsqueeze(1)
+            support = strength
+            coverage = concentration
+            concentration_semantics = "relative_evidence_coverage"
+        elif mode == "independent":
             strength = support
             concentration = coverage
             phase_weights = masked_gate / candidate_mask.sum(1, keepdim=True).to(
@@ -903,6 +928,10 @@ class DiscriminativeStructureBranch(nn.Module):
             strength = support * strength
             concentration = support * concentration
             phase_moments = phase_moments * torch.cat((support,) * 4, dim=-1)
+        elif mode == "b2":
+            phase_moments = phase_moments * torch.cat(
+                (peak_evidence,) * 4, dim=-1,
+            )
 
         return {
             "strength": strength,
@@ -912,6 +941,8 @@ class DiscriminativeStructureBranch(nn.Module):
             "absolute_gate": support_gate,
             "support": support,
             "coverage": coverage,
+            "relative_evidence": relative_evidence,
+            "peak_evidence": peak_evidence,
             "concentration_semantics": concentration_semantics,
         }
 
@@ -976,7 +1007,7 @@ class DiscriminativeStructureBranch(nn.Module):
             }
         if (
             self.shape_representation == "phase_moment"
-            and self.phase_response_mode == "independent"
+            and self.phase_response_mode in ("independent", "b2")
         ):
             similarity = self.shapelet_dictionary.compute_similarity(tokens)
             details = {
@@ -996,7 +1027,7 @@ class DiscriminativeStructureBranch(nn.Module):
         )
         if (
             self.shape_representation == "phase_moment"
-            and self.phase_response_mode == "independent"
+            and self.phase_response_mode in ("independent", "b2")
         ):
             strength = concentration = rich_response = None
         else:
@@ -1055,6 +1086,13 @@ class DiscriminativeStructureBranch(nn.Module):
             result["shapelet_absolute_gate"] = phase_response["absolute_gate"]
             result["shapelet_support"] = phase_response["support"]
             result["shapelet_coverage"] = phase_response["coverage"]
+            if phase_response["relative_evidence"] is not None:
+                result["shapelet_relative_evidence"] = phase_response[
+                    "relative_evidence"
+                ]
+                result["shapelet_peak_evidence"] = phase_response[
+                    "peak_evidence"
+                ]
         return result
 
     def forward(

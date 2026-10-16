@@ -400,7 +400,7 @@ class PseStructureProtoLTae(nn.Module):
             )
             diagnostics = {
                 "phase_response_mode_id": similarity.new_tensor({
-                    "softmax": 0., "support": 1., "independent": 2.,
+                    "softmax": 0., "support": 1., "independent": 2., "b2": 3.,
                 }[self.phase_response_mode]),
                 "phase_similarity_mean": similarity.mean(),
                 "phase_similarity_std": similarity.std(unbiased=False),
@@ -423,6 +423,20 @@ class PseStructureProtoLTae(nn.Module):
                 "phase_k1_mean_magnitude": magnitude[:, 0].mean(),
                 "phase_k2_mean_magnitude": magnitude[:, 1].mean(),
             }
+            if self.phase_response_mode == "b2":
+                evidence = output["shapelet_relative_evidence"]
+                peak = output["shapelet_peak_evidence"]
+                diagnostics.update({
+                    "phase_relative_evidence_mean": evidence.mean(),
+                    "phase_relative_evidence_std": evidence.std(unbiased=False),
+                    "phase_relative_evidence_max": evidence.amax(),
+                    "phase_peak_evidence_mean": peak.mean(),
+                    "phase_peak_evidence_std": peak.std(unbiased=False),
+                    "phase_peak_evidence_max": peak.amax(),
+                    "phase_zero_evidence_fraction": (
+                        evidence.sum(dim=1) <= 1e-8
+                    ).float().mean(),
+                })
             return diagnostics
         if (
             self.shape_representation == "state_org"
