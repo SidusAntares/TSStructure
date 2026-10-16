@@ -191,6 +191,29 @@ def test_full_ab_response_backpropagates_to_token_encoder_and_anchors(mode):
     assert any(gradient is not None and float(gradient.abs().sum()) > 0 for gradient in token_grads)
 
 
+@pytest.mark.parametrize("mode", ["support", "independent"])
+def test_ab_usage_diagnostics_are_tensor_values_for_epoch_accumulation(mode):
+    model = PseStructureProtoLTae(
+        input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,
+        n_head=2, d_k=4, d_model=8, mlp3=[8, 6], mlp4=[6], num_classes=3,
+        shape_dim=8, shape_window_scales=(24,), shape_window_stride=8,
+        shapelet_count=2, fourier_num_modes=5,
+        shape_representation="phase_moment", shape_injection="current_query",
+        phase_response_mode=mode,
+    ).eval()
+    pixels = torch.randn(2, 10, 3, 4)
+    mask = torch.ones(2, 10, 4, dtype=torch.bool)
+    positions = torch.arange(10).repeat(2, 1) * 25
+    with torch.no_grad():
+        output = model(
+            pixels, mask, positions, torch.zeros(2, 4), return_dict=True,
+        )
+    diagnostics = model.structure_usage_diagnostics(output)
+    assert diagnostics
+    assert all(torch.is_tensor(value) for value in diagnostics.values())
+    assert all(torch.isfinite(value).all() for value in diagnostics.values())
+
+
 def test_default_model_has_no_new_parameters_and_old_checkpoint_loads_strictly():
     kwargs = dict(
         input_dim=3, mlp1=[3, 4], mlp2=[8, 8], with_extra=False,

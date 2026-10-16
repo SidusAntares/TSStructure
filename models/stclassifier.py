@@ -399,9 +399,9 @@ class PseStructureProtoLTae(nn.Module):
                 dim=0, unbiased=False,
             )
             diagnostics = {
-                "phase_response_mode_id": {
+                "phase_response_mode_id": similarity.new_tensor({
                     "softmax": 0., "support": 1., "independent": 2.,
-                }[self.phase_response_mode],
+                }[self.phase_response_mode]),
                 "phase_similarity_mean": similarity.mean(),
                 "phase_similarity_std": similarity.std(unbiased=False),
                 "phase_similarity_min": similarity.amin(),
