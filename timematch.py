@@ -325,6 +325,23 @@ def validate_phase_equivariance_config(config):
         raise ValueError("shape equivariance max shift must be positive")
 
 
+def validate_phase_response_source_checkpoint(packet, config):
+    """Prevent a UDA run from silently changing its Source response semantics."""
+    if getattr(config, "shape_representation", "current") != "phase_moment":
+        return
+    source_config = packet.get("config", {})
+    if isinstance(source_config, dict):
+        source_mode = source_config.get("phase_response_mode", "softmax")
+    else:
+        source_mode = getattr(source_config, "phase_response_mode", "softmax")
+    requested_mode = getattr(config, "phase_response_mode", "softmax")
+    if source_mode != requested_mode:
+        raise ValueError(
+            "Source checkpoint phase_response_mode mismatch: "
+            f"checkpoint={source_mode}, UDA={requested_mode}"
+        )
+
+
 def configure_structure_specific_training(model, freeze=False):
     """Freeze state-org-only modules, never the shared PSE representation."""
     if not freeze:
@@ -1654,9 +1671,9 @@ def _train_structure_proto_timematch(
         splits, config, config.balance_source,
     )
     checkpoint_path = os.path.join(config.weights, f"fold_{fold_num}", "model.pt")
-    student.load_state_dict(
-        torch.load(checkpoint_path, weights_only=False)["state_dict"], strict=True,
-    )
+    source_packet = torch.load(checkpoint_path, weights_only=False)
+    validate_phase_response_source_checkpoint(source_packet, config)
+    student.load_state_dict(source_packet["state_dict"], strict=True)
     class_org_target_weight = float(
         getattr(config, "class_org_target_weight", 0.)
     )
@@ -2244,6 +2261,9 @@ def _train_structure_proto_timematch(
             if shape_equivariance_weight > 0:
                 values.update({
                     "loss_shape_equivariance": equivariance["total_loss"].detach(),
+                    "loss_shape_equivariance_weighted": (
+                        shape_equivariance_weight * equivariance["total_loss"].detach()
+                    ),
                     "loss_shape_equiv_occ": equivariance["occurrence_loss"].detach(),
                     "loss_shape_equiv_phase": equivariance["phase_loss"].detach(),
                     "equiv_shift_abs_mean": structure_aug_shift.float().abs().mean(),

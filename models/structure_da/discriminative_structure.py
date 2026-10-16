@@ -499,6 +499,7 @@ class DiscriminativeStructureBranch(nn.Module):
         shapelet_count=16, shapelet_beta=5., shape_resample_length=16,
         shape_representation="current", state_org_readout="full",
         phase_query_view="full", shape_phase_k2_enabled=True,
+        phase_response_mode="softmax",
     ):
         super().__init__()
         if shape_representation not in (
@@ -522,6 +523,13 @@ class DiscriminativeStructureBranch(nn.Module):
         if phase_query_view == "rich32" and shape_representation != "phase_moment":
             raise ValueError("rich32 phase query view requires phase_moment")
         self.phase_query_view = phase_query_view
+        if phase_response_mode not in ("softmax", "support", "independent"):
+            raise ValueError(
+                "phase_response_mode must be softmax, support, or independent"
+            )
+        if phase_response_mode != "softmax" and shape_representation != "phase_moment":
+            raise ValueError("non-softmax phase response requires phase_moment")
+        self.phase_response_mode = phase_response_mode
         if not bool(shape_phase_k2_enabled) and shape_representation != "phase_moment":
             raise ValueError("shape_phase_k2_enabled=false requires phase_moment")
         self.shape_phase_k2_enabled = bool(shape_phase_k2_enabled)
@@ -846,6 +854,67 @@ class DiscriminativeStructureBranch(nn.Module):
             ))
         return torch.cat(blocks, dim=-1)
 
+    def compose_phase_response(self, details, centers, phase_shift=0):
+        """Build the fixed 6-block phase response for the selected readout."""
+        similarity = details["similarity"]
+        candidate_mask = torch.as_tensor(
+            details["candidate_mask"], dtype=torch.bool, device=similarity.device,
+        )
+        if candidate_mask.ndim == 1:
+            candidate_mask = candidate_mask.unsqueeze(0).expand(similarity.shape[0], -1)
+        if candidate_mask.shape != similarity.shape[:2]:
+            raise ValueError("candidate_mask must align with similarity candidates")
+        if not candidate_mask.any(1).all():
+            raise ValueError("every sample must retain at least one candidate")
+
+        mode = self.phase_response_mode
+        support_gate = (similarity + 1.) / 2.
+        masked_gate = support_gate.masked_fill(~candidate_mask.unsqueeze(-1), 0.)
+        support = masked_gate.amax(1)
+        coverage = masked_gate.sum(1) / candidate_mask.sum(1, keepdim=True).to(
+            similarity.dtype
+        )
+
+        if mode == "independent":
+            strength = support
+            concentration = coverage
+            phase_weights = masked_gate / candidate_mask.sum(1, keepdim=True).to(
+                similarity.dtype
+            ).unsqueeze(-1)
+            concentration_semantics = "window_coverage"
+        else:
+            rich = self.compose_rich_response(details)
+            count = similarity.shape[-1]
+            strength, concentration = rich[:, :count], rich[:, count:]
+            phase_weights = details["weights"]
+            concentration_semantics = "normalized_window_concentration"
+
+        if self.shape_phase_k2_enabled:
+            phase_moments = self.compose_phase_moments(
+                phase_weights, centers, phase_shift, harmonics=(1, 2),
+            )
+        else:
+            k1_moments = self.compose_phase_moments(
+                phase_weights, centers, phase_shift, harmonics=(1,),
+            )
+            phase_moments = torch.cat((k1_moments, torch.zeros_like(k1_moments)), -1)
+
+        if mode == "support":
+            strength = support * strength
+            concentration = support * concentration
+            phase_moments = phase_moments * torch.cat((support,) * 4, dim=-1)
+
+        return {
+            "strength": strength,
+            "concentration": concentration,
+            "phase_moments": phase_moments,
+            "response": torch.cat((strength, concentration, phase_moments), dim=-1),
+            "absolute_gate": support_gate,
+            "support": support,
+            "coverage": coverage,
+            "concentration_semantics": concentration_semantics,
+        }
+
     def prepare_context(self, features, positions):
         return {"coefficients": self.exposer.analyze(features, positions)}
 
@@ -905,34 +974,48 @@ class DiscriminativeStructureBranch(nn.Module):
                     ) if key in state
                 },
             }
-        details = self.shapelet_dictionary.compute_response(tokens, return_details=True)
+        if (
+            self.shape_representation == "phase_moment"
+            and self.phase_response_mode == "independent"
+        ):
+            similarity = self.shapelet_dictionary.compute_similarity(tokens)
+            details = {
+                "similarity": similarity,
+                "candidate_mask": torch.ones(
+                    similarity.shape[:2], dtype=torch.bool,
+                    device=similarity.device,
+                ),
+            }
+        else:
+            details = self.shapelet_dictionary.compute_response(
+                tokens, return_details=True,
+            )
         response_details = (
             self._residual_response_details(details)
             if self.shape_representation == "residual_response" else details
         )
-        strength = response_details["response"]
-        rich_response = self.compose_rich_response(response_details)
-        concentration = rich_response[:, strength.shape[1]:]
+        if (
+            self.shape_representation == "phase_moment"
+            and self.phase_response_mode == "independent"
+        ):
+            strength = concentration = rich_response = None
+        else:
+            strength = response_details["response"]
+            rich_response = self.compose_rich_response(response_details)
+            concentration = rich_response[:, strength.shape[1]:]
         phase_moments = None
         if self.shape_representation == "set_response":
             response = self.compose_set_response(
                 details["similarity"], details["candidate_mask"],
             )
         elif self.shape_representation == "phase_moment":
-            if self.shape_phase_k2_enabled:
-                phase_moments = self.compose_phase_moments(
-                    response_details["weights"], centers, phase_shift,
-                    harmonics=(1, 2),
-                )
-            else:
-                k1_moments = self.compose_phase_moments(
-                    response_details["weights"], centers, phase_shift,
-                    harmonics=(1,),
-                )
-                phase_moments = torch.cat((
-                    k1_moments, torch.zeros_like(k1_moments),
-                ), dim=-1)
-            response = torch.cat((rich_response, phase_moments), dim=-1)
+            phase_response = self.compose_phase_response(
+                response_details, centers, phase_shift,
+            )
+            strength = phase_response["strength"]
+            concentration = phase_response["concentration"]
+            phase_moments = phase_response["phase_moments"]
+            response = phase_response["response"]
         else:
             response = rich_response
         profile = sorted_anchor_profile(details["similarity"])
@@ -969,6 +1052,9 @@ class DiscriminativeStructureBranch(nn.Module):
             })
         if phase_moments is not None:
             result["shapelet_phase_moments"] = phase_moments
+            result["shapelet_absolute_gate"] = phase_response["absolute_gate"]
+            result["shapelet_support"] = phase_response["support"]
+            result["shapelet_coverage"] = phase_response["coverage"]
         return result
 
     def forward(

@@ -127,6 +127,11 @@ def add_model_arguments(parser):
         choices=['full', 'rich32'],
     )
     parser.add_argument(
+        '--phase-response-mode', dest='phase_response_mode', default='softmax',
+        choices=['softmax', 'support', 'independent'],
+        help='phase_moment response readout; softmax preserves historical behavior',
+    )
+    parser.add_argument(
         '--shape-phase-k2-enabled', dest='shape_phase_k2_enabled',
         default=True, type=bool_flag,
         help='retain the k=2 phase block in phase_moment response and losses',
@@ -211,6 +216,7 @@ def create_model(config):
             state_org_readout=getattr(config, 'state_org_readout', 'full'),
             phase_query_view=getattr(config, 'phase_query_view', 'full'),
             shape_phase_k2_enabled=getattr(config, 'shape_phase_k2_enabled', True),
+            phase_response_mode=getattr(config, 'phase_response_mode', 'softmax'),
         )
         return model
     raise NotImplementedError(config.model)
@@ -280,6 +286,12 @@ def structure_usage_manifest(config):
             'equivariance_uses_target_labels': False,
             'equivariance_uses_pseudo_labels': False,
             'phase_query_view': getattr(config, 'phase_query_view', 'full'),
+            'phase_response_mode': getattr(config, 'phase_response_mode', 'softmax'),
+            'shape_concentration_semantics': (
+                'window_coverage'
+                if getattr(config, 'phase_response_mode', 'softmax') == 'independent'
+                else 'normalized_window_concentration'
+            ),
         })
     elif config.shape_representation == 'state_org':
         readout = getattr(config, 'state_org_readout', 'full')
@@ -462,6 +474,13 @@ def main(config):
                 f"evidence_dim={usage['shape_evidence_dim']}|"
                 f"shape_align_weight={usage['shape_align_weight']:g}"
             )
+            if config.shape_representation == 'phase_moment':
+                print(
+                    'PHASE_RESPONSE_CONFIG|'
+                    f"mode={getattr(config, 'phase_response_mode', 'softmax')}|"
+                    f"concentration_semantics={usage['shape_concentration_semantics']}|"
+                    'response_dim=96|g_is_calibrated_probability=false'
+                )
             shape_da_mode = getattr(config, 'shape_da_mode', 'batch_align')
             shape_alignment_label_source = getattr(
                 config, 'shape_alignment_label_source', 'pseudo',

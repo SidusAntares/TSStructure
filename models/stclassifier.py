@@ -76,6 +76,7 @@ class PseStructureProtoLTae(nn.Module):
         shape_representation="current", shape_injection="current_query",
         structure_shift_mode="none", state_org_readout="full",
         phase_query_view="full", shape_phase_k2_enabled=True,
+        phase_response_mode="softmax",
     ):
         super().__init__()
         if (
@@ -147,6 +148,7 @@ class PseStructureProtoLTae(nn.Module):
             state_org_readout=state_org_readout,
             phase_query_view=phase_query_view,
             shape_phase_k2_enabled=shape_phase_k2_enabled,
+            phase_response_mode=phase_response_mode,
         )
         candidates_per_scale = (64 + int(shape_window_stride) - 1) // int(shape_window_stride)
         sorted_profile_dim = (
@@ -204,6 +206,7 @@ class PseStructureProtoLTae(nn.Module):
         self.instance_dim = mlp3[-1]
         self.state_org_readout = state_org_readout
         self.phase_query_view = phase_query_view
+        self.phase_response_mode = phase_response_mode
         self.shape_phase_k2_enabled = bool(shape_phase_k2_enabled)
 
     def configure_state_org_query(self, query_view="full", query_scale=1., reference=None):
@@ -385,10 +388,42 @@ class PseStructureProtoLTae(nn.Module):
             count = moments.shape[-1] // 4
             blocks = moments.reshape(moments.shape[0], 2, 2, count)
             magnitude = blocks.square().sum(dim=2).sqrt()
-            return {
+            if self.phase_response_mode == "softmax":
+                return {
+                    "phase_k1_mean_magnitude": magnitude[:, 0].mean(),
+                    "phase_k2_mean_magnitude": magnitude[:, 1].mean(),
+                }
+            similarity = output["shapelet_similarity"]
+            response_blocks = output["shapelet_response"][:, :2 * count]
+            response_std = response_blocks.detach().float().std(
+                dim=0, unbiased=False,
+            )
+            diagnostics = {
+                "phase_response_mode_id": {
+                    "softmax": 0., "support": 1., "independent": 2.,
+                }[self.phase_response_mode],
+                "phase_similarity_mean": similarity.mean(),
+                "phase_similarity_std": similarity.std(unbiased=False),
+                "phase_similarity_min": similarity.amin(),
+                "phase_similarity_max": similarity.amax(),
+                "phase_absolute_gate_mean": output["shapelet_absolute_gate"].mean(),
+                "phase_absolute_gate_std": output["shapelet_absolute_gate"].std(unbiased=False),
+                "phase_absolute_gate_min": output["shapelet_absolute_gate"].amin(),
+                "phase_absolute_gate_max": output["shapelet_absolute_gate"].amax(),
+                "phase_support_mean": output["shapelet_support"].mean(),
+                "phase_support_std": output["shapelet_support"].std(unbiased=False),
+                "phase_support_min": output["shapelet_support"].amin(),
+                "phase_support_max": output["shapelet_support"].amax(),
+                "phase_coverage_mean": output["shapelet_coverage"].mean(),
+                "phase_coverage_std": output["shapelet_coverage"].std(unbiased=False),
+                "phase_coverage_min": output["shapelet_coverage"].amin(),
+                "phase_coverage_max": output["shapelet_coverage"].amax(),
+                "phase_response_anchor_std_mean": response_std.mean(),
+                "phase_response_active_fraction": (response_std > 1e-4).float().mean(),
                 "phase_k1_mean_magnitude": magnitude[:, 0].mean(),
                 "phase_k2_mean_magnitude": magnitude[:, 1].mean(),
             }
+            return diagnostics
         if (
             self.shape_representation == "state_org"
             and self.state_org_readout == "reliable_composition"
