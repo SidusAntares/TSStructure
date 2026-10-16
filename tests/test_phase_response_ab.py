@@ -467,6 +467,17 @@ def test_b2_frozen_check_detects_only_numerical_blockers():
     )
 
 
+def test_b2_frozen_check_initializes_every_extraction_buffer():
+    from analysis.structure_b2_frozen_check import _new_extraction_buffers
+
+    buffers = _new_extraction_buffers()
+    assert tuple(buffers) == (
+        "original", "b2", "similarity", "evidence",
+        "peak", "coverage", "k1", "k2",
+    )
+    assert all(value == [] for value in buffers.values())
+
+
 def test_b2_training_gate_requires_successful_frozen_manifest():
     import hashlib
     import json

@@ -32,6 +32,16 @@ from methods.structure_da.phase_equivariance import rotate_phase_moments  # noqa
 BLOCKS = ("presence", "coverage", "k1_real", "k1_imag", "k2_real", "k2_imag")
 
 
+def _new_extraction_buffers():
+    """Create one independent accumulator for every frozen-check tensor."""
+    return {
+        name: [] for name in (
+            "original", "b2", "similarity", "evidence",
+            "peak", "coverage", "k1", "k2",
+        )
+    }
+
+
 def _effective_rank(values, eps=1e-12):
     values = torch.as_tensor(values, dtype=torch.float64)
     if values.ndim != 2 or values.shape[0] < 2:
@@ -197,8 +207,7 @@ def _extract_checkpoint(label, task, checkpoint, args):
         config, DOMAINS[source_alias], DOMAINS[target_alias],
         args.data_root, args.seed,
     )
-    original_values, b2_values, similarity_values, evidence_values = [], [], [], []
-    peak_values, coverage_values, k1_values, k2_values = [], [], [], [], []
+    buffers = _new_extraction_buffers()
     maximum_rotation_error = 0.
     for batch in deterministic_loader(
         datasets["source_val"], args.batch_size, args.num_workers,
@@ -240,22 +249,18 @@ def _extract_checkpoint(label, task, checkpoint, args):
         moments = base["phase_moments"].reshape(
             similarity.shape[0], 2, 2, similarity.shape[-1],
         )
-        original_values.append(output["shapelet_response"].float().cpu())
-        b2_values.append(base["response"].float().cpu())
-        similarity_values.append(similarity.float().cpu())
-        evidence_values.append(base["relative_evidence"].float().cpu())
-        peak_values.append(base["peak_evidence"].float().cpu())
-        coverage_values.append(base["concentration"].float().cpu())
+        buffers["original"].append(output["shapelet_response"].float().cpu())
+        buffers["b2"].append(base["response"].float().cpu())
+        buffers["similarity"].append(similarity.float().cpu())
+        buffers["evidence"].append(base["relative_evidence"].float().cpu())
+        buffers["peak"].append(base["peak_evidence"].float().cpu())
+        buffers["coverage"].append(base["concentration"].float().cpu())
         magnitude = moments.square().sum(2).sqrt()
-        k1_values.append(magnitude[:, 0].float().cpu())
-        k2_values.append(magnitude[:, 1].float().cpu())
-    original = torch.cat(original_values)
-    b2 = torch.cat(b2_values)
-    similarity = torch.cat(similarity_values)
-    evidence = torch.cat(evidence_values)
-    peak = torch.cat(peak_values)
-    coverage = torch.cat(coverage_values)
-    k1, k2 = torch.cat(k1_values), torch.cat(k2_values)
+        buffers["k1"].append(magnitude[:, 0].float().cpu())
+        buffers["k2"].append(magnitude[:, 1].float().cpu())
+    (original, b2, similarity, evidence, peak, coverage, k1, k2) = (
+        torch.cat(buffers[name]) for name in buffers
+    )
     count = b2.shape[1] // 6
     block_rows = []
     for representation, values in (
