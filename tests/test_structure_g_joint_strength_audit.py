@@ -234,6 +234,30 @@ def test_checkpoint_validation_and_anchor_scope_are_checkpoint_local():
         assert_anchor_scope("sha-a", "sha-b")
 
 
+def test_four_task_checkpoint_validation_adapts_legacy_two_task_validator(monkeypatch):
+    import analysis.structure_g_joint_strength_audit as audit
+
+    calls = []
+
+    def legacy_validator(packet, task, variant):
+        calls.append((task, variant, packet["config"]["source"], packet["config"]["target"]))
+        assert task == "FR1_FR2"
+        assert packet["config"]["source"] == "france/30TXT/2017"
+        assert packet["config"]["target"] == "france/31TCJ/2017"
+        return {"source": packet["config"]["source"], "target": packet["config"]["target"]}
+
+    monkeypatch.setattr(audit, "validate_uda_checkpoint", legacy_validator)
+    packet = {"config": {
+        "source": "austria/33UVP/2017",
+        "target": "denmark/32VNH/2017",
+    }}
+    validated = audit.validate_four_task_g_checkpoint(packet, "AT1_DK1")
+    assert calls == [("FR1_FR2", "G", "france/30TXT/2017", "france/31TCJ/2017")]
+    assert validated["source"] == "austria/33UVP/2017"
+    assert validated["target"] == "denmark/32VNH/2017"
+    assert packet["config"]["source"] == "austria/33UVP/2017"
+
+
 def test_scheduler_dry_run_has_four_independent_tasks(capsys):
     from scripts.run_structure_g_joint_strength_audit_seed1 import (
         build_parser, planned_tasks, run_scheduler,

@@ -30,6 +30,7 @@ from analysis.structure_semantic_features import (
 )
 from analysis.structure_pair_semantics_audit import load_generic_frozen, run_extract
 from analysis.diagnose_eg_pair import (
+    TASKS as LEGACY_EG_TASKS,
     require_complete_checkpoint, sha256_file, validate_uda_checkpoint,
 )
 
@@ -100,6 +101,36 @@ def validate_response96_state(state):
         shape = None if weight is None else tuple(weight.shape)
         raise ValueError(f"G audit requires a Response96 shape classifier, got {shape}")
     return True
+
+
+def validate_four_task_g_checkpoint(packet, task):
+    """Reuse the strict E/G validator without inheriting its two-task registry limit."""
+    if task not in TASKS:
+        raise ValueError(f"unsupported G audit task: {task}")
+    raw = packet.get("config", {})
+    config = dict(raw if isinstance(raw, dict) else vars(raw))
+    expected_source, expected_target = TASKS[task][1], TASKS[task][3]
+    if config.get("source") != expected_source or config.get("target") != expected_target:
+        raise ValueError(
+            f"checkpoint task/domain mismatch: expected={expected_source}->{expected_target}, "
+            f"actual={config.get('source')}->{config.get('target')}"
+        )
+    if task in LEGACY_EG_TASKS:
+        return validate_uda_checkpoint(packet, task, "G")
+
+    # The shared validator's protocol is task-invariant except for source/target,
+    # but its historical registry contains only FR1_FR2 and FR2_DK1. Validate all
+    # invariant fields through an isolated canonical packet, then restore the
+    # already-validated real domains in the returned manifest.
+    canonical_task = "FR1_FR2"
+    canonical = dict(config)
+    canonical["source"] = LEGACY_EG_TASKS[canonical_task][1]
+    canonical["target"] = LEGACY_EG_TASKS[canonical_task][3]
+    proxy = dict(packet)
+    proxy["config"] = canonical
+    validated = dict(validate_uda_checkpoint(proxy, canonical_task, "G"))
+    validated.update(source=expected_source, target=expected_target)
+    return validated
 
 
 def _pipeline(alpha=1.):
@@ -430,7 +461,7 @@ def _class_geometry_rows(task, train, train_labels, val, val_labels, reference,
 
 def _load_checkpoint(path, task):
     packet = require_complete_checkpoint(path)
-    validate_uda_checkpoint(packet, task, "G")
+    validate_four_task_g_checkpoint(packet, task)
     validate_response96_state(packet.get("state_dict", {}))
     raw = packet.get("config", {}); config = dict(raw if isinstance(raw, dict) else vars(raw))
     validate_g_checkpoint_config(config, packet.get("epoch", -1))
