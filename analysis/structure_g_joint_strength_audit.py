@@ -509,7 +509,7 @@ def load_paired_views(path, checkpoint_sha):
 def _candidate_numpy(values, labels, reference):
     distance = class_distances(values, reference)[np.arange(len(values)), labels]
     excess = np.maximum(distance - reference["radius"][labels], 0.)
-    return distance, excess.square()
+    return distance, np.square(excess)
 
 
 def run_audit(args):

@@ -62,6 +62,19 @@ def test_joint_reference_uses_source_only_and_handles_missing_class():
     )
 
 
+def test_numpy_candidate_loss_is_finite_squared_excess():
+    from analysis.structure_g_joint_strength_audit import (
+        _candidate_numpy, fit_joint_reference,
+    )
+
+    values, labels = _separable()
+    reference = fit_joint_reference(values, labels, 3)
+    distance, loss = _candidate_numpy(values, labels, reference)
+    expected = np.square(np.maximum(distance - reference["radius"][labels], 0.))
+    np.testing.assert_allclose(loss, expected)
+    assert np.isfinite(loss).all()
+
+
 def test_multimodal_selection_uses_train_cv_not_target():
     from analysis.structure_g_joint_strength_audit import select_prototype_count
 
