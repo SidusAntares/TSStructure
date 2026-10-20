@@ -327,9 +327,26 @@ def validate_phase_equivariance_config(config):
 
 def validate_phase_response_source_checkpoint(packet, config):
     """Prevent a UDA run from silently changing its Source response semantics."""
+    source_config = packet.get("config", {})
+    source_representation = (
+        source_config.get("shape_representation")
+        if isinstance(source_config, dict)
+        else getattr(source_config, "shape_representation", None)
+    )
+    requested_representation = getattr(config, "shape_representation", "current")
+    if requested_representation == "direct_shape_token":
+        source_injection = (
+            source_config.get("shape_injection")
+            if isinstance(source_config, dict)
+            else getattr(source_config, "shape_injection", None)
+        )
+        if source_representation != requested_representation or source_injection != "current_query":
+            raise ValueError(
+                "Source checkpoint direct_shape_token/current_query mismatch"
+            )
+        return
     if getattr(config, "shape_representation", "current") != "phase_moment":
         return
-    source_config = packet.get("config", {})
     if isinstance(source_config, dict):
         source_mode = source_config.get("phase_response_mode", "softmax")
     else:
@@ -1647,12 +1664,44 @@ def _train_structure_proto_timematch(
     ) or (
         getattr(config, "shape_representation", None) == "phase_moment"
         and getattr(config, "shape_injection", None) == "current_query"
+    ) or (
+        getattr(config, "shape_representation", None) == "direct_shape_token"
+        and getattr(config, "shape_injection", None) == "current_query"
     )
     if detach_controls_enabled and not detach_controls_supported:
         raise ValueError(
             "target structure detach requires state_org + direct_response_query "
-            "or phase_moment + current_query"
+            "or phase_moment/direct_shape_token + current_query"
         )
+    direct_shape_token = (
+        getattr(config, "shape_representation", None) == "direct_shape_token"
+    )
+    if direct_shape_token:
+        forbidden = {
+            "shape_equivariance_weight": float(
+                getattr(config, "shape_equivariance_weight", 0.)
+            ),
+            "shape_align_weight": float(getattr(config, "shape_align_weight", 0.)),
+            "shapelet_diversity_weight": float(
+                getattr(config, "shapelet_diversity_weight", 0.)
+            ),
+            "class_org_target_weight": float(
+                getattr(config, "class_org_target_weight", 0.)
+            ),
+        }
+        nonzero = [name for name, value in forbidden.items() if value != 0.]
+        if nonzero:
+            raise ValueError(
+                "direct_shape_token disables anchor/phase losses; require zero: "
+                + ",".join(nonzero)
+            )
+        if shape_da_mode != "batch_align" or getattr(
+            config, "shape_alignment_view", "full"
+        ) != "none":
+            raise ValueError(
+                "direct_shape_token requires shape_da_mode=batch_align and "
+                "shape_alignment_view=none"
+            )
     if freeze_structure_specific and (
         getattr(config, "shape_representation", None) != "state_org"
     ):
@@ -1741,6 +1790,15 @@ def _train_structure_proto_timematch(
     anchor_geometric_limit = int(
         getattr(config, "anchor_geometric_token_limit", 50000)
     )
+    if direct_shape_token and (
+        structure_basis_mode != "adaptive"
+        or anchor_update_mode != "none"
+        or anchor_geometric_mode != "none"
+    ):
+        raise ValueError(
+            "direct_shape_token requires adaptive structure basis with all "
+            "anchor update modes disabled"
+        )
     if structure_basis_mode not in ("adaptive", "frozen_source"):
         raise ValueError("structure basis mode must be adaptive or frozen_source")
     if anchor_update_mode not in ("none", "fixed", "source", "target", "shared"):
@@ -2099,10 +2157,13 @@ def _train_structure_proto_timematch(
                 criterion(source_output["shape_logits"], source_labels)
                 if uda_shape_class_weight > 0 else source_output["shape_logits"].sum() * 0.
             )
-            loss_diversity = shapelet_diversity_loss(
-                student.structure_branch.shapelet_dictionary.anchors,
-                config.shapelet_diversity_margin,
-            )
+            if direct_shape_token:
+                loss_diversity = source_output["logits"].sum() * 0.
+            else:
+                loss_diversity = shapelet_diversity_loss(
+                    student.structure_branch.shapelet_dictionary.anchors,
+                    config.shapelet_diversity_margin,
+                )
             boundary_objective = None
             if shape_da_mode == "boundary_support":
                 optimizer.zero_grad(set_to_none=True)

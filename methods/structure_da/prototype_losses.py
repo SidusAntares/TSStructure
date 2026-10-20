@@ -831,9 +831,14 @@ def shape_health_snapshot(model, outputs):
         "shape_response_std_mean": float(response_std.mean()),
         "shape_response_std_min": float(response_std.min()),
         "shape_response_effective_rank": float(effective_rank),
-        "shape_anchor_param_norm": float(branch.shapelet_dictionary.anchors.detach().float().norm()),
         "shape_query_projection_norm": _parameter_l2_norm(query_projection),
     }
+    if hasattr(branch, "shapelet_dictionary"):
+        values["shape_anchor_param_norm"] = float(
+            branch.shapelet_dictionary.anchors.detach().float().norm()
+        )
+    else:
+        values["shape_response_semantics_direct_token"] = 1.
     if "shape_tokens" in outputs:
         tokens = outputs["shape_tokens"].detach().float()
         values.update({
@@ -870,16 +875,22 @@ def shape_health_snapshot(model, outputs):
 
 def shape_gradient_snapshot(model):
     usage_projection = _structure_usage_projection(model)
-    return {
+    values = {
         "grad_norm_shape_token_generator": _gradient_l2_norm(
             model.structure_branch.token_generator
-        ),
-        "grad_norm_shapelet_anchors": _gradient_l2_norm(
-            model.structure_branch.shapelet_dictionary
         ),
         "grad_norm_shape_classifier": _gradient_l2_norm(model.shape_classifier),
         "grad_norm_query_projection": _gradient_l2_norm(usage_projection),
     }
+    if hasattr(model.structure_branch, "shapelet_dictionary"):
+        values["grad_norm_shapelet_anchors"] = _gradient_l2_norm(
+            model.structure_branch.shapelet_dictionary
+        )
+    if hasattr(model.structure_branch, "shape_token_pool"):
+        values["grad_norm_shape_token_pool"] = _gradient_l2_norm(
+            model.structure_branch.shape_token_pool
+        )
+    return values
 
 
 def log_shape_health(writer, epoch, model, outputs):

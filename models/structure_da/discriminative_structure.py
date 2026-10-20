@@ -492,6 +492,75 @@ def initialize_shapelet_dictionary_from_tokens(dictionary, tokens, seed):
     }
 
 
+class ShapeTokenAttentionPool(nn.Module):
+    """Calendar-aware masked attention over Fourier-window shape tokens."""
+
+    def __init__(self, token_dim=128, hidden_dim=64, period_days=365., grid_points=64):
+        super().__init__()
+        self.token_projection = nn.Linear(token_dim, hidden_dim, bias=False)
+        self.time_projection = nn.Linear(4, hidden_dim, bias=False)
+        self.bias = nn.Parameter(torch.zeros(hidden_dim))
+        self.score = nn.Linear(hidden_dim, 1, bias=False)
+        self.norm = nn.LayerNorm(token_dim)
+        self.period_days = float(period_days)
+        self.grid_points = int(grid_points)
+
+    def time_encoding(self, centers, batch, phase_shift, device, dtype):
+        centers = torch.as_tensor(centers, device=device, dtype=dtype)
+        shift = torch.as_tensor(phase_shift, device=device, dtype=dtype)
+        if shift.ndim == 0:
+            shift = shift.expand(batch)
+        elif shift.ndim == 2 and shift.shape == (batch, 1):
+            shift = shift[:, 0]
+        elif shift.ndim != 1 or shift.shape[0] not in (1, batch):
+            raise ValueError("phase shift must be scalar, [B], or [B,1]")
+        if shift.shape[0] == 1:
+            shift = shift.expand(batch)
+        theta = 2. * torch.pi * (
+            centers[None] * self.period_days / self.grid_points + shift[:, None]
+        ) / self.period_days
+        return torch.stack((
+            theta.cos(), theta.sin(), (2. * theta).cos(), (2. * theta).sin(),
+        ), dim=-1)
+
+    def forward(self, tokens, centers, candidate_mask=None, phase_shift=0):
+        if tokens.ndim != 3:
+            raise ValueError("tokens must be [B,N,D]")
+        batch, candidates, _ = tokens.shape
+        encoding = self.time_encoding(
+            centers, batch, phase_shift, tokens.device, tokens.dtype,
+        )
+        if encoding.shape[1] != candidates:
+            raise ValueError("window centers must align with shape tokens")
+        if candidate_mask is None:
+            candidate_mask = torch.ones(
+                batch, candidates, dtype=torch.bool, device=tokens.device,
+            )
+        else:
+            candidate_mask = torch.as_tensor(
+                candidate_mask, dtype=torch.bool, device=tokens.device,
+            )
+            if candidate_mask.ndim == 1:
+                candidate_mask = candidate_mask.unsqueeze(0).expand(batch, -1)
+        if candidate_mask.shape != (batch, candidates):
+            raise ValueError("candidate_mask must be [N] or [B,N]")
+        if not candidate_mask.any(1).all():
+            raise ValueError("every sample must retain at least one candidate")
+        hidden = torch.tanh(
+            self.token_projection(tokens) + self.time_projection(encoding) + self.bias
+        )
+        scores = self.score(hidden).squeeze(-1).masked_fill(~candidate_mask, -torch.inf)
+        attention = torch.softmax(scores, dim=1)
+        pooled = self.norm((attention.unsqueeze(-1) * tokens).sum(1))
+        return {
+            "shape_token": pooled,
+            "attention": attention,
+            "scores": scores,
+            "time_encoding": encoding,
+            "candidate_mask": candidate_mask,
+        }
+
+
 class DiscriminativeStructureBranch(nn.Module):
     def __init__(
         self, channels, shape_dim=128, num_modes=13, grid_points=64,
@@ -504,7 +573,7 @@ class DiscriminativeStructureBranch(nn.Module):
         super().__init__()
         if shape_representation not in (
             "current", "sorted_profile", "set_response", "residual_response",
-            "phase_moment", "state_org",
+            "phase_moment", "state_org", "direct_shape_token",
         ):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
@@ -547,8 +616,19 @@ class DiscriminativeStructureBranch(nn.Module):
                 channels, shape_dim, resample_length=shape_resample_length,
             )
         )
-        self.shapelet_dictionary = ShapeletDictionary(shape_dim, shapelet_count, shapelet_beta)
-        if shape_representation == "state_org" and state_org_readout == "full":
+        if shape_representation == "direct_shape_token":
+            self.shape_token_pool = ShapeTokenAttentionPool(
+                shape_dim, hidden_dim=64, period_days=period_days,
+                grid_points=grid_points,
+            )
+            response_dim = shape_dim
+        else:
+            self.shapelet_dictionary = ShapeletDictionary(
+                shape_dim, shapelet_count, shapelet_beta,
+            )
+        if shape_representation == "direct_shape_token":
+            pass
+        elif shape_representation == "state_org" and state_org_readout == "full":
             self.organization_encoder = nn.Sequential(
                 nn.Conv1d(
                     shapelet_count, 32, kernel_size=3, padding=1,
@@ -604,7 +684,7 @@ class DiscriminativeStructureBranch(nn.Module):
                 torch.zeros(shapelet_count, shapelet_count)
             )
         self.response_to_query = (
-            None if shape_representation == "state_org" else nn.Sequential(
+            None if shape_representation in ("state_org", "direct_shape_token") else nn.Sequential(
                 nn.Linear(response_dim, 64), nn.GELU(),
                 nn.Linear(64, shape_dim), nn.LayerNorm(shape_dim),
             )
@@ -958,7 +1038,7 @@ class DiscriminativeStructureBranch(nn.Module):
         exposed, grid = self.exposer.synthesize_shifted(
             context["coefficients"], structure_aug_shift,
         )
-        if self.shape_representation == "phase_moment":
+        if self.shape_representation in ("phase_moment", "direct_shape_token"):
             window_groups, scales, centers = self.window_extractor(
                 exposed, return_centers=True,
             )
@@ -966,6 +1046,11 @@ class DiscriminativeStructureBranch(nn.Module):
             window_groups, scales = self.window_extractor(exposed)
             centers = None
         if self.shape_representation == "state_org":
+            tokens = torch.cat([
+                self.token_generator(windows) for windows in window_groups
+            ], dim=1)
+            stats_tokens = None
+        elif self.shape_representation == "direct_shape_token":
             tokens = torch.cat([
                 self.token_generator(windows) for windows in window_groups
             ], dim=1)
@@ -980,6 +1065,22 @@ class DiscriminativeStructureBranch(nn.Module):
                 torch.cat((value["mean_encoded"], value["std_encoded"]), dim=-1)
                 for value in encoded
             ], dim=1)
+        if self.shape_representation == "direct_shape_token":
+            pooled = self.shape_token_pool(
+                tokens, centers, candidate_mask=None, phase_shift=phase_shift,
+            )
+            return {
+                "shape_tokens": tokens,
+                "shapelet_response": pooled["shape_token"],
+                "shape_class_token": pooled["shape_token"],
+                "shape_attention_weights": pooled["attention"],
+                "shape_attention_scores": pooled["scores"],
+                "shape_candidate_mask": pooled["candidate_mask"],
+                "shape_response_semantics": "direct_token_128",
+                "shape_scales": scales,
+                "exposed_curve": exposed,
+                "exposed_grid": grid,
+            }
         if self.shape_representation == "state_org":
             similarity = self.shapelet_dictionary.compute_similarity(tokens)
             state = self.compose_state_org_response(

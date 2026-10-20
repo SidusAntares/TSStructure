@@ -104,7 +104,7 @@ def add_model_arguments(parser):
         '--shape-representation', dest='shape_representation', default='current',
         choices=[
             'current', 'sorted_profile', 'set_response', 'residual_response',
-            'phase_moment', 'state_org',
+            'phase_moment', 'state_org', 'direct_shape_token',
         ],
     )
     parser.add_argument(
@@ -222,6 +222,24 @@ def create_model(config):
     raise NotImplementedError(config.model)
 
 
+def validate_structure_configuration(config):
+    """Reject anchor-only controls for the anchor-free direct-token path."""
+    if getattr(config, 'shape_representation', None) != 'direct_shape_token':
+        return
+    if getattr(config, 'shape_injection', None) != 'current_query':
+        raise ValueError('direct_shape_token requires shape_injection=current_query')
+    if getattr(config, 'source_minority_mode', 'base') != 'base':
+        raise ValueError('direct_shape_token requires source_minority_mode=base')
+    required_zero = (
+        'shape_equivariance_weight', 'shape_align_weight',
+        'shapelet_diversity_weight', 'shapelet_shaping_weight',
+        'class_org_source_weight', 'class_org_target_weight',
+    )
+    for name in required_zero:
+        if float(getattr(config, name, 0.)) != 0.:
+            raise ValueError(f'direct_shape_token requires {name}=0')
+
+
 def structure_usage_manifest(config):
     candidates_per_scale = (
         64 + int(config.shape_window_stride) - 1
@@ -234,6 +252,8 @@ def structure_usage_manifest(config):
         evidence_dim = 32
     elif config.shape_representation == 'state_org':
         evidence_dim = int(config.shapelet_count) + 32
+    elif config.shape_representation == 'direct_shape_token':
+        evidence_dim = int(config.shape_dim)
     else:
         evidence_dim = (
             int(config.shapelet_count) * candidates_per_scale
@@ -260,7 +280,17 @@ def structure_usage_manifest(config):
             config, 'class_org_reference', None
         ),
     }
-    if config.shape_representation == 'phase_moment':
+    if config.shape_representation == 'direct_shape_token':
+        manifest.update({
+            'shapelet_response': 'direct_token_128',
+            'shape_response_dim': evidence_dim,
+            'shape_concentration': False,
+            'anchor_dictionary': False,
+            'anchor_losses': False,
+            'occurrence_phase': False,
+            'explicit_shape_alignment': False,
+        })
+    elif config.shape_representation == 'phase_moment':
         k2_enabled = bool(getattr(config, 'shape_phase_k2_enabled', True))
         manifest.update({
             'shapelet_response': (
@@ -421,6 +451,7 @@ def result_artifact_names(method, target_name):
 
 
 def main(config):
+    validate_structure_configuration(config)
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -1033,6 +1064,7 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
         structure_proto
         and not config.train_on_target
         and getattr(config, 'shapelet_init', 'random') == 'kmeans'
+        and getattr(config, 'shape_representation', None) != 'direct_shape_token'
     ):
         initialize_shapelet_dictionary_from_source(
             model, data_loader, device, config.seed,
@@ -1112,10 +1144,13 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                     ) if minority_mode != 'base' else criterion(outputs, targets)
                 )
                 loss_shape_source = criterion(structured["shape_logits"], targets)
-                loss_diversity = shapelet_diversity_loss(
-                    model.structure_branch.shapelet_dictionary.anchors,
-                    config.shapelet_diversity_margin,
-                )
+                if config.shape_representation == 'direct_shape_token':
+                    loss_diversity = outputs.sum() * 0.
+                else:
+                    loss_diversity = shapelet_diversity_loss(
+                        model.structure_branch.shapelet_dictionary.anchors,
+                        config.shapelet_diversity_margin,
+                    )
                 compactness = (
                     support_aware_prototype_compactness(
                         structured["shapelet_response"], targets,

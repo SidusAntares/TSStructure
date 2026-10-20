@@ -59,6 +59,21 @@ def validation(best_f1, best_model_path, config, criterion, device, epoch, model
     writer.add_scalar('val/f1', val_f1, global_step=epoch)
     writer.add_scalar('val/kappa', val_kappa, global_step=epoch)
     print(f"Validation result: loss={val_loss:.4f}, acc={val_acc:.2f}, f1={val_f1:.4f}")
+    if 'shape_head_macro_f1' in val_metrics:
+        writer.add_scalar(
+            'val/shape_head_macro_f1', val_metrics['shape_head_macro_f1'],
+            global_step=epoch,
+        )
+        writer.add_scalar(
+            'val/shape_head_fixed_class_macro_f1',
+            val_metrics['shape_head_fixed_class_macro_f1'], global_step=epoch,
+        )
+        print(
+            'SHAPE_AUX_VALIDATION|'
+            f'epoch={epoch}|accuracy={val_metrics["shape_head_accuracy"]:.6f}|'
+            f'macro_f1={val_metrics["shape_head_macro_f1"]:.6f}|'
+            f'fixed_class_macro_f1={val_metrics["shape_head_fixed_class_macro_f1"]:.6f}'
+        )
     if val_f1 > best_f1:
         print(f'Validation F1 improved from {best_f1:.4f} to {val_f1:.4f}!')
         best_f1 = val_f1
@@ -81,7 +96,10 @@ def evaluation(
     temporal_shift=None,
     progress_bar='auto',
 ):
-    y_true, y_pred = [], []
+    y_true, y_pred, shape_y_pred = [], [], []
+    collect_shape_head = (
+        getattr(model, 'shape_representation', None) == 'direct_shape_token'
+    )
 
     loss_meter = AverageMeter()
 
@@ -98,13 +116,17 @@ def evaluation(
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
         if temporal_shift is not None:
             if hasattr(model, "forward_with_temporal_shift"):
-                logits = model.forward_with_temporal_shift(
-                    pixels,
-                    valid_pixels,
-                    positions,
-                    extra,
-                    temporal_shift=temporal_shift,
-                )
+                if collect_shape_head:
+                    output = model.forward_with_temporal_shift(
+                        pixels, valid_pixels, positions, extra,
+                        temporal_shift=temporal_shift, return_dict=True,
+                    )
+                    logits = output['logits']
+                else:
+                    logits = model.forward_with_temporal_shift(
+                        pixels, valid_pixels, positions, extra,
+                        temporal_shift=temporal_shift,
+                    )
             else:
                 logits = model.forward(
                     pixels,
@@ -113,7 +135,16 @@ def evaluation(
                     extra,
                 )
         else:
-            logits = model.forward(pixels, valid_pixels, positions, extra)
+            if collect_shape_head:
+                output = model.forward(
+                    pixels, valid_pixels, positions, extra, return_dict=True,
+                )
+                logits = output['logits']
+            else:
+                logits = model.forward(pixels, valid_pixels, positions, extra)
+
+        if collect_shape_head:
+            shape_y_pred.extend(output['shape_logits'].argmax(dim=1).tolist())
 
         predictions = logits.argmax(dim=1)
 
@@ -126,5 +157,16 @@ def evaluation(
 
     metrics = classification_metrics(y_true, y_pred, class_names, mode=mode)
     metrics['loss'] = loss_meter.avg
+    if collect_shape_head:
+        shape_metrics = classification_metrics(
+            y_true, np.asarray(shape_y_pred), class_names, mode=mode,
+        )
+        metrics.update({
+            'shape_head_accuracy': shape_metrics['accuracy'],
+            'shape_head_macro_f1': shape_metrics['macro_f1'],
+            'shape_head_fixed_class_macro_f1': float(np.mean(
+                shape_metrics['per_class_f1']
+            )),
+        })
 
     return metrics

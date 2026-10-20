@@ -120,9 +120,16 @@ class PseStructureProtoLTae(nn.Module):
             )
         if shape_representation == "state_org" and shape_injection != "direct_response_query":
             raise ValueError("state_org representation requires direct_response_query injection")
+        if (
+            shape_representation == "direct_shape_token"
+            and shape_injection != "current_query"
+        ):
+            raise ValueError(
+                "direct_shape_token representation requires current_query injection"
+            )
         if shape_representation not in (
             "current", "sorted_profile", "set_response", "residual_response",
-            "phase_moment", "state_org",
+            "phase_moment", "state_org", "direct_shape_token",
         ):
             raise ValueError(f"unknown shape representation: {shape_representation}")
         self.shape_representation = shape_representation
@@ -162,6 +169,8 @@ class PseStructureProtoLTae(nn.Module):
             evidence_dim = 32
         elif shape_representation == "state_org":
             evidence_dim = int(shapelet_count) + 32
+        elif shape_representation == "direct_shape_token":
+            evidence_dim = int(shape_dim)
         else:
             evidence_dim = sorted_profile_dim
         external_query_dim = (
@@ -231,7 +240,7 @@ class PseStructureProtoLTae(nn.Module):
     def prepare_structure_from_context(
         self, context, temporal_shift=0, structure_aug_shift=None, phase_shift=None,
     ):
-        if self.shape_representation == "phase_moment":
+        if self.shape_representation in ("phase_moment", "direct_shape_token"):
             structure_shift = 0 if structure_aug_shift is None else structure_aug_shift
             calendar_shift = temporal_shift if phase_shift is None else phase_shift
         else:
@@ -251,7 +260,7 @@ class PseStructureProtoLTae(nn.Module):
     def prepare_structure(self, prepared, positions, temporal_shift=0):
         if (
             self.shape_injection in ("local_query", "local_query_only")
-            or self.shape_representation == "phase_moment"
+            or self.shape_representation in ("phase_moment", "direct_shape_token")
         ):
             return self.prepare_structure_from_context(
                 self.prepare_structure_context(prepared, positions), temporal_shift,
@@ -264,7 +273,7 @@ class PseStructureProtoLTae(nn.Module):
     def _shape_evidence(self, structure):
         if self.shape_representation in (
             "current", "set_response", "residual_response", "phase_moment",
-            "state_org",
+            "state_org", "direct_shape_token",
         ):
             evidence = structure["shapelet_response"]
             return (
@@ -438,6 +447,23 @@ class PseStructureProtoLTae(nn.Module):
                     ).float().mean(),
                 })
             return diagnostics
+        if self.shape_representation == "direct_shape_token":
+            attention = output["shape_attention_weights"]
+            entropy = -(attention.clamp_min(1e-12) * attention.clamp_min(1e-12).log()).sum(1)
+            response = output["shapelet_response"]
+            heads = self.temporal_encoder.attention_heads
+            correction = heads.external_query_projection(response)
+            base_norm = heads.query.detach().norm().clamp_min(1e-12)
+            return {
+                "direct_token_attention_entropy": entropy.mean(),
+                "direct_token_effective_windows": entropy.exp().mean(),
+                "direct_token_max_attention": attention.amax(1).mean(),
+                "direct_token_response_variance": response.var(0, unbiased=False).mean(),
+                "direct_token_query_correction_norm": correction.norm(dim=-1).mean(),
+                "direct_token_query_to_base_norm_ratio": (
+                    correction.norm(dim=-1).mean() / base_norm
+                ),
+            }
         if (
             self.shape_representation == "state_org"
             and self.state_org_readout == "reliable_composition"
@@ -566,11 +592,14 @@ class PseStructureProtoLTae(nn.Module):
         ) or (
             self.shape_representation == "phase_moment"
             and self.shape_injection == "current_query"
+        ) or (
+            self.shape_representation == "direct_shape_token"
+            and self.shape_injection == "current_query"
         )
         if detach_structure_query and not detach_supported:
             raise ValueError(
                 "detach_structure_query requires state_org + direct_response_query "
-                "or phase_moment + current_query"
+                "or phase_moment/direct_shape_token + current_query"
             )
         query_view = query_view or getattr(self, "_state_org_query_view", "full")
         query_scale = (
