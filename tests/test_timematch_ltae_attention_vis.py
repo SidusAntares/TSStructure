@@ -1,5 +1,6 @@
 import math
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,12 +12,43 @@ from scripts.visualize_timematch_ltae_attention import (
     fit_source_pc1,
     marker_rows,
     project_pc1,
+    resolve_original_final_checkpoint,
     resolve_student_domain_shifts,
     selection_summary_row,
     select_attention_indices,
     validate_attention_tensor,
     validate_original_final_checkpoint,
 )
+
+
+def test_checkpoint_resolution_uses_metadata_when_historical_directory_name_differs(
+    monkeypatch,
+):
+    expected = Path("outputs/timematch_AT1_to_DK1/fold_0/checkpoint_last.pt")
+    packet = {
+        "config": {
+            "model": "pseltae", "source": "austria/33UVP/2017",
+            "target": "denmark/32VNH/2017", "seed": 1, "epochs": 20,
+            "output_student": True,
+        },
+        "epoch": 19, "state_dict": {}, "teacher_state_dict": {},
+        "global_temporal_shift": -15,
+    }
+    monkeypatch.setattr(
+        "scripts.visualize_timematch_ltae_attention._checkpoint_candidates",
+        lambda *_args, **_kwargs: [expected],
+    )
+    resolved = resolve_original_final_checkpoint(
+        explicit_checkpoint=None,
+        checkpoint_root=Path("outputs"),
+        source_alias="AT1",
+        target_alias="DK1",
+        source="austria/33UVP/2017",
+        target="denmark/32VNH/2017",
+        seed=1,
+        packet_loader=lambda path: packet if path == expected else None,
+    )
+    assert resolved == expected
 
 
 def test_top_fraction_uses_ceil_and_deterministic_index_ties():

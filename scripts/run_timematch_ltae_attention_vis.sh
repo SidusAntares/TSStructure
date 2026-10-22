@@ -3,7 +3,7 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
-CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-outputs/timematch_original_4tasks_seed1/uda}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-outputs}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/timematch_ltae_attention_vis}"
 DEVICE="${DEVICE:-cuda}"
 SEED="${SEED:-1}"
@@ -25,11 +25,18 @@ fi
 mkdir -p "$OUTPUT_ROOT"
 for task in "${TASK_LIST[@]}"; do
   echo "ATTENTION_VIS_PLAN|task=$task|device=$DEVICE|seed=$SEED"
+  checkpoint_variable="CHECKPOINT_${task}"
+  checkpoint="${!checkpoint_variable:-}"
+  CHECKPOINT_ARGS=()
+  if [[ -n "$checkpoint" ]]; then
+    CHECKPOINT_ARGS=(--checkpoint "$checkpoint")
+  fi
   "$PYTHON_BIN" -u scripts/visualize_timematch_ltae_attention.py run \
     --task "$task" \
     --seed "$SEED" \
     --data-root "$DATA_ROOT" \
     --checkpoint-root "$CHECKPOINT_ROOT" \
+    "${CHECKPOINT_ARGS[@]}" \
     --output-root "$OUTPUT_ROOT" \
     --device "$DEVICE" \
     --batch-size "$BATCH_SIZE" \

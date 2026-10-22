@@ -85,6 +85,96 @@ def validate_original_final_checkpoint(path, packet, source, target, seed):
         raise ValueError("final checkpoint is missing global_temporal_shift")
 
 
+def _checkpoint_candidates(
+    checkpoint_root, source_alias, target_alias, seed,
+):
+    """Find Final checkpoints without assuming one historical experiment name."""
+    root = Path(checkpoint_root)
+    if root.is_file():
+        return [root]
+    task = f"{source_alias}_{target_alias}"
+    relative_paths = (
+        f"{task}_seed{seed}/fold_0/checkpoint_last.pt",
+        f"{task}/fold_0/checkpoint_last.pt",
+        f"timematch_{source_alias}_to_{target_alias}_seed{seed}/fold_0/checkpoint_last.pt",
+        f"timematch_{source_alias}_to_{target_alias}/fold_0/checkpoint_last.pt",
+        f"uda/{task}_seed{seed}/fold_0/checkpoint_last.pt",
+        f"timematch_original_4tasks_seed{seed}/uda/{task}_seed{seed}/fold_0/checkpoint_last.pt",
+    )
+    candidates = [root / relative for relative in relative_paths]
+    if root.is_dir():
+        source_token = source_alias.lower()
+        target_token = target_alias.lower()
+        candidates.extend(
+            path for path in root.rglob("checkpoint_last.pt")
+            if source_token in str(path).lower() and target_token in str(path).lower()
+        )
+    unique = []
+    seen = set()
+    for path in candidates:
+        key = str(path.resolve())
+        if key not in seen and path.is_file():
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def _load_checkpoint_packet(path):
+    import torch
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def resolve_original_final_checkpoint(
+    *, explicit_checkpoint, checkpoint_root, source_alias, target_alias,
+    source, target, seed, packet_loader=None,
+):
+    """Resolve exactly one metadata-compatible final Student checkpoint."""
+    loader = packet_loader or _load_checkpoint_packet
+    if explicit_checkpoint:
+        candidates = [Path(explicit_checkpoint)]
+        if not candidates[0].is_file():
+            raise FileNotFoundError(
+                f"missing explicitly requested Final Student checkpoint: {candidates[0]}"
+            )
+    else:
+        candidates = _checkpoint_candidates(
+            checkpoint_root, source_alias, target_alias, seed,
+        )
+    matches = []
+    rejected = []
+    for path in candidates:
+        try:
+            packet = loader(path)
+            validate_original_final_checkpoint(path, packet, source, target, seed)
+        except Exception as error:
+            rejected.append((path, str(error)))
+            continue
+        matches.append(path)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        rendered = "\n".join(f"  - {path}" for path in matches)
+        raise RuntimeError(
+            "multiple compatible Final Student checkpoints found; pass --checkpoint "
+            f"explicitly:\n{rendered}"
+        )
+    searched = Path(checkpoint_root)
+    rejected_text = ""
+    if rejected:
+        rejected_text = "\nRejected checkpoint_last.pt files:\n" + "\n".join(
+            f"  - {path}: {reason}" for path, reason in rejected[:20]
+        )
+    raise FileNotFoundError(
+        "no metadata-compatible original TimeMatch Final Student checkpoint found "
+        f"for {source_alias}_{target_alias} seed={seed} under {searched}. "
+        "Pass --checkpoint or CHECKPOINT_<TASK> with the exact checkpoint_last.pt path."
+        f"{rejected_text}"
+    )
+
+
 def resolve_student_domain_shifts(packet, config):
     """Reproduce the Student branches used during TimeMatch optimization."""
     target_to_source = _scalar_shift(packet.get("global_temporal_shift", 0))
@@ -532,12 +622,16 @@ def run_task(args):
     if args.task not in TASKS:
         raise ValueError(f"unknown task: {args.task}")
     source_alias, source, target_alias, target = TASKS[args.task]
-    checkpoint = Path(args.checkpoint) if args.checkpoint else (
-        Path(args.checkpoint_root) / f"{source_alias}_{target_alias}_seed{args.seed}"
-        / "fold_0/checkpoint_last.pt"
+    checkpoint = resolve_original_final_checkpoint(
+        explicit_checkpoint=args.checkpoint,
+        checkpoint_root=args.checkpoint_root,
+        source_alias=source_alias,
+        target_alias=target_alias,
+        source=source,
+        target=target,
+        seed=args.seed,
     )
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"missing Final Student checkpoint: {checkpoint}")
+    print(f"ATTENTION_VIS_CHECKPOINT|task={args.task}|path={checkpoint}")
     device = torch.device(args.device)
     model, config, packet = _load_model(checkpoint, device, final=True, teacher=False)
     validate_original_final_checkpoint(checkpoint, packet, source, target, args.seed)
@@ -708,7 +802,7 @@ def build_parser():
     run.add_argument("--task", required=True, choices=tuple(TASKS))
     run.add_argument("--seed", type=int, default=1)
     run.add_argument("--data-root", default="/data/user/dataset/timematch_data")
-    run.add_argument("--checkpoint-root", default="outputs/timematch_original_4tasks_seed1/uda")
+    run.add_argument("--checkpoint-root", default="outputs")
     run.add_argument("--checkpoint")
     run.add_argument("--output-root", default="outputs/timematch_ltae_attention_vis")
     run.add_argument("--device", default="cuda")
