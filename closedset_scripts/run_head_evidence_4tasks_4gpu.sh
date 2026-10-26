@@ -61,6 +61,7 @@ run_task() {
     # Each GPU runs its own source model, then immediately starts adaptation.
     # There is deliberately no cross-GPU source-stage barrier.
     if [[ "$REUSE_SOURCE" != "1" || ! -f "${source_weights}/fold_0/model.pt" ]]; then
+        mkdir -p "logs/${source_experiment}"
         echo "[GPU $gpu] Training source $source_tile, seed $SEED"
         CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train.py \
             --data_root "$DATA_ROOT" --source "$source" --target "$source" \
@@ -68,7 +69,8 @@ run_task() {
             --device cuda --closed_set true \
             --combine_spring_and_winter false --with_shift_aug false \
             --progress_bar off --epochs "$SOURCE_EPOCHS" \
-            --experiment_name "$source_experiment"
+            --experiment_name "$source_experiment" \
+            > "logs/${source_experiment}/${task}.log" 2>&1
     else
         echo "[GPU $gpu] Reusing verified-path source checkpoint: $source_weights"
     fi
@@ -76,6 +78,7 @@ run_task() {
     local mode experiment
     for mode in positive positive_rank; do
         experiment="head_evidence_${mode}_${source_tile}_to_${target_tile}_seed${SEED}"
+        mkdir -p "logs/${experiment}"
         echo "[GPU $gpu] $task: $mode from the same source checkpoint"
         CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train.py \
             --data_root "$DATA_ROOT" --source "$source" --target "$target" \
@@ -91,7 +94,8 @@ run_task() {
             --evidence_min_observations "$MIN_OBSERVATIONS" \
             --evidence_positive_weight "$POS_WEIGHT" \
             --evidence_rank_weight "$RANK_WEIGHT" \
-            --evidence_warmup_steps "$WARMUP_STEPS"
+            --evidence_warmup_steps "$WARMUP_STEPS" \
+            > "logs/${experiment}/${task}.log" 2>&1
     done
     echo "[GPU $gpu] Completed $task"
 }
