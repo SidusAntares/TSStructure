@@ -10,3 +10,4 @@ data/
 /sync_to_server.sh
 logs/
 docs/
+.dsh-plugins/
