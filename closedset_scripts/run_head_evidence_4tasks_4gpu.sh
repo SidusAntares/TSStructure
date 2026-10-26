@@ -10,6 +10,11 @@ DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 TASKS="${TASKS:-AT1_DK1 FR1_FR2 FR2_DK1 DK1_AT1}"
 GPUS="${GPUS:-0 1 2 3}"
 SEED="${SEED:-1}"
+LOG_EXPERIMENT="${LOG_EXPERIMENT:-head_evidence_seed${SEED}}"
+LOG_DIR="logs/${LOG_EXPERIMENT}"
+mkdir -p "$LOG_DIR"
+exec > "${LOG_DIR}/launcher.log" 2>&1
+
 NUM_WORKERS="${NUM_WORKERS:-4}"
 SOURCE_EPOCHS="${SOURCE_EPOCHS:-100}"
 UDA_EPOCHS="${UDA_EPOCHS:-20}"
@@ -61,7 +66,6 @@ run_task() {
     # Each GPU runs its own source model, then immediately starts adaptation.
     # There is deliberately no cross-GPU source-stage barrier.
     if [[ "$REUSE_SOURCE" != "1" || ! -f "${source_weights}/fold_0/model.pt" ]]; then
-        mkdir -p "logs/${source_experiment}"
         echo "[GPU $gpu] Training source $source_tile, seed $SEED"
         CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train.py \
             --data_root "$DATA_ROOT" --source "$source" --target "$source" \
@@ -70,15 +74,16 @@ run_task() {
             --combine_spring_and_winter false --with_shift_aug false \
             --progress_bar off --epochs "$SOURCE_EPOCHS" \
             --experiment_name "$source_experiment" \
-            > "logs/${source_experiment}/${task}.log" 2>&1
+            > "${LOG_DIR}/${task}_source.log" 2>&1
     else
         echo "[GPU $gpu] Reusing verified-path source checkpoint: $source_weights"
     fi
 
-    local mode experiment
+    local mode experiment version
     for mode in positive positive_rank; do
         experiment="head_evidence_${mode}_${source_tile}_to_${target_tile}_seed${SEED}"
-        mkdir -p "logs/${experiment}"
+        # A = positive; B = positive_rank. All tasks share the run log directory.
+        if [[ "$mode" == "positive" ]]; then version="A"; else version="B"; fi
         echo "[GPU $gpu] $task: $mode from the same source checkpoint"
         CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train.py \
             --data_root "$DATA_ROOT" --source "$source" --target "$target" \
@@ -95,7 +100,7 @@ run_task() {
             --evidence_positive_weight "$POS_WEIGHT" \
             --evidence_rank_weight "$RANK_WEIGHT" \
             --evidence_warmup_steps "$WARMUP_STEPS" \
-            > "logs/${experiment}/${task}.log" 2>&1
+            > "${LOG_DIR}/${task}_${version}.log" 2>&1
     done
     echo "[GPU $gpu] Completed $task"
 }
