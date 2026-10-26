@@ -536,6 +536,22 @@ if __name__ == '__main__':
     timematch.add_argument("--shift_estimator", type=str, default='AM', choices=['AM', 'IS', 'ACC', 'ENT'])
     timematch.add_argument('--run_validation', default=True, action='store_true', help='whether to run validation each epoch')
     timematch.add_argument("--output_student", type=bool_flag, default=True, help='output student or teacher')
+    # Head-local discriminative evidence: off preserves the original TimeMatch.
+    timematch.add_argument("--evidence_mode", default="off",
+                           choices=["off", "positive", "positive_rank"])
+    timematch.add_argument("--evidence_top_fraction", type=float, default=0.30)
+    timematch.add_argument("--evidence_coverage", type=float, default=0.75)
+    timematch.add_argument("--evidence_min_observations", type=int, default=3)
+    timematch.add_argument("--evidence_min_outside", type=int, default=2)
+    timematch.add_argument("--evidence_warmup_steps", type=int, default=100)
+    timematch.add_argument("--evidence_positive_weight", type=float, default=0.10)
+    timematch.add_argument("--evidence_rank_weight", type=float, default=0.10)
+    timematch.add_argument("--evidence_positive_margin", type=float, default=0.10)
+    timematch.add_argument("--evidence_ranking_margin", type=float, default=0.10)
+    timematch.add_argument("--evidence_source_min_count", type=int, default=16)
+    timematch.add_argument("--evidence_source_positive_rate", type=float, default=0.65)
+    timematch.add_argument("--evidence_source_min_contribution", type=float, default=0.05)
+    timematch.add_argument("--evidence_source_rank_gap", type=float, default=0.20)
 
     cfg = parser.parse_args()
 

@@ -81,16 +81,23 @@ class LTAE(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, positions, return_att=False):
+    def forward(self, x, positions, return_att=False, return_head_parts=False):
         if self.inconv is not None:
             x = self.inconv(x)
         enc_output = x + self.positional_enc(positions + self.max_temporal_shift)
 
-        enc_output, attn = self.attention_heads(enc_output)
+        if return_head_parts:
+            pooled, attn, raw_attention, head_values = self.attention_heads(
+                enc_output, return_parts=True
+            )
+        else:
+            pooled, attn = self.attention_heads(enc_output)
 
-        enc_output = self.dropout(self.mlp(enc_output))
+        enc_output = self.dropout(self.mlp(pooled))
 
-        if return_att:
+        if return_head_parts:
+            return enc_output, raw_attention, head_values
+        elif return_att:
             return enc_output, attn
         else:
             return enc_output
@@ -113,7 +120,7 @@ class MultiHeadAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
 
-    def forward(self, x):
+    def forward(self, x, return_parts=False):
         # Slightly more efficient re-implementation of LTAE
         B, T, C = x.size()
         q = self.query.repeat(B, 1, 1, 1).transpose(1, 2)  # (nh, hs) -> (B, nh, 1, d_k)
@@ -122,7 +129,10 @@ class MultiHeadAttention(nn.Module):
         # self-attend; (B, nh, 1, d_k) x (B, nh, d_k, T) -> (B, nh, 1, T)
         att = (q @ k.transpose(-2, -1)) / self.temperature
         att = self.softmax(att)
+        raw_attention = att.squeeze(-2)
         att = self.dropout(att)
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, C)
+        if return_parts:
+            return y, att, raw_attention, v
         return y, att

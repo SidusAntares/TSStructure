@@ -21,6 +21,10 @@ from transforms import (
     Identity,
 )
 from utils.focal_loss import FocalLoss
+from utils.head_evidence import (
+    SourceEvidenceTracker,
+    relative_logit_contributions,
+)
 from utils.train_utils import (
     AverageMeter,
     cycle,
@@ -60,6 +64,38 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
     teacher = deepcopy(student)
     student.to(device)
     teacher.to(device)
+
+    evidence_mode = getattr(config, "evidence_mode", "off")
+    if evidence_mode not in ("off", "positive", "positive_rank"):
+        raise ValueError(f"Unknown evidence mode: {evidence_mode}")
+    use_evidence = evidence_mode != "off"
+    evidence_tracker = None
+    evidence_options = {}
+    if use_evidence:
+        if not hasattr(student, "forward_with_head_evidence"):
+            raise ValueError("Head evidence requires the PSE-LTAE model")
+        evidence_tracker = SourceEvidenceTracker(
+            num_classes=config.num_classes,
+            num_heads=student.temporal_encoder.attention_heads.n_head,
+            device=device,
+            min_count=config.evidence_source_min_count,
+            min_positive_rate=config.evidence_source_positive_rate,
+            min_source_contribution=config.evidence_source_min_contribution,
+            rank_gap=config.evidence_source_rank_gap,
+        )
+        evidence_options = dict(
+            top_fraction=config.evidence_top_fraction,
+            coverage=config.evidence_coverage,
+            min_observations=config.evidence_min_observations,
+            min_outside=config.evidence_min_outside,
+        )
+
+    def student_forward(pixels, valid_pixels, positions, extra):
+        if use_evidence:
+            return student.forward_with_head_evidence(
+                pixels, valid_pixels, positions, extra, **evidence_options
+            )
+        return student.forward(pixels, valid_pixels, positions, extra), None, None
 
     # Training setup
     global_step, best_f1 = 0, 0
@@ -158,13 +194,21 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             source_labels = sample_source['label'].cuda(device, non_blocking=True)
             pixels_t, mask_t, position_t, extra_t = to_cuda(sample_target_strong, device)
             logits_target = None
+            evidence_source_logits = None
+            evidence_target_logits = None
+            target_head_valid = None
             loss_target = 0.0
             if config.domain_specific_bn:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
-                logits_source = student.forward(pixels_s, mask_s, position_s + source_to_target_shift, extra_s)
+                logits_source, evidence_source_logits, source_head_valid = student_forward(
+                    pixels_s, mask_s, position_s + source_to_target_shift, extra_s
+                )
                 if num_pseudo >= 2:  # at least 2 examples required for BN
                     _check_temporal_index_range(student, position_t[pseudo_mask], 0, "target")
-                    logits_target = student.forward(pixels_t[pseudo_mask], mask_t[pseudo_mask], position_t[pseudo_mask], extra_t[pseudo_mask])
+                    logits_target, evidence_target_logits, target_head_valid = student_forward(
+                        pixels_t[pseudo_mask], mask_t[pseudo_mask],
+                        position_t[pseudo_mask], extra_t[pseudo_mask]
+                    )
             else:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
                 if num_pseudo > 0:
@@ -183,12 +227,19 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     )
                     extra = torch.cat([extra_s, selected_extra_t], dim=0)
 
-                    logits = student.forward(pixels, mask, position, extra)
+                    logits, evidence_logits, head_valid = student_forward(
+                        pixels, mask, position, extra
+                    )
                     source_batch_size = pixels_s.shape[0]
                     logits_source = logits[:source_batch_size]
                     logits_target = logits[source_batch_size:]
+                    if use_evidence:
+                        evidence_source_logits = evidence_logits[:source_batch_size]
+                        evidence_target_logits = evidence_logits[source_batch_size:]
+                        source_head_valid = head_valid[:source_batch_size]
+                        target_head_valid = head_valid[source_batch_size:]
                 else:
-                    logits_source = student.forward(
+                    logits_source, evidence_source_logits, source_head_valid = student_forward(
                         pixels_s,
                         mask_s,
                         position_s + source_to_target_shift,
@@ -200,6 +251,34 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             if logits_target is not None:
                 loss_target = criterion(logits_target, pseudo_targets[pseudo_mask])
             loss = loss_source + config.trade_off * loss_target
+
+            if use_evidence:
+                source_contributions = relative_logit_contributions(
+                    evidence_source_logits, source_labels
+                )
+                # Freeze source class-head roles once transfer begins. The
+                # target loss cannot redefine what counts as source evidence.
+                if global_step < config.evidence_warmup_steps:
+                    evidence_tracker.update(
+                        source_labels, source_contributions, source_head_valid
+                    )
+                positive_loss = loss.new_zeros(())
+                ranking_loss = loss.new_zeros(())
+                active_heads = 0
+                if (evidence_target_logits is not None
+                        and global_step >= config.evidence_warmup_steps):
+                    target_contributions = relative_logit_contributions(
+                        evidence_target_logits, pseudo_targets[pseudo_mask]
+                    )
+                    positive_loss, ranking_loss, active_heads = evidence_tracker.losses(
+                        target_contributions, target_head_valid,
+                        pseudo_targets[pseudo_mask], pseudo_conf[pseudo_mask],
+                        positive_margin=config.evidence_positive_margin,
+                        ranking_margin=config.evidence_ranking_margin,
+                    )
+                    loss = loss + config.evidence_positive_weight * positive_loss
+                    if evidence_mode == "positive_rank":
+                        loss = loss + config.evidence_rank_weight * ranking_loss
 
             # compute loss and backprop
             optimizer.zero_grad()
@@ -220,6 +299,12 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                 writer.add_scalar("train/loss", loss_meter.val, global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                 writer.add_scalar("train/target_updates", len(torch.nonzero(pseudo_mask)), global_step)
+                if use_evidence:
+                    writer.add_scalar("evidence/positive_loss", positive_loss.item(), global_step)
+                    writer.add_scalar("evidence/ranking_loss", ranking_loss.item(), global_step)
+                    writer.add_scalar("evidence/active_target_heads", active_heads, global_step)
+                    _, reliable_heads = evidence_tracker.source_roles()
+                    writer.add_scalar("evidence/source_class_heads", reliable_heads.sum().item(), global_step)
 
             global_step += 1
 

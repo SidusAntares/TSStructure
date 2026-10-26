@@ -7,6 +7,11 @@ from models.decoder import get_decoder
 from models.ltae import LTAE
 from models.pse import PixelSetEncoder
 from models.tae import TemporalAttentionEncoder
+from utils.head_evidence import (
+    build_counterfactual_head_embeddings,
+    frozen_evidence_normalization,
+    select_attention_intervals,
+)
 
 
 class PseLTae(nn.Module):
@@ -73,6 +78,42 @@ class PseLTae(nn.Module):
             return logits, temporal_feats
         else:
             return logits
+
+    def forward_with_head_evidence(
+        self, pixels, mask, positions, extra, top_fraction=0.30,
+        coverage=0.75, min_observations=3, min_outside=2,
+    ):
+        """Ordinary logits plus deterministic head-local masked logits.
+
+        The usual classification path retains its train-mode BatchNorm and
+        Dropout. A separate comparison through the existing temporal MLP and
+        classifier uses running BN statistics for both original and masked
+        head outputs, keeping the contribution difference meaningful.
+        """
+        spatial_feats = self.spatial_encoder(pixels, mask, extra)
+        temporal_feats, attention, values = self.temporal_encoder(
+            spatial_feats, positions, return_head_parts=True
+        )
+        logits = self.decoder(temporal_feats)
+        inside, valid = select_attention_intervals(
+            attention, positions, top_fraction=top_fraction,
+            coverage=coverage, min_observations=min_observations,
+            min_outside=min_outside,
+        )
+        counterfactuals = build_counterfactual_head_embeddings(
+            attention, values, inside
+        )
+        batch, cases, channels = counterfactuals.shape
+        with frozen_evidence_normalization(
+            self.temporal_encoder.mlp, self.decoder,
+        ):
+            evidence_features = self.temporal_encoder.mlp(
+                counterfactuals.reshape(batch * cases, channels)
+            )
+            evidence_logits = self.decoder(evidence_features).reshape(
+                batch, cases, -1
+            )
+        return logits, evidence_logits, valid
 
     def param_ratio(self):
         total = get_ntrainparams(self)
