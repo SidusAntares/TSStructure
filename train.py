@@ -106,9 +106,17 @@ def main(config):
             else:
                 train_supervised(model, config, writer, splits, val_loader, device, best_model_path)
 
-        print('Restoring best model weights for testing...')
-
-        state_dict = torch.load(best_model_path, weights_only=False)['state_dict']
+        tested_checkpoint = None
+        if getattr(config, 'method', None) == 'timematch' and getattr(config, 'diagnostic_dir', None):
+            from pathlib import Path
+            from utils.timematch_diagnostic import load_final_student
+            tested_checkpoint = Path(config.diagnostic_dir) / 'checkpoints/checkpoint_epoch20.pt'
+            packet = load_final_student(tested_checkpoint)
+            print(f'Testing completed 20-epoch Student: {tested_checkpoint}')
+            state_dict = packet['state_dict']
+        else:
+            print('Restoring saved model weights for testing...')
+            state_dict = torch.load(best_model_path, weights_only=False)['state_dict']
         model.load_state_dict(state_dict)
 
         test_metrics = evaluation(
@@ -121,6 +129,12 @@ def main(config):
         )
 
         print(f"Test result for {config.experiment_name}: accuracy={test_metrics['accuracy']:.4f}, f1={test_metrics['macro_f1']:.4f}")
+        if tested_checkpoint is not None:
+            from analysis.timematch_diagnostic import sha256, write_json
+            write_json(os.path.join(config.fold_dir, 'tested_checkpoint.json'), {
+                'path': str(tested_checkpoint.resolve()), 'sha256': sha256(tested_checkpoint),
+                'completed_epochs': 20, 'role': 'student',
+            })
         print(test_metrics['classification_report'])
 
         save_results(test_metrics, config)
@@ -536,6 +550,10 @@ if __name__ == '__main__':
     timematch.add_argument("--shift_estimator", type=str, default='AM', choices=['AM', 'IS', 'ACC', 'ENT'])
     timematch.add_argument('--run_validation', default=True, action='store_true', help='whether to run validation each epoch')
     timematch.add_argument("--output_student", type=bool_flag, default=True, help='output student or teacher')
+    timematch.add_argument('--diagnostic_dir', default=None,
+                           help='Optional isolated 0/10/20-epoch Student diagnostic output')
+    timematch.add_argument('--diagnostic_log', default=None)
+    timematch.add_argument('--diagnostic_task', default=None)
     # Head-local discriminative evidence: off preserves the original TimeMatch.
     timematch.add_argument("--evidence_mode", default="off",
                            choices=["off", "positive", "positive_rank"])

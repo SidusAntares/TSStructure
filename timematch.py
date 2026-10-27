@@ -55,6 +55,10 @@ def _check_temporal_index_range(model, positions, applied_shift, tag):
 
 
 def train_timematch(student, config, writer, val_loader, device, best_model_path, fold_num, splits):
+    diagnostic = None
+    if getattr(config, 'diagnostic_dir', None):
+        from utils.timematch_diagnostic import StudentDiagnostic
+        diagnostic = StudentDiagnostic(config, splits)
     source_loader, target_loader_no_aug, target_loader = get_data_loaders(splits, config, config.balance_source)
 
     # Setup model
@@ -173,6 +177,9 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                     source_to_target_shift = 0
                 min_shift, max_shift = min(target_to_source_shift, 0), max(0, target_to_source_shift)
             writer.add_scalar("train/temporal_shift", target_to_source_shift, epoch)
+
+        if diagnostic is not None and epoch == 0:
+            diagnostic.capture(0, student, source_to_target_shift, target_to_source_shift)
 
         student.train()
         teacher.eval()  # don't update BN or use dropout for teacher
@@ -329,9 +336,13 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                 teacher.eval()
                 best_f1 = validation(best_f1, None, config, criterion, device, epoch, teacher, val_loader, writer)
 
-    # Save model final model 
+        if diagnostic is not None:
+            diagnostic.capture(epoch + 1, student, source_to_target_shift, target_to_source_shift)
+
+    # Always export the final model; validation never selects the test weights.
     if config.output_student:
-        torch.save({'state_dict': student.state_dict()}, best_model_path)
+        torch.save({'state_dict': student.state_dict(), 'role': 'student',
+                    'completed_epochs': config.epochs}, best_model_path)
     else:
         torch.save({'state_dict': teacher.state_dict()}, best_model_path)
 
