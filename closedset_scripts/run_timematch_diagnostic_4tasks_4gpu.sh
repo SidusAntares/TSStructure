@@ -10,11 +10,18 @@ TASKS="${TASKS:-AT1_DK1 FR1_FR2 FR2_DK1 DK1_AT1}"
 GPUS="${GPUS:-0 1 2 3}"
 SEED="${SEED:-1}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-EXPERIMENT="${EXPERIMENT:-timematch_original_diagnostic_seed${SEED}}"
+EXPERIMENT="${EXPERIMENT:-timematch_original_seed${SEED}}"
+DIAGNOSTIC_EXPERIMENT="${DIAGNOSTIC_EXPERIMENT:-timematch_original_diagnostic_seed${SEED}}"
 OUTPUT_ROOT="outputs/${EXPERIMENT}"
+DIAGNOSTIC_ROOT="outputs/${DIAGNOSTIC_EXPERIMENT}"
 LOG_ROOT="logs/${EXPERIMENT}"
-mkdir -p "$LOG_ROOT"
-exec > "$LOG_ROOT/diagnostic_control.log" 2>&1
+DIAGNOSTIC_LOG_ROOT="logs/${DIAGNOSTIC_EXPERIMENT}"
+mkdir -p "$LOG_ROOT" "$DIAGNOSTIC_LOG_ROOT"
+exec > "$DIAGNOSTIC_LOG_ROOT/diagnostic_control.log" 2>&1
+
+[[ "$EXPERIMENT" != "$DIAGNOSTIC_EXPERIMENT" ]] || {
+    echo 'ERROR: training and diagnostic experiment names must differ'; exit 1;
+}
 
 [[ -d "$DATA_ROOT" ]] || { echo "ERROR: dataset root missing: $DATA_ROOT"; exit 1; }
 read -r -a tasks <<< "${TASKS//,/ }"
@@ -48,8 +55,8 @@ for index in "${!tasks[@]}"; do
     [[ -f "$source_weights/fold_0/model.pt" ]] || {
         echo "ERROR: source checkpoint missing: $source_weights/fold_0/model.pt"; exit 1;
     }
-    [[ ! -e "$OUTPUT_ROOT/uda/$task" && ! -e "$OUTPUT_ROOT/diagnostics/$task" ]] || {
-        echo "ERROR: existing experiment for $task; choose a new EXPERIMENT to preserve results"; exit 1;
+    [[ ! -e "$OUTPUT_ROOT/$task" && ! -e "$DIAGNOSTIC_ROOT/$task" ]] || {
+        echo "ERROR: existing experiment for $task; choose new EXPERIMENT / DIAGNOSTIC_EXPERIMENT names to preserve results"; exit 1;
     }
     "$PYTHON_BIN" -u -m analysis.timematch_diagnostic validate-source \
         --root "$source_weights" --source "$source" --seed "$SEED"
@@ -59,7 +66,7 @@ run_task() {
     local gpu="$1" task="$2" source target tile
     resolve_task "$task"
     local source_weights="outputs/closedset_source_${tile}_seed${SEED}"
-    local diagnostic_root="$OUTPUT_ROOT/diagnostics/$task"
+    local diagnostic_root="$DIAGNOSTIC_ROOT/$task"
     echo "UDA_START|gpu=$gpu|task=$task|source=$source_weights|epochs=20"
     CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train.py \
         --data_root "$DATA_ROOT" --source "$source" --target "$target" \
@@ -67,17 +74,17 @@ run_task() {
         --model pseltae --device cuda --closed_set true \
         --combine_spring_and_winter false --with_shift_aug false \
         --progress_bar off --experiment_name "$task" \
-        --output_dir "$OUTPUT_ROOT/uda" \
+        --output_dir "$OUTPUT_ROOT" \
         --tensorboard_log_dir "$OUTPUT_ROOT/tensorboard" \
         timematch --weights "$source_weights" \
         --epochs 20 --steps_per_epoch 500 --evidence_mode off --output_student true \
         --diagnostic_dir "$diagnostic_root" \
-        --diagnostic_log "$LOG_ROOT/diagnostic_${task}.log" \
+        --diagnostic_log "$DIAGNOSTIC_LOG_ROOT/diagnostic_${task}.log" \
         --diagnostic_task "$task" \
         > "$LOG_ROOT/${task}.log" 2>&1
     "$PYTHON_BIN" -u -m analysis.timematch_diagnostic verify-task \
         --root "$diagnostic_root" --task "$task" \
-        --training-dir "$OUTPUT_ROOT/uda/$task/fold_0"
+        --training-dir "$OUTPUT_ROOT/$task/fold_0"
 }
 
 pids=()
@@ -90,7 +97,7 @@ for index in "${!pids[@]}"; do
     if wait "${pids[$index]}"; then
         echo "TASK_COMPLETE|task=${tasks[$index]}|tested_epoch=20|structures=18|contributions=54"
     else
-        echo "ERROR: task ${tasks[$index]} failed; see ${tasks[$index]}.log and diagnostic_${tasks[$index]}.log"
+        echo "ERROR: task ${tasks[$index]} failed; see $LOG_ROOT/${tasks[$index]}.log and $DIAGNOSTIC_LOG_ROOT/diagnostic_${tasks[$index]}.log"
         status=1
     fi
 done

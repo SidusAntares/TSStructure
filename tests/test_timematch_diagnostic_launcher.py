@@ -37,7 +37,8 @@ def setup_run(tmp_path):
 
 def run_script(tmp_path, python='/bin/echo', **options):
     env = dict(os.environ, DATA_ROOT='data', PYTHON_BIN=python,
-               EXPERIMENT='test_audit', TASKS=' '.join(TASKS), GPUS='0 1 2 3', SEED='1')
+               EXPERIMENT='test_train', DIAGNOSTIC_EXPERIMENT='test_audit',
+               TASKS=' '.join(TASKS), GPUS='0 1 2 3', SEED='1')
     env.update(options)
     return subprocess.run([bash_bin(), f'closedset_scripts/{SCRIPT.name}'],
                           cwd=tmp_path, env=env, capture_output=True, text=True)
@@ -56,13 +57,16 @@ def test_four_task_echo_maps_source_final_epoch_and_isolated_logs(tmp_path):
     control = (root / 'diagnostic_control.log').read_text()
     assert 'structures=72|contributions=216' in control
     for task, tile in zip(TASKS, TILES):
-        command = (root / f'{task}.log').read_text()
+        command = (tmp_path / f'logs/test_train/{task}.log').read_text()
+        assert not (root / f'{task}.log').exists()
         assert f'--experiment_name {task}' in command
         assert f'--weights outputs/closedset_source_{tile}_seed1' in command
         assert '--epochs 20 --steps_per_epoch 500 --evidence_mode off --output_student true' in command
         assert f'--diagnostic_log logs/test_audit/diagnostic_{task}.log' in command
-        assert f'--diagnostic_dir outputs/test_audit/diagnostics/{task}' in command
-        assert '--output_dir outputs/test_audit/uda' in command
+        assert f'--diagnostic_dir outputs/test_audit/{task}' in command
+        assert '--output_dir outputs/test_train' in command
+        assert '--tensorboard_log_dir outputs/test_train/tensorboard' in command
+        assert f'--training-dir outputs/test_train/{task}/fold_0' in control
         assert all(f'--experiment_name {other}' not in command for other in TASKS if other != task)
 
 
@@ -79,7 +83,7 @@ def test_failed_task_returns_nonzero_and_other_tasks_complete(tmp_path):
     assert 'ERROR: task FR1_FR2 failed' in control
     assert 'RUN_VERIFIED' not in control
     for i, task in enumerate(TASKS):
-        assert f'gpu={i} ' in (tmp_path / f'logs/test_audit/{task}.log').read_text()
+        assert f'gpu={i} ' in (tmp_path / f'logs/test_train/{task}.log').read_text()
         if task != 'FR1_FR2':
             assert f'TASK_COMPLETE|task={task}' in control
 
@@ -88,11 +92,35 @@ def test_missing_source_or_existing_output_fails_before_training(tmp_path):
     setup_run(tmp_path)
     (tmp_path / 'outputs/closedset_source_32VNH_seed1/fold_0/model.pt').unlink()
     assert run_script(tmp_path).returncode == 1
-    assert not (tmp_path / 'logs/test_audit/AT1_DK1.log').exists()
+    assert not (tmp_path / 'logs/test_train/AT1_DK1.log').exists()
 
 
 def test_subset_can_use_a_different_gpu(tmp_path):
     setup_run(tmp_path)
     assert run_script(tmp_path, TASKS='AT1_DK1', GPUS='3').returncode == 0
-    assert (tmp_path / 'logs/test_audit/AT1_DK1.log').exists()
-    assert not (tmp_path / 'logs/test_audit/FR1_FR2.log').exists()
+    assert (tmp_path / 'logs/test_train/AT1_DK1.log').exists()
+    assert not (tmp_path / 'logs/test_train/FR1_FR2.log').exists()
+
+
+def test_default_roots_match_separate_training_and_diagnostic_experiments(tmp_path):
+    setup_run(tmp_path)
+    assert run_script(tmp_path, EXPERIMENT='', DIAGNOSTIC_EXPERIMENT='').returncode == 0
+    assert (tmp_path / 'logs/timematch_original_diagnostic_seed1/diagnostic_control.log').is_file()
+    for task in TASKS:
+        command = (tmp_path / f'logs/timematch_original_seed1/{task}.log').read_text()
+        assert '--output_dir outputs/timematch_original_seed1 ' in command
+        assert f'--diagnostic_dir outputs/timematch_original_diagnostic_seed1/{task}' in command
+        assert f'--diagnostic_log logs/timematch_original_diagnostic_seed1/diagnostic_{task}.log' in command
+
+
+@pytest.mark.parametrize('root', ['outputs/test_train/AT1_DK1', 'outputs/test_audit/AT1_DK1'])
+def test_existing_training_or_diagnostic_output_is_preserved(tmp_path, root):
+    setup_run(tmp_path)
+    (tmp_path / root).mkdir(parents=True)
+    assert run_script(tmp_path).returncode == 1
+    assert not (tmp_path / 'logs/test_train/AT1_DK1.log').exists()
+
+
+def test_training_and_diagnostic_roots_cannot_be_the_same(tmp_path):
+    setup_run(tmp_path)
+    assert run_script(tmp_path, DIAGNOSTIC_EXPERIMENT='test_train').returncode == 1
