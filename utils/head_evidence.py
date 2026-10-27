@@ -1,11 +1,12 @@
 """Head-local temporal evidence for the closed-set TimeMatch experiments.
 
-The interval is selected from the *undropped* LTAE attention distribution.
-Only actually observed dates inside the interval are used; no interpolation
-or Fourier reconstruction is performed.
+Structures use the *undropped* LTAE attention distribution: either the legacy
+shortest interval or direct Top-fraction observed points. No interpolation or
+Fourier reconstruction is performed.
 """
 
 from contextlib import contextmanager
+import math
 
 import torch
 import torch.nn.functional as F
@@ -67,22 +68,43 @@ def select_attention_intervals(
         return inside, valid
 
 
-def build_counterfactual_head_embeddings(attention, values, inside):
+def select_attention_top_fraction(attention, positions, top_fraction=0.30):
+    """Select ceil(fraction*T) observed points per head, without any interval."""
+    if (attention.ndim != 3 or positions.shape != (attention.size(0), attention.size(2))
+            or attention.size(2) == 0 or not 0 < top_fraction <= 1):
+        raise ValueError('Expected attention [B,H,T], positions [B,T] and fraction in (0,1]')
+    with torch.no_grad():
+        count = math.ceil(top_fraction*attention.size(2))
+        indices = torch.argsort(attention.detach(), dim=-1, descending=True, stable=True)[..., :count]
+        inside = torch.zeros_like(attention, dtype=torch.bool).scatter_(-1, indices, True)
+        valid = torch.ones(attention.shape[:2], dtype=torch.bool, device=attention.device)
+    return inside, valid
+
+
+def build_counterfactual_head_embeddings(attention, values, inside, intervention='mean', gate=0.5):
     """Produce full and one-head-at-a-time ablated embeddings [B,H+1,C].
 
     Values in a head's selected region are replaced by the *same sample's*
     unweighted mean of the observations outside that region. Attention is
     unchanged and is never renormalized after removing a region. All other
-    heads stay exactly as they were.
+    heads stay exactly as they were. With intervention='gate', only the selected
+    weighted Value sum is multiplied by gate, without a reference mean.
     """
     if attention.shape != values.shape[:-1] or inside.shape != attention.shape:
         raise ValueError("incompatible attention, values and interval shapes")
     batch, heads, _ = attention.shape
-    outside = (~inside).to(values.dtype).unsqueeze(-1)
-    reference = (values * outside).sum(dim=-2) / outside.sum(dim=-2).clamp_min(1)
     original = (attention.unsqueeze(-1) * values).sum(dim=-2)
-    removed = (attention.unsqueeze(-1) * inside.unsqueeze(-1)
-               * (values - reference.unsqueeze(-2))).sum(dim=-2)
+    if intervention == 'mean':
+        outside = (~inside).to(values.dtype).unsqueeze(-1)
+        reference = (values * outside).sum(dim=-2) / outside.sum(dim=-2).clamp_min(1)
+        removed = (attention.unsqueeze(-1) * inside.unsqueeze(-1)
+                   * (values - reference.unsqueeze(-2))).sum(dim=-2)
+    elif intervention == 'gate':
+        if not 0 <= gate <= 1:
+            raise ValueError('gate must be in [0,1]')
+        removed = (1-gate)*(attention.unsqueeze(-1)*inside.unsqueeze(-1)*values).sum(dim=-2)
+    else:
+        raise ValueError(f'Unknown evidence intervention: {intervention}')
     identity = torch.eye(heads, device=values.device, dtype=values.dtype)
     alternatives = (original[:, None] -
                     identity[None, :, :, None] * removed[:, None])

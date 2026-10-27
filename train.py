@@ -558,6 +558,9 @@ if __name__ == '__main__':
     timematch.add_argument("--evidence_mode", default="off",
                            choices=["off", "positive", "positive_rank"])
     timematch.add_argument("--evidence_top_fraction", type=float, default=0.30)
+    timematch.add_argument('--evidence_structure', choices=['interval', 'top30'], default='interval')
+    timematch.add_argument('--evidence_intervention', choices=['mean', 'gate'], default='mean')
+    timematch.add_argument('--evidence_gate', type=float, default=0.5)
     timematch.add_argument("--evidence_coverage", type=float, default=0.75)
     timematch.add_argument("--evidence_min_observations", type=int, default=3)
     timematch.add_argument("--evidence_min_outside", type=int, default=2)

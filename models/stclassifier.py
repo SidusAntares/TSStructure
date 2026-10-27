@@ -11,6 +11,7 @@ from utils.head_evidence import (
     build_counterfactual_head_embeddings,
     frozen_evidence_normalization,
     select_attention_intervals,
+    select_attention_top_fraction,
 )
 
 
@@ -82,6 +83,7 @@ class PseLTae(nn.Module):
     def forward_with_head_evidence(
         self, pixels, mask, positions, extra, top_fraction=0.30,
         coverage=0.75, min_observations=3, min_outside=2,
+        structure='interval', intervention='mean', gate=0.5,
     ):
         """Ordinary logits plus deterministic head-local masked logits.
 
@@ -95,13 +97,18 @@ class PseLTae(nn.Module):
             spatial_feats, positions, return_head_parts=True
         )
         logits = self.decoder(temporal_feats)
-        inside, valid = select_attention_intervals(
-            attention, positions, top_fraction=top_fraction,
-            coverage=coverage, min_observations=min_observations,
-            min_outside=min_outside,
-        )
+        if structure == 'top30':
+            inside, valid = select_attention_top_fraction(attention, positions, top_fraction)
+        elif structure == 'interval':
+            inside, valid = select_attention_intervals(
+                attention, positions, top_fraction=top_fraction,
+                coverage=coverage, min_observations=min_observations,
+                min_outside=min_outside,
+            )
+        else:
+            raise ValueError(f'Unknown evidence structure: {structure}')
         counterfactuals = build_counterfactual_head_embeddings(
-            attention, values, inside
+            attention, values, inside, intervention=intervention, gate=gate,
         )
         batch, cases, channels = counterfactuals.shape
         with frozen_evidence_normalization(

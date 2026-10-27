@@ -88,6 +88,9 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             rank_gap=config.evidence_source_rank_gap,
         )
         evidence_options = dict(
+            structure=getattr(config, 'evidence_structure', 'interval'),
+            intervention=getattr(config, 'evidence_intervention', 'mean'),
+            gate=getattr(config, 'evidence_gate', 0.5),
             top_fraction=config.evidence_top_fraction,
             coverage=config.evidence_coverage,
             min_observations=config.evidence_min_observations,
