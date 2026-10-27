@@ -52,8 +52,8 @@ def validate_source(root, source, seed):
     if protocol.get('source') != source or not protocol.get('closed_set'):
         raise ValueError('Source closed-set protocol mismatch')
     missing = set(CLASSES) - set(protocol['classes'])
-    if missing:
-        raise ValueError(f'Requested diagnostic classes absent from source classifier: {sorted(missing)}')
+    for name in sorted(missing):
+        print(f'SOURCE_DIAGNOSTIC_N/A|path={root}|class={name}|reason=not_in_source_classifier', flush=True)
     checkpoint = root / 'fold_0/model.pt'
     packet = torch.load(checkpoint, map_location='cpu', weights_only=False)
     # Strict loading catches model/class-count/config incompatibilities.
@@ -120,10 +120,9 @@ def _selection(dataset, class_names, seed):
     selected = {}
     for name in CLASSES:
         if name not in class_names:
-            raise ValueError(f'Diagnostic class {name} is not a source classifier output')
+            selected[name] = []
+            continue
         pool = np.flatnonzero(labels == class_names.index(name))
-        if not len(pool):
-            raise ValueError(f'No held-out {name} samples in {dataset.dataset_name}')
         selected[name] = rng.permutation(pool)[:100].tolist()
     return selected
 
@@ -132,13 +131,25 @@ def _selection(dataset, class_names, seed):
 def analyze_domain(model, dataset, selected, config, shift, mean, component, device, output):
     """Per-sample interventions first, then average true-class relative margins."""
     output.mkdir(parents=True, exist_ok=True)
-    means = np.empty((3, 3, 3, 16))
-    errors = np.empty_like(means)
+    means = np.full((3, 3, 3, 16), np.nan)
+    errors = np.full_like(means, np.nan)
     counts = []
     representatives = []
+    availability = {}
     for class_index, name in enumerate(CLASSES):
         all_attention, all_masks, all_scores, all_logits, parcels = [], [], [], [], []
         indices = selected[name]
+        reason = ('not_in_source_classifier' if name not in config['classes']
+                  else 'no_samples_in_uda_test_split' if not indices else '')
+        availability[name] = dict(status='N/A' if reason else 'available',
+                                  reason=reason, count=0 if reason else len(indices))
+        if reason:
+            counts.append(0)
+            representatives.append(None)
+            np.savez_compressed(output / f'{name}.npz', status='N/A', reason=reason,
+                                sample_count=0, contributions=np.empty((3, 3, 0, 16)))
+            print(f'CLASS_N/A|domain={dataset.dataset_name}|class={name}|reason={reason}', flush=True)
+            continue
         representative = None
         for start in range(0, len(indices), 8):
             samples = [_sample(dataset, index, config['seed']) for index in indices[start:start+8]]
@@ -189,6 +200,7 @@ def analyze_domain(model, dataset, selected, config, shift, mean, component, dev
                                    if len(indices) > 1 else 0.)
         counts.append(len(indices))
         np.savez_compressed(output / f'{name}.npz',
+                            status='available', reason='', sample_count=len(indices),
                             parcel_ids=parcels, positions=dates[0],
                             attention=attention_np, structures=masks_np,
                             contributions=scores, original_logits=np.concatenate(all_logits),
@@ -198,7 +210,8 @@ def analyze_domain(model, dataset, selected, config, shift, mean, component, dev
                             observed=representative['observed'])
         representatives.append(representative)
         print(f'CLASS_COMPLETE|domain={dataset.dataset_name}|class={name}|n={len(indices)}', flush=True)
-    return dict(representatives=representatives, means=means, errors=errors, counts=counts)
+    return dict(representatives=representatives, means=means, errors=errors, counts=counts,
+                availability=availability, shift=int(shift))
 
 
 def plot_stage(task, stage, domains, output):
@@ -217,7 +230,13 @@ def plot_stage(task, stage, domains, output):
             fig, axes = plt.subplots(4, 4, figsize=(16, 13), sharex=True, sharey=True)
             for head, axis in enumerate(axes.flat):
                 counts = []
-                for sample, color in zip(results['representatives'], colors):
+                for name, sample, color in zip(CLASSES, results['representatives'], colors):
+                    if sample is None:
+                        reason = results['availability'][name]['reason'].replace('_', ' ')
+                        axis.plot([], [], color=color, marker='x', linestyle='None',
+                                  label=f'{name}: N/A\n{reason}')
+                        counts.append('N/A')
+                        continue
                     mask = sample['masks'][structure_index, head]
                     axis.plot(sample['grid'], sample['curve'], color=color, lw=1.2,
                               label=f"{sample['name']} parcel={sample['parcel']}")
@@ -225,9 +244,15 @@ def plot_stage(task, stage, domains, output):
                                  color=color, edgecolor='black', linewidth=.3, s=22, zorder=3)
                     counts.append(int(mask.sum()))
                 axis.set_title(f'Head {head+1} | selected={counts}', fontsize=9)
+                if not any(results['counts']):
+                    axis.set_xlim(0, 365)
+                    axis.set_yticks([])
+                    axis.text(.5, .5, 'N/A: no supported samples', transform=axis.transAxes,
+                              ha='center', va='center', fontsize=8, color='gray')
                 axis.grid(alpha=.2)
             axes[0, 0].legend(fontsize=6)
-            shift = results['representatives'][0]['shift']
+            shift = results.get('shift', next((sample['shift'] for sample in results['representatives']
+                                               if sample is not None), 0))
             fig.suptitle(f'{task} | epoch {stage} | {domain} | {method} | Student shift={shift}')
             fig.supxlabel('Original observation day')
             fig.supylabel('Fixed epoch-0 Source-Train PSE PC1 (Fourier display only)')
@@ -241,15 +266,27 @@ def plot_stage(task, stage, domains, output):
                 for class_index, (name, color) in enumerate(zip(CLASSES, colors)):
                     values = results['means'][structure_index, intervention_index, class_index]
                     errors = results['errors'][structure_index, intervention_index, class_index]
-                    axis.bar(np.arange(16)+(class_index-1)*.25, values, .25,
-                             yerr=errors, capsize=2, color=color,
-                             label=f"{name} (n={results['counts'][class_index]})")
+                    info = results.get('availability', {}).get(name, dict(status='available', reason=''))
+                    available = info['status'] == 'available'
+                    if available:
+                        axis.bar(np.arange(16)+(class_index-1)*.25, values, .25,
+                                 yerr=errors, capsize=2, color=color,
+                                 label=f"{name} (n={results['counts'][class_index]})")
+                    else:
+                        axis.plot([], [], color=color, marker='x', linestyle='None',
+                                  label=f"{name}: N/A ({info['reason']})")
                     for head, (value, error) in enumerate(zip(values, errors)):
                         rows.append(dict(task=task, epoch=stage, domain=domain, structure=method,
                                          intervention=intervention, class_name=name, head=head+1,
-                                         mean=float(value), standard_error=float(error),
-                                         count=results['counts'][class_index]))
+                                         mean=float(value) if available else 'N/A',
+                                         standard_error=float(error) if available else 'N/A',
+                                         count=results['counts'][class_index],
+                                         status=info['status'], reason=info['reason']))
                 axis.axhline(0, color='black', lw=.8)
+                if not any(results['counts']):
+                    axis.set_yticks([])
+                    axis.text(.5, .65, 'N/A: no supported diagnostic samples',
+                              transform=axis.transAxes, ha='center', color='gray')
                 axis.set_xticks(np.arange(16))
                 axis.set_xticklabels([f'H{head+1}' for head in range(16)])
                 axis.set_ylabel('Original minus intervened class-vs-best-other logit margin')
@@ -316,6 +353,7 @@ def render(snapshot, output, task):
         student_shifts=packet['student_shifts'], fixed_sample_split='current UDA test split',
         source_pretraining_split_disjointness='not asserted; original source splitting is unchanged',
         sample_counts={domain: result['counts'] for domain, result in domains.items()},
+        class_availability={domain: result['availability'] for domain, result in domains.items()},
         structure_figures=structure_files, contribution_figures=contribution_files,
         attention='pre-dropout, real observations only',
         selection='Top30 intersect shortest 75%-mass/count interval, or Top30',

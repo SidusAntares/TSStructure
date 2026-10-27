@@ -149,6 +149,70 @@ def test_fixed_selection_uses_100_or_all_and_is_reproducible():
     assert selection == _selection(Dataset(), list(CLASSES), 1)
 
 
+def test_missing_classifier_class_and_empty_test_pool_select_no_samples():
+    from analysis.timematch_diagnostic import _selection
+
+    class Dataset:
+        dataset_name = 'synthetic'
+
+        def get_labels(self):
+            return np.array([0, 0])
+
+    selected = _selection(Dataset(), ['spring_barley', 'spring_oat', 'other'], 1)
+    assert len(selected['spring_barley']) == 2
+    assert selected['spring_wheat'] == []
+    assert selected['spring_oat'] == []
+
+
+def test_na_diagnostics_do_not_invoke_model_or_fabricate_zero_contributions(tmp_path):
+    from analysis.timematch_diagnostic import analyze_domain, plot_stage
+    from utils.timematch_diagnostic import CLASSES
+
+    class Dataset:
+        dataset_name = 'synthetic'
+
+    # All requested classes are unsupported: training can still be entirely valid.
+    results = analyze_domain(None, Dataset(), {name: [] for name in CLASSES},
+                             dict(seed=1, classes=['other1', 'other2']), 8,
+                             None, None, torch.device('cpu'), tmp_path / 'data')
+    assert results['counts'] == [0, 0, 0]
+    assert np.isnan(results['means']).all()
+    assert all(info['status'] == 'N/A' for info in results['availability'].values())
+    assert all(info['reason'] == 'not_in_source_classifier' for info in results['availability'].values())
+    packet = np.load(tmp_path / 'data/spring_wheat.npz')
+    assert packet['status'] == 'N/A'
+    assert packet['contributions'].shape == (3, 3, 0, 16)
+    structures, bars = plot_stage('AT1_DK1', 0, {'source': results, 'target': results}, tmp_path / 'figures')
+    assert len(structures) == 6 and len(bars) == 18
+    import csv
+    with (tmp_path / 'figures/contributions.csv').open(newline='') as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows and all(row['mean'] == 'N/A' and row['count'] == '0' for row in rows)
+    assert all(row['status'] == 'N/A' for row in rows)
+
+
+def test_source_validation_allows_missing_requested_class_but_checks_weights(tmp_path, capsys):
+    import json
+    from analysis.timematch_diagnostic import validate_source
+    from models.stclassifier import PseLTae
+    root = tmp_path / 'source'
+    (root / 'fold_0').mkdir(parents=True)
+    config = dict(source='src', target='src', model='pseltae', seed=1, epochs=100,
+                  closed_set=True, combine_spring_and_winter=False, input_dim=10,
+                  with_extra=False, method=None)
+    (root / 'train_config.json').write_text(json.dumps(config))
+    (root / 'closed_set_protocol.json').write_text(json.dumps(dict(
+        source='src', closed_set=True, classes=['spring_barley', 'spring_oat'],
+    )))
+    torch.save({'state_dict': PseLTae(num_classes=2, with_extra=False).state_dict()}, root / 'fold_0/model.pt')
+    validate_source(root, 'src', 1)
+    output = capsys.readouterr().out
+    assert 'SOURCE_VALID|' in output and 'spring_wheat' in output and 'N/A' in output
+    torch.save({'state_dict': {}}, root / 'fold_0/model.pt')
+    with pytest.raises(RuntimeError):
+        validate_source(root, 'src', 1)
+
+
 def test_real_training_hooks_preserve_updates_and_export_epoch20_student(tmp_path, monkeypatch):
     """20 tiny real optimizer steps; fake only server data/GPU and child rendering."""
     from types import SimpleNamespace
@@ -215,24 +279,27 @@ def test_real_training_hooks_preserve_updates_and_export_epoch20_student(tmp_pat
     assert 'CHILD_DIAGNOSTIC_ONLY' in (tmp_path / 'diagnostic.log').read_text()
 
 
-def test_three_stage_render_and_verification_rejects_wrong_final_export(tmp_path, monkeypatch):
+@pytest.mark.parametrize('missing_wheat', [False, True])
+def test_three_stage_render_and_verification_rejects_wrong_final_export(tmp_path, monkeypatch, missing_wheat):
     from types import SimpleNamespace
     import analysis.timematch_diagnostic as diagnostic
     from models.stclassifier import PseLTae
     from utils.timematch_diagnostic import CLASSES, save_student_snapshot
+    class_names = [name for name in CLASSES if not (missing_wheat and name == 'spring_wheat')]
+    class_count = len(class_names)
 
     class Dataset:
         dataset_name = 'synthetic'
-        samples = [(None, i, i//2, None) for i in range(6)]
+        samples = [(None, i, i//2, None) for i in range(class_count*2)]
 
         def get_labels(self):
-            return np.repeat(np.arange(3), 2)
+            return np.repeat(np.arange(class_count), 2)
 
         def get_parcel_indices(self):
-            return np.arange(6)
+            return np.arange(class_count*2)
 
         def __len__(self):
-            return 6
+            return class_count*2
 
         def __getitem__(self, index):
             rng = np.random.default_rng(index)
@@ -242,12 +309,21 @@ def test_three_stage_render_and_verification_rejects_wrong_final_export(tmp_path
                         label=index//2, parcel_index=index)
 
     monkeypatch.setattr(diagnostic, '_dataset', lambda *a: Dataset())
-    config = SimpleNamespace(source='src', target='dst', seed=1, classes=list(CLASSES),
-                             num_classes=3, input_dim=10, with_extra=False, device='cpu')
-    model = PseLTae(num_classes=3, with_extra=False).eval()
+    config = SimpleNamespace(source='src', target='dst', seed=1, classes=class_names,
+                             num_classes=class_count, input_dim=10, with_extra=False, device='cpu')
+    model = PseLTae(num_classes=class_count, with_extra=False).eval()
     for stage in (0, 10, 20):
         snapshot = save_student_snapshot(model, config, {}, tmp_path / 'checkpoints', stage, -8, 8)
         diagnostic.render(snapshot, tmp_path, 'AT1_DK1')
+    import json
+    manifest = json.loads((tmp_path / 'epoch_20/manifest.json').read_text())
+    wheat = manifest['class_availability']['target']['spring_wheat']
+    assert wheat['status'] == ('N/A' if missing_wheat else 'available')
+    assert wheat['count'] == (0 if missing_wheat else 2)
+    if missing_wheat:
+        packet = np.load(tmp_path / 'epoch_20/data/target/spring_wheat.npz')
+        assert packet['status'] == 'N/A'
+        assert packet['contributions'].shape == (3, 3, 0, 16)
     assert len(list(tmp_path.glob('epoch_*/source/*/structures.png'))) == 9
     assert len(list(tmp_path.glob('epoch_*/*/*/contributions_*.png'))) == 54
     training = tmp_path / 'training'
