@@ -81,12 +81,25 @@ class LTAE(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, positions, return_att=False, return_head_parts=False):
+    def forward(self, x, positions, return_att=False, return_head_parts=False,
+                return_attention_scores=False, valid_time=None):
         if self.inconv is not None:
-            x = self.inconv(x)
+            if valid_time is not None and not bool(valid_time.all()):
+                projected = self.inconv(x[valid_time])
+                result = x.new_zeros(*x.shape[:2], projected.size(-1))
+                result[valid_time] = projected
+                x = result
+            else:
+                x = self.inconv(x)
+        if valid_time is not None:
+            positions = torch.where(valid_time, positions, torch.zeros_like(positions))
         enc_output = x + self.positional_enc(positions + self.max_temporal_shift)
 
-        if return_head_parts:
+        if return_attention_scores:
+            pooled, attn, raw_attention, head_values, scores = self.attention_heads(
+                enc_output, return_parts=True, return_scores=True, valid_time=valid_time,
+            )
+        elif return_head_parts:
             pooled, attn, raw_attention, head_values = self.attention_heads(
                 enc_output, return_parts=True
             )
@@ -95,7 +108,9 @@ class LTAE(nn.Module):
 
         enc_output = self.dropout(self.mlp(pooled))
 
-        if return_head_parts:
+        if return_attention_scores:
+            return enc_output, raw_attention, head_values, scores
+        elif return_head_parts:
             return enc_output, raw_attention, head_values
         elif return_att:
             return enc_output, attn
@@ -120,7 +135,7 @@ class MultiHeadAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
 
-    def forward(self, x, return_parts=False):
+    def forward(self, x, return_parts=False, return_scores=False, valid_time=None):
         # Slightly more efficient re-implementation of LTAE
         B, T, C = x.size()
         q = self.query.repeat(B, 1, 1, 1).transpose(1, 2)  # (nh, hs) -> (B, nh, 1, d_k)
@@ -128,11 +143,18 @@ class MultiHeadAttention(nn.Module):
         v = x.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         # self-attend; (B, nh, 1, d_k) x (B, nh, d_k, T) -> (B, nh, 1, T)
         att = (q @ k.transpose(-2, -1)) / self.temperature
+        scores = att.squeeze(-2)
+        if valid_time is not None:
+            if valid_time.shape != (B, T) or not valid_time.any(-1).all():
+                raise ValueError('Every sample requires a valid observed date')
+            att = att.masked_fill(~valid_time[:, None, None, :], float('-inf'))
         att = self.softmax(att)
         raw_attention = att.squeeze(-2)
         att = self.dropout(att)
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, C)
-        if return_parts:
+        if return_scores:
+            return y, att, raw_attention, v, scores
+        elif return_parts:
             return y, att, raw_attention, v
         return y, att

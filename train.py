@@ -36,6 +36,9 @@ from utils.train_utils import (
 
 
 def main(config):
+    if getattr(config, 'm1', False) or getattr(config, 'mode', None) in ('M0', 'M1'):
+        if config.source != config.target or config.method is not None or config.train_on_target or config.model != 'pseltae':
+            raise ValueError('M0/M1 source entry requires source==target, PSE-LTAE, no UDA or target training')
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -107,10 +110,12 @@ def main(config):
                 train_supervised(model, config, writer, splits, val_loader, device, best_model_path)
 
         tested_checkpoint = None
-        if getattr(config, 'method', None) == 'timematch' and getattr(config, 'diagnostic_dir', None):
+        if getattr(config, 'method', None) == 'timematch' and (getattr(config, 'diagnostic_dir', None)
+                                                             or getattr(config, 'strict_final_student', False)):
             from pathlib import Path
             from utils.timematch_diagnostic import load_final_student
-            tested_checkpoint = Path(config.diagnostic_dir) / 'checkpoints/checkpoint_epoch20.pt'
+            tested_checkpoint = (Path(config.diagnostic_dir) / 'checkpoints/checkpoint_epoch20.pt'
+                                 if getattr(config, 'diagnostic_dir', None) else Path(best_model_path))
             packet = load_final_student(tested_checkpoint)
             print(f'Testing completed 20-epoch Student: {tested_checkpoint}')
             state_dict = packet['state_dict']
@@ -119,14 +124,26 @@ def main(config):
             state_dict = torch.load(best_model_path, weights_only=False)['state_dict']
         model.load_state_dict(state_dict)
 
-        test_metrics = evaluation(
-            model,
-            test_loader,
-            device,
-            config.classes,
-            mode='test',
-            progress_bar=getattr(config, "progress_bar", "auto"),
-        )
+        if getattr(config, 'm1', False) or getattr(config, 'mode', None) == 'M0':
+            from utils.m1_training import paired_source_evaluation
+            from utils.soft_top50 import schedule
+            selected = torch.load(best_model_path, map_location='cpu', weights_only=False)
+            test_tau, _ = schedule(selected['epoch'], config.epochs, config.m1_tau_start,
+                                   config.m1_tau_end, config.m1_warmup_epochs)
+            paired = paired_source_evaluation(model, test_loader, config, device, test_tau)
+            test_metrics = paired['full']
+            keep_metrics = {key: value.tolist() if isinstance(value, np.ndarray) else value
+                            for key, value in paired['keep'].items()}
+            keep_metrics.update(tau=test_tau, selected_source_epoch=selected['epoch']+1,
+                                selection_protocol='source validation Full macro_f1', domain=config.source)
+            with open(os.path.join(config.fold_dir, 'soft_top50_keep_source_test_metrics.json'), 'w') as stream:
+                json.dump(keep_metrics, stream, indent=2)
+            print(f"{getattr(config, 'mode', 'M1')} source test Full/Keep F1={test_metrics['macro_f1']:.4f}/{paired['keep']['macro_f1']:.4f}, tau={test_tau:.5g}")
+        else:
+            test_metrics = evaluation(
+                model, test_loader, device, config.classes, mode='test',
+                progress_bar=getattr(config, "progress_bar", "auto"),
+            )
 
         print(f"Test result for {config.experiment_name}: accuracy={test_metrics['accuracy']:.4f}, f1={test_metrics['macro_f1']:.4f}")
         if tested_checkpoint is not None:
@@ -277,6 +294,15 @@ def get_dataset_size(data_root, dataset):
     return len([name for name in os.listdir(os.path.join(dir, 'data')) if name.endswith('.zarr')])
 
 def train_supervised(model, config, writer, splits, val_loader, device, best_model_path):
+    use_m1 = getattr(config, 'm1', False)
+    if use_m1:
+        from utils.m1_training import m1_loss, selection_metrics
+        from utils.soft_top50 import schedule
+        import csv
+        epoch_history = []
+        degenerate_epochs = 0
+        if config.source != config.target or config.train_on_target:
+            raise ValueError('M1 supervised training may only read source labels')
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
@@ -313,6 +339,11 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
     for epoch in range(config.epochs):
         model.train()
         loss_meter = AverageMeter()
+        if use_m1:
+            tau, ramp = schedule(epoch, config.epochs, config.m1_tau_start, config.m1_tau_end,
+                                 config.m1_warmup_epochs)
+            epoch_sums, epoch_count = {}, 0
+            head_spread_sum = None
 
         progress_bar = tqdm(
             enumerate(data_loader),
@@ -327,8 +358,24 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
             targets = sample['label'].cuda(device=device, non_blocking=True)
 
             pixels, mask, positions, extra = to_cuda(sample, device)
-            outputs = model.forward(pixels, mask, positions, extra)
-            loss = criterion(outputs, targets)
+            if use_m1:
+                outputs, kept, info = model.forward_m1(pixels, mask, positions, extra,
+                                                       tau=tau, rho=config.m1_rho)
+                loss, components = m1_loss(outputs, kept, info, targets, criterion,
+                                           config.m1_lambda_keep*ramp, config.m1_lambda_budget,
+                                           config.m1_sharpness)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError('Nonfinite M1 loss')
+                statistics = selection_metrics(info)
+                n = len(targets)
+                epoch_count += n
+                for key, value in {**{key: float(value.detach()) for key, value in components.items()}, **statistics}.items():
+                    epoch_sums[key] = epoch_sums.get(key, 0.) + value*n
+                spread = info['gate_std_per_head'].detach().mean(0).cpu()*n
+                head_spread_sum = spread if head_spread_sum is None else head_spread_sum+spread
+            else:
+                outputs = model.forward(pixels, mask, positions, extra)
+                loss = criterion(outputs, targets)
 
             optimizer.zero_grad()
             loss.backward()
@@ -342,11 +389,51 @@ def train_supervised(model, config, writer, splits, val_loader, device, best_mod
                 progress_bar.set_postfix(lr=f'{lr:.1E}', loss=f"{loss_meter.avg:.3f}")
                 writer.add_scalar("train/loss", loss_meter.val, global_step + step)
                 writer.add_scalar("train/lr", lr, global_step + step)
+                if use_m1:
+                    for key, value in components.items():
+                        writer.add_scalar('m1/loss_'+key, float(value.detach()), global_step+step)
+                    for key, value in statistics.items():
+                        writer.add_scalar('m1/'+key, value, global_step+step)
+                    writer.add_scalar('m1/tau', tau, global_step+step)
+                    writer.add_scalar('m1/lambda_keep_effective', config.m1_lambda_keep*ramp, global_step+step)
+                    if hasattr(writer, 'add_histogram'):
+                        valid = info['valid_time'][:, None].expand_as(info['selection'])
+                        writer.add_histogram('m1/selection', info['selection'].detach()[valid].cpu(), global_step+step)
 
         progress_bar.close()
 
         model.eval()
         best_f1 = validation(best_f1, best_model_path, config, criterion, device, epoch, model, val_loader, writer)
+        if use_m1:
+            if not epoch_count:
+                raise ValueError('M1 source loader has no complete training batch')
+            epoch_record = dict(epoch=epoch+1, tau=tau, lambda_keep_effective=config.m1_lambda_keep*ramp,
+                                source_val_best_f1=best_f1,
+                                **{key: value/epoch_count for key, value in epoch_sums.items()})
+            epoch_record['per_head_std_min'] = float((head_spread_sum/epoch_count).min())
+            epoch_history.append(epoch_record)
+            with open(os.path.join(config.fold_dir, 'm1_training.csv'), 'w', newline='') as stream:
+                csv_writer = csv.DictWriter(stream, fieldnames=list(epoch_record))
+                csv_writer.writeheader()
+                csv_writer.writerows(epoch_history)
+            print('M1_METRICS|' + json.dumps(epoch_record, sort_keys=True))
+            if epoch >= config.m1_warmup_epochs:
+                collapsed = epoch_record['per_head_std_min'] < config.m1_degenerate_tolerance
+                degenerate_epochs = degenerate_epochs+1 if collapsed else 0
+                if degenerate_epochs >= config.m1_degenerate_patience:
+                    raise RuntimeError('M1 selector remained uniform after warm-up; see m1_training.csv')
+
+    if getattr(config, 'mode', None) in ('M0', 'M1') or use_m1:
+        # Additional metadata never changes the selected source weights.
+        torch.save({'state_dict': model.state_dict(), 'completed_epochs': config.epochs,
+                    'role': 'source_supervised', 'source': config.source},
+                   os.path.join(config.fold_dir, 'model_last.pt'))
+        if not os.path.isfile(best_model_path):
+            raise RuntimeError('No source-validation checkpoint was selected')
+        selected = torch.load(best_model_path, map_location='cpu', weights_only=False)
+        selected.update(role='source_supervised', trained_epochs=config.epochs,
+                        selection_domain=config.source, selection_criterion='source validation Full macro_f1')
+        torch.save(selected, best_model_path)
 
 
 def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1, test_ratio=0.2):
@@ -548,7 +635,12 @@ if __name__ == '__main__':
     timematch.add_argument("--max_temporal_shift", type=int, default=60, help='maximum temporal shift to consider')
     timematch.add_argument("--domain_specific_bn", type=bool_flag, default=True, help='whether to use domain specific batch normalization')
     timematch.add_argument("--shift_estimator", type=str, default='AM', choices=['AM', 'IS', 'ACC', 'ENT'])
-    timematch.add_argument('--run_validation', default=True, action='store_true', help='whether to run validation each epoch')
+    timematch.add_argument('--run_validation', default=True, type=bool_flag, nargs='?', const=True,
+                           help='whether to run validation each epoch; bare flag remains supported')
+    timematch.add_argument('--log_target_labels', type=bool_flag, default=True,
+                           help='optional true-target monitoring only; never changes the optimization objective')
+    timematch.add_argument('--strict_final_student', type=bool_flag, default=False,
+                           help='Require and record the completed 20-epoch Student used for final testing')
     timematch.add_argument("--output_student", type=bool_flag, default=True, help='output student or teacher')
     timematch.add_argument('--diagnostic_dir', default=None,
                            help='Optional isolated 0/10/20-epoch Student diagnostic output')

@@ -122,8 +122,10 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
     target_to_source_shift = 0
 
     # To evaluate how well we estimate class distribution
-    target_labels = target_loader_no_aug.dataset.get_labels()
-    actual_class_distr = estimate_class_distribution(target_labels, config.num_classes)
+    log_target_labels = getattr(config, 'log_target_labels', True)
+    if log_target_labels:
+        target_labels = target_loader_no_aug.dataset.get_labels()
+        actual_class_distr = estimate_class_distribution(target_labels, config.num_classes)
 
     # estimate an initial guess for shift using Inception Score
     if config.estimate_shift:
@@ -137,6 +139,7 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             sample_size=config.sample_size,
             shift_estimator=shift_estimator,
             progress_bar=getattr(config, "progress_bar", "auto"),
+            log_target_labels=log_target_labels,
         )
         if target_to_source_shift >= 0:
             min_shift = 0
@@ -167,12 +170,14 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
 
         if config.estimate_shift:
             estimated_class_distr = estimate_class_distribution(all_pseudo_labels, config.num_classes)
-            writer.add_scalar("train/kl_d", kl_divergence(actual_class_distr, estimated_class_distr), epoch)
+            if log_target_labels:
+                writer.add_scalar("train/kl_d", kl_divergence(actual_class_distr, estimated_class_distr), epoch)
             target_to_source_shift = estimate_temporal_shift(teacher,
                     target_loader_no_aug, device, estimated_class_distr,
                     min_shift=min_shift, max_shift=max_shift, sample_size=config.sample_size,
                     shift_estimator=config.shift_estimator,
-                    progress_bar=getattr(config, "progress_bar", "auto"))
+                    progress_bar=getattr(config, "progress_bar", "auto"),
+                    log_target_labels=log_target_labels)
             if epoch == 0:
                 if config.shift_source:
                     source_to_target_shift = -target_to_source_shift
@@ -301,7 +306,8 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             # Metrics
             loss_meter.update(loss.item())
             progress_bar.set_postfix(loss=f"{loss_meter.avg:.3f}")
-            all_labels.extend(sample_target_weak['label'].tolist())
+            if log_target_labels:
+                all_labels.extend(sample_target_weak['label'].tolist())
             all_pseudo_labels.extend(pseudo_targets.tolist())
             all_pseudo_mask.extend(pseudo_mask.tolist())
 
@@ -323,12 +329,14 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         # Evaluate pseudo labels
         all_labels, all_pseudo_labels, all_pseudo_mask = np.array(all_labels), np.array(all_pseudo_labels), np.array(all_pseudo_mask)
         pseudo_count = all_pseudo_mask.sum()
-        conf_pseudo_f1 = sklearn.metrics.f1_score(all_labels[all_pseudo_mask], all_pseudo_labels[all_pseudo_mask], average='macro', zero_division=0)
-        print(f"Teacher pseudo label F1 {conf_pseudo_f1:.3f} (n={pseudo_count})")
-        writer.add_scalar("train/pseudo_f1", conf_pseudo_f1, epoch)
-        writer.add_scalar("train/pseudo_count", pseudo_count, epoch)
-
-        writer.add_scalar("train/pseudo_f1", conf_pseudo_f1, epoch)
+        if log_target_labels:
+            conf_pseudo_f1 = sklearn.metrics.f1_score(all_labels[all_pseudo_mask], all_pseudo_labels[all_pseudo_mask], average='macro', zero_division=0)
+            print(f"Teacher pseudo label F1 {conf_pseudo_f1:.3f} (n={pseudo_count})")
+            writer.add_scalar("train/pseudo_f1", conf_pseudo_f1, epoch)
+            writer.add_scalar("train/pseudo_count", pseudo_count, epoch)
+            writer.add_scalar("train/pseudo_f1", conf_pseudo_f1, epoch)
+        else:
+            print(f'Teacher confident pseudo labels n={pseudo_count} (true-label monitoring disabled)')
         writer.add_scalar("train/pseudo_count", pseudo_count, epoch)
 
         if config.run_validation:
@@ -474,7 +482,10 @@ def estimate_temporal_shift(
     sample_size=100,
     shift_estimator='IS',
     progress_bar='auto',
+    log_target_labels=True,
 ):
+    if shift_estimator == 'ACC' and not log_target_labels:
+        raise ValueError('ACC shift estimation requires true target labels')
     shifts = list(range(min_shift, max_shift + 1))
     model.eval()
     if sample_size is None:
@@ -488,19 +499,19 @@ def estimate_temporal_shift(
         disable=progress_bar_disabled(progress_bar),
     ):
         sample = next(target_iter)
-        labels.extend(sample['label'].tolist())
+        if log_target_labels:
+            labels.extend(sample['label'].tolist())
         pixels, valid_pixels, positions, extra = to_cuda(sample, device)
         spatial_feats = model.spatial_encoder.forward(pixels, valid_pixels, extra)
         shift_logits = torch.stack([model.decoder(model.temporal_encoder(spatial_feats, positions + shift)) for shift in shifts], dim=1)
         shift_probs = F.softmax(shift_logits, dim=2)
         shift_softmaxes.append(shift_probs)
     shift_softmaxes = torch.cat(shift_softmaxes).cpu().numpy()  # (N, n_shifts, n_classes)
-    labels = np.array(labels)
     shift_predictions = np.argmax(shift_softmaxes, axis=2)  # (N, n_shifts)
-
-    # shift_f1_scores = [f1_score(labels, shift_predictions, num_classes) for shift_predictions in all_shift_predictions]
-    shift_acc_scores = [(labels == predictions).mean() for predictions in np.moveaxis(shift_predictions, 0, 1)]
-    print(f"Most accurate shift {shifts[np.argmax(shift_acc_scores)]} with {np.max(shift_acc_scores):.3f}")
+    if log_target_labels:
+        labels = np.array(labels)
+        shift_acc_scores = [(labels == predictions).mean() for predictions in np.moveaxis(shift_predictions, 0, 1)]
+        print(f"Most accurate shift {shifts[np.argmax(shift_acc_scores)]} with {np.max(shift_acc_scores):.3f}")
 
     p_yx = shift_softmaxes # (N, n_shifts, n_classes)
     p_y = shift_softmaxes.mean(axis=0)  # (n_shifts, n_classes)
@@ -512,7 +523,8 @@ def estimate_temporal_shift(
         shift_indices_ranked = np.argsort(inception_score)[::-1]  # max is best
         best_shift_idx = shift_indices_ranked[0]
         best_shift = shifts[best_shift_idx]
-        print(f"Best Inception Score shift {best_shift} with accuracy {shift_acc_scores[best_shift_idx]:.3f}")
+        detail = f" with accuracy {shift_acc_scores[best_shift_idx]:.3f}" if log_target_labels else ''
+        print(f"Best Inception Score shift {best_shift}{detail}")
         return best_shift
 
     elif shift_estimator == 'ENT':
@@ -520,7 +532,8 @@ def estimate_temporal_shift(
         shift_indices_ranked = np.argsort(entropy_score)  # min is best
         best_shift_idx = shift_indices_ranked[0]
         best_shift = shifts[best_shift_idx]
-        print(f"Best Entropy Score shift {best_shift} with accuracy {shift_acc_scores[best_shift_idx]:.3f}")
+        detail = f" with accuracy {shift_acc_scores[best_shift_idx]:.3f}" if log_target_labels else ''
+        print(f"Best Entropy Score shift {best_shift}{detail}")
         return best_shift
 
     elif shift_estimator == 'AM':
@@ -541,7 +554,8 @@ def estimate_temporal_shift(
         shift_indices_ranked = np.argsort(am)  # min is best
         best_shift_idx = shift_indices_ranked[0]
         best_shift = shifts[best_shift_idx]
-        print(f"Best AM Score shift {best_shift} with accuracy {shift_acc_scores[best_shift_idx]:.3f}")
+        detail = f" with accuracy {shift_acc_scores[best_shift_idx]:.3f}" if log_target_labels else ''
+        print(f"Best AM Score shift {best_shift}{detail}")
 
         return best_shift
     elif shift_estimator == 'ACC':  # for upperbound comparison

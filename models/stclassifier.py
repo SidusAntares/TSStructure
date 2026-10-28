@@ -122,6 +122,37 @@ class PseLTae(nn.Module):
             )
         return logits, evidence_logits, valid
 
+    def forward_m1(self, pixels, mask, positions, extra, tau=.5, rho=.5):
+        """One PSE pass, ordinary Full path plus jointly retained Soft Top50 heads.
+
+        No model parameters are added. Only Keep's BatchNorm uses frozen running
+        statistics; its shared weights keep gradients and Dropout stays active.
+        """
+        import torch
+        from utils.soft_top50 import frozen_batchnorm_only, keep_head_embeddings, soft_top50
+        valid_time = mask.bool().any(-1)
+        if not valid_time.any(-1).all():
+            raise ValueError('M1 requires at least one observed date per sample')
+        if bool(valid_time.all()):
+            spatial = self.spatial_encoder(pixels, mask, extra)
+            attention_mask = None  # Preserve the original numerical path exactly.
+        else:
+            selected_extra = None if extra is None else extra[:, None].expand(-1, pixels.size(1), -1)[valid_time]
+            selected = self.spatial_encoder(pixels[valid_time][:, None], mask[valid_time][:, None], selected_extra)
+            spatial = selected.new_zeros(pixels.size(0), pixels.size(1), selected.size(-1))
+            spatial[valid_time] = selected[:, 0]
+            attention_mask = valid_time
+        temporal, attention, values, scores = self.temporal_encoder(
+            spatial, positions, return_attention_scores=True, valid_time=attention_mask)
+        full = self.decoder(temporal)
+        info = soft_top50(scores, valid_time, tau=tau, rho=rho)
+        pooled, normalized, mass = keep_head_embeddings(attention, values, info['selection'])
+        with frozen_batchnorm_only(self.temporal_encoder.mlp, self.decoder):
+            keep_temporal = self.temporal_encoder.dropout(self.temporal_encoder.mlp(pooled))
+            keep = self.decoder(keep_temporal)
+        info.update(attention=attention, keep_attention=normalized, retained_mass=mass, scores=scores)
+        return full, keep, info
+
     def param_ratio(self):
         total = get_ntrainparams(self)
         s = get_ntrainparams(self.spatial_encoder)
