@@ -425,10 +425,7 @@ def get_data_loaders(splits, config, balance_source=True):
             combine_spring_and_winter=config.combine_spring_and_winter)
 
     strong_dataset = deepcopy(target_dataset)
-    student_target_aug = getattr(config, 'student_target_aug', 'strong')
-    if student_target_aug not in ('strong', 'weak'):
-        raise ValueError('student_target_aug must be strong or weak')
-    strong_dataset.transform = weak_aug if student_target_aug == 'weak' else strong_aug
+    strong_dataset.transform = strong_aug
     weak_dataset = deepcopy(target_dataset)
     weak_dataset.transform = weak_aug
     target_dataset_weak_strong = TupleDataset(weak_dataset, strong_dataset)

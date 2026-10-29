@@ -174,34 +174,3 @@ def test_real_shift_estimator_needs_no_target_labels(monkeypatch, capsys, estima
     with pytest.raises(ValueError, match='requires true target labels'):
         timematch.estimate_temporal_shift(model, [], torch.device('cpu'),
                                          shift_estimator='ACC', log_target_labels=False)
-
-
-@pytest.mark.parametrize('augmentation,expected_dates', [('strong', 30), ('weak', 60)])
-def test_target_student_augmentation_preserves_source_and_teacher(monkeypatch, augmentation, expected_dates):
-    import timematch
-    # Match the server's legacy NumPy alias while exercising the real transforms.
-    monkeypatch.setitem(np.__dict__, 'long', np.int64)
-    class SyntheticDataset:
-        def __init__(self, root, name, classes, transform, **kwargs):
-            self.transform = transform
-        def __len__(self):
-            return 4
-        def __getitem__(self, index):
-            sample = dict(pixels=np.ones((60, 10, 64), dtype=np.float32),
-                          positions=np.arange(60), extra=np.zeros(4), label=0)
-            return self.transform(sample)
-    monkeypatch.setattr(timematch, 'PixelSetData', SyntheticDataset)
-    class Loader:
-        def __init__(self, dataset, **kwargs): self.dataset = dataset
-        def __len__(self): return 1
-    monkeypatch.setattr(timematch.data, 'DataLoader', Loader)
-    config = SimpleNamespace(num_pixels=64, seq_length=30, with_shift_aug=False,
-                             data_root='synthetic', source='source', target='target', classes=['a'],
-                             closed_set=True, combine_spring_and_winter=False, num_workers=8,
-                             batch_size=4, student_target_aug=augmentation)
-    source, no_aug, paired = timematch.get_data_loaders(
-        {'source': {'train': [0]}, 'target': {'train': [0]}}, config, balance_source=False)
-    teacher, student = paired.dataset[0]
-    assert source.dataset[0]['pixels'].shape[0] == 30
-    assert teacher['pixels'].shape[0] == no_aug.dataset[0]['pixels'].shape[0] == 60
-    assert student['pixels'].shape[0] == expected_dates
