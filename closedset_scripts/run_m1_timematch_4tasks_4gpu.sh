@@ -8,6 +8,9 @@ MODE="${MODE:-M1}"
 [[ "$MODE" == M0 || "$MODE" == M1 ]] || { echo 'ERROR: MODE must be M0 or M1'; exit 1; }
 EXPERIMENT="${EXPERIMENT:-${MODE,,}_soft_top50_seed1}"
 ROOT="outputs/${EXPERIMENT}"
+SOURCE_ROOT="${SOURCE_ROOT:-$ROOT/source}"
+STUDENT_TARGET_AUG="${STUDENT_TARGET_AUG:-strong}"
+[[ "$STUDENT_TARGET_AUG" == strong || "$STUDENT_TARGET_AUG" == weak ]] || { echo 'ERROR: STUDENT_TARGET_AUG must be strong or weak'; exit 1; }
 LOG_ROOT="logs/${EXPERIMENT}"
 mkdir -p "$LOG_ROOT"
 exec >> "$LOG_ROOT/uda_launcher.log" 2>&1
@@ -35,7 +38,7 @@ for index in "${!tasks[@]}"; do
     [[ -z "${seen_tasks[$task]:-}" && -z "${seen_gpus[$gpu]:-}" ]] || { echo 'ERROR: duplicate task/GPU'; exit 1; }
     seen_tasks[$task]=1; seen_gpus[$gpu]=1
     resolve_task "$task"
-    weights="$ROOT/source/${MODE,,}_source_${tile}_seed1"
+    weights="$SOURCE_ROOT/${MODE,,}_source_${tile}_seed1"
     for file in train_config.json fold_0/model.pt "fold_0/test_metrics_${source//\//_}.json"; do
         [[ -f "$weights/$file" ]] || { echo "ERROR: incomplete source: $weights/$file"; exit 1; }
     done
@@ -61,8 +64,9 @@ run_task() {
         --seed 1 --num_workers 8 --device cuda --num_folds 1 \
         --model pseltae --closed_set true --combine_spring_and_winter false --with_shift_aug false \
         --experiment_name "$task" --output_dir "$ROOT/uda" --tensorboard_log_dir "$ROOT/tensorboard" \
-        timematch --weights "$ROOT/source/${MODE,,}_source_${tile}_seed1" \
+        timematch --weights "$SOURCE_ROOT/${MODE,,}_source_${tile}_seed1" \
         --epochs 20 --steps_per_epoch 500 --output_student true --evidence_mode off \
+        --student_target_aug "$STUDENT_TARGET_AUG" \
         --run_validation false --log_target_labels false --strict_final_student true \
         > "$LOG_ROOT/${task}_uda.log" 2>&1
     "$PYTHON_BIN" - "$ROOT/uda/$task/fold_0" <<'PY'
@@ -81,6 +85,7 @@ if tested.get('sha256') != hashlib.sha256((root / 'model.pt').read_bytes()).hexd
 print(f'FINAL_STUDENT_VERIFIED|path={root}|epochs=20', flush=True)
 PY
 }
+mkdir -p "$ROOT"
 mkdir "$ROOT/uda"
 pids=()
 for index in "${!tasks[@]}"; do

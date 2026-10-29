@@ -44,6 +44,7 @@ def test_m1_adaptation_is_original_20_epoch_without_true_target_monitoring(tmp_p
         assert config['strict_final_student'] and config['output_student']
         assert config['epochs'] == 20 and config['steps_per_epoch'] == 500
         assert config['num_workers'] == 8 and config['seed'] == 1
+        assert config['student_target_aug'] == 'strong'
     control = (tmp_path / 'logs/m1_soft_top50_seed1/uda_launcher.log').read_text()
     assert '- outputs/m1_soft_top50_seed1/uda/AT1_DK1/fold_0' in control
     assert all(f'COMPLETED|task={task}' in control for task in TASKS)
@@ -73,3 +74,23 @@ def test_missing_source_and_worker_failure_return_nonzero(tmp_path):
 
 def test_bash_syntax():
     subprocess.run([bash_bin(), '-n', str(SCRIPT)], check=True)
+
+
+def test_top25_weak_student_reuses_sources_in_separate_experiment(tmp_path):
+    setup_run(tmp_path)
+    original = tmp_path / 'outputs/m1_soft_top50_seed1'
+    top25 = tmp_path / 'outputs/m1_soft_top25_seed1'
+    original.rename(top25)
+    result = launch(tmp_path, EXPERIMENT='m1_soft_top25_weak_student_seed1',
+                    SOURCE_ROOT='outputs/m1_soft_top25_seed1/source', STUDENT_TARGET_AUG='weak')
+    assert result.returncode == 0, result.stderr
+    for task, tile in zip(TASKS, TILES):
+        path = tmp_path / f'logs/m1_soft_top25_weak_student_seed1/{task}_uda.log'
+        config = arguments(path.read_text())
+        assert config['student_target_aug'] == 'weak'
+        assert config['weights'] == f'outputs/m1_soft_top25_seed1/source/m1_source_{tile}_seed1'
+        assert config['output_dir'] == 'outputs/m1_soft_top25_weak_student_seed1/uda'
+        assert config['epochs'] == 20 and config['steps_per_epoch'] == 500
+        assert config['strict_final_student'] and config['evidence_mode'] == 'off'
+    assert not (top25 / 'uda').exists()
+    assert launch(tmp_path, EXPERIMENT='invalid', STUDENT_TARGET_AUG='invalid').returncode == 1

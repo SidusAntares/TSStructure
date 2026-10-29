@@ -641,6 +641,8 @@ if __name__ == '__main__':
                            help='optional true-target monitoring only; never changes the optimization objective')
     timematch.add_argument('--strict_final_student', type=bool_flag, default=False,
                            help='Require and record the completed 20-epoch Student used for final testing')
+    timematch.add_argument('--student_target_aug', choices=['strong', 'weak'], default='strong',
+                           help='Target Student augmentation; source augmentation stays unchanged')
     timematch.add_argument("--output_student", type=bool_flag, default=True, help='output student or teacher')
     timematch.add_argument('--diagnostic_dir', default=None,
                            help='Optional isolated 0/10/20-epoch Student diagnostic output')
