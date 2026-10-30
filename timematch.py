@@ -68,6 +68,11 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
     teacher = deepcopy(student)
     student.to(device)
     teacher.to(device)
+    imputation = getattr(config, '_imputation_runtime', None)
+    if imputation is not None:
+        if not config.domain_specific_bn or getattr(config, 'evidence_mode', 'off') != 'off':
+            raise ValueError('Imputation experiment requires domain-specific BN and evidence_mode=off')
+        imputation.attach(student, teacher)
 
     evidence_mode = getattr(config, "evidence_mode", "off")
     if evidence_mode not in ("off", "positive", "positive_rank"):
@@ -97,7 +102,9 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             min_outside=config.evidence_min_outside,
         )
 
-    def student_forward(pixels, valid_pixels, positions, extra):
+    def student_forward(pixels, valid_pixels, positions, extra, domain='source', applied_shift=0):
+        if imputation is not None:
+            return imputation.classification(pixels, valid_pixels, positions, extra, domain, applied_shift), None, None
         if use_evidence:
             return student.forward_with_head_evidence(
                 pixels, valid_pixels, positions, extra, **evidence_options
@@ -113,7 +120,11 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
 
     steps_per_epoch = config.steps_per_epoch
 
-    optimizer = torch.optim.Adam(student.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    parameters = student.parameters() if imputation is None else [
+        {'params': student.parameters()},
+        {'params': imputation.imputer.parameters(), 'lr': config.imputer_lr,
+         'weight_decay': config.imputer_weight_decay}]
+    optimizer = torch.optim.Adam(parameters, lr=config.lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs * steps_per_epoch, eta_min=0)
 
     source_iter = iter(cycle(source_loader))
@@ -191,6 +202,8 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
 
         student.train()
         teacher.eval()  # don't update BN or use dropout for teacher
+        if imputation is not None:
+            imputation.target_probe_shift = target_to_source_shift
 
         all_labels, all_pseudo_labels, all_pseudo_mask = [], [], []
         for step in progress_bar:
@@ -203,6 +216,8 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             pseudo_conf, pseudo_targets = torch.max(teacher_preds, dim=1)
             pseudo_mask = pseudo_conf > config.pseudo_threshold
             num_pseudo = int(pseudo_mask.sum().item())
+            if imputation is not None:
+                imputation.statistics = {}
 
             # Update student on shifted source data and pseudo-labeled target data
             pixels_s, mask_s, position_s, extra_s = to_cuda(sample_source, device)
@@ -216,13 +231,14 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             if config.domain_specific_bn:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
                 logits_source, evidence_source_logits, source_head_valid = student_forward(
-                    pixels_s, mask_s, position_s + source_to_target_shift, extra_s
+                    pixels_s, mask_s, position_s + source_to_target_shift, extra_s,
+                    applied_shift=source_to_target_shift
                 )
                 if num_pseudo >= 2:  # at least 2 examples required for BN
                     _check_temporal_index_range(student, position_t[pseudo_mask], 0, "target")
                     logits_target, evidence_target_logits, target_head_valid = student_forward(
                         pixels_t[pseudo_mask], mask_t[pseudo_mask],
-                        position_t[pseudo_mask], extra_t[pseudo_mask]
+                        position_t[pseudo_mask], extra_t[pseudo_mask], domain='target'
                     )
             else:
                 _check_temporal_index_range(student, position_s, source_to_target_shift, "source")
@@ -266,6 +282,13 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
             if logits_target is not None:
                 loss_target = criterion(logits_target, pseudo_targets[pseudo_mask])
             loss = loss_source + config.trade_off * loss_target
+            if imputation is not None:
+                recovery_source = imputation.recovery(sample_source, 'source', source_to_target_shift, device)
+                recovery_target = imputation.recovery(sample_target_strong, 'target', 0, device)
+                loss = loss + config.reconstruction_weight*(recovery_source+recovery_target)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError('Nonfinite imputed TimeMatch loss')
+                imputation.record_step(loss_source, loss_target, pseudo_conf, pseudo_mask)
 
             if use_evidence:
                 source_contributions = relative_logit_contributions(
@@ -315,6 +338,11 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
                 writer.add_scalar("train/loss", loss_meter.val, global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                 writer.add_scalar("train/target_updates", len(torch.nonzero(pseudo_mask)), global_step)
+                if imputation is not None:
+                    writer.add_scalar('imputation/source_classification', float(loss_source.detach()), global_step)
+                    writer.add_scalar('imputation/target_classification', float(loss_target), global_step)
+                    for key, value in imputation.statistics.items():
+                        writer.add_scalar('imputation/'+key, value, global_step)
                 if use_evidence:
                     writer.add_scalar("evidence/positive_loss", positive_loss.item(), global_step)
                     writer.add_scalar("evidence/ranking_loss", ranking_loss.item(), global_step)
@@ -338,6 +366,8 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
         else:
             print(f'Teacher confident pseudo labels n={pseudo_count} (true-label monitoring disabled)')
         writer.add_scalar("train/pseudo_count", pseudo_count, epoch)
+        if imputation is not None:
+            imputation.end_epoch(epoch+1, target_to_source_shift)
 
         if config.run_validation:
             if config.output_student:
@@ -352,8 +382,14 @@ def train_timematch(student, config, writer, val_loader, device, best_model_path
 
     # Always export the final model; validation never selects the test weights.
     if config.output_student:
-        torch.save({'state_dict': student.state_dict(), 'role': 'student',
-                    'completed_epochs': config.epochs}, best_model_path)
+        packet = {'state_dict': student.state_dict(), 'role': 'student', 'completed_epochs': config.epochs}
+        if imputation is not None:
+            packet.update(imputer_state_dict=imputation.imputer.state_dict(),
+                          source_to_target_shift=source_to_target_shift,
+                          target_to_source_shift=target_to_source_shift,
+                          imputer_initial_sha256=config.imputer_checkpoint_sha256,
+                          source_checkpoint_sha256=config.source_checkpoint_sha256, variant=config.variant)
+        torch.save(packet, best_model_path)
     else:
         torch.save({'state_dict': teacher.state_dict()}, best_model_path)
 
