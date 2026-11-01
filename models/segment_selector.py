@@ -1,0 +1,137 @@
+"""Shared segment content encoder and head-conditioned binary ReinMax selector.
+
+ReinMax backward adapted from microsoft/ReinMax, reinmax/reinmax.py (tau=1).
+https://github.com/microsoft/ReinMax
+
+MIT License. Copyright (c) Microsoft Corporation.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+import torch
+from torch import nn
+
+
+class _ReinMax(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits):
+        probability = logits.softmax(-1)
+        draw = torch.multinomial(probability.reshape(-1, 2), 1).reshape(*logits.shape[:-1], 1)
+        hard = torch.zeros_like(probability).scatter_(-1, draw, 1.)
+        ctx.save_for_backward(hard, probability)
+        return hard, probability
+
+    @staticmethod
+    def backward(ctx, grad_hard, grad_probability):
+        hard, probability = ctx.saved_tensors
+        if grad_hard is None:
+            grad_hard = torch.zeros_like(probability)
+        if grad_probability is None:
+            grad_probability = torch.zeros_like(probability)
+        shifted = .5 * (probability + hard)  # softmax(logits/tau), tau fixed to 1
+        first = 2 * grad_hard * shifted
+        first = first - shifted * first.sum(-1, keepdim=True)
+        zeroth = (-.5 * grad_hard + grad_probability) * probability
+        zeroth = zeroth - probability * zeroth.sum(-1, keepdim=True)
+        gradient = first + zeroth
+        return gradient - gradient.mean(-1, keepdim=True)
+
+
+class SegmentSelector(nn.Module):
+    """One shared segment Transformer; both variants have identical parameters.
+
+    `heads` is the number of Transformer heads, independent of LTAE head count.
+    Segments use consecutive labels from zero; invalid time steps have label -1.
+    As in upstream INSHAPE ROITransformerSelector, a learned CLS token pools
+    each masked segment without positional embeddings. This implementation
+    adapts input channels to PSE features and adds shared head conditioning.
+    The three conditioning values are mass, T/n * mass, and n/T. Attention
+    mass and enrichment are zero in the content-only `inshape` variant. Both
+    variants receive the same length fraction, so length metadata is controlled.
+    Attention is detached only
+    for this conditioning; segment content retains its gradient to the PSE.
+    """
+    def __init__(self, feature_dim=128, width=64, heads=4, dropout=0.0, layers=1):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.width, self.heads, self.layers = width, heads, layers
+        self.projection = nn.Linear(feature_dim, width)
+        self.cls = nn.Parameter(torch.randn(1, 1, width))
+        layer = nn.TransformerEncoderLayer(width, heads, dim_feedforward=2*width,
+                                          dropout=dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=layers, enable_nested_tensor=False)
+        self.scorer = nn.Sequential(nn.Linear(width+3, width), nn.ReLU(), nn.Linear(width, 1))
+
+    def forward(self, features, attention, segments, variant='attention', deterministic=False):
+        if variant not in ('inshape', 'attention'):
+            raise ValueError('variant must be inshape or attention')
+        if features.ndim != 3 or segments.shape != features.shape[:2]:
+            raise ValueError('Expected features [B,T,C] and segments [B,T]')
+        if attention.ndim != 3 or attention.shape[0] != features.shape[0] or attention.shape[2] != features.shape[1]:
+            raise ValueError('Expected attention [B,H,T]')
+        valid = segments >= 0
+        if not valid.any(-1).all():
+            raise ValueError('Each sequence requires at least one segment')
+        batch, time, _ = features.shape
+        count = segments.max(-1).values + 1
+        maximum = int(count.max())
+        candidates = torch.arange(maximum, device=features.device)
+        membership = (segments[:, None, :] == candidates[None, :, None]) & valid[:, None]
+        lengths = membership.sum(-1)
+        valid_segments = lengths > 0
+        if not torch.equal(valid_segments, candidates[None] < count[:, None]):
+            raise ValueError('Segment labels must be contiguous from zero')
+        # Encode each variable-length segment independently, excluding padded tokens.
+        groups = [features[b, membership[b, k]] for b in range(batch) for k in range(int(count[b]))]
+        padded = nn.utils.rnn.pad_sequence(groups, batch_first=True)
+        sizes = torch.tensor([len(group) for group in groups], device=features.device)
+        pad = torch.arange(padded.size(1), device=features.device)[None] >= sizes[:, None]
+        tokens = torch.cat((self.cls.expand(padded.size(0), -1, -1), self.projection(padded)), 1)
+        pad = torch.cat((torch.zeros_like(pad[:, :1]), pad), 1)
+        content = self.encoder(tokens, src_key_padding_mask=pad)[:, 0]
+        embeddings = features.new_zeros(batch, maximum, content.size(-1))
+        embeddings[valid_segments] = content
+        head_count = attention.size(1)
+        mass = torch.einsum('bht,bkt->bhk', attention.detach(), membership.to(attention.dtype))
+        fraction = lengths.to(features.dtype) / valid.sum(-1, keepdim=True)
+        conditions = torch.stack((mass, mass / fraction[:, None].clamp_min(1e-12),
+                                  fraction[:, None].expand(-1, head_count, -1)), -1)
+        if variant == 'inshape':
+            conditions = torch.stack((torch.zeros_like(mass), torch.zeros_like(mass),
+                                      fraction[:, None].expand(-1, head_count, -1)), -1)
+        inputs = torch.cat((embeddings[:, None].expand(-1, head_count, -1, -1), conditions), -1)
+        logit = self.scorer(inputs).squeeze(-1)
+        logits = torch.stack((torch.zeros_like(logit), logit), -1)
+        if deterministic:
+            probability = logits.softmax(-1)[..., 1]
+            gate = (probability >= .5).to(features.dtype)
+        else:
+            hard, soft = _ReinMax.apply(logits)
+            gate, probability = hard[..., 1], soft[..., 1]
+        probability = probability * valid_segments[:, None]
+        gate = gate * valid_segments[:, None]
+        empty = gate.detach().sum(-1) == 0
+        best = probability.detach().masked_fill(~valid_segments[:, None], -1).argmax(-1)
+        repair = torch.zeros_like(gate).scatter_(-1, best[..., None], 1.)
+        # Constant forward repair, retaining the original ReinMax gradient.
+        gate = gate + repair * empty[..., None]
+        point_mask = torch.einsum('bhk,bkt->bht', gate, membership.to(gate.dtype))
+        return dict(gate=gate, probabilities=probability, point_mask=point_mask,
+                    sparse_loss=probability.sum(-1).mean(), segments=segments,
+                    valid_segments=valid_segments, valid_time=valid,
+                    fallback_rate=empty.float().mean(), repaired=empty,
+                    selected_count=gate.detach().sum(-1), candidate_count=count,
+                    coverage=point_mask.detach().sum(-1)/valid.sum(-1)[:, None])
