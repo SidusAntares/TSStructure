@@ -198,3 +198,64 @@ def test_reinmax_backward_matches_official_tau_one_equations():
     expected = first+zeroth
     expected = expected-expected.mean(-1, keepdim=True)
     assert torch.allclose(logits.grad, expected)
+
+
+@pytest.mark.parametrize('training', [False, True])
+def test_unified_keep_all_matches_original_logits_gradients_and_bn(training):
+    from models.segment_selector import SegmentSelector
+    from utils.segment_structure import structure_forward
+    torch.manual_seed(19)
+    model = _model().train(training)
+    baseline = copy.deepcopy(model)
+    selector = SegmentSelector(feature_dim=8, width=16, heads=4)
+    with torch.no_grad():
+        selector.scorer[-1].weight.zero_()
+        selector.scorer[-1].bias.fill_(10)
+    pixels = torch.randn(4, 12, 3, 5)
+    mask = torch.ones(4, 12, 5)
+    positions = torch.arange(12)[None].expand(4, -1)
+    torch.manual_seed(33)
+    expected = baseline(pixels, mask, positions, None)
+    torch.manual_seed(33)
+    full, keep, info = structure_forward(model, selector, pixels, mask, positions, None,
+        full_loss=False, unified=True, deterministic=True, penalty=.01)
+    assert full is None and info['coverage'].eq(1).all()
+    torch.testing.assert_close(keep, expected, atol=2e-6, rtol=2e-5)
+    for name, buffer in model.named_buffers():
+        torch.testing.assert_close(buffer, dict(baseline.named_buffers())[name], atol=2e-6, rtol=2e-5)
+    expected.square().mean().backward()
+    (keep.square().mean()+.1*info['sparse_loss']).backward()
+    for (name, parameter), (_, reference) in zip(model.named_parameters(), baseline.named_parameters()):
+        if reference.grad is not None:
+            torch.testing.assert_close(parameter.grad, reference.grad, atol=2e-5, rtol=2e-4, msg=name)
+
+
+def test_sparse_loss_updates_selector_without_backbone_gradient():
+    from models.segment_selector import SegmentSelector
+    features = torch.randn(2, 9, 8, requires_grad=True)
+    attention = torch.randn(2, 4, 9, requires_grad=True).softmax(-1)
+    selector = SegmentSelector(feature_dim=8, width=16, heads=4)
+    info = selector(features, attention, torch.arange(9)[None].expand(2, -1)//3)
+    parameters = list(selector.parameters())
+    expected = torch.autograd.grad(info['probabilities'].sum(-1).mean(), parameters, retain_graph=True)
+    actual = torch.autograd.grad(info['sparse_loss'], parameters, retain_graph=True)
+    for reference, restricted in zip(expected, actual):
+        torch.testing.assert_close(restricted, reference)
+    info['sparse_loss'].backward()
+    assert features.grad is None
+    assert selector.scorer[-1].bias.grad.abs().sum() > 0
+
+
+def test_unified_partial_keep_classification_updates_backbone_and_selector():
+    from models.segment_selector import SegmentSelector
+    from utils.segment_structure import structure_forward
+    torch.manual_seed(8)
+    model = _model().train()
+    selector = SegmentSelector(feature_dim=8, width=16, heads=4)
+    _, keep, info = structure_forward(model, selector, torch.randn(4, 18, 3, 5),
+        torch.ones(4, 18, 5), torch.arange(18)[None].expand(4, -1), None,
+        full_loss=False, unified=True, penalty=0, min_size=3)
+    assert (info['coverage'] < 1).any()
+    keep.square().mean().backward()
+    assert selector.scorer[0].weight.grad.abs().sum() > 0
+    assert model.spatial_encoder.mlp1[0].linear.weight.grad.abs().sum() > 0

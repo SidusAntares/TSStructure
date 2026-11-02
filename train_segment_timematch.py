@@ -36,8 +36,8 @@ def build_config(argv=None):
         seq_length=30, num_pixels=64, input_dim=10, num_folds=1, num_blocks=100,
         log_step=10, max_shift_aug=60, sample_size=100, max_temporal_shift=60,
         pelt_min_size=3, selector_width=64, selector_heads=4, selector_layers=1)
-    floats = dict(lr=1e-4, weight_decay=1e-4, selector_lr=1e-4, keep_weight=.5,
-        sparse_weight=.01, pelt_penalty=.1, reinmax_tau=1., selector_dropout=0., focal_loss_gamma=1.,
+    floats = dict(lr=1e-4, weight_decay=1e-4, selector_lr=1e-4, keep_weight=1.,
+        sparse_weight=.01, pelt_penalty=.8, reinmax_tau=1., selector_dropout=0., focal_loss_gamma=1.,
         val_ratio=.1, test_ratio=.2, shift_aug_p=1., pseudo_threshold=.9,
         ema_decay=.9999, trade_off=2.)
     booleans = dict(closed_set=True, sample_pixels_val=True, combine_spring_and_winter=False,
@@ -52,6 +52,7 @@ def build_config(argv=None):
         parser.add_argument('--' + name, type=boolean, default=value)
     parser.add_argument('--shift_estimator', choices=('AM',), default='AM')
     parser.add_argument('--evidence_mode', choices=('off',), default='off')
+    parser.add_argument('--pelt_penalty_mode', choices=('absolute',), default='absolute')
     parser.add_argument('--dry_run', action='store_true')
     cfg = parser.parse_args(argv)
     if cfg.source == cfg.target:
@@ -77,10 +78,11 @@ def build_config(argv=None):
     cfg.method = 'timematch'
     cfg.experiment_name = cfg.experiment_name or Path(cfg.output_dir).name
     cfg.tensorboard_log_dir = cfg.tensorboard_log_dir or str(Path(cfg.output_dir) / 'tensorboard')
-    cfg.structure_protocol = dict(source_full_weight=.5, source_keep_weight=.5,
+    cfg.structure_protocol = dict(source_full_weight=0., source_keep_weight=1.,
+        classification_path='keep_only_unified', sparse_updates='Selector only; no PSE/LTAE/Classifier',
         sparsity='mean per-head expected segment count', target='one Keep pseudo Focal loss',
         teacher='weak original observations, EMA PSE-LTAE classifier; no Teacher selector',
-        segmentation='PELT RBF on normalized content, penalty=0.1*T, minimum 3',
+        segmentation='PELT RBF on feature-zscored content, median-positive bandwidth, absolute penalty=0.8, minimum 3',
         selection='ReinMax tau=1', optimizer='Adam', scheduler='CosineAnnealingLR',
         selector='shared CLS Transformer; length fraction in both variants; attention adds detached mass and enrichment',
         finetune='20 full source epochs, fixed final checkpoint',

@@ -22,6 +22,9 @@ exec >> "$LOG_ROOT/launcher.log" 2>&1
 [[ "$SPARSE_SWEEP" == 0 || "$SPARSE_SWEEP" == 1 ]] || {
     echo 'ERROR: SPARSE_SWEEP must be 0 or 1'; exit 1;
 }
+[[ "${INSHAPE_ONLY:-0}" == 0 || "${INSHAPE_ONLY:-0}" == 1 ]] || {
+    echo 'ERROR: INSHAPE_ONLY must be 0 or 1'; exit 1;
+}
 [[ "${SEED:-1}" == 1 && "${NUM_WORKERS:-8}" == 8 ]] || {
     echo 'ERROR: smoke requires seed 1 and workers 8'; exit 1;
 }
@@ -51,6 +54,10 @@ done
 
 base_tasks=(FR1_FR2 FR1_FR2 FR2_DK1 FR2_DK1 DK1_AT1 DK1_AT1 AT1_DK1 AT1_DK1)
 base_variants=(inshape attention inshape attention inshape attention inshape attention)
+if [[ "${INSHAPE_ONLY:-0}" == 1 ]]; then
+    base_tasks=(FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1)
+    base_variants=(inshape inshape inshape inshape)
+fi
 weights=(0.01)
 if [[ "$SPARSE_SWEEP" == 1 ]]; then
     read -r -a weights <<< "${SPARSE_WEIGHTS-0.01 0.03 0.1}"

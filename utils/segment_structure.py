@@ -91,13 +91,19 @@ def segment_pelt(features, valid=None, penalty=.1, min_size=3, penalty_mode='per
 
 def structure_forward(model, selector, pixels, mask, positions, extra, variant='attention',
                       deterministic=False, full_loss=True, penalty=.1, min_size=3,
-                      penalty_mode='per_observation'):
-    """One PSE pass; Full keeps original BN/dropout, Keep freezes only source BN.
+                      penalty_mode='per_observation', unified=False):
+    """One PSE pass, with an opt-in unified Keep-only training path.
+
+    unified=True uses original attention dropout and one normal backend BN/dropout
+    pass. Full is evaluated separately. The legacy two-path behavior remains
+    available for inspecting archived experiments.
 
     Target full_loss=False avoids the unused Full MLP/classifier entirely and
     updates their BN once using Keep. Gates multiply raw attention continuously
     in autograd while remaining exactly binary in the forward pass.
     """
+    if unified and full_loss:
+        raise ValueError('Unified training uses only Keep; evaluate Full separately in eval mode')
     valid = mask.bool().any(-1)
     if not valid.any(-1).all():
         raise ValueError('Each sample requires an observed date')
@@ -126,10 +132,17 @@ def structure_forward(model, selector, pixels, mask, positions, extra, variant='
                 x[valid] = projected
         safe_positions = torch.where(valid, positions, torch.zeros_like(positions))
         x = x + encoder.positional_enc(safe_positions + encoder.max_temporal_shift)
-        _, _, attention, values, scores = encoder.attention_heads(x, return_parts=True, return_scores=True, valid_time=attention_mask)
+        _, _, attention, values, scores = encoder.attention_heads(x, return_parts=True,
+            return_scores=True, valid_time=attention_mask, apply_dropout=not unified)
     segments = segment_pelt(features, valid, penalty=penalty, min_size=min_size, penalty_mode=penalty_mode)
     info = selector(features, attention, segments, variant=variant, deterministic=deterministic)
     pooled, normalized, mass = keep_head_embeddings(attention, values, info['point_mask'])
+    if unified:
+        # Use the original attention-dropout and aggregation operations after
+        # mask normalization. Backend BN/dropout runs exactly once in its
+        # normal mode, just as for the unmodified LTAE.
+        dropped = encoder.attention_heads.dropout(normalized.unsqueeze(-2))
+        pooled = (dropped @ values).transpose(1, 2).contiguous().view(pixels.size(0), -1)
     if full_loss:
         with frozen_batchnorm_only(encoder.mlp, model.decoder):
             keep = model.decoder(encoder.dropout(encoder.mlp(pooled)))

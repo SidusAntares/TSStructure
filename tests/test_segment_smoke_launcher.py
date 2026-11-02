@@ -54,7 +54,7 @@ def test_dry_run_is_stdlib_only_and_has_fixed_probe_protocol(tmp_path):
     assert cfg['probe_samples'] == 128 and cfg['health_window'] == cfg['warmup_steps'] == 20
     assert cfg['seed'] == 1 and cfg['num_workers'] == 8 and cfg['batch_size'] == 128
     assert cfg['lr'] == cfg['selector_lr'] == cfg['weight_decay'] == 1e-4
-    assert cfg['focal_loss_gamma'] == 1 and cfg['keep_weight'] == .5 and cfg['sparse_weight'] == .01
+    assert cfg['focal_loss_gamma'] == 1 and cfg['keep_weight'] == 1 and cfg['sparse_weight'] == .01
     assert cfg['evidence_mode'] == 'off' and cfg['structure_protocol']['imputation'] is False
     assert not (tmp_path / 'output').exists()
 
@@ -63,7 +63,7 @@ def test_dry_run_is_stdlib_only_and_has_fixed_probe_protocol(tmp_path):
     ('--probe_every', '0'), ('--probe_samples', '0'), ('--gradient_every', '0'),
     ('--health_window', '0'), ('--warmup_steps', '-1'), ('--num_workers', '4'),
     ('--epochs', '1'), ('--pelt_penalty', '.1'), ('--pelt_penalty_mode', 'scaled'),
-    ('--keep_weight', '1'), ('--sparse_weight', 'nan')])
+    ('--keep_weight', '.5'), ('--sparse_weight', 'nan')])
 def test_protocol_and_probe_limits_are_enforced(tmp_path, flag, value):
     with pytest.raises(SystemExit):
         entry().build_config([*args(tmp_path), flag, value])
@@ -184,7 +184,7 @@ def test_bash_syntax():
 def test_smoke_accepts_approved_sparse_weights_only(tmp_path, weight):
     config = entry().build_config([*args(tmp_path), '--sparse_weight', weight])
     assert config.sparse_weight == float(weight)
-    assert config.pelt_penalty == .8 and config.keep_weight == .5
+    assert config.pelt_penalty == .8 and config.keep_weight == 1
 
 
 @pytest.mark.parametrize('weight', ['0', '-1', '.02', 'inf'])
@@ -237,3 +237,14 @@ def test_retry_sweep_rejects_invalid_or_duplicate_weights(tmp_path, weights):
     setup_run(tmp_path)
     assert run_script(tmp_path, SPARSE_SWEEP='1', SPARSE_WEIGHTS=weights).returncode != 0
     assert not list((tmp_path / 'logs/test_smoke').glob('*_sparse_*.log'))
+
+
+def test_inshape_only_queue_runs_four_source_tasks(tmp_path):
+    setup_run(tmp_path)
+    assert run_script(tmp_path, INSHAPE_ONLY='1').returncode == 0
+    log = (tmp_path/'logs/test_smoke/launcher.log').read_text()
+    assert log.count('TASK_COMPLETE|') == 4
+    assert 'variant=attention' not in log
+    assert 'gpu=0|task=FR1_FR2' in log
+    assert 'gpu=1|task=FR2_DK1' in log
+    assert 'gpu=2|task=DK1_AT1' in log

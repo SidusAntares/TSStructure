@@ -215,7 +215,9 @@ def analyze_job(job, args):
             pixels, mask, dates, extra = _batch(sample, args.device)
             _, keep, info = structure_forward(model, selector, pixels.float(), mask.float(),
                 dates.long()+shift, extra.float(), variant=job['variant'], deterministic=True,
-                full_loss=False, penalty=config.get('pelt_penalty', .1), min_size=config.get('pelt_min_size', 3))
+                full_loss=False, penalty=config.get('pelt_penalty', .1), min_size=config.get('pelt_min_size', 3),
+                penalty_mode=config.get('pelt_penalty_mode', 'per_observation'),
+                unified=config.get('structure_protocol', {}).get('classification_path') == 'keep_only_unified')
             result = {key: info[key][0].detach().cpu().tolist()
                       for key in ('segments', 'gate', 'probabilities', 'point_mask', 'attention')}
             result.update(parcel_id=int(sample['parcel_index']), label=int(sample['label']),

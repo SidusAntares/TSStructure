@@ -17,7 +17,7 @@ def batch():
 
 def cfg(path):
     return SimpleNamespace(device='cpu', steps=3, scheduler_epochs=20, lr=1e-4, selector_lr=1e-4,
-        weight_decay=1e-4, focal_loss_gamma=1., keep_weight=.5, sparse_weight=.01,
+        weight_decay=1e-4, focal_loss_gamma=1., keep_weight=1., sparse_weight=.01,
         pelt_penalty=.8, pelt_penalty_mode='absolute', pelt_min_size=3, variant='attention',
         seed=1, fold_dir=str(path), probe_every=2, gradient_every=2, health_window=2,
         warmup_steps=20, original_source_checkpoint_sha256='original', source='source')
@@ -43,13 +43,16 @@ def test_smoke_updates_jointly_without_exporting_twenty_epoch_checkpoint(tmp_pat
     assert report['scheduler_total_steps'] == 20
     assert report['last_learning_rate'] > 0
     assert report['sparse_weight'] == sparse_weight and packet['sparse_weight'] == sparse_weight
+    assert packet['classification_path'] == 'keep_only_unified'
     import csv
     with (tmp_path/'keep_gradients.csv').open() as stream:
         gradients = list(csv.DictReader(stream))
     assert len(gradients) == 3
     assert all(float(row['sparse_selector_grad_norm']) > 0 for row in gradients)
+    assert all(float(row['sparse_pse_grad_norm']) == 0 for row in gradients)
     assert 'weighted_keep_selector_grad_norm' in gradients[0]
     assert report['final_probe']['all_selected_rate'] >= 0
+    assert 'random_keep_accuracy' in report['final_probe']
     if report['final_probe']['all_selected_rate'] >= .95:
         assert any('retain all segments' in warning for warning in report['warnings'])
 
@@ -121,3 +124,14 @@ def test_zero_classification_gradient_is_explicit_in_balance_report():
     assert report['sparse_to_keep_gradient_ratio'] is None
     assert report['weighted_sparse_selector_grad_norm'] > 0
     assert all(p.grad is None for p in selector.parameters())
+
+
+def test_random_control_matches_selected_segment_counts_and_padding():
+    from utils.segment_smoke import matched_random_point_mask
+    gate = torch.tensor([[[1., 0., 1.], [0., 1., 0.]], [[1., 0., 0.], [1., 0., 0.]]])
+    info = dict(gate=gate, valid_segments=torch.tensor([[True]*3, [True, False, False]]),
+        segments=torch.tensor([[0, 0, 1, 1, 2, 2], [0, 0, 0, -1, -1, -1]]))
+    points, random_gate = matched_random_point_mask(info)
+    assert torch.equal(random_gate.sum(-1), gate.sum(-1))
+    assert points[1, :, 3:].eq(0).all()
+    assert random_gate[1, :, 1:].eq(0).all()

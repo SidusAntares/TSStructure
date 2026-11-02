@@ -135,7 +135,7 @@ class MultiHeadAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
 
-    def forward(self, x, return_parts=False, return_scores=False, valid_time=None):
+    def forward(self, x, return_parts=False, return_scores=False, valid_time=None, apply_dropout=True):
         # Slightly more efficient re-implementation of LTAE
         B, T, C = x.size()
         q = self.query.repeat(B, 1, 1, 1).transpose(1, 2)  # (nh, hs) -> (B, nh, 1, d_k)
@@ -150,7 +150,8 @@ class MultiHeadAttention(nn.Module):
             att = att.masked_fill(~valid_time[:, None, None, :], float('-inf'))
         att = self.softmax(att)
         raw_attention = att.squeeze(-2)
-        att = self.dropout(att)
+        if apply_dropout:
+            att = self.dropout(att)
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, C)
         if return_scores:

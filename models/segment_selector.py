@@ -25,6 +25,24 @@ import torch
 from torch import nn
 
 
+def selector_only_loss(loss, parameters):
+    """Preserve scalar value and exact first-order Selector gradients only.
+
+    The classification graph stays intact, including its path through content
+    to the PSE. Sparse gradients are extracted without accumulating backbone
+    .grad, then attached exclusively to Selector parameters.
+    """
+    if not torch.is_grad_enabled() or not loss.requires_grad:
+        return loss.detach()
+    parameters = [parameter for parameter in parameters if parameter.requires_grad]
+    gradients = torch.autograd.grad(loss, parameters, retain_graph=True, allow_unused=True)
+    restricted = loss.detach()
+    for parameter, gradient in zip(parameters, gradients):
+        if gradient is not None:
+            restricted = restricted + ((parameter-parameter.detach())*gradient.detach()).sum()
+    return restricted
+
+
 class _ReinMax(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits):
@@ -130,7 +148,7 @@ class SegmentSelector(nn.Module):
         gate = gate + repair * empty[..., None]
         point_mask = torch.einsum('bhk,bkt->bht', gate, membership.to(gate.dtype))
         return dict(gate=gate, probabilities=probability, point_mask=point_mask,
-                    sparse_loss=probability.sum(-1).mean(), segments=segments,
+                    sparse_loss=selector_only_loss(probability.sum(-1).mean(), self.parameters()), segments=segments,
                     valid_segments=valid_segments, valid_time=valid,
                     fallback_rate=empty.float().mean(), repaired=empty,
                     selected_count=gate.detach().sum(-1), candidate_count=count,

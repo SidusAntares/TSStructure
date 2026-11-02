@@ -20,8 +20,8 @@ def sample():
 
 def config(tmp_path):
     return SimpleNamespace(device='cpu', epochs=20, lr=1e-4, selector_lr=1e-4,
-        weight_decay=1e-4, focal_loss_gamma=1., keep_weight=.5, sparse_weight=.01,
-        pelt_penalty=.1, pelt_min_size=3, variant='attention', fold_dir=str(tmp_path),
+        weight_decay=1e-4, focal_loss_gamma=1., keep_weight=1., sparse_weight=.01,
+        pelt_penalty=.8, pelt_penalty_mode='absolute', pelt_min_size=3, variant='attention', fold_dir=str(tmp_path),
         original_source_checkpoint_sha256='original_source', source='source', seed=1)
 
 
@@ -34,11 +34,26 @@ def test_source_twenty_epoch_joint_finetune_exports_final_not_best(tmp_path):
     packet = torch.load(tmp_path/'model.pt', weights_only=False)
     assert packet['role'] == 'source_structure' and packet['completed_epochs'] == 20
     assert packet['original_source_checkpoint_sha256'] == 'original_source'
+    assert packet['classification_path'] == 'keep_only_unified'
+    assert 'full' not in rows[0]
     assert any(not torch.equal(v, old_model[k]) for k, v in packet['state_dict'].items())
     assert any(not torch.equal(v, old_selector[k]) for k, v in packet['selector_state_dict'].items())
     assert model.temporal_encoder.positional_enc.weight.requires_grad is False
     torch.testing.assert_close(packet['state_dict']['temporal_encoder.positional_enc.weight'],
                                old_model['temporal_encoder.positional_enc.weight'], rtol=0, atol=0)
+
+
+def test_structure_runtime_source_uses_single_keep_classification(tmp_path):
+    from utils.focal_loss import FocalLoss
+    model, selector = models()
+    runtime = StructureRuntime(config(tmp_path), selector)
+    runtime.attach(model, model)
+    data = sample()
+    logits = runtime.classification(data['pixels'], data['valid_pixels'], data['positions'], data['extra'])
+    criterion = FocalLoss(gamma=1)
+    torch.testing.assert_close(runtime.source_loss(criterion, data['label']), criterion(logits, data['label']))
+    assert runtime.full_source is None
+    assert model.temporal_encoder.mlp[0].norm.num_batches_tracked == 1
 
 
 def test_uda_structure_trains_both_domains_without_target_labels(tmp_path, monkeypatch):

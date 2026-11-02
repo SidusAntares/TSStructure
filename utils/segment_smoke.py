@@ -10,6 +10,7 @@ import torch
 from utils.focal_loss import FocalLoss
 from utils.segment_structure import structure_forward
 from utils.segment_training import sample_to_device, write_history
+from utils.soft_top50 import keep_head_embeddings
 
 
 @contextmanager
@@ -45,12 +46,15 @@ def statistics(info):
     lengths = gate.new_zeros(labels.size(0), gate.size(-1))
     lengths.scatter_add_(1, labels.clamp_min(0), (labels >= 0).to(lengths.dtype))
     actual_lengths = lengths[info['valid_segments']]
+    mean = probability.sum(-1, keepdim=True)/count[:, None, None]
+    spread = (((probability-mean)**2)*valid).sum(-1)/count[:, None]
     return dict(candidate_count=float(count.mean()), candidate_count_min=float(count.min()),
         candidate_count_max=float(count.max()), single_segment_rate=float((count == 1).float().mean()),
         selected_count=float(info['selected_count'].float().mean()),
         coverage=float(info['coverage'].float().mean()), fallback_rate=float(info['fallback_rate']),
         all_selected_rate=float((gate.sum(-1) == count[:, None]).float().mean()),
         mean_gate_probability=float(probability[valid].mean()),
+        mean_probability_std=float(spread.sqrt().mean()),
         expected_empty_rate=float(torch.where(valid, 1-probability, torch.ones_like(probability)).prod(-1).mean()),
         sparse=float(info['sparse_loss'].detach()),
         median_segment_observations=float(actual_lengths.median()))
@@ -59,9 +63,20 @@ def statistics(info):
 def _forward(model, selector, sample, config, deterministic=False):
     pixels, mask, dates, extra = sample_to_device(sample, config.device)
     return structure_forward(model, selector, pixels, mask, dates, extra,
-        variant=config.variant, deterministic=deterministic, full_loss=True,
+        variant=config.variant, deterministic=deterministic, full_loss=False, unified=True,
         penalty=config.pelt_penalty, min_size=config.pelt_min_size,
         penalty_mode=config.pelt_penalty_mode)
+
+
+def matched_random_point_mask(info):
+    """Random segments with exactly the learned count per sample/head (not duration)."""
+    gate = info['gate'].detach()
+    rank = torch.rand_like(gate).masked_fill(~info['valid_segments'][:, None], float('inf')).argsort(-1)
+    chosen = torch.arange(gate.size(-1), device=gate.device)[None, None] < gate.sum(-1, keepdim=True)
+    random_gate = torch.zeros_like(gate).scatter(-1, rank, chosen.to(gate.dtype))
+    labels = info['segments']
+    points = random_gate.gather(-1, labels.clamp_min(0)[:, None].expand(-1, gate.size(1), -1))
+    return points*(labels >= 0)[:, None], random_gate
 
 
 @torch.no_grad()
@@ -70,13 +85,19 @@ def probe_statistics(model, selector, loader, config):
     criterion = FocalLoss(gamma=config.focal_loss_gamma)
     with preserve_rng_and_modes(model, selector, config.seed+12000, config.device):
         for sample in loader:
-            full, keep, info = _forward(model, selector, sample, config, deterministic=True)
+            _, keep, info = _forward(model, selector, sample, config, deterministic=True)
+            full = model(*sample_to_device(sample, config.device))
+            random_mask, _ = matched_random_point_mask(info)
+            pooled, _, _ = keep_head_embeddings(info['attention'], info['values'], random_mask)
+            random_logits = model.decoder(model.temporal_encoder.dropout(model.temporal_encoder.mlp(pooled)))
             n = len(full)
             labels = sample['label'].to(config.device)
             row = dict(statistics(info), full_loss=float(criterion(full, labels)),
                 keep_loss=float(criterion(keep, labels)),
                 full_accuracy=float((full.argmax(-1) == labels).float().mean()),
-                keep_accuracy=float((keep.argmax(-1) == labels).float().mean()))
+                keep_accuracy=float((keep.argmax(-1) == labels).float().mean()),
+                random_keep_loss=float(criterion(random_logits, labels)),
+                random_keep_accuracy=float((random_logits.argmax(-1) == labels).float().mean()))
             minimum = min(minimum, row['candidate_count_min'])
             maximum = max(maximum, row['candidate_count_max'])
             for key, value in row.items():
@@ -171,18 +192,22 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
             sample = next(iterator)
         model.train()
         selector.train()
-        full, keep, info = _forward(model, selector, sample, config)
+        _, keep, info = _forward(model, selector, sample, config)
         labels = sample['label'].to(config.device)
-        full_loss, keep_loss = criterion(full, labels), criterion(keep, labels)
-        loss = ((1-config.keep_weight)*full_loss+config.keep_weight*keep_loss
-                +config.sparse_weight*info['sparse_loss'])
+        keep_loss = criterion(keep, labels)
+        loss = keep_loss+config.sparse_weight*info['sparse_loss']
         if not torch.isfinite(loss):
             raise FloatingPointError('Nonfinite source smoke loss')
         checks = {}
         if step == 1 or step % config.gradient_every == 0 or step == config.steps:
             checks = keep_gradient_check(keep_loss, model, selector)
             checks.update(selector_loss_gradients(keep_loss, info['sparse_loss'], selector,
-                                                  config.keep_weight, config.sparse_weight))
+                                                  1., config.sparse_weight))
+            sparse_pse = torch.autograd.grad(info['sparse_loss'],
+                model.spatial_encoder.mlp1[0].linear.weight, retain_graph=True, allow_unused=True)[0]
+            if sparse_pse is not None:
+                raise RuntimeError('Sparse loss must not have a PSE gradient path')
+            checks['sparse_pse_grad_norm'] = 0.
             gradient_rows.append(dict(step=step, **checks))
             print('SMOKE_GRADIENT|' + json.dumps(dict(step=step, sparse_weight=config.sparse_weight,
                                                       **checks)), flush=True)
@@ -193,7 +218,7 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         scheduler.step()
         row = dict(step=step, variant=config.variant, sparse_weight=config.sparse_weight,
             actual_pelt_penalty=config.pelt_penalty,
-            total_loss=float(loss.detach()), full_loss=float(full_loss.detach()), keep_loss=float(keep_loss.detach()),
+            total_loss=float(loss.detach()), keep_loss=float(keep_loss.detach()),
             learning_rate=optimizer.param_groups[0]['lr'], model_grad_norm=model_grad,
             selector_grad_norm=selector_grad, **statistics(info), **checks)
         rows.append(row)
@@ -226,7 +251,7 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         scheduler_total_steps=horizon, last_learning_rate=optimizer.param_groups[0]['lr'],
         variant=config.variant, pelt_penalty_mode=config.pelt_penalty_mode,
         actual_pelt_penalty=config.pelt_penalty, tail_training_statistics=tail,
-        sparse_weight=config.sparse_weight,
+        sparse_weight=config.sparse_weight, classification_path='keep_only_unified',
         initial_probe=probes[0], final_probe=probes[-1], warnings=warnings,
         probe_split='fixed SourceTrain diagnostic cohort, not validation or test',
         no_uda=True, no_target_labels=True, full_training_not_started=True,
@@ -236,6 +261,7 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
     torch.save(dict(state_dict=model.state_dict(), selector_state_dict=selector.state_dict(),
         role='source_structure_smoke', completed_steps=len(rows), requested_steps=config.steps,
         status=status, variant=config.variant, sparse_weight=config.sparse_weight,
+        classification_path='keep_only_unified',
         original_source_checkpoint_sha256=config.original_source_checkpoint_sha256),
         Path(config.fold_dir)/'smoke_checkpoint.pt')
     print('SMOKE_COMPLETE|' + json.dumps(result), flush=True)

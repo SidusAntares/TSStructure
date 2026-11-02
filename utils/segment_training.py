@@ -59,21 +59,20 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None):
         rows = []
         for sample in loader:
             pixels, mask, dates, extra = sample_to_device(sample, config.device)
-            full, keep, info = structure_forward(model, selector, pixels, mask, dates, extra,
-                variant=config.variant, full_loss=True, penalty=config.pelt_penalty,
-                min_size=config.pelt_min_size)
+            _, keep, info = structure_forward(model, selector, pixels, mask, dates, extra,
+                variant=config.variant, full_loss=False, unified=True, penalty=config.pelt_penalty,
+                min_size=config.pelt_min_size, penalty_mode=config.pelt_penalty_mode)
             labels = sample['label'].to(config.device)
-            full_loss, keep_loss = criterion(full, labels), criterion(keep, labels)
-            loss = ((1-config.keep_weight)*full_loss + config.keep_weight*keep_loss
-                    + config.sparse_weight*info['sparse_loss'])
+            keep_loss = criterion(keep, labels)
+            loss = keep_loss+config.sparse_weight*info['sparse_loss']
             if not torch.isfinite(loss):
                 raise FloatingPointError('Nonfinite source structure loss')
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             scheduler.step()
-            rows.append(dict(total=float(loss.detach()), full=float(full_loss.detach()),
-                keep=float(keep_loss.detach()), sparse=float(info['sparse_loss'].detach()),
+            rows.append(dict(total=float(loss.detach()), keep=float(keep_loss.detach()),
+                sparse=float(info['sparse_loss'].detach()),
                 **structure_statistics(info)))
         record = dict(epoch=epoch+1, variant=config.variant,
                       **{key: sum(row[key] for row in rows)/len(rows) for key in rows[0]})
@@ -86,6 +85,7 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None):
                     writer.add_scalar('structure_finetune/'+key, value, epoch+1)
     torch.save(dict(state_dict=model.state_dict(), selector_state_dict=selector.state_dict(),
                     role='source_structure', completed_epochs=config.epochs, variant=config.variant,
+                    classification_path='keep_only_unified',
                     source=config.source, original_source_checkpoint_sha256=config.original_source_checkpoint_sha256),
                Path(config.fold_dir)/'model.pt')
     return history
@@ -106,20 +106,21 @@ class StructureRuntime:
         self.statistics = {}
 
     def classification(self, pixels, mask, positions, extra, domain='source', applied_shift=0):
-        full, keep, info = structure_forward(self.student, self.selector, pixels, mask, positions, extra,
-            variant=self.config.variant, full_loss=domain == 'source',
-            penalty=self.config.pelt_penalty, min_size=self.config.pelt_min_size)
+        _, keep, info = structure_forward(self.student, self.selector, pixels, mask, positions, extra,
+            variant=self.config.variant, full_loss=False, unified=True,
+            penalty=self.config.pelt_penalty, min_size=self.config.pelt_min_size,
+            penalty_mode=self.config.pelt_penalty_mode)
         self.statistics.update({domain+'/'+key: value for key, value in structure_statistics(info).items()})
         if domain == 'source':
-            self.full_source, self.keep_source, self.source_info = full, keep, info
-            return full
-        self.target_info = info
+            self.keep_source, self.source_info = keep, info
+        else:
+            self.target_info = info
         return keep
 
     def source_loss(self, criterion, labels):
-        full, keep = criterion(self.full_source, labels), criterion(self.keep_source, labels)
-        self.statistics.update(source_full=float(full.detach()), source_keep=float(keep.detach()))
-        return (1-self.config.keep_weight)*full+self.config.keep_weight*keep
+        keep = criterion(self.keep_source, labels)
+        self.statistics.update(source_keep=float(keep.detach()))
+        return keep
 
     def sparse_loss(self):
         loss = self.source_info['sparse_loss']
@@ -216,6 +217,7 @@ def run_structure_uda(config):
     initial_path = Path(config.structure_checkpoint)
     initial = torch.load(initial_path, map_location=config.device, weights_only=False)
     if (initial.get('role') != 'source_structure' or initial.get('completed_epochs') != 20
+        or initial.get('classification_path') != 'keep_only_unified'
         or initial.get('variant') != config.variant or initial.get('source') != config.source
         or initial.get('original_source_checkpoint_sha256') != config.original_source_checkpoint_sha256):
         raise ValueError('UDA requires this variant\'s epoch20 structure checkpoint from the exact original Source')
@@ -270,7 +272,8 @@ def evaluate_structure(model, selector, loader, config, domain, shift):
         pixels, mask, dates, extra = sample_to_device(sample, config.device)
         full, keep, info = structure_forward(model, selector, pixels, mask, dates+shift, extra,
             variant=config.variant, deterministic=True, full_loss=True,
-            penalty=config.pelt_penalty, min_size=config.pelt_min_size)
+            penalty=config.pelt_penalty, min_size=config.pelt_min_size,
+            penalty_mode=config.pelt_penalty_mode)
         full_rows.append(full.cpu())
         keep_rows.append(keep.cpu())
         labels.extend(sample['label'].tolist())

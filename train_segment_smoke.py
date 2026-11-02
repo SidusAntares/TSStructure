@@ -34,7 +34,9 @@ def build_config(argv=None):
     cfg.mode = cfg.stage = 'smoke'
     cfg.scheduler_epochs = 20
     cfg.fold_dir = str(Path(cfg.output_dir) / 'fold_0')
-    cfg.structure_protocol = dict(source_full_weight=.5, source_keep_weight=.5,
+    cfg.keep_weight = 1.
+    cfg.structure_protocol = dict(source_full_weight=0., source_keep_weight=1.,
+        classification_path='keep_only_unified', sparse_updates='Selector only; no PSE/LTAE/Classifier',
         sparsity='mean per-head expected segment count',
         sparse_weight=cfg.sparse_weight,
         segmentation='PELT RBF on feature-zscored content, median-positive bandwidth with gamma multiplier 1, absolute penalty=0.8, minimum 3',
