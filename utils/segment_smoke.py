@@ -11,6 +11,7 @@ from utils.focal_loss import FocalLoss
 from utils.segment_structure import structure_forward
 from utils.segment_training import sample_to_device, write_history
 from utils.soft_top50 import keep_head_embeddings
+from utils.segment_ranking import batch_ranking_diagnostic, ranking_summary
 
 
 @contextmanager
@@ -80,8 +81,9 @@ def matched_random_point_mask(info):
 
 
 @torch.no_grad()
-def probe_statistics(model, selector, loader, config):
+def probe_statistics(model, selector, loader, config, ranking=False, checkpoint_step=0):
     sums, samples, minimum, maximum = {}, 0, float('inf'), 0
+    ranking_rows, deletion_rows = [], []
     criterion = FocalLoss(gamma=config.focal_loss_gamma)
     with preserve_rng_and_modes(model, selector, config.seed+12000, config.device):
         for sample in loader:
@@ -92,6 +94,18 @@ def probe_statistics(model, selector, loader, config):
             random_logits = model.decoder(model.temporal_encoder.dropout(model.temporal_encoder.mlp(pooled)))
             n = len(full)
             labels = sample['label'].to(config.device)
+            if ranking:
+                ranked, deleted = batch_ranking_diagnostic(model, info, labels, config.focal_loss_gamma)
+                classes = labels.tolist()
+                parcels = sample['parcel_index'].tolist() if 'parcel_index' in sample else None
+                for record in ranked+deleted:
+                    local_index = record['probe_index']
+                    record['probe_index'] += samples
+                    record['class_id'] = classes[local_index]
+                    if parcels is not None:
+                        record['parcel_index'] = parcels[local_index]
+                ranking_rows.extend(ranked)
+                deletion_rows.extend(deleted)
             row = dict(statistics(info), full_loss=float(criterion(full, labels)),
                 keep_loss=float(criterion(keep, labels)),
                 full_accuracy=float((full.argmax(-1) == labels).float().mean()),
@@ -107,6 +121,14 @@ def probe_statistics(model, selector, loader, config):
         raise ValueError('Empty fixed SourceTrain probe cohort')
     result = {key: value/samples for key, value in sums.items()}
     result.update(candidate_count_min=minimum, candidate_count_max=maximum)
+    if ranking:
+        result.update(ranking_summary(ranking_rows))
+        result['ranking_unidentifiable_samples'] = samples-result['ranking_identifiable_samples']
+        directory = Path(config.fold_dir)/'ranking'
+        directory.mkdir(exist_ok=True)
+        for name, rows in [('budgets', ranking_rows), ('deletions', deletion_rows)]:
+            if rows:
+                write_history(directory/f'step_{checkpoint_step:06d}_{name}.csv', rows)
     return result
 
 
@@ -171,7 +193,12 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
     if not len(loader):
         raise ValueError('No complete source training batches')
     horizon = config.scheduler_epochs*len(loader)
-    if config.steps >= horizon:
+    smoke_epochs = getattr(config, 'smoke_epochs', None)
+    if smoke_epochs not in (None, 5):
+        raise ValueError('Epoch smoke budget must be exactly 5')
+    total_steps = smoke_epochs*len(loader) if smoke_epochs else config.steps
+    probe_interval = len(loader) if smoke_epochs else config.probe_every
+    if not isinstance(total_steps, int) or total_steps < 1 or total_steps >= horizon:
         raise ValueError('Smoke must stop before the full 20-epoch schedule; reduce --steps')
     optimizer = torch.optim.Adam([{'params': model.parameters()},
         {'params': selector.parameters(), 'lr': config.selector_lr}],
@@ -180,11 +207,12 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
     criterion = FocalLoss(gamma=config.focal_loss_gamma)
     rows, probes, gradient_rows = [], [], []
     status = 'completed'
-    initial = dict(step=0, **probe_statistics(model, selector, probe_loader, config))
+    initial = dict(step=0, source_epoch=0.,
+        **probe_statistics(model, selector, probe_loader, config, ranking=True, checkpoint_step=0))
     probes.append(initial)
     print('SMOKE_PROBE|' + json.dumps(initial), flush=True)
     iterator = iter(loader)
-    for step in range(1, config.steps+1):
+    for step in range(1, total_steps+1):
         try:
             sample = next(iterator)
         except StopIteration:
@@ -199,7 +227,7 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         if not torch.isfinite(loss):
             raise FloatingPointError('Nonfinite source smoke loss')
         checks = {}
-        if step == 1 or step % config.gradient_every == 0 or step == config.steps:
+        if step == 1 or step % config.gradient_every == 0 or step == total_steps:
             checks = keep_gradient_check(keep_loss, model, selector)
             checks.update(selector_loss_gradients(keep_loss, info['sparse_loss'], selector,
                                                   1., config.sparse_weight))
@@ -216,18 +244,19 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         model_grad, selector_grad = _norm(model.parameters()), _norm(selector.parameters())
         optimizer.step()
         scheduler.step()
-        row = dict(step=step, variant=config.variant, sparse_weight=config.sparse_weight,
+        row = dict(step=step, source_epoch=step/len(loader), variant=config.variant, sparse_weight=config.sparse_weight,
             actual_pelt_penalty=config.pelt_penalty,
             total_loss=float(loss.detach()), keep_loss=float(keep_loss.detach()),
             learning_rate=optimizer.param_groups[0]['lr'], model_grad_norm=model_grad,
             selector_grad_norm=selector_grad, **statistics(info), **checks)
         rows.append(row)
         write_history(Path(config.fold_dir)/'steps.csv', rows)
-        if step == 1 or step % 10 == 0 or step == config.steps:
+        if step == 1 or step % 10 == 0 or step == total_steps:
             print('SMOKE_STEP|' + json.dumps(row), flush=True)
         failed = inspect_health(rows, config)
-        if step % config.probe_every == 0 or step == config.steps or failed:
-            record = dict(step=step, **probe_statistics(model, selector, probe_loader, config))
+        if step % probe_interval == 0 or step == total_steps or failed:
+            record = dict(step=step, source_epoch=step/len(loader),
+                **probe_statistics(model, selector, probe_loader, config, ranking=True, checkpoint_step=step))
             probes.append(record)
             print('SMOKE_PROBE|' + json.dumps(record), flush=True)
         if failed:
@@ -247,7 +276,9 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         warnings.append('No nonzero isolated Keep gradient observed on selector scorer')
     if probes[-1]['all_selected_rate'] >= .95:
         warnings.append('At least 95% of deterministic probe head/sample gates retain all segments')
-    result = dict(status=status, completed_steps=len(rows), requested_steps=config.steps,
+    result = dict(status=status, completed_steps=len(rows), requested_steps=total_steps,
+        requested_smoke_epochs=smoke_epochs, completed_source_epochs=len(rows)/len(loader),
+        steps_per_source_epoch=len(loader),
         scheduler_total_steps=horizon, last_learning_rate=optimizer.param_groups[0]['lr'],
         variant=config.variant, pelt_penalty_mode=config.pelt_penalty_mode,
         actual_pelt_penalty=config.pelt_penalty, tail_training_statistics=tail,
@@ -259,7 +290,8 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
     with (Path(config.fold_dir)/'health_summary.json').open('w') as stream:
         json.dump(result, stream, indent=2)
     torch.save(dict(state_dict=model.state_dict(), selector_state_dict=selector.state_dict(),
-        role='source_structure_smoke', completed_steps=len(rows), requested_steps=config.steps,
+        role='source_structure_smoke', completed_steps=len(rows), requested_steps=total_steps,
+        completed_smoke_epochs=len(rows)/len(loader),
         status=status, variant=config.variant, sparse_weight=config.sparse_weight,
         classification_path='keep_only_unified',
         original_source_checkpoint_sha256=config.original_source_checkpoint_sha256),

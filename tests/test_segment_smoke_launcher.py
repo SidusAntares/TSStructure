@@ -153,7 +153,11 @@ def test_failed_job_propagates_status_while_rest_of_queue_runs(tmp_path):
 def test_free_gpu_takes_next_job_before_slow_initial_jobs_finish(tmp_path):
     setup_run(tmp_path)
     fake = tmp_path / 'fake-python'
-    fake.write_text('#!/usr/bin/env bash\n/bin/echo "$*"\nif [[ "$*" == *"--experiment_name FR1_FR2"* ]]; then sleep 0.4; fi\n')
+    fake.write_text('#!/usr/bin/env bash\n/bin/echo "$*"\n'
+        'if [[ "$*" == *"--experiment_name FR1_FR2"* ]]; then\n'
+        '  for ((i=0; i<500; i++)); do [[ -f next_job_started ]] && exit 0; sleep 0.02; done\n'
+        '  exit 99\n'
+        'elif [[ "$*" == *"--experiment_name FR2_DK1"* && "$*" == *"--variant attention"* ]]; then touch next_job_started; fi\n')
     fake.chmod(0o755)
     assert run_script(tmp_path, PYTHON_BIN='./fake-python').returncode == 0
     lines = (tmp_path / 'logs/test_smoke/launcher.log').read_text().splitlines()
@@ -248,3 +252,27 @@ def test_inshape_only_queue_runs_four_source_tasks(tmp_path):
     assert 'gpu=0|task=FR1_FR2' in log
     assert 'gpu=1|task=FR2_DK1' in log
     assert 'gpu=2|task=DK1_AT1' in log
+
+
+def test_epoch_budget_has_no_step_cap_and_keeps_twenty_epoch_scheduler(tmp_path):
+    config = entry().build_config([*args(tmp_path), '--smoke_epochs', '5'])
+    assert config.smoke_epochs == 5 and config.steps is None
+    assert config.scheduler_epochs == 20
+    with pytest.raises(SystemExit):
+        entry().build_config([*args(tmp_path), '--smoke_epochs', '5', '--steps', '200'])
+
+
+def test_five_epoch_launcher_dispatches_four_tasks_without_steps(tmp_path):
+    import shlex
+    setup_run(tmp_path)
+    assert run_script(tmp_path, INSHAPE_ONLY='1', SMOKE_EPOCHS='5').returncode == 0
+    for task in TASKS:
+        tokens = shlex.split((tmp_path/f'logs/test_smoke/{task}_inshape.log').read_text())
+        config = entry().build_config(tokens[2:])
+        assert config.smoke_epochs == 5 and '--steps' not in tokens
+
+
+@pytest.mark.parametrize('epochs', ['0', '20', 'invalid'])
+def test_epoch_budget_rejects_invalid_values(tmp_path, epochs):
+    setup_run(tmp_path)
+    assert run_script(tmp_path, INSHAPE_ONLY='1', SMOKE_EPOCHS=epochs).returncode != 0

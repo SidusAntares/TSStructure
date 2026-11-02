@@ -57,17 +57,17 @@ def test_smoke_updates_jointly_without_exporting_twenty_epoch_checkpoint(tmp_pat
         assert any('retain all segments' in warning for warning in report['warnings'])
 
 
-def test_probe_restores_rng_and_every_model_mode_and_bn_buffer():
+def test_probe_restores_rng_and_every_model_mode_and_bn_buffer(tmp_path):
     model = PseLTae(num_classes=3, with_extra=False).train()
     selector = SegmentSelector(width=16, heads=2).train()
     selector.encoder.eval()
-    config = cfg('.')
+    config = cfg(tmp_path)
     sample = batch()
     modes = [m.training for root in (model, selector) for m in root.modules()]
     buffers = {name: value.clone() for name, value in model.named_buffers()}
     state = torch.get_rng_state().clone()
-    first = probe_statistics(model, selector, [sample], config)
-    second = probe_statistics(model, selector, [sample], config)
+    first = probe_statistics(model, selector, [sample], config, ranking=True)
+    second = probe_statistics(model, selector, [sample], config, ranking=True)
     assert first == second and torch.equal(state, torch.get_rng_state())
     assert modes == [m.training for root in (model, selector) for m in root.modules()]
     assert all(torch.equal(v, buffers[name]) for name, v in model.named_buffers())
@@ -135,3 +135,26 @@ def test_random_control_matches_selected_segment_counts_and_padding():
     assert torch.equal(random_gate.sum(-1), gate.sum(-1))
     assert points[1, :, 3:].eq(0).all()
     assert random_gate[1, :, 1:].eq(0).all()
+
+
+def test_five_complete_epochs_follow_loader_length_and_probe_each_epoch(tmp_path):
+    config = cfg(tmp_path)
+    config.smoke_epochs, config.steps = 5, None
+    model = PseLTae(num_classes=3, with_extra=False)
+    selector = SegmentSelector(width=16, heads=2)
+    result = train_smoke_steps(model, selector, [batch(), batch()], [batch()], config)
+    assert result['completed_steps'] == 10
+    assert result['completed_source_epochs'] == 5
+    assert result['scheduler_total_steps'] == 40
+    import math
+    assert result['last_learning_rate'] == pytest.approx(config.lr*(1+math.cos(math.pi/4))/2)
+    assert result['steps_per_source_epoch'] == 2
+    import csv
+    with (tmp_path/'probes.csv').open() as stream:
+        probes = list(csv.DictReader(stream))
+    assert [int(row['step']) for row in probes] == [0, 2, 4, 6, 8, 10]
+    assert len(list((tmp_path/'ranking').glob('*_budgets.csv'))) == 6
+    assert 'ranking_half_loss_gain_vs_random' in probes[-1]
+    packet = torch.load(tmp_path/'smoke_checkpoint.pt', weights_only=False)
+    assert packet['completed_smoke_epochs'] == 5 and packet['role'] == 'source_structure_smoke'
+    assert 'completed_epochs' not in packet and not (tmp_path/'model.pt').exists()

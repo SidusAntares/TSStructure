@@ -31,9 +31,17 @@ exec >> "$LOG_ROOT/launcher.log" 2>&1
 [[ "${GPUS:-0 1 2}" == '0 1 2' ]] || {
     echo 'ERROR: this queue requires GPUs 0 1 2'; exit 1;
 }
-[[ "$SMOKE_STEPS" =~ ^[0-9]{1,4}$ ]] && (( 10#$SMOKE_STEPS >= 1 && 10#$SMOKE_STEPS <= 1000 )) || {
-    echo 'ERROR: SMOKE_STEPS must be between 1 and 1000'; exit 1;
-}
+if [[ -v SMOKE_EPOCHS ]]; then
+    [[ "$SMOKE_EPOCHS" == 5 ]] || { echo 'ERROR: SMOKE_EPOCHS must be 5'; exit 1; }
+    budget_args=(--smoke_epochs "$SMOKE_EPOCHS")
+    budget_description='epochs=5'
+else
+    [[ "$SMOKE_STEPS" =~ ^[0-9]{1,4}$ ]] && (( 10#$SMOKE_STEPS >= 1 && 10#$SMOKE_STEPS <= 1000 )) || {
+        echo 'ERROR: SMOKE_STEPS must be between 1 and 1000'; exit 1;
+    }
+    budget_args=(--steps "$SMOKE_STEPS")
+    budget_description="steps=$SMOKE_STEPS"
+fi
 [[ -d "$DATA_ROOT" ]] || { echo "ERROR: missing dataset: $DATA_ROOT"; exit 1; }
 
 resolve_task() {
@@ -107,7 +115,7 @@ run_job() {
     fi
     CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train_segment_smoke.py \
         --source "$source" --target "$target" --variant "$variant" --weights "$original" \
-        --data_root "$DATA_ROOT" --seed 1 --num_workers 8 --steps "$SMOKE_STEPS" \
+        --data_root "$DATA_ROOT" --seed 1 --num_workers 8 "${budget_args[@]}" \
         --sparse_weight "$weight" \
         --experiment_name "$task" --progress_bar off --output_dir "$leaf" \
         > "$log" 2>&1 || return $?
@@ -134,7 +142,7 @@ worker() {
         echo "TASK_START|gpu=$gpu|task=$task|variant=$variant|queue_index=$index|sparse_weight=$weight"
         rmdir "$queue_dir/lock"
         if run_job "$gpu" "$task" "$variant" "$weight"; then
-            echo "TASK_COMPLETE|gpu=$gpu|task=$task|variant=$variant|steps=$SMOKE_STEPS|sparse_weight=$weight"
+            echo "TASK_COMPLETE|gpu=$gpu|task=$task|variant=$variant|$budget_description|sparse_weight=$weight"
         else
             echo "TASK_FAILED|gpu=$gpu|task=$task|variant=$variant|status=$?|sparse_weight=$weight"
             status=1

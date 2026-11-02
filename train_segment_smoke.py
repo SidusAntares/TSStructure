@@ -10,14 +10,19 @@ from train_segment_timematch import build_config as build_training_config, valid
 
 def build_config(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, add_help=False)
-    for name, default in dict(steps=200, probe_every=25, probe_samples=128,
+    budget = parser.add_mutually_exclusive_group()
+    budget.add_argument('--steps', type=int)
+    budget.add_argument('--smoke_epochs', type=int, choices=(5,))
+    for name, default in dict(probe_every=25, probe_samples=128,
                               gradient_every=25, health_window=20, warmup_steps=20).items():
         parser.add_argument('--' + name, type=int, default=default)
     parser.add_argument('--pelt_penalty', type=float, default=.8)
     parser.add_argument('--pelt_penalty_mode', choices=('absolute',), default='absolute')
     parser.add_argument('--sparse_weight', type=float, choices=(.01, .03, .1), default=.01)
     diagnostic, remaining = parser.parse_known_args(argv)
-    if not 1 <= diagnostic.steps <= 1000:
+    if diagnostic.steps is None and diagnostic.smoke_epochs is None:
+        diagnostic.steps = 200
+    if diagnostic.steps is not None and not 1 <= diagnostic.steps <= 1000:
         parser.error('steps must be between 1 and 1000')
     for name in ('probe_every', 'probe_samples', 'gradient_every', 'health_window'):
         if getattr(diagnostic, name) <= 0:
@@ -42,6 +47,8 @@ def build_config(argv=None):
         segmentation='PELT RBF on feature-zscored content, median-positive bandwidth with gamma multiplier 1, absolute penalty=0.8, minimum 3',
         selection='ReinMax tau=1', optimizer='Adam', scheduler='CosineAnnealingLR',
         scheduler_horizon='20 full Source epochs; probe stops at the configured steps',
+        diagnostic_budget='5 complete Source epochs' if cfg.smoke_epochs else 'bounded optimizer steps',
+        ranking='one/half candidates vs 10 random subsets; leave-one-segment-out contributions; diagnostic only',
         selector='shared CLS Transformer; length fraction in both variants; attention adds detached mass and enrichment',
         finetune='bounded Source-only smoke probe', uda=False, imputation=False)
     return cfg
