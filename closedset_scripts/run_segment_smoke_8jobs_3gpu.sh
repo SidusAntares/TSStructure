@@ -52,7 +52,23 @@ done
 base_tasks=(FR1_FR2 FR1_FR2 FR2_DK1 FR2_DK1 DK1_AT1 DK1_AT1 AT1_DK1 AT1_DK1)
 base_variants=(inshape attention inshape attention inshape attention inshape attention)
 weights=(0.01)
-if [[ "$SPARSE_SWEEP" == 1 ]]; then weights=(0.01 0.03 0.1); fi
+if [[ "$SPARSE_SWEEP" == 1 ]]; then
+    read -r -a weights <<< "${SPARSE_WEIGHTS-0.01 0.03 0.1}"
+    (( ${#weights[@]} > 0 )) || { echo 'ERROR: SPARSE_WEIGHTS is empty'; exit 1; }
+    seen_weights=' '
+    for weight in "${weights[@]}"; do
+        case "$weight" in
+            0.01|0.03|0.1) ;;
+            *) echo "ERROR: unsupported sparse weight: $weight"; exit 1 ;;
+        esac
+        [[ "$seen_weights" != *" $weight "* ]] || {
+            echo "ERROR: duplicate sparse weight: $weight"; exit 1;
+        }
+        seen_weights+="$weight "
+    done
+elif [[ -v SPARSE_WEIGHTS ]]; then
+    echo 'ERROR: SPARSE_WEIGHTS requires SPARSE_SWEEP=1'; exit 1
+fi
 job_tasks=(); job_variants=(); job_weights=()
 for weight in "${weights[@]}"; do
     for index in "${!base_tasks[@]}"; do

@@ -219,3 +219,21 @@ def test_failed_sweep_job_does_not_skip_remaining_weights(tmp_path):
     assert run_script(tmp_path, SPARSE_SWEEP='1', PYTHON_BIN='./fake-python').returncode != 0
     log = (tmp_path / 'logs/test_smoke/launcher.log').read_text()
     assert log.count('TASK_COMPLETE|') == 23 and log.count('TASK_FAILED|') == 1
+
+
+def test_retry_sweep_runs_only_missing_sixteen_jobs(tmp_path):
+    setup_run(tmp_path)
+    result = run_script(tmp_path, SPARSE_SWEEP='1', SPARSE_WEIGHTS='0.03 0.1')
+    assert result.returncode == 0, result.stderr
+    log = (tmp_path / 'logs/test_smoke/launcher.log').read_text()
+    assert log.count('TASK_COMPLETE|') == 16
+    assert not list((tmp_path / 'logs/test_smoke').glob('*_sparse_0p01.log'))
+    assert len(list((tmp_path / 'logs/test_smoke').glob('*_sparse_0p03.log'))) == 8
+    assert len(list((tmp_path / 'logs/test_smoke').glob('*_sparse_0p1.log'))) == 8
+
+
+@pytest.mark.parametrize('weights', ['0.02', '0.03 0.03', ' ', '0.1 invalid'])
+def test_retry_sweep_rejects_invalid_or_duplicate_weights(tmp_path, weights):
+    setup_run(tmp_path)
+    assert run_script(tmp_path, SPARSE_SWEEP='1', SPARSE_WEIGHTS=weights).returncode != 0
+    assert not list((tmp_path / 'logs/test_smoke').glob('*_sparse_*.log'))
