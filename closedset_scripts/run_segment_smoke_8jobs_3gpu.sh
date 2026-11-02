@@ -28,9 +28,17 @@ exec >> "$LOG_ROOT/launcher.log" 2>&1
 [[ "${SEED:-1}" == 1 && "${NUM_WORKERS:-8}" == 8 ]] || {
     echo 'ERROR: smoke requires seed 1 and workers 8'; exit 1;
 }
-[[ "${GPUS:-0 1 2}" == '0 1 2' ]] || {
-    echo 'ERROR: this queue requires GPUs 0 1 2'; exit 1;
+read -r -a gpu_ids <<< "${GPUS:-0 1 2}"
+(( ${#gpu_ids[@]} == 3 || ${#gpu_ids[@]} == 4 )) || {
+    echo 'ERROR: this queue requires 3 or 4 GPU IDs'; exit 1;
 }
+seen_gpus=' '
+for gpu in "${gpu_ids[@]}"; do
+    [[ "$gpu" =~ ^(0|[1-9][0-9]*)$ && "$seen_gpus" != *" $gpu "* ]] || {
+        echo "ERROR: invalid or duplicate GPU ID: $gpu"; exit 1;
+    }
+    seen_gpus+="$gpu "
+done
 if [[ -v SMOKE_EPOCHS ]]; then
     [[ "$SMOKE_EPOCHS" == 5 ]] || { echo 'ERROR: SMOKE_EPOCHS must be 5'; exit 1; }
     budget_args=(--smoke_epochs "$SMOKE_EPOCHS")
@@ -122,12 +130,12 @@ run_job() {
 }
 
 worker() {
-    local gpu="$1" index task variant weight status=0
+    local slot="$1" gpu="${gpu_ids[$1]}" index task variant weight status=0
     while true; do
         until mkdir "$queue_dir/lock" 2>/dev/null; do sleep 0.05; done
         read -r index < "$queue_dir/next"
-        # Reserve the first three jobs on their specified GPUs, including fast mocks.
-        if (( index < 3 && index != gpu )); then
+        # Reserve initial jobs by worker slot, independently of physical GPU IDs.
+        if (( index < ${#gpu_ids[@]} && index != slot )); then
             rmdir "$queue_dir/lock"
             sleep 0.05
             continue
@@ -152,8 +160,8 @@ worker() {
 }
 
 pids=()
-for gpu in 0 1 2; do
-    worker "$gpu" &
+for slot in "${!gpu_ids[@]}"; do
+    worker "$slot" &
     pids+=("$!")
 done
 status=0

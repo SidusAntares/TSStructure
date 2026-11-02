@@ -276,3 +276,21 @@ def test_five_epoch_launcher_dispatches_four_tasks_without_steps(tmp_path):
 def test_epoch_budget_rejects_invalid_values(tmp_path, epochs):
     setup_run(tmp_path)
     assert run_script(tmp_path, INSHAPE_ONLY='1', SMOKE_EPOCHS=epochs).returncode != 0
+
+
+@pytest.mark.parametrize('gpus', ['0 1 2 3', '3 1 2 0'])
+def test_four_gpus_start_one_source_task_each(tmp_path, gpus):
+    setup_run(tmp_path)
+    assert run_script(tmp_path, INSHAPE_ONLY='1', SMOKE_EPOCHS='5', GPUS=gpus).returncode == 0
+    lines = (tmp_path/'logs/test_smoke/launcher.log').read_text().splitlines()
+    starts = [line for line in lines if line.startswith('TASK_START|')]
+    assert len(starts) == 4
+    for task, gpu in zip(TASKS, gpus.split()):
+        assert any(f'gpu={gpu}|task={task}|variant=inshape' in line for line in starts)
+    assert sum(line.startswith('TASK_COMPLETE|') for line in lines) == 4
+
+
+@pytest.mark.parametrize('gpus', ['0 1 2 2', '0 1 2 invalid', '0 1 2 3 4', '00 1 2'])
+def test_gpu_queue_rejects_duplicates_invalid_ids_and_counts(tmp_path, gpus):
+    setup_run(tmp_path)
+    assert run_script(tmp_path, INSHAPE_ONLY='1', GPUS=gpus).returncode != 0
