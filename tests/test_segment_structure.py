@@ -72,6 +72,24 @@ def test_variants_control_length_metadata_and_change_only_attention_inputs():
     torch.testing.assert_close(inputs[0][..., -1], inputs[1][..., -1], rtol=0, atol=0)
 
 
+def test_absolute_penalty_matches_diagnostic_without_changing_legacy_default():
+    from utils.pelt_diagnostic import make_cost, pelt_boundaries
+    from utils.segment_structure import segment_pelt
+    for length in (12, 30, 58):
+        features = torch.randn(2, length, 8)
+        got = segment_pelt(features, penalty=.8, penalty_mode='absolute')
+        legacy = segment_pelt(features, penalty=.1)
+        explicit = segment_pelt(features, penalty=.1, penalty_mode='per_observation')
+        assert torch.equal(legacy, explicit)
+        for b in range(2):
+            cost, _ = make_cost(features[b].numpy())
+            bounds = pelt_boundaries(cost, length, .8, 3)
+            expected = torch.empty(length, dtype=torch.long)
+            for segment, (start, end) in enumerate(zip(bounds, bounds[1:])):
+                expected[start:end] = segment
+            assert torch.equal(got[b], expected)
+
+
 def test_structure_full_matches_original_and_keep_gradients():
     from models.segment_selector import SegmentSelector
     from utils.segment_structure import structure_forward

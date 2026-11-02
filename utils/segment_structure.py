@@ -61,14 +61,17 @@ def _pelt_boundaries(x, penalty, min_size):
     return boundaries[::-1]
 
 
-def segment_pelt(features, valid=None, penalty=.1, min_size=3):
+def segment_pelt(features, valid=None, penalty=.1, min_size=3, penalty_mode='per_observation'):
     """Return [B,T] labels, -1 for invalid dates, contiguous observed segments.
 
     Exact PELT with all integer candidate boundaries (jump=1); short sequences
-    below min_size remain one segment. Min_size counts observed dates.
+    below min_size remain one segment. Min_size counts observed dates. The legacy
+    default scales penalty by N; opt-in absolute mode uses a fixed cost penalty.
     """
-    if features.ndim != 3 or penalty < 0 or min_size < 1 or int(min_size) != min_size:
+    if features.ndim != 3 or not np.isfinite(penalty) or penalty < 0 or min_size < 1 or int(min_size) != min_size:
         raise ValueError('Expected features [B,T,C], nonnegative penalty, positive integer min_size')
+    if penalty_mode not in ('per_observation', 'absolute'):
+        raise ValueError('penalty_mode must be per_observation or absolute')
     valid = torch.ones(features.shape[:2], dtype=torch.bool, device=features.device) if valid is None else valid.bool()
     if valid.shape != features.shape[:2] or not valid.any(-1).all():
         raise ValueError('Each sequence requires at least one observed date')
@@ -77,7 +80,8 @@ def segment_pelt(features, valid=None, penalty=.1, min_size=3):
         x = features[batch, valid[batch]].detach().to(device='cpu', dtype=torch.float64).numpy()
         if not np.isfinite(x).all():
             raise ValueError('Observed features must be finite')
-        boundaries = _pelt_boundaries(x, penalty*len(x), int(min_size))
+        actual_penalty = penalty*len(x) if penalty_mode == 'per_observation' else penalty
+        boundaries = _pelt_boundaries(x, actual_penalty, int(min_size))
         sequence = np.empty(len(x), dtype=np.int64)
         for k, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
             sequence[start:end] = k
@@ -86,7 +90,8 @@ def segment_pelt(features, valid=None, penalty=.1, min_size=3):
 
 
 def structure_forward(model, selector, pixels, mask, positions, extra, variant='attention',
-                      deterministic=False, full_loss=True, penalty=.1, min_size=3):
+                      deterministic=False, full_loss=True, penalty=.1, min_size=3,
+                      penalty_mode='per_observation'):
     """One PSE pass; Full keeps original BN/dropout, Keep freezes only source BN.
 
     Target full_loss=False avoids the unused Full MLP/classifier entirely and
@@ -122,7 +127,7 @@ def structure_forward(model, selector, pixels, mask, positions, extra, variant='
         safe_positions = torch.where(valid, positions, torch.zeros_like(positions))
         x = x + encoder.positional_enc(safe_positions + encoder.max_temporal_shift)
         _, _, attention, values, scores = encoder.attention_heads(x, return_parts=True, return_scores=True, valid_time=attention_mask)
-    segments = segment_pelt(features, valid, penalty=penalty, min_size=min_size)
+    segments = segment_pelt(features, valid, penalty=penalty, min_size=min_size, penalty_mode=penalty_mode)
     info = selector(features, attention, segments, variant=variant, deterministic=deterministic)
     pooled, normalized, mass = keep_head_embeddings(attention, values, info['point_mask'])
     if full_loss:
