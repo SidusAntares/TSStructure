@@ -178,3 +178,44 @@ def test_queue_preflight_refuses_unsafe_or_changed_runs(tmp_path, failure):
 
 def test_bash_syntax():
     subprocess.run([bash_bin(), '-n', str(SCRIPT)], check=True)
+
+
+@pytest.mark.parametrize('weight', ['0.01', '0.03', '0.1'])
+def test_smoke_accepts_approved_sparse_weights_only(tmp_path, weight):
+    config = entry().build_config([*args(tmp_path), '--sparse_weight', weight])
+    assert config.sparse_weight == float(weight)
+    assert config.pelt_penalty == .8 and config.keep_weight == .5
+
+
+@pytest.mark.parametrize('weight', ['0', '-1', '.02', 'inf'])
+def test_smoke_rejects_unapproved_sparse_weights(tmp_path, weight):
+    with pytest.raises(SystemExit):
+        entry().build_config([*args(tmp_path), '--sparse_weight', weight])
+
+
+def test_sparse_sweep_maps_all_24_jobs_to_distinct_paths(tmp_path):
+    import shlex
+    setup_run(tmp_path)
+    assert run_script(tmp_path, SPARSE_SWEEP='1').returncode == 0
+    for weight in ('0.01', '0.03', '0.1'):
+        tag = 'sparse_' + weight.replace('.', 'p')
+        for task, tile in zip(TASKS, TILES):
+            for variant in ('inshape', 'attention'):
+                path = tmp_path / f'logs/test_smoke/{task}_{variant}_{tag}.log'
+                config = entry().build_config(shlex.split(path.read_text())[2:])
+                assert config.sparse_weight == float(weight)
+                assert config.weights.endswith(f'closedset_source_{tile}_seed1')
+                assert config.output_dir == f'outputs/test_smoke/{tag}/{variant}/{task}'
+    log = (tmp_path / 'logs/test_smoke/launcher.log').read_text()
+    assert log.count('TASK_COMPLETE|') == 24
+    assert len(list((tmp_path / 'logs/test_smoke').glob('*.log'))) == 25
+
+
+def test_failed_sweep_job_does_not_skip_remaining_weights(tmp_path):
+    setup_run(tmp_path)
+    fake = tmp_path / 'fake-python'
+    fake.write_text('#!/usr/bin/env bash\n/bin/echo "$*"\nif [[ "$*" == *"--experiment_name FR1_FR2"* && "$*" == *"--variant inshape"* && "$*" == *"--sparse_weight 0.03"* ]]; then exit 23; fi\n')
+    fake.chmod(0o755)
+    assert run_script(tmp_path, SPARSE_SWEEP='1', PYTHON_BIN='./fake-python').returncode != 0
+    log = (tmp_path / 'logs/test_smoke/launcher.log').read_text()
+    assert log.count('TASK_COMPLETE|') == 23 and log.count('TASK_FAILED|') == 1

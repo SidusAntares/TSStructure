@@ -5,7 +5,10 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
-EXPERIMENT="${EXPERIMENT:-timematch_segments_smoke_seed1}"
+SPARSE_SWEEP="${SPARSE_SWEEP:-0}"
+default_experiment=timematch_segments_smoke_seed1
+if [[ "$SPARSE_SWEEP" == 1 ]]; then default_experiment=timematch_segments_sparse_sweep_seed1; fi
+EXPERIMENT="${EXPERIMENT:-$default_experiment}"
 OUTPUT_ROOT="outputs/$EXPERIMENT"
 LOG_ROOT="logs/$EXPERIMENT"
 SOURCE_ROOT="outputs/timematch_historical_rerun_seed1/source"
@@ -16,6 +19,9 @@ SMOKE_STEPS="${SMOKE_STEPS:-200}"
 }
 mkdir -p "$LOG_ROOT"
 exec >> "$LOG_ROOT/launcher.log" 2>&1
+[[ "$SPARSE_SWEEP" == 0 || "$SPARSE_SWEEP" == 1 ]] || {
+    echo 'ERROR: SPARSE_SWEEP must be 0 or 1'; exit 1;
+}
 [[ "${SEED:-1}" == 1 && "${NUM_WORKERS:-8}" == 8 ]] || {
     echo 'ERROR: smoke requires seed 1 and workers 8'; exit 1;
 }
@@ -43,8 +49,18 @@ for task in FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1; do
     }
 done
 
-job_tasks=(FR1_FR2 FR1_FR2 FR2_DK1 FR2_DK1 DK1_AT1 DK1_AT1 AT1_DK1 AT1_DK1)
-job_variants=(inshape attention inshape attention inshape attention inshape attention)
+base_tasks=(FR1_FR2 FR1_FR2 FR2_DK1 FR2_DK1 DK1_AT1 DK1_AT1 AT1_DK1 AT1_DK1)
+base_variants=(inshape attention inshape attention inshape attention inshape attention)
+weights=(0.01)
+if [[ "$SPARSE_SWEEP" == 1 ]]; then weights=(0.01 0.03 0.1); fi
+job_tasks=(); job_variants=(); job_weights=()
+for weight in "${weights[@]}"; do
+    for index in "${!base_tasks[@]}"; do
+        job_tasks+=("${base_tasks[$index]}")
+        job_variants+=("${base_variants[$index]}")
+        job_weights+=("$weight")
+    done
+done
 mkdir "$OUTPUT_ROOT"
 queue_dir="$(mktemp -d "$LOG_ROOT/queue.XXXXXX")"
 printf '%s\n' 0 > "$queue_dir/next"
@@ -56,19 +72,26 @@ cleanup_queue() {
 trap cleanup_queue EXIT
 
 run_job() {
-    local gpu="$1" task="$2" variant="$3" source target tile
+    local gpu="$1" task="$2" variant="$3" weight="$4" source target tile
     resolve_task "$task"
     local original="$SOURCE_ROOT/closedset_source_${tile}_seed1"
     local leaf="$OUTPUT_ROOT/$variant/$task"
+    local log="$LOG_ROOT/${task}_${variant}.log"
+    if [[ "$SPARSE_SWEEP" == 1 ]]; then
+        local tag="sparse_${weight/./p}"
+        leaf="$OUTPUT_ROOT/$tag/$variant/$task"
+        log="$LOG_ROOT/${task}_${variant}_${tag}.log"
+    fi
     CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train_segment_smoke.py \
         --source "$source" --target "$target" --variant "$variant" --weights "$original" \
         --data_root "$DATA_ROOT" --seed 1 --num_workers 8 --steps "$SMOKE_STEPS" \
+        --sparse_weight "$weight" \
         --experiment_name "$task" --progress_bar off --output_dir "$leaf" \
-        > "$LOG_ROOT/${task}_${variant}.log" 2>&1 || return $?
+        > "$log" 2>&1 || return $?
 }
 
 worker() {
-    local gpu="$1" index task variant status=0
+    local gpu="$1" index task variant weight status=0
     while true; do
         until mkdir "$queue_dir/lock" 2>/dev/null; do sleep 0.05; done
         read -r index < "$queue_dir/next"
@@ -84,12 +107,13 @@ worker() {
         fi
         printf '%s\n' "$((index + 1))" > "$queue_dir/next"
         task="${job_tasks[$index]}"; variant="${job_variants[$index]}"
-        echo "TASK_START|gpu=$gpu|task=$task|variant=$variant|queue_index=$index"
+        weight="${job_weights[$index]}"
+        echo "TASK_START|gpu=$gpu|task=$task|variant=$variant|queue_index=$index|sparse_weight=$weight"
         rmdir "$queue_dir/lock"
-        if run_job "$gpu" "$task" "$variant"; then
-            echo "TASK_COMPLETE|gpu=$gpu|task=$task|variant=$variant|steps=$SMOKE_STEPS"
+        if run_job "$gpu" "$task" "$variant" "$weight"; then
+            echo "TASK_COMPLETE|gpu=$gpu|task=$task|variant=$variant|steps=$SMOKE_STEPS|sparse_weight=$weight"
         else
-            echo "TASK_FAILED|gpu=$gpu|task=$task|variant=$variant|status=$?"
+            echo "TASK_FAILED|gpu=$gpu|task=$task|variant=$variant|status=$?|sparse_weight=$weight"
             status=1
         fi
     done

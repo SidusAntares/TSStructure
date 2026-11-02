@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import json
+import pytest
 import torch
 
 from models.stclassifier import PseLTae
@@ -22,11 +23,13 @@ def cfg(path):
         warmup_steps=20, original_source_checkpoint_sha256='original', source='source')
 
 
-def test_smoke_updates_jointly_without_exporting_twenty_epoch_checkpoint(tmp_path):
+@pytest.mark.parametrize('sparse_weight', [.01, .03, .1])
+def test_smoke_updates_jointly_without_exporting_twenty_epoch_checkpoint(tmp_path, sparse_weight):
     torch.manual_seed(5)
     model, selector = PseLTae(num_classes=3, with_extra=False), SegmentSelector(width=16, heads=2)
     old = {k: v.clone() for k, v in model.state_dict().items()}
     config = cfg(tmp_path)
+    config.sparse_weight = sparse_weight
     result = train_smoke_steps(model, selector, [batch()], [batch()], config)
     assert result['completed_steps'] == 3 and result['status'] == 'completed'
     packet = torch.load(tmp_path/'smoke_checkpoint.pt', weights_only=False)
@@ -39,6 +42,16 @@ def test_smoke_updates_jointly_without_exporting_twenty_epoch_checkpoint(tmp_pat
     report = json.loads((tmp_path/'health_summary.json').read_text())
     assert report['scheduler_total_steps'] == 20
     assert report['last_learning_rate'] > 0
+    assert report['sparse_weight'] == sparse_weight and packet['sparse_weight'] == sparse_weight
+    import csv
+    with (tmp_path/'keep_gradients.csv').open() as stream:
+        gradients = list(csv.DictReader(stream))
+    assert len(gradients) == 3
+    assert all(float(row['sparse_selector_grad_norm']) > 0 for row in gradients)
+    assert 'weighted_keep_selector_grad_norm' in gradients[0]
+    assert report['final_probe']['all_selected_rate'] >= 0
+    if report['final_probe']['all_selected_rate'] >= .95:
+        assert any('retain all segments' in warning for warning in report['warnings'])
 
 
 def test_probe_restores_rng_and_every_model_mode_and_bn_buffer():
@@ -81,3 +94,30 @@ def test_smoke_consumes_actual_numpy_transform_and_collated_batches(tmp_path):
         SegmentSelector(width=16, heads=2), loader, loader, config)
     assert result['completed_steps'] == 3 and result['no_uda']
     assert result['final_probe']['candidate_count'] >= 1
+
+
+def test_loss_gradient_balance_records_actual_weights_without_accumulation():
+    from utils.segment_smoke import selector_loss_gradients
+    selector = torch.nn.Linear(2, 1, bias=False)
+    parameter = selector.weight
+    keep = parameter.sum()*2
+    sparse = -parameter.sum()*3
+    report = selector_loss_gradients(keep, sparse, selector, .5, .1)
+    assert abs(report['selector_gradient_cosine'] + 1) < 1e-6
+    assert abs(report['sparse_to_keep_gradient_ratio'] - .3) < 1e-6
+    assert abs(report['weighted_keep_selector_grad_norm'] - 2**.5) < 1e-6
+    assert abs(report['weighted_sparse_selector_grad_norm'] - .3*2**.5) < 1e-6
+    assert parameter.grad is None
+    (.5*keep+.1*sparse).backward()
+    torch.testing.assert_close(parameter.grad, torch.full_like(parameter, .7))
+
+
+def test_zero_classification_gradient_is_explicit_in_balance_report():
+    from utils.segment_smoke import selector_loss_gradients
+    selector = torch.nn.Linear(2, 1)
+    keep, sparse = selector.weight.sum()*0, selector.weight.sum()
+    report = selector_loss_gradients(keep, sparse, selector, .5, .03)
+    assert report['selector_gradient_cosine'] is None
+    assert report['sparse_to_keep_gradient_ratio'] is None
+    assert report['weighted_sparse_selector_grad_norm'] > 0
+    assert all(p.grad is None for p in selector.parameters())

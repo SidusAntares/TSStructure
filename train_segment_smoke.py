@@ -15,6 +15,7 @@ def build_config(argv=None):
         parser.add_argument('--' + name, type=int, default=default)
     parser.add_argument('--pelt_penalty', type=float, default=.8)
     parser.add_argument('--pelt_penalty_mode', choices=('absolute',), default='absolute')
+    parser.add_argument('--sparse_weight', type=float, choices=(.01, .03, .1), default=.01)
     diagnostic, remaining = parser.parse_known_args(argv)
     if not 1 <= diagnostic.steps <= 1000:
         parser.error('steps must be between 1 and 1000')
@@ -35,6 +36,7 @@ def build_config(argv=None):
     cfg.fold_dir = str(Path(cfg.output_dir) / 'fold_0')
     cfg.structure_protocol = dict(source_full_weight=.5, source_keep_weight=.5,
         sparsity='mean per-head expected segment count',
+        sparse_weight=cfg.sparse_weight,
         segmentation='PELT RBF on feature-zscored content, median-positive bandwidth with gamma multiplier 1, absolute penalty=0.8, minimum 3',
         selection='ReinMax tau=1', optimizer='Adam', scheduler='CosineAnnealingLR',
         scheduler_horizon='20 full Source epochs; probe stops at the configured steps',

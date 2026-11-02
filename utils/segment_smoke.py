@@ -123,6 +123,29 @@ def keep_gradient_check(loss, model, selector):
     return result
 
 
+def selector_loss_gradients(keep_loss, sparse_loss, selector, keep_weight, sparse_weight):
+    """Compare both losses on all trainable selector parameters without .grad writes."""
+    parameters = [p for p in selector.parameters() if p.requires_grad]
+    vectors = []
+    for loss in (keep_loss, sparse_loss):
+        gradients = torch.autograd.grad(loss, parameters, retain_graph=True, allow_unused=True)
+        vector = torch.cat([(g.detach() if g is not None else torch.zeros_like(p)).reshape(-1)
+                            for p, g in zip(parameters, gradients)])
+        if not torch.isfinite(vector).all():
+            raise FloatingPointError('Nonfinite loss-specific selector gradient')
+        vectors.append(vector)
+    keep, sparse = vectors
+    keep_norm, sparse_norm = float(keep.norm()), float(sparse.norm())
+    weighted_keep, weighted_sparse = keep*keep_weight, sparse*sparse_weight
+    wk, ws = float(weighted_keep.norm()), float(weighted_sparse.norm())
+    cosine = float(torch.dot(keep, sparse)/keep.norm()/sparse.norm()) if keep_norm and sparse_norm else None
+    return dict(keep_all_selector_grad_norm=keep_norm, sparse_selector_grad_norm=sparse_norm,
+        weighted_keep_selector_grad_norm=wk, weighted_sparse_selector_grad_norm=ws,
+        combined_selector_loss_grad_norm=float((weighted_keep+weighted_sparse).norm()),
+        selector_gradient_cosine=cosine,
+        sparse_to_keep_gradient_ratio=ws/wk if wk else None)
+
+
 def train_smoke_steps(model, selector, loader, probe_loader, config):
     if not len(loader):
         raise ValueError('No complete source training batches')
@@ -158,13 +181,18 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         checks = {}
         if step == 1 or step % config.gradient_every == 0 or step == config.steps:
             checks = keep_gradient_check(keep_loss, model, selector)
+            checks.update(selector_loss_gradients(keep_loss, info['sparse_loss'], selector,
+                                                  config.keep_weight, config.sparse_weight))
             gradient_rows.append(dict(step=step, **checks))
+            print('SMOKE_GRADIENT|' + json.dumps(dict(step=step, sparse_weight=config.sparse_weight,
+                                                      **checks)), flush=True)
         optimizer.zero_grad()
         loss.backward()
         model_grad, selector_grad = _norm(model.parameters()), _norm(selector.parameters())
         optimizer.step()
         scheduler.step()
-        row = dict(step=step, variant=config.variant, actual_pelt_penalty=config.pelt_penalty,
+        row = dict(step=step, variant=config.variant, sparse_weight=config.sparse_weight,
+            actual_pelt_penalty=config.pelt_penalty,
             total_loss=float(loss.detach()), full_loss=float(full_loss.detach()), keep_loss=float(keep_loss.detach()),
             learning_rate=optimizer.param_groups[0]['lr'], model_grad_norm=model_grad,
             selector_grad_norm=selector_grad, **statistics(info), **checks)
@@ -192,10 +220,13 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         warnings.append('More than one quarter of samples still have only one candidate segment')
     if not any(row['keep_selector_grad_norm'] > 0 for row in gradient_rows):
         warnings.append('No nonzero isolated Keep gradient observed on selector scorer')
+    if probes[-1]['all_selected_rate'] >= .95:
+        warnings.append('At least 95% of deterministic probe head/sample gates retain all segments')
     result = dict(status=status, completed_steps=len(rows), requested_steps=config.steps,
         scheduler_total_steps=horizon, last_learning_rate=optimizer.param_groups[0]['lr'],
         variant=config.variant, pelt_penalty_mode=config.pelt_penalty_mode,
         actual_pelt_penalty=config.pelt_penalty, tail_training_statistics=tail,
+        sparse_weight=config.sparse_weight,
         initial_probe=probes[0], final_probe=probes[-1], warnings=warnings,
         probe_split='fixed SourceTrain diagnostic cohort, not validation or test',
         no_uda=True, no_target_labels=True, full_training_not_started=True,
@@ -204,7 +235,7 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         json.dump(result, stream, indent=2)
     torch.save(dict(state_dict=model.state_dict(), selector_state_dict=selector.state_dict(),
         role='source_structure_smoke', completed_steps=len(rows), requested_steps=config.steps,
-        status=status, variant=config.variant,
+        status=status, variant=config.variant, sparse_weight=config.sparse_weight,
         original_source_checkpoint_sha256=config.original_source_checkpoint_sha256),
         Path(config.fold_dir)/'smoke_checkpoint.pt')
     print('SMOKE_COMPLETE|' + json.dumps(result), flush=True)
