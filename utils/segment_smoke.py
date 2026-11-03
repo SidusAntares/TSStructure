@@ -196,8 +196,8 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         raise ValueError('No complete source training batches')
     horizon = config.scheduler_epochs*len(loader)
     smoke_epochs = getattr(config, 'smoke_epochs', None)
-    if smoke_epochs not in (None, 5):
-        raise ValueError('Epoch smoke budget must be exactly 5')
+    if smoke_epochs not in (None, 5, 10):
+        raise ValueError('Epoch budget must be 5 or 10')
     total_steps = smoke_epochs*len(loader) if smoke_epochs else config.steps
     probe_interval = len(loader) if smoke_epochs else config.probe_every
     if not isinstance(total_steps, int) or total_steps < 1 or total_steps >= horizon:
@@ -207,7 +207,7 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         lr=config.lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, horizon)
     criterion = FocalLoss(gamma=config.focal_loss_gamma)
-    rows, probes, gradient_rows = [], [], []
+    rows, probes, gradient_rows, epoch_rows = [], [], [], []
     status = 'completed'
     initial = dict(step=0, source_epoch=0.,
         **probe_statistics(model, selector, probe_loader, config, ranking=True, checkpoint_step=0))
@@ -247,11 +247,21 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         optimizer.step()
         scheduler.step()
         row = dict(step=step, source_epoch=step/len(loader), variant=config.variant, sparse_weight=config.sparse_weight,
+            batch_samples=len(labels), keep_accuracy=float((keep.argmax(-1)==labels).float().mean()),
             actual_pelt_penalty=config.pelt_penalty,
             total_loss=float(loss.detach()), keep_loss=float(keep_loss.detach()),
             learning_rate=optimizer.param_groups[0]['lr'], model_grad_norm=model_grad,
             selector_grad_norm=selector_grad, **statistics(info), **checks)
         rows.append(row)
+        if step % len(loader) == 0:
+            epoch = rows[-len(loader):]
+            record = dict(source_epoch=step//len(loader), samples=sum(r['batch_samples'] for r in epoch),
+                **{key: sum(r[key] for r in epoch)/len(epoch) for key in
+                   ('keep_loss','keep_accuracy','candidate_count','single_segment_rate',
+                    'coverage','fallback_rate','all_selected_rate','raw_coverage')})
+            epoch_rows.append(record)
+            write_history(Path(config.fold_dir)/'epoch_training.csv', epoch_rows)
+            print('SOURCE_EPOCH|'+json.dumps(record), flush=True)
         write_history(Path(config.fold_dir)/'steps.csv', rows)
         if step == 1 or step % 10 == 0 or step == total_steps:
             print('SMOKE_STEP|' + json.dumps(row), flush=True)
@@ -279,6 +289,9 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
     if probes[-1]['all_selected_rate'] >= .95:
         warnings.append('At least 95% of deterministic probe head/sample gates retain all segments')
     result = dict(status=status, completed_steps=len(rows), requested_steps=total_steps,
+        source_init=getattr(config, 'source_init', 'checkpoint'),
+        source_checkpoint_loaded=getattr(config, 'source_init', 'checkpoint') == 'checkpoint',
+        epoch_training=epoch_rows,
         requested_smoke_epochs=smoke_epochs, completed_source_epochs=len(rows)/len(loader),
         steps_per_source_epoch=len(loader),
         scheduler_total_steps=horizon, last_learning_rate=optimizer.param_groups[0]['lr'],
@@ -293,6 +306,10 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
     with (Path(config.fold_dir)/'health_summary.json').open('w') as stream:
         json.dump(result, stream, indent=2)
     torch.save(dict(state_dict=model.state_dict(), selector_state_dict=selector.state_dict(),
+        source_init=getattr(config, 'source_init', 'checkpoint'),
+        optimizer_state_dict=optimizer.state_dict(), scheduler_state_dict=scheduler.state_dict(),
+        torch_rng_state=torch.get_rng_state(), numpy_rng_state=np.random.get_state(), python_rng_state=random.getstate(),
+        cuda_rng_state=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
         role='source_structure_smoke', completed_steps=len(rows), requested_steps=total_steps,
         completed_smoke_epochs=len(rows)/len(loader),
         status=status, variant=config.variant, sparse_weight=config.sparse_weight,
@@ -320,6 +337,14 @@ class FixedProbeTransform:
             np.random.set_state(numpy_state)
 
 
+def initialize_source_model(model, config):
+    if getattr(config, 'source_init', 'checkpoint') == 'scratch':
+        return False
+    model.load_state_dict(torch.load(Path(config.weights)/'fold_0/model.pt',
+                                    map_location=config.device, weights_only=False)['state_dict'])
+    return True
+
+
 def run_smoke(config):
     from dataset import PixelSetData, create_train_loader
     from torchvision.transforms import Compose
@@ -329,8 +354,9 @@ def run_smoke(config):
     config, splits = prepare(config, source_only=True)
     write_resolved(config)
     model, selector = new_models(config)
-    model.load_state_dict(torch.load(Path(config.weights)/'fold_0/model.pt',
-                                    map_location=config.device, weights_only=False)['state_dict'])
+    loaded = initialize_source_model(model, config)
+    print('SOURCE_INITIALIZATION|'+json.dumps(dict(source_init=getattr(config, 'source_init', 'checkpoint'),
+        source_checkpoint_loaded=loaded, scheduler_epochs=config.scheduler_epochs)), flush=True)
     transform = Compose([RandomSamplePixels(config.num_pixels), RandomSampleTimeSteps(config.seq_length),
                          Normalize(), ToTensor()])
     kwargs = dict(indices=splits[config.source]['train'], closed_set=True, combine_spring_and_winter=False)

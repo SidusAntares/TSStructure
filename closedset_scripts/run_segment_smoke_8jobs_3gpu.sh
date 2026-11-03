@@ -40,9 +40,9 @@ for gpu in "${gpu_ids[@]}"; do
     seen_gpus+="$gpu "
 done
 if [[ -v SMOKE_EPOCHS ]]; then
-    [[ "$SMOKE_EPOCHS" == 5 ]] || { echo 'ERROR: SMOKE_EPOCHS must be 5'; exit 1; }
+    [[ "$SMOKE_EPOCHS" == 5 || "$SMOKE_EPOCHS" == 10 ]] || { echo 'ERROR: SMOKE_EPOCHS must be 5 or 10'; exit 1; }
     budget_args=(--smoke_epochs "$SMOKE_EPOCHS")
-    budget_description='epochs=5'
+    budget_description="epochs=$SMOKE_EPOCHS"
 else
     [[ "$SMOKE_STEPS" =~ ^[0-9]{1,4}$ ]] && (( 10#$SMOKE_STEPS >= 1 && 10#$SMOKE_STEPS <= 1000 )) || {
         echo 'ERROR: SMOKE_STEPS must be between 1 and 1000'; exit 1;
@@ -117,6 +117,13 @@ run_job() {
     local original="$SOURCE_ROOT/closedset_source_${tile}_seed1"
     local leaf="$OUTPUT_ROOT/$variant/$task"
     local log="$LOG_ROOT/${task}_${variant}.log"
+    local initialization_args=()
+    if [[ "${SOURCE_INIT:-checkpoint}" == scratch ]]; then
+        [[ "${INSHAPE_ONLY:-0}" == 1 && "${SMOKE_EPOCHS:-}" == 10 ]] || return 2
+        initialization_args=(--source_init scratch)
+    elif [[ "${SOURCE_INIT:-checkpoint}" != checkpoint ]]; then
+        echo 'ERROR: SOURCE_INIT must be checkpoint or scratch'; return 2
+    fi
     if [[ "$SPARSE_SWEEP" == 1 ]]; then
         local tag="sparse_${weight/./p}"
         leaf="$OUTPUT_ROOT/$tag/$variant/$task"
@@ -126,6 +133,7 @@ run_job() {
         --source "$source" --target "$target" --variant "$variant" --weights "$original" \
         --data_root "$DATA_ROOT" --seed 1 --num_workers 8 "${budget_args[@]}" \
         --sparse_weight "$weight" \
+        "${initialization_args[@]}" \
         --experiment_name "$task" --progress_bar off --output_dir "$leaf" \
         > "$log" 2>&1 || return $?
 }
