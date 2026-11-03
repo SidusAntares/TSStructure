@@ -19,7 +19,8 @@ def boolean(value):
 
 def build_config(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--stage', required=True, choices=('finetune', 'uda'))
+    parser.add_argument('--stage', required=True, choices=('finetune', 'joint_source', 'uda'))
+    parser.add_argument('--source_training_epochs', type=int, choices=(20, 100), default=20)
     parser.add_argument('--variant', required=True, choices=('inshape', 'attention'))
     parser.add_argument('--source', required=True, choices=TILES)
     parser.add_argument('--target', required=True, choices=TILES)
@@ -59,7 +60,7 @@ def build_config(argv=None):
         parser.error('specify the downstream source/target pair; finetuning uses source only internally')
     if cfg.stage == 'uda' and not cfg.structure_checkpoint:
         parser.error('UDA requires --structure_checkpoint from its own final source finetuning')
-    if cfg.stage == 'finetune' and cfg.structure_checkpoint:
+    if cfg.stage != 'uda' and cfg.structure_checkpoint:
         parser.error('finetune starts from --weights and does not accept --structure_checkpoint')
     # The approved run is a fixed matched comparison; refuse silent protocol drift.
     fixed = dict(integers, **floats, **booleans)
@@ -77,6 +78,15 @@ def build_config(argv=None):
     cfg.selector_protocol = 'inshape_coverage_v1' if cfg.variant == 'inshape' else 'legacy'
     if cfg.variant == 'inshape':
         cfg.selector_width, cfg.selector_dropout, cfg.reinmax_tau, cfg.sparse_weight = 32, .1, 1.3, 3.
+    cfg.source_init = 'scratch' if cfg.stage == 'joint_source' else 'checkpoint'
+    if cfg.stage == 'uda' and cfg.source_training_epochs == 100:
+        cfg.source_init = 'scratch'
+    if cfg.stage == 'uda' and cfg.source_training_epochs == 100:
+        cfg.source_init = 'scratch'
+    if cfg.stage == 'joint_source':
+        if cfg.variant != 'inshape':
+            parser.error('Joint Source comparison requires restored INSHAPE')
+        cfg.epochs, cfg.lr, cfg.selector_lr, cfg.source_training_epochs = 100, .001, .0005, 100
     cfg.m1 = cfg.eval = cfg.overall = cfg.train_on_target = False
     cfg.method = 'timematch'
     cfg.experiment_name = cfg.experiment_name or Path(cfg.output_dir).name
@@ -95,6 +105,8 @@ def build_config(argv=None):
         cfg.structure_protocol.update(selector='pure content CLS Transformer; one shared segment gate; initial bias p=0.8',
             sparsity='sampled pre-repair observation coverage times detached (2*coverage-1)',
             sparse_weight=cfg.sparse_weight, sparse_updates='Selector only', selection='ReinMax tau=1.3')
+    cfg.structure_protocol.update(source_init=cfg.source_init, source_training_epochs=cfg.source_training_epochs,
+        actual_stage_epochs=cfg.epochs)
     return cfg
 
 
@@ -147,7 +159,7 @@ def main(argv=None):
     (output / 'config.json').write_text(json.dumps(vars(cfg), indent=2), encoding='utf-8')
     (output / 'code_provenance.json').write_text(json.dumps(source_provenance(), indent=2), encoding='utf-8')
     from utils.segment_training import finetune_structure, run_structure_uda
-    if cfg.stage == 'finetune':
+    if cfg.stage != 'uda':
         finetune_structure(cfg)
     else:
         run_structure_uda(cfg)

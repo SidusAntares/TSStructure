@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from models.stclassifier import PseLTae
 from models.segment_selector import SegmentSelector
@@ -89,7 +90,8 @@ def test_uda_structure_trains_both_domains_without_target_labels(tmp_path, monke
     assert calls.count('source') == calls.count('target') == 20
 
 
-def test_independent_entry_finetune_then_uda_and_endpoint_reports(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize('source_stage', ['finetune', 'joint_source'])
+def test_independent_entry_finetune_then_uda_and_endpoint_reports(tmp_path, monkeypatch, capsys, source_stage):
     import json
     import sys
     import types
@@ -104,7 +106,7 @@ def test_independent_entry_finetune_then_uda_and_endpoint_reports(tmp_path, monk
     model, _ = models()
     torch.save({'state_dict': model.state_dict()}, weights/'fold_0/model.pt')
     common = ['--source', source, '--target', target, '--weights', str(weights), '--device', 'cpu',
-              '--variant', 'attention']
+              '--variant', 'inshape']
     old_builder = entry.build_config
     source_config = vars(old_builder(common+['--stage', 'finetune', '--output_dir', str(tmp_path/'fine')])).copy()
     source_config.update(target=source, epochs=100, lr=.001, method=None)
@@ -135,10 +137,13 @@ def test_independent_entry_finetune_then_uda_and_endpoint_reports(tmp_path, monk
     tb.SummaryWriter = Writer
     monkeypatch.setitem(sys.modules, 'torch.utils.tensorboard', tb)
     monkeypatch.setattr(torch.Tensor, 'cuda', lambda self, *a, **kw: self)
-    entry.main(common+['--stage', 'finetune', '--output_dir', str(tmp_path/'fine')])
+    entry.main(common+['--stage', source_stage, '--output_dir', str(tmp_path/'fine')])
     assert seen == [source]
     initial = tmp_path/'fine/fold_0/model.pt'
     assert initial.is_file()
+    source_packet = torch.load(initial, weights_only=False)
+    assert source_packet['completed_epochs'] == (100 if source_stage == 'joint_source' else 20)
+    assert source_packet['source_init'] == ('scratch' if source_stage == 'joint_source' else 'checkpoint')
     def synthetic_budget(argv=None):
         cfg = old_builder(argv)
         if cfg.stage == 'uda': cfg.steps_per_epoch = 1
@@ -148,11 +153,12 @@ def test_independent_entry_finetune_then_uda_and_endpoint_reports(tmp_path, monk
     monkeypatch.setattr(timematch, 'estimate_temporal_shift', lambda *a, **kw: 8)
     monkeypatch.setattr(timematch, 'get_pseudo_labels', lambda *a, **kw: torch.eye(3))
     leaf = tmp_path/'uda'
-    entry.main(common+['--stage', 'uda', '--structure_checkpoint', str(initial), '--output_dir', str(leaf)])
+    entry.main(common+['--stage', 'uda', '--structure_checkpoint', str(initial), '--output_dir', str(leaf),
+                       '--source_training_epochs', '100' if source_stage == 'joint_source' else '20'])
     packet = torch.load(leaf/'fold_0/model.pt', weights_only=False)
     assert packet['role'] == 'student' and packet['completed_epochs'] == 20
     tested = json.loads((leaf/'fold_0/tested_checkpoint.json').read_text())
-    assert tested['variant'] == 'attention' and tested['structure_initial_sha256']
+    assert tested['variant'] == 'inshape' and tested['structure_initial_sha256']
     for domain in ('austria_33UVP_2017', 'denmark_32VNH_2017'):
         report = json.loads((leaf/f'fold_0/test_{domain}.json').read_text())
         assert 'full' in report and 'keep' in report

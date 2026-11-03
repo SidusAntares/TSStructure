@@ -87,6 +87,7 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None):
                     role='source_structure', completed_epochs=config.epochs, variant=config.variant,
                     classification_path='keep_only_unified',
                     selector_protocol=getattr(config, 'selector_protocol', 'legacy'),
+                    source_init=getattr(config, 'source_init', 'checkpoint'),
                     source=config.source, original_source_checkpoint_sha256=config.original_source_checkpoint_sha256),
                Path(config.fold_dir)/'model.pt')
     return history
@@ -190,7 +191,10 @@ def finetune_structure(config):
     write_resolved(config)
     model, selector = new_models(config)
     checkpoint = Path(config.weights)/'fold_0/model.pt'
-    model.load_state_dict(torch.load(checkpoint, map_location=config.device, weights_only=False)['state_dict'])
+    if getattr(config, 'source_init', 'checkpoint') != 'scratch':
+        model.load_state_dict(torch.load(checkpoint, map_location=config.device, weights_only=False)['state_dict'])
+    print('SOURCE_INITIALIZATION|'+json.dumps(dict(source_init=getattr(config, 'source_init', 'checkpoint'),
+        source_checkpoint_loaded=getattr(config, 'source_init', 'checkpoint') != 'scratch', epochs=config.epochs)), flush=True)
     transform = Compose([RandomSamplePixels(config.num_pixels), RandomSampleTimeSteps(config.seq_length),
                          Normalize(), ToTensor()])
     dataset = PixelSetData(config.data_root, config.source, config.classes, transform,
@@ -202,8 +206,8 @@ def finetune_structure(config):
     finally:
         writer.close()
     packet = torch.load(Path(config.fold_dir)/'model.pt', map_location=config.device, weights_only=False)
-    if packet['completed_epochs'] != 20 or packet['role'] != 'source_structure':
-        raise ValueError('Testing requires the completed epoch20 source structure checkpoint')
+    if packet['completed_epochs'] != config.epochs or packet['role'] != 'source_structure':
+        raise ValueError('Testing requires the completed final source structure checkpoint')
     model.load_state_dict(packet['state_dict'])
     selector.load_state_dict(packet['selector_state_dict'])
     _, test_loader = create_evaluation_loaders(config.source, splits, config, config.sample_pixels_val)
@@ -218,12 +222,14 @@ def run_structure_uda(config):
     model, selector = new_models(config)
     initial_path = Path(config.structure_checkpoint)
     initial = torch.load(initial_path, map_location=config.device, weights_only=False)
-    if (initial.get('role') != 'source_structure' or initial.get('completed_epochs') != 20
+    required_epochs = getattr(config, 'source_training_epochs', 20)
+    if (initial.get('role') != 'source_structure' or initial.get('completed_epochs') != required_epochs
+        or initial.get('source_init', 'checkpoint') != ('scratch' if required_epochs == 100 else 'checkpoint')
         or initial.get('classification_path') != 'keep_only_unified'
         or initial.get('selector_protocol', 'legacy') != getattr(config, 'selector_protocol', 'legacy')
         or initial.get('variant') != config.variant or initial.get('source') != config.source
         or initial.get('original_source_checkpoint_sha256') != config.original_source_checkpoint_sha256):
-        raise ValueError('UDA requires this variant\'s epoch20 structure checkpoint from the exact original Source')
+        raise ValueError('UDA requires its own final Source checkpoint with matching route, epochs and protocol')
     if initial_path.name != 'model.pt' or initial_path.parent.name != 'fold_0':
         raise ValueError('Expected structure checkpoint in <finetune>/fold_0/model.pt')
     model.load_state_dict(initial['state_dict'])
@@ -269,7 +275,8 @@ def evaluate_structure(model, selector, loader, config, domain, shift):
     seed_all(config.seed+1000)
     model.eval()
     selector.eval()
-    print(f'STRUCTURE_TEST_START|variant={config.variant}|domain={domain}|checkpoint_epoch=20', flush=True)
+    evaluated_epoch = config.epochs
+    print(f'STRUCTURE_TEST_START|variant={config.variant}|domain={domain}|checkpoint_epoch={evaluated_epoch}', flush=True)
     full_rows, keep_rows, labels, statistics = [], [], [], []
     for index, sample in enumerate(loader):
         pixels, mask, dates, extra = sample_to_device(sample, config.device)
@@ -287,7 +294,7 @@ def evaluate_structure(model, selector, loader, config, domain, shift):
         raise ValueError('Empty structure final test loader')
     truth = np.asarray(labels)
     arrays = dict(labels=truth, full=torch.cat(full_rows).numpy(), keep=torch.cat(keep_rows).numpy())
-    report = dict(domain=domain, variant=config.variant, shift=shift, completed_epochs=20,
+    report = dict(domain=domain, variant=config.variant, shift=shift, completed_epochs=evaluated_epoch,
         structure_statistics={key: sum(row[key] for row in statistics)/len(statistics) for key in statistics[0]})
     for name in ('full', 'keep'):
         predictions = arrays[name].argmax(-1)
