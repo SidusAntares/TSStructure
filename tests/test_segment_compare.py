@@ -16,6 +16,29 @@ def test_joint_source_and_uda_endpoint_configuration(tmp_path):
     assert uda.epochs == 20 and uda.source_training_epochs == 100 and uda.keep_weight == 1
 
 
+@pytest.mark.parametrize('complete_source', [True, False])
+def test_resume_preserves_source_and_refuses_incomplete_stage(tmp_path, complete_source):
+    setup_run(tmp_path)
+    script = 'run_segment_compare_8jobs_4gpu.sh'
+    root = Path(__file__).resolve().parents[1]
+    shutil.copyfile(root/'closedset_scripts'/script, tmp_path/'closedset_scripts'/script)
+    source = tmp_path/'outputs/compare/finetune/AT1_DK1/source'
+    (source/'fold_0').mkdir(parents=True)
+    if complete_source:
+        (source/'fold_0/model.pt').write_bytes(b'final source checkpoint')
+    logs = tmp_path/'logs/compare'
+    logs.mkdir(parents=True)
+    (logs/'AT1_DK1_finetune_source.log').write_text('existing source log\n')
+    result = subprocess.run([bash_bin(), 'closedset_scripts/'+script], cwd=tmp_path,
+        env=dict(os.environ, DATA_ROOT='data', PYTHON_BIN='/bin/echo', EXPERIMENT='compare', RESUME='1'),
+        capture_output=True, text=True, timeout=40)
+    assert (result.returncode == 0) == complete_source
+    assert (logs/'AT1_DK1_finetune_source.log').read_text() == 'existing source log\n'
+    assert (logs/'AT1_DK1_finetune_uda.log').exists() == complete_source
+    if complete_source:
+        assert (source/'fold_0/model.pt').read_bytes() == b'final source checkpoint'
+
+
 @pytest.mark.parametrize('fail', [False, True])
 def test_eight_comparison_chains_and_logs_are_parseable(tmp_path, fail):
     setup_run(tmp_path)

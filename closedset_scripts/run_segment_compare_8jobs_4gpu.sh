@@ -6,6 +6,7 @@ cd "$PROJECT_DIR"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 EXPERIMENT="${EXPERIMENT:-timematch_segments_compare_seed1}"
+RESUME="${RESUME:-0}"
 OUTPUT_ROOT="outputs/$EXPERIMENT"
 LOG_ROOT="logs/$EXPERIMENT"
 VISUALIZATION_ROOT="outputs/${EXPERIMENT}_visualization"
@@ -18,8 +19,11 @@ exec >> "$LOG_ROOT/launcher.log" 2>&1
     echo 'ERROR: experiment requires seed 1 and workers 8'; exit 1;
 }
 [[ -d "$DATA_ROOT" ]] || { echo "ERROR: missing dataset: $DATA_ROOT"; exit 1; }
-[[ ! -e "$OUTPUT_ROOT" && ! -e "$VISUALIZATION_ROOT" ]] || {
-    echo 'ERROR: experiment or visualization output exists'; exit 1;
+[[ "$RESUME" == 0 || "$RESUME" == 1 ]] || {
+    echo 'ERROR: RESUME must be 0 or 1'; exit 1;
+}
+[[ ! -e "$OUTPUT_ROOT" || "$RESUME" == 1 ]] || {
+    echo 'ERROR: experiment output exists; use RESUME=1 to reuse final Source checkpoints'; exit 1;
 }
 [[ "${GPUS:-0 1 2 3}" == '0 1 2 3' ]] || {
     echo 'ERROR: this queue requires GPUs 0 1 2 3'; exit 1;
@@ -42,7 +46,7 @@ done
 # Slow FR1 jobs enter first; each free GPU takes the next pair immediately.
 job_tasks=(FR1_FR2 FR1_FR2 FR2_DK1 DK1_AT1 FR2_DK1 DK1_AT1 AT1_DK1 AT1_DK1)
 job_variants=(joint finetune joint joint finetune finetune joint finetune)
-mkdir "$OUTPUT_ROOT"
+mkdir -p "$OUTPUT_ROOT"
 queue_dir="$(mktemp -d "$LOG_ROOT/queue.XXXXXX")"
 printf '%s\n' 0 > "$queue_dir/next"
 cleanup_queue() {
@@ -62,9 +66,21 @@ run_job() {
     local common=(--source "$source" --target "$target" --weights "$original"
         --data_root "$DATA_ROOT" --seed 1 --num_workers 8 --variant inshape
         --experiment_name "$task" --progress_bar off)
-    CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train_segment_timematch.py \
-        --stage "$stage" "${common[@]}" --output_dir "$leaf/source" \
-        > "$LOG_ROOT/${task}_${route}_source.log" 2>&1 || return $?
+    if [[ "$RESUME" == 1 && -s "$leaf/source/fold_0/model.pt" ]]; then
+        # UDA validates the saved role, epoch count, route, protocol and source hash.
+        echo "SOURCE_REUSE|gpu=$gpu|task=$task|route=$route|checkpoint=$leaf/source/fold_0/model.pt"
+    elif [[ -e "$leaf/source" ]]; then
+        echo "ERROR: incomplete Source output preserved: $leaf/source"
+        return 1
+    else
+        CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train_segment_timematch.py \
+            --stage "$stage" "${common[@]}" --output_dir "$leaf/source" \
+            > "$LOG_ROOT/${task}_${route}_source.log" 2>&1 || return $?
+    fi
+    if [[ -e "$leaf/uda" ]]; then
+        echo "ERROR: existing UDA output preserved; inspect before restarting: $leaf/uda"
+        return 1
+    fi
     CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train_segment_timematch.py \
         --stage uda "${common[@]}" --source_training_epochs "$source_epochs" \
         --structure_checkpoint "$leaf/source/fold_0/model.pt" --output_dir "$leaf/uda" \
