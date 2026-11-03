@@ -74,6 +74,9 @@ def build_config(argv=None):
     if cfg.log_step <= 0:
         parser.error('log_step must be positive')
     cfg.mode = None
+    cfg.selector_protocol = 'inshape_coverage_v1' if cfg.variant == 'inshape' else 'legacy'
+    if cfg.variant == 'inshape':
+        cfg.selector_width, cfg.selector_dropout, cfg.reinmax_tau, cfg.sparse_weight = 32, .1, 1.3, 3.
     cfg.m1 = cfg.eval = cfg.overall = cfg.train_on_target = False
     cfg.method = 'timematch'
     cfg.experiment_name = cfg.experiment_name or Path(cfg.output_dir).name
@@ -88,6 +91,10 @@ def build_config(argv=None):
         finetune='20 full source epochs, fixed final checkpoint',
         uda='20 epochs x 500 steps, fixed final joint Student and selector',
         imputation=False)
+    if cfg.variant == 'inshape':
+        cfg.structure_protocol.update(selector='pure content CLS Transformer; one shared segment gate; initial bias p=0.8',
+            sparsity='sampled pre-repair observation coverage times detached (2*coverage-1)',
+            sparse_weight=cfg.sparse_weight, sparse_updates='Selector only', selection='ReinMax tau=1.3')
     return cfg
 
 

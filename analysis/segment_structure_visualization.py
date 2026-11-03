@@ -179,7 +179,8 @@ def load_job(job, args):
     model.load_state_dict(packet['state_dict'], strict=True)
     selector = SegmentSelector(width=config.get('selector_width', 64),
                                heads=config.get('selector_heads', 4),
-                               dropout=config.get('selector_dropout', 0.)).to(args.device).eval()
+                               dropout=config.get('selector_dropout', 0.),
+                               protocol=config.get('selector_protocol', 'legacy')).to(args.device).eval()
     selector.load_state_dict(packet['selector_state_dict'], strict=True)
     def transform(sample):
         return Normalize()(RandomSamplePixels(config.get('num_pixels', 64))(sample))

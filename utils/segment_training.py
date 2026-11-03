@@ -86,6 +86,7 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None):
     torch.save(dict(state_dict=model.state_dict(), selector_state_dict=selector.state_dict(),
                     role='source_structure', completed_epochs=config.epochs, variant=config.variant,
                     classification_path='keep_only_unified',
+                    selector_protocol=getattr(config, 'selector_protocol', 'legacy'),
                     source=config.source, original_source_checkpoint_sha256=config.original_source_checkpoint_sha256),
                Path(config.fold_dir)/'model.pt')
     return history
@@ -175,7 +176,8 @@ def new_models(config):
     model = PseLTae(input_dim=config.input_dim, num_classes=config.num_classes,
                    with_extra=config.with_extra).to(config.device)
     selector = SegmentSelector(width=config.selector_width, heads=config.selector_heads,
-                               dropout=config.selector_dropout).to(config.device)
+                               dropout=config.selector_dropout,
+                               protocol=getattr(config, 'selector_protocol', 'legacy')).to(config.device)
     return model, selector
 
 
@@ -218,6 +220,7 @@ def run_structure_uda(config):
     initial = torch.load(initial_path, map_location=config.device, weights_only=False)
     if (initial.get('role') != 'source_structure' or initial.get('completed_epochs') != 20
         or initial.get('classification_path') != 'keep_only_unified'
+        or initial.get('selector_protocol', 'legacy') != getattr(config, 'selector_protocol', 'legacy')
         or initial.get('variant') != config.variant or initial.get('source') != config.source
         or initial.get('original_source_checkpoint_sha256') != config.original_source_checkpoint_sha256):
         raise ValueError('UDA requires this variant\'s epoch20 structure checkpoint from the exact original Source')

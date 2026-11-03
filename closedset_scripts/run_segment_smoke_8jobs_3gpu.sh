@@ -75,6 +75,7 @@ if [[ "${INSHAPE_ONLY:-0}" == 1 ]]; then
     base_variants=(inshape inshape inshape inshape)
 fi
 weights=(0.01)
+if [[ "${INSHAPE_ONLY:-0}" == 1 ]]; then weights=(3.0); fi
 if [[ "$SPARSE_SWEEP" == 1 ]]; then
     read -r -a weights <<< "${SPARSE_WEIGHTS-0.01 0.03 0.1}"
     (( ${#weights[@]} > 0 )) || { echo 'ERROR: SPARSE_WEIGHTS is empty'; exit 1; }

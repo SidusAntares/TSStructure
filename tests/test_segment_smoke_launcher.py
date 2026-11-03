@@ -54,7 +54,9 @@ def test_dry_run_is_stdlib_only_and_has_fixed_probe_protocol(tmp_path):
     assert cfg['probe_samples'] == 128 and cfg['health_window'] == cfg['warmup_steps'] == 20
     assert cfg['seed'] == 1 and cfg['num_workers'] == 8 and cfg['batch_size'] == 128
     assert cfg['lr'] == cfg['selector_lr'] == cfg['weight_decay'] == 1e-4
-    assert cfg['focal_loss_gamma'] == 1 and cfg['keep_weight'] == 1 and cfg['sparse_weight'] == .01
+    assert cfg['focal_loss_gamma'] == 1 and cfg['keep_weight'] == 1 and cfg['sparse_weight'] == 3.
+    assert cfg['selector_protocol'] == 'inshape_coverage_v1'
+    assert cfg['selector_width'] == 32 and cfg['selector_dropout'] == .1 and cfg['reinmax_tau'] == 1.3
     assert cfg['evidence_mode'] == 'off' and cfg['structure_protocol']['imputation'] is False
     assert not (tmp_path / 'output').exists()
 

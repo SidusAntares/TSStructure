@@ -18,7 +18,7 @@ def build_config(argv=None):
         parser.add_argument('--' + name, type=int, default=default)
     parser.add_argument('--pelt_penalty', type=float, default=.8)
     parser.add_argument('--pelt_penalty_mode', choices=('absolute',), default='absolute')
-    parser.add_argument('--sparse_weight', type=float, choices=(.01, .03, .1), default=.01)
+    parser.add_argument('--sparse_weight', type=float, choices=(.01, .03, .1, 3.))
     diagnostic, remaining = parser.parse_known_args(argv)
     if diagnostic.steps is None and diagnostic.smoke_epochs is None:
         diagnostic.steps = 200
@@ -36,6 +36,8 @@ def build_config(argv=None):
     cfg = build_training_config(['--stage', 'finetune', *remaining])
     for name, value in vars(diagnostic).items():
         setattr(cfg, name, value)
+    if cfg.sparse_weight is None:
+        cfg.sparse_weight = 3. if cfg.variant == 'inshape' else .01
     cfg.mode = cfg.stage = 'smoke'
     cfg.scheduler_epochs = 20
     cfg.fold_dir = str(Path(cfg.output_dir) / 'fold_0')
@@ -51,6 +53,9 @@ def build_config(argv=None):
         ranking='one/half candidates vs 10 random subsets; leave-one-segment-out contributions; diagnostic only',
         selector='shared CLS Transformer; length fraction in both variants; attention adds detached mass and enrichment',
         finetune='bounded Source-only smoke probe', uda=False, imputation=False)
+    if cfg.variant == 'inshape':
+        cfg.structure_protocol.update(selector='pure content CLS Transformer; one gate shared by all LTAE heads; initial p=0.8 bias',
+            sparsity='sampled pre-repair observation coverage times detached (2*coverage-1)', selection='ReinMax tau=1.3')
     return cfg
 
 

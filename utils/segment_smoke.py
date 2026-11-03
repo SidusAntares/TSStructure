@@ -55,6 +55,8 @@ def statistics(info):
         coverage=float(info['coverage'].float().mean()), fallback_rate=float(info['fallback_rate']),
         all_selected_rate=float((gate.sum(-1) == count[:, None]).float().mean()),
         mean_gate_probability=float(probability[valid].mean()),
+        raw_coverage=float(info.get('raw_coverage', info['coverage'].mean())),
+        sparse_coefficient=float(info.get('sparse_coefficient', probability.new_tensor(1.))),
         mean_probability_std=float(spread.sqrt().mean()),
         expected_empty_rate=float(torch.where(valid, 1-probability, torch.ones_like(probability)).prod(-1).mean()),
         sparse=float(info['sparse_loss'].detach()),
@@ -283,6 +285,7 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         variant=config.variant, pelt_penalty_mode=config.pelt_penalty_mode,
         actual_pelt_penalty=config.pelt_penalty, tail_training_statistics=tail,
         sparse_weight=config.sparse_weight, classification_path='keep_only_unified',
+        selector_protocol=getattr(config, 'selector_protocol', 'legacy'),
         initial_probe=probes[0], final_probe=probes[-1], warnings=warnings,
         probe_split='fixed SourceTrain diagnostic cohort, not validation or test',
         no_uda=True, no_target_labels=True, full_training_not_started=True,
@@ -294,6 +297,7 @@ def train_smoke_steps(model, selector, loader, probe_loader, config):
         completed_smoke_epochs=len(rows)/len(loader),
         status=status, variant=config.variant, sparse_weight=config.sparse_weight,
         classification_path='keep_only_unified',
+        selector_protocol=getattr(config, 'selector_protocol', 'legacy'),
         original_source_checkpoint_sha256=config.original_source_checkpoint_sha256),
         Path(config.fold_dir)/'smoke_checkpoint.pt')
     print('SMOKE_COMPLETE|' + json.dumps(result), flush=True)

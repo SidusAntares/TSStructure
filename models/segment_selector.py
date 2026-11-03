@@ -45,31 +45,36 @@ def selector_only_loss(loss, parameters):
 
 class _ReinMax(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits):
+    def forward(ctx, logits, tau=1.):
         probability = logits.softmax(-1)
         draw = torch.multinomial(probability.reshape(-1, 2), 1).reshape(*logits.shape[:-1], 1)
         hard = torch.zeros_like(probability).scatter_(-1, draw, 1.)
-        ctx.save_for_backward(hard, probability)
+        ctx.save_for_backward(hard, probability, (logits/tau).softmax(-1))
         return hard, probability
 
     @staticmethod
     def backward(ctx, grad_hard, grad_probability):
-        hard, probability = ctx.saved_tensors
+        hard, probability, tempered = ctx.saved_tensors
         if grad_hard is None:
             grad_hard = torch.zeros_like(probability)
         if grad_probability is None:
             grad_probability = torch.zeros_like(probability)
-        shifted = .5 * (probability + hard)  # softmax(logits/tau), tau fixed to 1
+        shifted = .5 * (tempered + hard)
         first = 2 * grad_hard * shifted
         first = first - shifted * first.sum(-1, keepdim=True)
         zeroth = (-.5 * grad_hard + grad_probability) * probability
         zeroth = zeroth - probability * zeroth.sum(-1, keepdim=True)
         gradient = first + zeroth
-        return gradient - gradient.mean(-1, keepdim=True)
+        gradient = gradient - gradient.mean(-1, keepdim=True)
+        return gradient if len(ctx.needs_input_grad) == 1 else (gradient, None)
 
 
 class SegmentSelector(nn.Module):
-    """One shared segment Transformer; both variants have identical parameters.
+    """Segment content encoder with archived and restored INSHAPE protocols.
+
+    inshape_coverage_v1 reads content only, samples one gate per segment shared
+    across LTAE heads, and applies adaptive sampled observation-coverage cost.
+    The conditioning description below applies only to archived legacy runs.
 
     `heads` is the number of Transformer heads, independent of LTAE head count.
     Segments use consecutive labels from zero; invalid time steps have label -1.
@@ -82,18 +87,28 @@ class SegmentSelector(nn.Module):
     Attention is detached only
     for this conditioning; segment content retains its gradient to the PSE.
     """
-    def __init__(self, feature_dim=128, width=64, heads=4, dropout=0.0, layers=1):
+    def __init__(self, feature_dim=128, width=64, heads=4, dropout=0.0, layers=1, protocol='legacy'):
         super().__init__()
+        if protocol not in ('legacy', 'inshape_coverage_v1'):
+            raise ValueError('Unknown Selector protocol')
+        self.protocol = protocol
         self.feature_dim = feature_dim
         self.width, self.heads, self.layers = width, heads, layers
         self.projection = nn.Linear(feature_dim, width)
         self.cls = nn.Parameter(torch.randn(1, 1, width))
-        layer = nn.TransformerEncoderLayer(width, heads, dim_feedforward=2*width,
+        layer = nn.TransformerEncoderLayer(width, heads, dim_feedforward=(4 if protocol != 'legacy' else 2)*width,
                                           dropout=dropout, batch_first=True)
         self.encoder = nn.TransformerEncoder(layer, num_layers=layers, enable_nested_tensor=False)
-        self.scorer = nn.Sequential(nn.Linear(width+3, width), nn.ReLU(), nn.Linear(width, 1))
+        if protocol == 'legacy':
+            self.scorer = nn.Sequential(nn.Linear(width+3, width), nn.ReLU(), nn.Linear(width, 1))
+        else:
+            self.scorer = nn.Sequential(nn.Linear(width, 2))
+            with torch.no_grad():
+                self.scorer[0].bias.copy_(torch.tensor([-.69314718056, .69314718056]))
 
     def forward(self, features, attention, segments, variant='attention', deterministic=False):
+        if self.protocol != 'legacy' and variant != 'inshape':
+            raise ValueError('Restored INSHAPE baseline has no attention-conditioned variant')
         if variant not in ('inshape', 'attention'):
             raise ValueError('variant must be inshape or attention')
         if features.ndim != 3 or segments.shape != features.shape[:2]:
@@ -130,17 +145,27 @@ class SegmentSelector(nn.Module):
         if variant == 'inshape':
             conditions = torch.stack((torch.zeros_like(mass), torch.zeros_like(mass),
                                       fraction[:, None].expand(-1, head_count, -1)), -1)
-        inputs = torch.cat((embeddings[:, None].expand(-1, head_count, -1, -1), conditions), -1)
-        logit = self.scorer(inputs).squeeze(-1)
-        logits = torch.stack((torch.zeros_like(logit), logit), -1)
+        if self.protocol == 'legacy':
+            inputs = torch.cat((embeddings[:, None].expand(-1, head_count, -1, -1), conditions), -1)
+            logit = self.scorer(inputs).squeeze(-1)
+            logits = torch.stack((torch.zeros_like(logit), logit), -1)
+        else:
+            logits = self.scorer(embeddings)[:, None]
         if deterministic:
             probability = logits.softmax(-1)[..., 1]
             gate = (probability >= .5).to(features.dtype)
         else:
-            hard, soft = _ReinMax.apply(logits)
+            hard, soft = _ReinMax.apply(logits, 1.3 if self.protocol != 'legacy' else 1.)
             gate, probability = hard[..., 1], soft[..., 1]
+        if self.protocol != 'legacy':
+            gate = gate.expand(-1, head_count, -1)
+            probability = probability.expand(-1, head_count, -1)
         probability = probability * valid_segments[:, None]
         gate = gate * valid_segments[:, None]
+        unrepaired_points = torch.einsum('bhk,bkt->bht', gate, membership.to(gate.dtype))
+        raw_coverage = (unrepaired_points.sum(-1)/valid.sum(-1)[:, None]).mean()
+        sparse = (probability.sum(-1).mean() if self.protocol == 'legacy'
+                  else (2*raw_coverage.detach()-1)*raw_coverage)
         empty = gate.detach().sum(-1) == 0
         best = probability.detach().masked_fill(~valid_segments[:, None], -1).argmax(-1)
         repair = torch.zeros_like(gate).scatter_(-1, best[..., None], 1.)
@@ -148,7 +173,8 @@ class SegmentSelector(nn.Module):
         gate = gate + repair * empty[..., None]
         point_mask = torch.einsum('bhk,bkt->bht', gate, membership.to(gate.dtype))
         return dict(gate=gate, probabilities=probability, point_mask=point_mask,
-                    sparse_loss=selector_only_loss(probability.sum(-1).mean(), self.parameters()), segments=segments,
+                    sparse_loss=selector_only_loss(sparse, self.parameters()), segments=segments,
+                    raw_coverage=raw_coverage.detach(), sparse_coefficient=(2*raw_coverage.detach()-1),
                     valid_segments=valid_segments, valid_time=valid,
                     fallback_rate=empty.float().mean(), repaired=empty,
                     selected_count=gate.detach().sum(-1), candidate_count=count,

@@ -183,10 +183,11 @@ def test_dry_run_has_protocol_and_no_heavy_imports_or_outputs(tmp_path):
     assert cfg['mode'] is None and cfg['m1'] is False
     assert cfg['epochs'] == 20 and cfg['steps_per_epoch'] == 500
     assert cfg['lr'] == cfg['selector_lr'] == cfg['weight_decay'] == 1e-4
-    assert cfg['keep_weight'] == 1 and cfg['sparse_weight'] == .01
+    assert cfg['keep_weight'] == 1 and cfg['sparse_weight'] == 3.
     assert cfg['pelt_penalty'] == .8 and cfg['pelt_min_size'] == 3
     assert cfg['pelt_penalty_mode'] == 'absolute'
-    assert cfg['selector_dropout'] == 0.
+    assert cfg['selector_dropout'] == .1
+    assert cfg['selector_protocol'] == 'inshape_coverage_v1'
     assert cfg['run_validation'] is False and cfg['strict_final_student'] is True
     assert not (tmp_path / 'output').exists()
 
