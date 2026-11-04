@@ -29,7 +29,7 @@ def checkpoint_digest(path):
     return result.hexdigest()
 
 
-def validate_jobs(experiment_root, tasks=TASKS, variants=VARIANTS):
+def validate_jobs(experiment_root, tasks=TASKS, variants=VARIANTS, comparison=False):
     """All-or-nothing preflight; this function creates no output directories."""
     import torch
     jobs = []
@@ -42,7 +42,8 @@ def validate_jobs(experiment_root, tasks=TASKS, variants=VARIANTS):
             packet = torch.load(checkpoint, map_location='cpu', weights_only=False)
             if packet.get('role') != 'student' or packet.get('completed_epochs') != 20:
                 raise ValueError(f'Expected final Student completed_epochs=20: {checkpoint}')
-            if packet.get('variant') != variant:
+            model_variant = 'inshape' if comparison else variant
+            if packet.get('variant') != model_variant:
                 raise ValueError(f'Checkpoint variant mismatch: {checkpoint}')
             for key in ('state_dict', 'selector_state_dict', 'source_to_target_shift'):
                 if key not in packet:
@@ -51,6 +52,21 @@ def validate_jobs(experiment_root, tasks=TASKS, variants=VARIANTS):
             if not config_path.exists():
                 config_path = leaf / 'config.json'
             config = json.loads(config_path.read_text(encoding='utf-8'))
+            tested = None
+            if comparison:
+                tested_path = leaf / 'fold_0' / 'tested_checkpoint.json'
+                if not tested_path.is_file():
+                    raise ValueError(f'Missing tested checkpoint record: {tested_path}')
+                tested = json.loads(tested_path.read_text(encoding='utf-8'))
+                if (tested.get('sha256') != checkpoint_digest(checkpoint)
+                        or tested.get('role') != 'student' or tested.get('completed_epochs') != 20):
+                    raise ValueError(f'Final model differs from tested checkpoint: {checkpoint}')
+                expected_epochs = 100 if variant == 'joint' else 20
+                expected_init = 'scratch' if variant == 'joint' else 'checkpoint'
+                if (config.get('source_training_epochs') != expected_epochs
+                        or config.get('source_init') != expected_init
+                        or config.get('variant') != model_variant):
+                    raise ValueError(f'Comparison route/config mismatch: {leaf}')
             splits = json.loads((leaf / 'split_indices.json').read_text(encoding='utf-8'))
             evaluation_path = leaf / 'evaluation_split_indices.json'
             evaluation_splits = (json.loads(evaluation_path.read_text(encoding='utf-8'))
@@ -62,12 +78,17 @@ def validate_jobs(experiment_root, tasks=TASKS, variants=VARIANTS):
                     raise ValueError(f'Overlapping held-out splits for {domain}')
                 if not set(evaluation_splits[domain]['test']).issubset(parts['test']):
                     raise ValueError(f'Evaluation test parcels must be held out of UDA training: {domain}')
-            jobs.append(dict(task=task, variant=variant, checkpoint=checkpoint,
+            jobs.append(dict(task=task, variant=model_variant, route=variant, checkpoint=checkpoint,
+                             tested_checkpoint=tested,
                              config=config, splits=splits, evaluation_splits=evaluation_splits,
                              evaluation_split_provenance=(str(evaluation_path) if evaluation_path.exists()
                                                           else str(leaf / 'split_indices.json'))))
             del packet
     return jobs
+
+
+def validate_comparison_jobs(experiment_root):
+    return validate_jobs(experiment_root, variants=('finetune', 'joint'), comparison=True)
 
 
 def ifft_display(dates, values, keep_fraction=.2):
@@ -121,13 +142,21 @@ def plot_pair(source, target, output, title, keep_fraction=.2):
                     ax.axvspan(edges[positions[0]], edges[positions[-1]+1],
                                ymin=.015 + index*.045, ymax=.05 + index*.045,
                                color=color, alpha=.65)
+                    ax.axvspan(edges[positions[0]], edges[positions[-1]+1],
+                               color=color, alpha=.055)
+                # Label every candidate, including rejected ones, on two domain rows.
+                center = (edges[positions[0]] + edges[positions[-1]+1]) / 2
+                chosen = packet['gate'][head][int(segment)] >= .5
+                ax.text(center, .98-index*.085, f'S{int(segment)+1}{"+" if chosen else "-"}',
+                        transform=ax.get_xaxis_transform(), ha='center', va='top',
+                        fontsize=6, color=color)
             for cut in np.flatnonzero(np.diff(segments)) + 1:
                 ax.axvline(edges[cut], color=color, ls='--', lw=.5, alpha=.25)
         ax.set_title(f'Head {head+1:02d}', fontsize=10)
         ax.set_ylim(*limits)
         ax.grid(alpha=.15)
     axes[0, 0].legend(fontsize=9)
-    fig.suptitle(title + '\nShared Source-train PCA; dots: observations; lines: display-only iFFT; bottom strips: selected segments')
+    fig.suptitle(title + '\nShared Source-train PCA; lines: display-only iFFT; dashed: candidate boundaries; S+/shading/strips: kept; S-: rejected')
     fig.supxlabel('Original calendar day relative to Source start date (no model shift)')
     fig.supylabel('Shared PSE principal component')
     fig.tight_layout(rect=(.02, .025, 1, .95))
@@ -196,7 +225,8 @@ def analyze_job(job, args):
     from utils.segment_structure import structure_forward
     model, selector, checkpoint, train, source, target = load_job(job, args)
     config = job['config']
-    output = Path(args.output_dir) / job['variant'] / job['task']
+    route = job.get('route', job['variant'])
+    output = Path(args.output_dir) / route / job['task']
     output.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     train_indices = rng.permutation(len(train))[:args.pca_parcels]
@@ -241,7 +271,7 @@ def analyze_job(job, args):
                 s = collect(source, pools[0][pair], checkpoint['source_to_target_shift'])
                 t = collect(target, pools[1][pair], 0)
                 filename = f'{label:02d}_{re.sub(r"[^A-Za-z0-9_-]+", "_", name)}_pair{pair+1:02d}'
-                plot_pair(s, t, output / filename, f'{job["task"]} / {job["variant"]} / {name} / pair {pair+1}', args.keep_fraction)
+                plot_pair(s, t, output / filename, f'{job["task"]} / {route} / UDA epoch20 / {name} / pair {pair+1}', args.keep_fraction)
                 record['pairs'].append(dict(source_parcel_id=s['parcel_id'], target_parcel_id=t['parcel_id'],
                                             source_prediction=s['prediction'], target_prediction=t['prediction'],
                                             figure=filename+'.png', numeric=filename+'.json'))
@@ -249,7 +279,8 @@ def analyze_job(job, args):
             record['target_sampled_keep_accuracy'] = (sum(p['target_prediction'] == label for p in record['pairs']) / count if count else None)
             coverage[name] = record
             print(f'SEGMENT_CLASS|variant={job["variant"]}|task={job["task"]}|class={name}|status={record["status"]}|pairs={count}', flush=True)
-    manifest = dict(task=job['task'], variant=job['variant'], seed=args.seed,
+    manifest = dict(task=job['task'], variant=job['variant'], route=route, seed=args.seed,
+                    tested_checkpoint=job.get('tested_checkpoint'),
                     checkpoint=str(job['checkpoint']), checkpoint_sha256=checkpoint_digest(job['checkpoint']),
                     role='student', completed_epochs=20, source=config['source'], target=config['target'],
                     source_train_pca_parcel_ids=train.get_parcel_indices()[train_indices].tolist(),
@@ -271,6 +302,8 @@ def main(argv=None):
     parser.add_argument('--data_root', required=True)
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--layout', choices=('variants', 'compare'), default='variants',
+                        help='compare reads finetune/joint routes, both using the INSHAPE selector')
     parser.add_argument('--tasks', nargs='+', choices=TASKS, default=list(TASKS))
     parser.add_argument('--variants', nargs='+', choices=VARIANTS, default=list(VARIANTS))
     parser.add_argument('--seed', type=int, default=1)
@@ -285,12 +318,13 @@ def main(argv=None):
     if args.pairs_per_class < 1 or args.pca_parcels < 1 or not 0 < args.keep_fraction <= 1:
         raise ValueError('Positive sample counts and 0 < keep_fraction <= 1 required')
     # Even requested subsets cannot bypass the complete eight-job barrier.
-    complete_jobs = validate_jobs(experiment)
+    complete_jobs = (validate_comparison_jobs(experiment) if args.layout == 'compare'
+                     else validate_jobs(experiment))
     jobs = [job for job in complete_jobs if job['task'] in args.tasks and job['variant'] in args.variants]
     print(f'SEGMENT_VISUALIZATION_READY|completed_jobs={len(complete_jobs)}|selected_jobs={len(jobs)}', flush=True)
     manifests = []
     for number, job in enumerate(jobs, 1):
-        print(f'SEGMENT_JOB|job={number}/{len(jobs)}|variant={job["variant"]}|task={job["task"]}', flush=True)
+        print(f'SEGMENT_JOB|job={number}/{len(jobs)}|route={job["route"]}|variant={job["variant"]}|task={job["task"]}', flush=True)
         manifests.append(analyze_job(job, args))
     write_json(output / 'manifest.json', dict(completed_jobs=len(complete_jobs), jobs=manifests,
                                             no_imputation=True, display_only_ifft=True))

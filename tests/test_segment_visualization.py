@@ -61,6 +61,34 @@ def test_preflight_rejects_teacher_and_incomplete(tmp_path):
             vis.validate_jobs(tmp_path)
 
 
+def test_comparison_routes_require_exact_tested_student(tmp_path):
+    torch = pytest.importorskip('torch')
+    for route, epochs in [('finetune', 20), ('joint', 100)]:
+        for task in vis.TASKS:
+            leaf = tmp_path/route/task/'uda'
+            (leaf/'fold_0').mkdir(parents=True)
+            path = leaf/'fold_0/model.pt'
+            torch.save(dict(role='student', completed_epochs=20, variant='inshape',
+                state_dict={}, selector_state_dict={}, source_to_target_shift=8), path)
+            (leaf/'resolved_config.json').write_text(json.dumps(dict(source='s', target='t',
+                variant='inshape', source_training_epochs=epochs,
+                source_init='scratch' if route == 'joint' else 'checkpoint')))
+            (leaf/'split_indices.json').write_text(json.dumps({
+                d: dict(train=[1], val=[2], test=[3]) for d in ('s', 't')}))
+            (leaf/'fold_0/tested_checkpoint.json').write_text(json.dumps(dict(
+                sha256=vis.checkpoint_digest(path), role='student', completed_epochs=20)))
+    jobs = vis.validate_comparison_jobs(tmp_path)
+    assert len(jobs) == 8
+    assert {j['variant'] for j in jobs} == {'inshape'}
+    assert {j['route'] for j in jobs} == {'joint', 'finetune'}
+    record = tmp_path/'joint/AT1_DK1/uda/fold_0/tested_checkpoint.json'
+    data = json.loads(record.read_text())
+    data['sha256'] = 'wrong'
+    record.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='tested checkpoint'):
+        vis.validate_comparison_jobs(tmp_path)
+
+
 def test_all_stage_evaluation_split_preferred_over_raw_uda_holdout(tmp_path):
     paths = _jobs(tmp_path)
     leaf = paths[0].parent.parent
