@@ -67,6 +67,6 @@ if (( status != 0 )); then echo 'ERROR: task failed; visualization skipped'; exi
 echo 'ANALYSIS_START|route=finetune_attention'
 CUDA_VISIBLE_DEVICES="${gpu_ids[0]}" "$PYTHON_BIN" -u -m analysis.segment_structure_visualization \
     --layout attention_finetune --experiment_root "$OUTPUT_ROOT" --data_root "$DATA_ROOT" \
-    --output_dir "$VISUALIZATION_ROOT" --device cuda --seed 1 --pairs_per_class 3 \
+    --output_dir "$VISUALIZATION_ROOT" --device cuda --seed 1 --pairs_per_class 1 \
     > "$VISUALIZATION_LOG/attention_analysis.log" 2>&1
 echo 'ANALYSIS_COMPLETE|route=finetune_attention'

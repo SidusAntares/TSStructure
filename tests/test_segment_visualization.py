@@ -115,7 +115,7 @@ def test_all_stage_evaluation_split_preferred_over_raw_uda_holdout(tmp_path):
     assert jobs[1]['evaluation_split_provenance'].endswith('split_indices.json')
 
 
-def test_shared_projection_and_sixteen_panel_pair(tmp_path):
+def test_shared_projection_and_single_panel_pair(tmp_path):
     pytest.importorskip('matplotlib')
     features = [np.array([[0., 0.], [1., 2.], [2., 4.]])]
     mean, component = vis.fit_projection(features)
@@ -124,10 +124,11 @@ def test_shared_projection_and_sixteen_panel_pair(tmp_path):
                   gate=[[1, 0]] * 16, probabilities=[[.9, .1]]*16, parcel_id=1)
     target = dict(dates=[1, 5, 10], curve=(np.asarray(curve)+2).tolist(),
                   segments=[0, 1, 1], gate=[[0, 1]]*16, probabilities=[[.1, .9]]*16, parcel_id=2)
-    assert vis.plot_pair(source, target, tmp_path / 'pair', 'Wheat') == 16
+    assert vis.plot_pair(source, target, tmp_path / 'pair', 'Wheat') == 1
     assert (tmp_path / 'pair.png').stat().st_size > 1000
     packet = json.loads((tmp_path / 'pair.json').read_text())
     assert packet['heads'] == 16 and packet['display_only']
+    assert packet['panels'] == 1 and packet['shared_gate']
     assert packet['source'] == source and packet['target'] == target
     assert packet['y_limits'][0] < min(curve)
     assert packet['y_limits'][1] > max(target['curve'])
@@ -200,7 +201,15 @@ def test_analysis_heldout_pairs_missing_class_and_readonly_checkpoint(tmp_path, 
     monkeypatch.setattr(segment_structure, 'structure_forward', forward)
     args = SimpleNamespace(output_dir=str(tmp_path / 'visualization'), seed=1, device='cpu',
                            pca_parcels=256, pairs_per_class=3, keep_fraction=.2, num_workers=8)
+    output = tmp_path/'visualization/attention/AT1_DK1'
+    output.mkdir(parents=True)
+    (output/'00_wheat_pair02.png').write_bytes(b'old surplus figure')
+    (output/'00_wheat_pair02.json').write_text('{}')
+    (output/'unrelated.json').write_text('preserve')
     manifest = vis.analyze_job(job, args)
+    assert not (output/'00_wheat_pair02.png').exists()
+    assert not (output/'00_wheat_pair02.json').exists()
+    assert (output/'unrelated.json').read_text() == 'preserve'
     assert len(spatial_calls) == 1
     assert shifts == [[7, 11, 16], [0, 4, 9]]
     assert manifest['source_train_pca_parcel_ids'] == [1]

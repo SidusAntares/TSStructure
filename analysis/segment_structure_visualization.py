@@ -125,13 +125,21 @@ def fit_projection(features):
 
 
 def plot_pair(source, target, output, title, keep_fraction=.2):
-    """Sixteen heads share both domain projection and common x/y scales."""
+    """Shared gates use one panel; archived head-specific gates retain their panels."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(4, 4, figsize=(18, 13), sharex=True, sharey=True)
+    shared = all(np.array_equal(np.asarray(p['gate']),
+                 np.broadcast_to(np.asarray(p['gate'])[:1], np.asarray(p['gate']).shape))
+                 for p in (source, target))
+    panels = 1 if shared else len(source['gate'])
+    if shared:
+        fig, ax = plt.subplots(figsize=(12, 5))
+        axes = np.asarray([ax])
+    else:
+        fig, axes = plt.subplots(4, 4, figsize=(18, 13), sharex=True, sharey=True)
     all_values = np.concatenate([np.asarray(p['curve']) for p in (source, target)])
     span = max(float(np.ptp(all_values)), 1e-5)
     limits = (float(all_values.min() - .12 * span), float(all_values.max() + .08 * span))
@@ -140,7 +148,7 @@ def plot_pair(source, target, output, title, keep_fraction=.2):
             dates, curve, segments = (np.asarray(packet[k]) for k in ('dates', 'curve', 'segments'))
             grid, smooth = ifft_display(dates, curve, keep_fraction)
             ax.plot(grid, smooth, color=color, lw=1.3, label=name)
-            ax.scatter(dates, curve, color=color, s=8, alpha=.55)
+            ax.scatter(dates, curve, color=color, s=20 if shared else 8, alpha=.55)
             edges = np.r_[dates[0], (dates[:-1] + dates[1:]) / 2, dates[-1]]
             for segment in np.unique(segments[segments >= 0]):
                 positions = np.flatnonzero(segments == segment)
@@ -155,22 +163,24 @@ def plot_pair(source, target, output, title, keep_fraction=.2):
                 chosen = packet['gate'][head][int(segment)] >= .5
                 ax.text(center, .98-index*.085, f'S{int(segment)+1}{"+" if chosen else "-"}',
                         transform=ax.get_xaxis_transform(), ha='center', va='top',
-                        fontsize=6, color=color)
+                        fontsize=9 if shared else 6, color=color)
             for cut in np.flatnonzero(np.diff(segments)) + 1:
                 ax.axvline(edges[cut], color=color, ls='--', lw=.5, alpha=.25)
-        ax.set_title(f'Head {head+1:02d}', fontsize=10)
+        if not shared:
+            ax.set_title(f'Head {head+1:02d}', fontsize=10)
         ax.set_ylim(*limits)
         ax.grid(alpha=.15)
-    axes[0, 0].legend(fontsize=9)
+    axes.flat[0].legend(fontsize=9, loc='lower right')
     fig.suptitle(title + '\nShared Source-train PCA; lines: display-only iFFT; dashed: candidate boundaries; S+/shading/strips: kept; S-: rejected')
     fig.supxlabel('Original calendar day relative to Source start date (no model shift)')
     fig.supylabel('Shared PSE principal component')
-    fig.tight_layout(rect=(.02, .025, 1, .95))
+    fig.tight_layout(rect=(.02, .025, 1, .88 if shared else .95))
     fig.savefig(output.with_suffix('.png'), dpi=140)
     write_json(output.with_suffix('.json'), dict(title=title, source=source, target=target,
-               keep_fraction=keep_fraction, display_only=True, y_limits=list(limits), heads=16))
+               keep_fraction=keep_fraction, display_only=True, y_limits=list(limits),
+               heads=len(source['gate']), panels=panels, shared_gate=shared))
     plt.close(fig)
-    return 16
+    return panels
 
 
 def _sample(dataset, index, seed):
@@ -273,14 +283,21 @@ def analyze_job(job, args):
                           status='available' if count else 'N/A', pair_count=count, pairs=[])
             if not count:
                 record['reason'] = 'class_absent_from_source_or_target_heldout_test'
+            prefix = f'{label:02d}_{re.sub(r"[^A-Za-z0-9_-]+", "_", name)}'
             for pair in range(count):
                 s = collect(source, pools[0][pair], checkpoint['source_to_target_shift'])
                 t = collect(target, pools[1][pair], 0)
-                filename = f'{label:02d}_{re.sub(r"[^A-Za-z0-9_-]+", "_", name)}_pair{pair+1:02d}'
+                filename = f'{prefix}_pair{pair+1:02d}'
                 plot_pair(s, t, output / filename, f'{job["task"]} / {route} / UDA epoch20 / {name} / pair {pair+1}', args.keep_fraction)
                 record['pairs'].append(dict(source_parcel_id=s['parcel_id'], target_parcel_id=t['parcel_id'],
                                             source_prediction=s['prediction'], target_prediction=t['prediction'],
                                             figure=filename+'.png', numeric=filename+'.json'))
+            # Re-render in place: remove only surplus figures/numeric sidecars
+            # generated for this same class by a previous multi-pair run.
+            for stale in output.glob(prefix+'_pair*'):
+                match = re.fullmatch(re.escape(prefix)+r'_pair(\d+)\.(png|json)', stale.name)
+                if match and int(match[1]) > count:
+                    stale.unlink()
             record['source_sampled_keep_accuracy'] = (sum(p['source_prediction'] == label for p in record['pairs']) / count if count else None)
             record['target_sampled_keep_accuracy'] = (sum(p['target_prediction'] == label for p in record['pairs']) / count if count else None)
             coverage[name] = record
@@ -315,7 +332,7 @@ def main(argv=None):
                         default=list(VARIANTS)+['attention_shared'])
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--num_workers', type=int, default=8)
-    parser.add_argument('--pairs_per_class', type=int, default=3)
+    parser.add_argument('--pairs_per_class', type=int, default=1)
     parser.add_argument('--pca_parcels', type=int, default=256)
     parser.add_argument('--keep_fraction', type=float, default=.2)
     args = parser.parse_args(argv)
