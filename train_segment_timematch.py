@@ -21,7 +21,7 @@ def build_config(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--stage', required=True, choices=('finetune', 'joint_source', 'uda'))
     parser.add_argument('--source_training_epochs', type=int, choices=(20, 100), default=20)
-    parser.add_argument('--variant', required=True, choices=('inshape', 'attention'))
+    parser.add_argument('--variant', required=True, choices=('inshape', 'attention', 'attention_shared'))
     parser.add_argument('--source', required=True, choices=TILES)
     parser.add_argument('--target', required=True, choices=TILES)
     parser.add_argument('--weights', required=True, help='Historical Original Source leaf containing fold_0/model.pt')
@@ -76,7 +76,9 @@ def build_config(argv=None):
         parser.error('log_step must be positive')
     cfg.mode = None
     cfg.selector_protocol = 'inshape_coverage_v1' if cfg.variant == 'inshape' else 'legacy'
-    if cfg.variant == 'inshape':
+    if cfg.variant == 'attention_shared':
+        cfg.selector_protocol = 'inshape_attention_coverage_v1'
+    if cfg.variant in ('inshape', 'attention_shared'):
         cfg.selector_width, cfg.selector_dropout, cfg.reinmax_tau, cfg.sparse_weight = 32, .1, 1.3, 3.
     cfg.source_init = 'scratch' if cfg.stage == 'joint_source' else 'checkpoint'
     if cfg.stage == 'uda' and cfg.source_training_epochs == 100:
@@ -101,10 +103,13 @@ def build_config(argv=None):
         finetune='20 full source epochs, fixed final checkpoint',
         uda='20 epochs x 500 steps, fixed final joint Student and selector',
         imputation=False)
-    if cfg.variant == 'inshape':
+    if cfg.variant in ('inshape', 'attention_shared'):
         cfg.structure_protocol.update(selector='pure content CLS Transformer; one shared segment gate; initial bias p=0.8',
             sparsity='sampled pre-repair observation coverage times detached (2*coverage-1)',
             sparse_weight=cfg.sparse_weight, sparse_updates='Selector only', selection='ReinMax tau=1.3')
+    if cfg.variant == 'attention_shared':
+        cfg.structure_protocol.update(selector='content CLS plus detached 16-head mass and enrichment; one shared gate; zero-initialized attention weights',
+                                      attention_conditions='32 features: 16 masses and 16 observation-count normalized enrichments')
     cfg.structure_protocol.update(source_init=cfg.source_init, source_training_epochs=cfg.source_training_epochs,
         actual_stage_epochs=cfg.epochs)
     return cfg
@@ -135,7 +140,8 @@ def source_provenance():
     root = Path(__file__).resolve().parent
     paths = [root / 'train_segment_timematch.py', root / 'train.py', root / 'timematch.py',
         root / 'dataset.py', root / 'transforms.py', root / 'evaluation.py',
-        root / 'closedset_scripts/run_segment_timematch_8jobs_3gpu.sh']
+        root / 'closedset_scripts/run_segment_timematch_8jobs_3gpu.sh',
+        root / 'closedset_scripts/run_segment_attention_finetune_4gpu.sh']
     paths.extend(sorted((root / 'models').rglob('*.py')))
     paths.extend(sorted((root / 'utils').glob('*.py')))
     return {'sha256': {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()

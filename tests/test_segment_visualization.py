@@ -61,32 +61,36 @@ def test_preflight_rejects_teacher_and_incomplete(tmp_path):
             vis.validate_jobs(tmp_path)
 
 
-def test_comparison_routes_require_exact_tested_student(tmp_path):
+@pytest.mark.parametrize('attention', [False, True])
+def test_comparison_routes_require_exact_tested_student(tmp_path, attention):
     torch = pytest.importorskip('torch')
-    for route, epochs in [('finetune', 20), ('joint', 100)]:
+    routes = [('finetune_attention', 20)] if attention else [('finetune', 20), ('joint', 100)]
+    variant = 'attention_shared' if attention else 'inshape'
+    for route, epochs in routes:
         for task in vis.TASKS:
             leaf = tmp_path/route/task/'uda'
             (leaf/'fold_0').mkdir(parents=True)
             path = leaf/'fold_0/model.pt'
-            torch.save(dict(role='student', completed_epochs=20, variant='inshape',
+            torch.save(dict(role='student', completed_epochs=20, variant=variant,
                 state_dict={}, selector_state_dict={}, source_to_target_shift=8), path)
             (leaf/'resolved_config.json').write_text(json.dumps(dict(source='s', target='t',
-                variant='inshape', source_training_epochs=epochs,
+                variant=variant, source_training_epochs=epochs,
                 source_init='scratch' if route == 'joint' else 'checkpoint')))
             (leaf/'split_indices.json').write_text(json.dumps({
                 d: dict(train=[1], val=[2], test=[3]) for d in ('s', 't')}))
             (leaf/'fold_0/tested_checkpoint.json').write_text(json.dumps(dict(
                 sha256=vis.checkpoint_digest(path), role='student', completed_epochs=20)))
-    jobs = vis.validate_comparison_jobs(tmp_path)
-    assert len(jobs) == 8
-    assert {j['variant'] for j in jobs} == {'inshape'}
-    assert {j['route'] for j in jobs} == {'joint', 'finetune'}
-    record = tmp_path/'joint/AT1_DK1/uda/fold_0/tested_checkpoint.json'
+    validate = vis.validate_attention_finetune_jobs if attention else vis.validate_comparison_jobs
+    jobs = validate(tmp_path)
+    assert len(jobs) == len(routes)*4
+    assert {j['variant'] for j in jobs} == {variant}
+    assert {j['route'] for j in jobs} == {r for r, _ in routes}
+    record = tmp_path/routes[-1][0]/'AT1_DK1/uda/fold_0/tested_checkpoint.json'
     data = json.loads(record.read_text())
     data['sha256'] = 'wrong'
     record.write_text(json.dumps(data))
     with pytest.raises(ValueError, match='tested checkpoint'):
-        vis.validate_comparison_jobs(tmp_path)
+        validate(tmp_path)
 
 
 def test_all_stage_evaluation_split_preferred_over_raw_uda_holdout(tmp_path):
@@ -133,6 +137,24 @@ def test_output_cannot_overwrite_training(tmp_path):
     with pytest.raises(ValueError, match='separate'):
         vis.main(['--experiment_root', str(tmp_path), '--data_root', 'unused',
                   '--output_dir', str(tmp_path / 'plots')])
+
+
+def test_attention_summary_preserves_existing_baseline_manifest(tmp_path, monkeypatch):
+    output = tmp_path/'visualization'
+    output.mkdir()
+    baseline = output/'manifest.json'
+    baseline.write_text('existing baseline')
+    job = dict(task='AT1_DK1', variant='attention_shared', route='finetune_attention')
+    monkeypatch.setattr(vis, 'validate_attention_finetune_jobs', lambda root: [job])
+    def analyze(job, args):
+        (output/'finetune_attention/AT1_DK1').mkdir(parents=True)
+        return dict(route=job['route'], task=job['task'])
+    monkeypatch.setattr(vis, 'analyze_job', analyze)
+    vis.main(['--layout', 'attention_finetune', '--experiment_root', str(tmp_path/'training'),
+              '--output_dir', str(output), '--data_root', 'unused'])
+    assert baseline.read_text() == 'existing baseline'
+    summary = json.loads((output/'finetune_attention/manifest.json').read_text())
+    assert summary['completed_jobs'] == 1 and summary['jobs'][0]['route'] == 'finetune_attention'
 
 
 def test_analysis_heldout_pairs_missing_class_and_readonly_checkpoint(tmp_path, monkeypatch):

@@ -29,7 +29,8 @@ def checkpoint_digest(path):
     return result.hexdigest()
 
 
-def validate_jobs(experiment_root, tasks=TASKS, variants=VARIANTS, comparison=False):
+def validate_jobs(experiment_root, tasks=TASKS, variants=VARIANTS, comparison=False,
+                  model_variant_override=None):
     """All-or-nothing preflight; this function creates no output directories."""
     import torch
     jobs = []
@@ -42,7 +43,7 @@ def validate_jobs(experiment_root, tasks=TASKS, variants=VARIANTS, comparison=Fa
             packet = torch.load(checkpoint, map_location='cpu', weights_only=False)
             if packet.get('role') != 'student' or packet.get('completed_epochs') != 20:
                 raise ValueError(f'Expected final Student completed_epochs=20: {checkpoint}')
-            model_variant = 'inshape' if comparison else variant
+            model_variant = model_variant_override or ('inshape' if comparison else variant)
             if packet.get('variant') != model_variant:
                 raise ValueError(f'Checkpoint variant mismatch: {checkpoint}')
             for key in ('state_dict', 'selector_state_dict', 'source_to_target_shift'):
@@ -89,6 +90,11 @@ def validate_jobs(experiment_root, tasks=TASKS, variants=VARIANTS, comparison=Fa
 
 def validate_comparison_jobs(experiment_root):
     return validate_jobs(experiment_root, variants=('finetune', 'joint'), comparison=True)
+
+
+def validate_attention_finetune_jobs(experiment_root):
+    return validate_jobs(experiment_root, variants=('finetune_attention',), comparison=True,
+                         model_variant_override='attention_shared')
 
 
 def ifft_display(dates, values, keep_fraction=.2):
@@ -302,10 +308,11 @@ def main(argv=None):
     parser.add_argument('--data_root', required=True)
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--layout', choices=('variants', 'compare'), default='variants',
+    parser.add_argument('--layout', choices=('variants', 'compare', 'attention_finetune'), default='variants',
                         help='compare reads finetune/joint routes, both using the INSHAPE selector')
     parser.add_argument('--tasks', nargs='+', choices=TASKS, default=list(TASKS))
-    parser.add_argument('--variants', nargs='+', choices=VARIANTS, default=list(VARIANTS))
+    parser.add_argument('--variants', nargs='+', choices=VARIANTS+('attention_shared',),
+                        default=list(VARIANTS)+['attention_shared'])
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--pairs_per_class', type=int, default=3)
@@ -318,15 +325,19 @@ def main(argv=None):
     if args.pairs_per_class < 1 or args.pca_parcels < 1 or not 0 < args.keep_fraction <= 1:
         raise ValueError('Positive sample counts and 0 < keep_fraction <= 1 required')
     # Even requested subsets cannot bypass the complete eight-job barrier.
-    complete_jobs = (validate_comparison_jobs(experiment) if args.layout == 'compare'
-                     else validate_jobs(experiment))
+    if args.layout == 'attention_finetune':
+        complete_jobs = validate_attention_finetune_jobs(experiment)
+    else:
+        complete_jobs = (validate_comparison_jobs(experiment) if args.layout == 'compare'
+                         else validate_jobs(experiment))
     jobs = [job for job in complete_jobs if job['task'] in args.tasks and job['variant'] in args.variants]
     print(f'SEGMENT_VISUALIZATION_READY|completed_jobs={len(complete_jobs)}|selected_jobs={len(jobs)}', flush=True)
     manifests = []
     for number, job in enumerate(jobs, 1):
         print(f'SEGMENT_JOB|job={number}/{len(jobs)}|route={job["route"]}|variant={job["variant"]}|task={job["task"]}', flush=True)
         manifests.append(analyze_job(job, args))
-    write_json(output / 'manifest.json', dict(completed_jobs=len(complete_jobs), jobs=manifests,
+    summary = output / 'finetune_attention' if args.layout == 'attention_finetune' else output
+    write_json(summary / 'manifest.json', dict(completed_jobs=len(complete_jobs), jobs=manifests,
                                             no_imputation=True, display_only_ifft=True))
 
 

@@ -74,6 +74,8 @@ class SegmentSelector(nn.Module):
 
     inshape_coverage_v1 reads content only, samples one gate per segment shared
     across LTAE heads, and applies adaptive sampled observation-coverage cost.
+    inshape_attention_coverage_v1 adds detached mass/enrichment from all 16
+    heads to that same shared scorer, with otherwise identical gate and loss.
     The conditioning description below applies only to archived legacy runs.
 
     `heads` is the number of Transformer heads, independent of LTAE head count.
@@ -89,7 +91,7 @@ class SegmentSelector(nn.Module):
     """
     def __init__(self, feature_dim=128, width=64, heads=4, dropout=0.0, layers=1, protocol='legacy'):
         super().__init__()
-        if protocol not in ('legacy', 'inshape_coverage_v1'):
+        if protocol not in ('legacy', 'inshape_coverage_v1', 'inshape_attention_coverage_v1'):
             raise ValueError('Unknown Selector protocol')
         self.protocol = protocol
         self.feature_dim = feature_dim
@@ -105,11 +107,19 @@ class SegmentSelector(nn.Module):
             self.scorer = nn.Sequential(nn.Linear(width, 2))
             with torch.no_grad():
                 self.scorer[0].bias.copy_(torch.tensor([-.69314718056, .69314718056]))
+            if protocol == 'inshape_attention_coverage_v1':
+                # Equivalent to concatenating 32 attention conditions to CLS
+                # before the same two-logit linear scorer. Zero extra weights
+                # preserve baseline initial scores and the global RNG state.
+                with torch.random.fork_rng(devices=[]):
+                    self.attention_scorer = nn.Linear(32, 2, bias=False)
+                nn.init.zeros_(self.attention_scorer.weight)
 
     def forward(self, features, attention, segments, variant='attention', deterministic=False):
-        if self.protocol != 'legacy' and variant != 'inshape':
-            raise ValueError('Restored INSHAPE baseline has no attention-conditioned variant')
-        if variant not in ('inshape', 'attention'):
+        expected_variant = ('attention_shared' if self.protocol == 'inshape_attention_coverage_v1' else 'inshape')
+        if self.protocol != 'legacy' and variant != expected_variant:
+            raise ValueError('Selector protocol and variant do not match')
+        if variant not in ('inshape', 'attention', 'attention_shared'):
             raise ValueError('variant must be inshape or attention')
         if features.ndim != 3 or segments.shape != features.shape[:2]:
             raise ValueError('Expected features [B,T,C] and segments [B,T]')
@@ -150,7 +160,14 @@ class SegmentSelector(nn.Module):
             logit = self.scorer(inputs).squeeze(-1)
             logits = torch.stack((torch.zeros_like(logit), logit), -1)
         else:
-            logits = self.scorer(embeddings)[:, None]
+            shared_logits = self.scorer(embeddings)
+            if self.protocol == 'inshape_attention_coverage_v1':
+                if head_count != 16:
+                    raise ValueError('Shared attention conditioning requires 16 LTAE heads')
+                attention_inputs = torch.cat((mass.transpose(1, 2),
+                    (mass / fraction[:, None].clamp_min(1e-12)).transpose(1, 2)), -1)
+                shared_logits = shared_logits + self.attention_scorer(attention_inputs)
+            logits = shared_logits[:, None]
         if deterministic:
             probability = logits.softmax(-1)[..., 1]
             gate = (probability >= .5).to(features.dtype)
