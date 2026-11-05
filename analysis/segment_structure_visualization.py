@@ -211,7 +211,7 @@ def dataset_indices(job, domain, partition):
     return set(partitions[domain][partition])
 
 
-def load_job(job, args):
+def load_job(job, args, sample_pixels=True):
     import torch
     from dataset import PixelSetData
     from models.stclassifier import PseLTae
@@ -228,7 +228,9 @@ def load_job(job, args):
                                protocol=config.get('selector_protocol', 'legacy')).to(args.device).eval()
     selector.load_state_dict(packet['selector_state_dict'], strict=True)
     def transform(sample):
-        return Normalize()(RandomSamplePixels(config.get('num_pixels', 64))(sample))
+        if sample_pixels:
+            sample = RandomSamplePixels(config.get('num_pixels', 64))(sample)
+        return Normalize()(sample)
     def dataset(domain, part):
         return PixelSetData(args.data_root, domain, config['classes'], transform=transform,
                             indices=dataset_indices(job, domain, part), closed_set=True,
