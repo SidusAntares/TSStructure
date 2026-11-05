@@ -24,7 +24,9 @@ SOFTWARE.
 import torch
 from torch import nn
 
-DROP_PROTOCOLS = ('inshape_drop_v1', 'inshape_drop_proxy_v1')
+DETACHED_DROP_PROTOCOL = 'inshape_drop_proxy_detached_v1'
+DROP_PROXY_PROTOCOLS = ('inshape_drop_proxy_v1', DETACHED_DROP_PROTOCOL)
+DROP_PROTOCOLS = ('inshape_drop_v1', *DROP_PROXY_PROTOCOLS)
 
 
 def selector_only_loss(loss, parameters):

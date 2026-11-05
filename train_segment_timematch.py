@@ -75,7 +75,7 @@ def build_config(argv=None):
     if cfg.log_step <= 0:
         parser.error('log_step must be positive')
     cfg.mode = None
-    cfg.selector_protocol = 'inshape_drop_proxy_v1' if cfg.variant == 'inshape' else 'legacy'
+    cfg.selector_protocol = 'inshape_drop_proxy_detached_v1' if cfg.variant == 'inshape' else 'legacy'
     if cfg.variant == 'attention_shared':
         cfg.selector_protocol = 'inshape_attention_coverage_v1'
     if cfg.variant in ('inshape', 'attention_shared'):
@@ -112,6 +112,7 @@ def build_config(argv=None):
                                       attention_conditions='32 features: 16 masses and 16 observation-count normalized enrichments')
     if cfg.variant == 'inshape':
         cfg.structure_protocol.update(keep_input='only retained PSE features and original dates enter LTAE',
+                                      selector_input_gradient='detached PSE features; Keep classifier trains PSE',
                                       keep_gate_gradient='frozen LTAE pooling proxy, gates 0.05 + 0.95 * hard gate, forward canceled')
     cfg.structure_protocol.update(source_init=cfg.source_init, source_training_epochs=cfg.source_training_epochs,
         actual_stage_epochs=cfg.epochs)

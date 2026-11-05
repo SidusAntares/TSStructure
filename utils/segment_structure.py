@@ -11,7 +11,7 @@ No imputation, fixed segment count, segmentation gradient, or external package.
 import numpy as np
 import torch
 
-from models.segment_selector import DROP_PROTOCOLS
+from models.segment_selector import DETACHED_DROP_PROTOCOL, DROP_PROTOCOLS, DROP_PROXY_PROTOCOLS
 from utils.soft_top50 import frozen_batchnorm_only, keep_head_embeddings
 
 
@@ -105,12 +105,13 @@ def _pool_gate_gradient(encoder, features, positions, valid, gate):
 
 def _classify_retained_observations(model, selector, features, positions, segments, deterministic):
     encoder = model.temporal_encoder
-    info = selector(features, None, segments, variant='inshape', deterministic=deterministic,
+    selector_features = features.detach() if selector.protocol == DETACHED_DROP_PROTOCOL else features
+    info = selector(selector_features, None, segments, variant='inshape', deterministic=deterministic,
                     head_count=encoder.attention_heads.n_head)
     gate = info['point_mask'][:, 0]
     retained = gate.detach().bool()
     pool_gradient = None
-    if selector.protocol == 'inshape_drop_proxy_v1':
+    if selector.protocol in DROP_PROXY_PROTOCOLS:
         selected = [x[mask] for x, mask in zip(features, retained)]
         if torch.is_grad_enabled() and gate.requires_grad:
             pool_gradient = _pool_gate_gradient(encoder, features, positions, segments >= 0, gate)
