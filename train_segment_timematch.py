@@ -75,7 +75,7 @@ def build_config(argv=None):
     if cfg.log_step <= 0:
         parser.error('log_step must be positive')
     cfg.mode = None
-    cfg.selector_protocol = 'inshape_coverage_v1' if cfg.variant == 'inshape' else 'legacy'
+    cfg.selector_protocol = 'inshape_drop_v1' if cfg.variant == 'inshape' else 'legacy'
     if cfg.variant == 'attention_shared':
         cfg.selector_protocol = 'inshape_attention_coverage_v1'
     if cfg.variant in ('inshape', 'attention_shared'):
@@ -110,6 +110,9 @@ def build_config(argv=None):
     if cfg.variant == 'attention_shared':
         cfg.structure_protocol.update(selector='content CLS plus detached 16-head mass and enrichment; one shared gate; zero-initialized attention weights',
                                       attention_conditions='32 features: 16 masses and 16 observation-count normalized enrichments')
+    if cfg.variant == 'inshape':
+        cfg.structure_protocol.update(keep_input='only retained PSE features and original dates enter LTAE',
+                                      keep_gate_gradient='retained features multiplied by their sampled unit gates')
     cfg.structure_protocol.update(source_init=cfg.source_init, source_training_epochs=cfg.source_training_epochs,
         actual_stage_epochs=cfg.epochs)
     return cfg

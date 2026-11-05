@@ -259,3 +259,35 @@ def test_unified_partial_keep_classification_updates_backbone_and_selector():
     keep.square().mean().backward()
     assert selector.scorer[0].weight.grad.abs().sum() > 0
     assert model.spatial_encoder.mlp1[0].linear.weight.grad.abs().sum() > 0
+
+
+def test_drop_protocol_projects_only_retained_dates_and_trains_selector(monkeypatch):
+    from models.segment_selector import SegmentSelector
+    from utils import segment_structure
+
+    torch.manual_seed(8)
+    model = _model().train()
+    selector = SegmentSelector(feature_dim=8, width=16, heads=4, protocol='inshape_drop_v1')
+    monkeypatch.setattr(segment_structure, 'segment_pelt', lambda features, *args, **kwargs:
+                        torch.arange(18)[None].expand(features.size(0), -1) // 3)
+    positions = torch.arange(18)[None].expand(4, -1) * 7
+    encoder_inputs = []
+    projected_inputs = []
+    model.temporal_encoder.register_forward_pre_hook(
+        lambda module, args, kwargs: encoder_inputs.append((args, kwargs)), with_kwargs=True)
+    model.temporal_encoder.inconv.register_forward_pre_hook(
+        lambda module, args: projected_inputs.append(args[0]))
+    _, logits, info = segment_structure.structure_forward(model, selector,
+        torch.randn(4, 18, 3, 5), torch.ones(4, 18, 5), positions, None,
+        variant='inshape', full_loss=False, unified=True)
+    retained = info['point_mask'][:, 0].bool()
+    assert not retained.all()
+    assert len(encoder_inputs) == len(projected_inputs) == 1
+    (features, dates), options = encoder_inputs[0]
+    valid = options['valid_time']
+    torch.testing.assert_close(dates[valid], positions[retained])
+    torch.testing.assert_close(features[valid], info['features'][retained])
+    torch.testing.assert_close(projected_inputs[0].reshape(-1, 8), info['features'][retained])
+    assert info['attention'].transpose(1, 2)[~retained].eq(0).all()
+    torch.nn.functional.cross_entropy(logits, torch.tensor([0, 1, 2, 0])).backward()
+    assert selector.scorer[0].weight.grad.abs().sum() > 0

@@ -91,7 +91,7 @@ class SegmentSelector(nn.Module):
     """
     def __init__(self, feature_dim=128, width=64, heads=4, dropout=0.0, layers=1, protocol='legacy'):
         super().__init__()
-        if protocol not in ('legacy', 'inshape_coverage_v1', 'inshape_attention_coverage_v1'):
+        if protocol not in ('legacy', 'inshape_coverage_v1', 'inshape_attention_coverage_v1', 'inshape_drop_v1'):
             raise ValueError('Unknown Selector protocol')
         self.protocol = protocol
         self.feature_dim = feature_dim
@@ -115,7 +115,8 @@ class SegmentSelector(nn.Module):
                     self.attention_scorer = nn.Linear(32, 2, bias=False)
                 nn.init.zeros_(self.attention_scorer.weight)
 
-    def forward(self, features, attention, segments, variant='attention', deterministic=False):
+    def forward(self, features, attention, segments, variant='attention', deterministic=False,
+                head_count=None):
         expected_variant = ('attention_shared' if self.protocol == 'inshape_attention_coverage_v1' else 'inshape')
         if self.protocol != 'legacy' and variant != expected_variant:
             raise ValueError('Selector protocol and variant do not match')
@@ -123,8 +124,13 @@ class SegmentSelector(nn.Module):
             raise ValueError('variant must be inshape or attention')
         if features.ndim != 3 or segments.shape != features.shape[:2]:
             raise ValueError('Expected features [B,T,C] and segments [B,T]')
-        if attention.ndim != 3 or attention.shape[0] != features.shape[0] or attention.shape[2] != features.shape[1]:
-            raise ValueError('Expected attention [B,H,T]')
+        if attention is None:
+            if self.protocol != 'inshape_drop_v1' or head_count is None:
+                raise ValueError('Only the drop protocol accepts content without attention')
+        else:
+            if attention.ndim != 3 or attention.shape[0] != features.shape[0] or attention.shape[2] != features.shape[1]:
+                raise ValueError('Expected attention [B,H,T]')
+            head_count = attention.size(1)
         valid = segments >= 0
         if not valid.any(-1).all():
             raise ValueError('Each sequence requires at least one segment')
@@ -147,15 +153,14 @@ class SegmentSelector(nn.Module):
         content = self.encoder(tokens, src_key_padding_mask=pad)[:, 0]
         embeddings = features.new_zeros(batch, maximum, content.size(-1))
         embeddings[valid_segments] = content
-        head_count = attention.size(1)
-        mass = torch.einsum('bht,bkt->bhk', attention.detach(), membership.to(attention.dtype))
-        fraction = lengths.to(features.dtype) / valid.sum(-1, keepdim=True)
-        conditions = torch.stack((mass, mass / fraction[:, None].clamp_min(1e-12),
-                                  fraction[:, None].expand(-1, head_count, -1)), -1)
-        if variant == 'inshape':
-            conditions = torch.stack((torch.zeros_like(mass), torch.zeros_like(mass),
-                                      fraction[:, None].expand(-1, head_count, -1)), -1)
+        if self.protocol in ('legacy', 'inshape_attention_coverage_v1'):
+            mass = torch.einsum('bht,bkt->bhk', attention.detach(), membership.to(attention.dtype))
+            fraction = lengths.to(features.dtype) / valid.sum(-1, keepdim=True)
+            enrichment = mass / fraction[:, None].clamp_min(1e-12)
         if self.protocol == 'legacy':
+            if variant == 'inshape':
+                mass, enrichment = torch.zeros_like(mass), torch.zeros_like(enrichment)
+            conditions = torch.stack((mass, enrichment, fraction[:, None].expand(-1, head_count, -1)), -1)
             inputs = torch.cat((embeddings[:, None].expand(-1, head_count, -1, -1), conditions), -1)
             logit = self.scorer(inputs).squeeze(-1)
             logits = torch.stack((torch.zeros_like(logit), logit), -1)
@@ -164,8 +169,7 @@ class SegmentSelector(nn.Module):
             if self.protocol == 'inshape_attention_coverage_v1':
                 if head_count != 16:
                     raise ValueError('Shared attention conditioning requires 16 LTAE heads')
-                attention_inputs = torch.cat((mass.transpose(1, 2),
-                    (mass / fraction[:, None].clamp_min(1e-12)).transpose(1, 2)), -1)
+                attention_inputs = torch.cat((mass.transpose(1, 2), enrichment.transpose(1, 2)), -1)
                 shared_logits = shared_logits + self.attention_scorer(attention_inputs)
             logits = shared_logits[:, None]
         if deterministic:

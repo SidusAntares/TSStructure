@@ -89,6 +89,27 @@ def segment_pelt(features, valid=None, penalty=.1, min_size=3, penalty_mode='per
     return labels
 
 
+def _classify_retained_observations(model, selector, features, positions, segments, deterministic):
+    encoder = model.temporal_encoder
+    info = selector(features, None, segments, variant='inshape', deterministic=deterministic,
+                    head_count=encoder.attention_heads.n_head)
+    gate = info['point_mask'][:, 0]
+    retained = gate.detach().bool()
+    # Gather drops whole observations. At retained positions the binary gate
+    # is exactly one and supplies a surrogate classification gradient.
+    selected = [x[mask] * g[mask, None] for x, mask, g in zip(features, retained, gate)]
+    selected_dates = [dates[mask] for dates, mask in zip(positions, retained)]
+    packed = torch.nn.utils.rnn.pad_sequence(selected, batch_first=True)
+    packed_dates = torch.nn.utils.rnn.pad_sequence(selected_dates, batch_first=True)
+    valid = torch.arange(packed.size(1), device=packed.device)[None] < retained.sum(-1, keepdim=True)
+    temporal, attention, _, _ = encoder(packed, packed_dates, return_attention_scores=True, valid_time=valid)
+    # Export attention on the original observation axis for visualization.
+    aligned = attention.new_zeros((*features.shape[:2], attention.size(1)))
+    aligned[retained] = attention.transpose(1, 2)[valid]
+    info.update(features=features, attention=aligned.transpose(1, 2))
+    return model.decoder(temporal), info
+
+
 def structure_forward(model, selector, pixels, mask, positions, extra, variant='attention',
                       deterministic=False, full_loss=True, penalty=.1, min_size=3,
                       penalty_mode='per_observation', unified=False):
@@ -117,6 +138,14 @@ def structure_forward(model, selector, pixels, mask, positions, extra, variant='
         features[valid] = selected[:, 0]
         attention_mask = valid
     encoder = model.temporal_encoder
+    if getattr(selector, 'protocol', None) == 'inshape_drop_v1':
+        if variant != 'inshape':
+            raise ValueError('Dropping observations before LTAE requires the pure-content variant')
+        segments = segment_pelt(features, valid, penalty=penalty, min_size=min_size, penalty_mode=penalty_mode)
+        keep, info = _classify_retained_observations(model, selector, features, positions, segments, deterministic)
+        full = (model.decoder(encoder(features, positions, return_attention_scores=True,
+                                      valid_time=attention_mask)[0]) if full_loss else None)
+        return full, keep, info
     full = None
     if full_loss:
         temporal, attention, values, scores = encoder(features, positions, return_attention_scores=True, valid_time=attention_mask)
