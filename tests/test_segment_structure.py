@@ -291,3 +291,34 @@ def test_drop_protocol_projects_only_retained_dates_and_trains_selector(monkeypa
     assert info['attention'].transpose(1, 2)[~retained].eq(0).all()
     torch.nn.functional.cross_entropy(logits, torch.tensor([0, 1, 2, 0])).backward()
     assert selector.scorer[0].weight.grad.abs().sum() > 0
+
+
+def test_drop_proxy_trains_rejected_gates_without_changing_forward(monkeypatch):
+    from models.segment_selector import SegmentSelector
+    from utils import segment_structure
+
+    torch.manual_seed(8)
+    reference = _model().train()
+    model = copy.deepcopy(reference)
+    selector = SegmentSelector(feature_dim=8, width=16, heads=4, protocol='inshape_drop_v1')
+    proxy_selector = copy.deepcopy(selector)
+    proxy_selector.protocol = 'inshape_drop_proxy_v1'
+    monkeypatch.setattr(segment_structure, 'segment_pelt', lambda features, *args, **kwargs:
+                        torch.arange(18)[None].expand(features.size(0), -1) // 3)
+    args = (torch.randn(4, 18, 3, 5), torch.ones(4, 18, 5),
+            torch.arange(18)[None].expand(4, -1) * 7, None)
+    kwargs = dict(variant='inshape', full_loss=False, unified=True)
+    torch.manual_seed(17)
+    _, expected, ref_info = segment_structure.structure_forward(reference, selector, *args, **kwargs)
+    torch.manual_seed(17)
+    _, logits, info = segment_structure.structure_forward(model, proxy_selector, *args, **kwargs)
+    torch.testing.assert_close(info['gate'], ref_info['gate'], rtol=0, atol=0)
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+    for name, buffer in model.named_buffers():
+        torch.testing.assert_close(buffer, dict(reference.named_buffers())[name], rtol=0, atol=0)
+    loss = torch.nn.functional.cross_entropy(logits, torch.tensor([0, 1, 2, 0]))
+    gate_grad, score_grad = torch.autograd.grad(loss, (info['gate'], proxy_selector.scorer[0].weight))
+    rejected = info['gate'][:, 0].eq(0) & info['valid_segments']
+    assert rejected.any()
+    assert gate_grad[:, 0][rejected].abs().sum() > 0
+    assert score_grad.abs().sum() > 0

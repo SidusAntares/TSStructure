@@ -11,6 +11,7 @@ No imputation, fixed segment count, segmentation gradient, or external package.
 import numpy as np
 import torch
 
+from models.segment_selector import DROP_PROTOCOLS
 from utils.soft_top50 import frozen_batchnorm_only, keep_head_embeddings
 
 
@@ -89,20 +90,39 @@ def segment_pelt(features, valid=None, penalty=.1, min_size=3, penalty_mode='per
     return labels
 
 
+def _pool_gate_gradient(encoder, features, positions, valid, gate):
+    """Estimate gate gradients using frozen, dropout-free temporal features."""
+    with torch.no_grad(), frozen_batchnorm_only(encoder):
+        encoded = encoder.encode_dates(features, positions, valid)
+        _, _, attention, values = encoder.attention_heads(
+            encoded, return_parts=True, valid_time=valid, apply_dropout=False)
+    # A small floor bounds the gradient when retained dates have little
+    # attention mass. The proxy value itself is canceled before classification.
+    soft_gate = .05 + .95 * gate
+    pooled, _, _ = keep_head_embeddings(attention, values, soft_gate[:, None].expand_as(attention))
+    return pooled
+
+
 def _classify_retained_observations(model, selector, features, positions, segments, deterministic):
     encoder = model.temporal_encoder
     info = selector(features, None, segments, variant='inshape', deterministic=deterministic,
                     head_count=encoder.attention_heads.n_head)
     gate = info['point_mask'][:, 0]
     retained = gate.detach().bool()
-    # Gather drops whole observations. At retained positions the binary gate
-    # is exactly one and supplies a surrogate classification gradient.
-    selected = [x[mask] * g[mask, None] for x, mask, g in zip(features, retained, gate)]
+    pool_gradient = None
+    if selector.protocol == 'inshape_drop_proxy_v1':
+        selected = [x[mask] for x, mask in zip(features, retained)]
+        if torch.is_grad_enabled() and gate.requires_grad:
+            pool_gradient = _pool_gate_gradient(encoder, features, positions, segments >= 0, gate)
+    else:
+        # Historical protocol passes the gradient through retained gates only.
+        selected = [x[mask] * g[mask, None] for x, mask, g in zip(features, retained, gate)]
     selected_dates = [dates[mask] for dates, mask in zip(positions, retained)]
     packed = torch.nn.utils.rnn.pad_sequence(selected, batch_first=True)
     packed_dates = torch.nn.utils.rnn.pad_sequence(selected_dates, batch_first=True)
     valid = torch.arange(packed.size(1), device=packed.device)[None] < retained.sum(-1, keepdim=True)
-    temporal, attention, _, _ = encoder(packed, packed_dates, return_attention_scores=True, valid_time=valid)
+    temporal, attention, _, _ = encoder(packed, packed_dates, return_attention_scores=True,
+                                        valid_time=valid, pool_gradient=pool_gradient)
     # Export attention on the original observation axis for visualization.
     aligned = attention.new_zeros((*features.shape[:2], attention.size(1)))
     aligned[retained] = attention.transpose(1, 2)[valid]
@@ -138,7 +158,7 @@ def structure_forward(model, selector, pixels, mask, positions, extra, variant='
         features[valid] = selected[:, 0]
         attention_mask = valid
     encoder = model.temporal_encoder
-    if getattr(selector, 'protocol', None) == 'inshape_drop_v1':
+    if getattr(selector, 'protocol', None) in DROP_PROTOCOLS:
         if variant != 'inshape':
             raise ValueError('Dropping observations before LTAE requires the pure-content variant')
         segments = segment_pelt(features, valid, penalty=penalty, min_size=min_size, penalty_mode=penalty_mode)

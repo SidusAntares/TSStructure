@@ -24,6 +24,8 @@ SOFTWARE.
 import torch
 from torch import nn
 
+DROP_PROTOCOLS = ('inshape_drop_v1', 'inshape_drop_proxy_v1')
+
 
 def selector_only_loss(loss, parameters):
     """Preserve scalar value and exact first-order Selector gradients only.
@@ -91,7 +93,7 @@ class SegmentSelector(nn.Module):
     """
     def __init__(self, feature_dim=128, width=64, heads=4, dropout=0.0, layers=1, protocol='legacy'):
         super().__init__()
-        if protocol not in ('legacy', 'inshape_coverage_v1', 'inshape_attention_coverage_v1', 'inshape_drop_v1'):
+        if protocol not in ('legacy', 'inshape_coverage_v1', 'inshape_attention_coverage_v1', *DROP_PROTOCOLS):
             raise ValueError('Unknown Selector protocol')
         self.protocol = protocol
         self.feature_dim = feature_dim
@@ -125,7 +127,7 @@ class SegmentSelector(nn.Module):
         if features.ndim != 3 or segments.shape != features.shape[:2]:
             raise ValueError('Expected features [B,T,C] and segments [B,T]')
         if attention is None:
-            if self.protocol != 'inshape_drop_v1' or head_count is None:
+            if self.protocol not in DROP_PROTOCOLS or head_count is None:
                 raise ValueError('Only the drop protocol accepts content without attention')
         else:
             if attention.ndim != 3 or attention.shape[0] != features.shape[0] or attention.shape[2] != features.shape[1]:

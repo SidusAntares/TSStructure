@@ -81,8 +81,7 @@ class LTAE(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, positions, return_att=False, return_head_parts=False,
-                return_attention_scores=False, valid_time=None):
+    def encode_dates(self, x, positions, valid_time=None):
         if self.inconv is not None:
             if valid_time is not None and not bool(valid_time.all()):
                 projected = self.inconv(x[valid_time])
@@ -93,7 +92,11 @@ class LTAE(nn.Module):
                 x = self.inconv(x)
         if valid_time is not None:
             positions = torch.where(valid_time, positions, torch.zeros_like(positions))
-        enc_output = x + self.positional_enc(positions + self.max_temporal_shift)
+        return x + self.positional_enc(positions + self.max_temporal_shift)
+
+    def forward(self, x, positions, return_att=False, return_head_parts=False,
+                return_attention_scores=False, valid_time=None, pool_gradient=None):
+        enc_output = self.encode_dates(x, positions, valid_time)
 
         if return_attention_scores:
             pooled, attn, raw_attention, head_values, scores = self.attention_heads(
@@ -106,6 +109,8 @@ class LTAE(nn.Module):
         else:
             pooled, attn = self.attention_heads(enc_output)
 
+        if pool_gradient is not None:
+            pooled = pooled + (pool_gradient - pool_gradient.detach())
         enc_output = self.dropout(self.mlp(pooled))
 
         if return_attention_scores:

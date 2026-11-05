@@ -187,7 +187,7 @@ def test_dry_run_has_protocol_and_no_heavy_imports_or_outputs(tmp_path):
     assert cfg['pelt_penalty'] == .8 and cfg['pelt_min_size'] == 3
     assert cfg['pelt_penalty_mode'] == 'absolute'
     assert cfg['selector_dropout'] == .1
-    assert cfg['selector_protocol'] == 'inshape_drop_v1'
+    assert cfg['selector_protocol'] == 'inshape_drop_proxy_v1'
     assert cfg['run_validation'] is False and cfg['strict_final_student'] is True
     assert not (tmp_path / 'output').exists()
 
