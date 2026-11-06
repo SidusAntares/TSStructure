@@ -224,9 +224,27 @@ def target_cut_diagnostic(job, args):
               f'native_acc={np.mean(base[rows] == label):.6f} source_cut_acc={np.mean(cut[rows] == label):.6f}', flush=True)
 
 
+def validate_final_drop_jobs(experiment_root, joint_task):
+    from models.segment_selector import DROP_PROTOCOLS
+
+    jobs = validate_jobs(experiment_root, variants=('finetune',), comparison=True)
+    jobs += validate_jobs(experiment_root, tasks=(joint_task,), variants=('joint',), comparison=True)
+    for job in jobs:
+        if job['config'].get('selector_protocol') not in DROP_PROTOCOLS:
+            raise ValueError(f'Expected an INSHAPE hard-delete checkpoint: {job["checkpoint"]}')
+        target = job['config']['target']
+        path = job['checkpoint'].parent / f'test_{target.replace("/", "_")}.json'
+        if not path.is_file():
+            raise ValueError(f'Final target test report is required: {path}')
+        report = json.loads(path.read_text(encoding='utf-8'))
+        if report.get('completed_epochs') != 20 or report.get('domain') != target or 'keep' not in report:
+            raise ValueError(f'Expected completed epoch20 target Keep report: {path}')
+        job['test_report'] = report
+    return jobs
+
+
 def main(argv=None):
     import torch
-    from models.segment_selector import DROP_PROTOCOLS
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', required=True, choices=('plots', 'diagnostic'))
@@ -249,19 +267,7 @@ def main(argv=None):
         experiment, output = Path(args.experiment_root).resolve(), Path(args.output_dir).resolve()
         if output == experiment or experiment in output.parents:
             parser.error('Plot directory must be outside the experiment directory')
-    jobs = validate_jobs(args.experiment_root, variants=('finetune',), comparison=True)
-    jobs += validate_jobs(args.experiment_root, tasks=(args.joint_task,), variants=('joint',), comparison=True)
-    for job in jobs:
-        if job['config'].get('selector_protocol') not in DROP_PROTOCOLS:
-            raise ValueError(f'Expected an INSHAPE hard-delete checkpoint: {job["checkpoint"]}')
-        target = job['config']['target']
-        path = job['checkpoint'].parent / f'test_{target.replace("/", "_")}.json'
-        if not path.is_file():
-            raise ValueError(f'Final target test report is required: {path}')
-        report = json.loads(path.read_text(encoding='utf-8'))
-        if report.get('completed_epochs') != 20 or report.get('domain') != target or 'keep' not in report:
-            raise ValueError(f'Expected completed epoch20 target Keep report: {path}')
-        job['test_report'] = report
+    jobs = validate_final_drop_jobs(args.experiment_root, args.joint_task)
     run_job = make_images if args.mode == 'plots' else target_cut_diagnostic
     with torch.no_grad():
         for job in jobs:
