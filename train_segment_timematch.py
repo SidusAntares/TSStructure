@@ -26,6 +26,8 @@ def build_config(argv=None):
     parser.add_argument('--target', required=True, choices=TILES)
     parser.add_argument('--weights', required=True, help='Historical Original Source leaf containing fold_0/model.pt')
     parser.add_argument('--structure_checkpoint', help='Own variant/task finetune/fold_0/model.pt, required for UDA')
+    parser.add_argument('--finetune_ltae_only', action='store_true',
+                        help='Train LTAE and Selector while freezing PSE and classifier')
     parser.add_argument('--output_dir', required=True, help='Exact new stage leaf; existing directories are refused')
     parser.add_argument('--experiment_name')
     parser.add_argument('--tensorboard_log_dir')
@@ -62,6 +64,8 @@ def build_config(argv=None):
         parser.error('UDA requires --structure_checkpoint from its own final source finetuning')
     if cfg.stage != 'uda' and cfg.structure_checkpoint:
         parser.error('finetune starts from --weights and does not accept --structure_checkpoint')
+    if cfg.finetune_ltae_only and cfg.stage != 'finetune':
+        parser.error('--finetune_ltae_only requires --stage finetune')
     # The approved run is a fixed matched comparison; refuse silent protocol drift.
     fixed = dict(integers, **floats, **booleans)
     for name in ('log_step',):
@@ -114,6 +118,10 @@ def build_config(argv=None):
         cfg.structure_protocol.update(keep_input='only retained PSE features and original dates enter LTAE',
                                       selector_input_gradient='detached PSE features; Keep classifier trains PSE',
                                       keep_gate_gradient='frozen LTAE pooling proxy, gates 0.05 + 0.95 * hard gate, forward canceled')
+    if cfg.finetune_ltae_only:
+        cfg.structure_protocol.update(finetune_trainable='LTAE and Selector',
+                                      finetune_frozen='PSE and classifier including normalization buffers',
+                                      selector_input_gradient='frozen PSE features')
     cfg.structure_protocol.update(source_init=cfg.source_init, source_training_epochs=cfg.source_training_epochs,
         actual_stage_epochs=cfg.epochs)
     return cfg

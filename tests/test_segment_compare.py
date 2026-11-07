@@ -16,6 +16,32 @@ def test_joint_source_and_uda_endpoint_configuration(tmp_path):
     assert uda.epochs == 20 and uda.source_training_epochs == 100 and uda.keep_weight == 1
 
 
+def test_ltae_finetune_hands_off_to_historical_uda_arguments(tmp_path):
+    from test_closedset_historical_rerun import arguments
+
+    setup_run(tmp_path)
+    root = Path(__file__).resolve().parents[1]
+    scripts = ('run_ltae_finetune_original_uda_4tasks_seed1.sh', 'run_closedset_historical_4tasks_seed1.sh')
+    for tile in ('33UVP', '30TXT', '31TCJ', '32VNH'):
+        checkpoint = tmp_path/f'outputs/timematch_historical_rerun_seed1/source/closedset_source_{tile}_seed1/fold_0/model.pt'
+        checkpoint.write_bytes(b'original source')
+    for script, experiment in zip(scripts, ('fine', 'historical')):
+        shutil.copyfile(root/'closedset_scripts'/script, tmp_path/'closedset_scripts'/script)
+        subprocess.run([bash_bin(), 'closedset_scripts/'+script], cwd=tmp_path, check=True, timeout=40,
+                       env=dict(os.environ, DATA_ROOT='data', PYTHON_BIN='/bin/echo', EXPERIMENT=experiment))
+    for task, tile in zip(('AT1_DK1', 'FR1_FR2', 'FR2_DK1', 'DK1_AT1'), ('33UVP', '30TXT', '31TCJ', '32VNH')):
+        config = build_config(shlex.split((tmp_path/f'logs/fine/{task}_finetune.log').read_text())[2:])
+        assert config.finetune_ltae_only and config.stage == 'finetune' and config.epochs == 20
+        assert config.weights == f'outputs/timematch_historical_rerun_seed1/source/closedset_source_{tile}_seed1'
+        actual = arguments((tmp_path/f'logs/fine/{task}.log').read_text())
+        expected = arguments((tmp_path/f'logs/historical/{task}.log').read_text())
+        assert actual['weights'] == config.output_dir
+        assert actual['strict_final_student'] is True
+        ignored = {'weights', 'experiment_name', 'output_dir', 'tensorboard_log_dir', 'strict_final_student'}
+        assert {k: v for k, v in actual.items() if k not in ignored} == {
+            k: v for k, v in expected.items() if k not in ignored}
+
+
 @pytest.mark.parametrize('complete_source', [True, False])
 def test_resume_preserves_source_and_refuses_incomplete_stage(tmp_path, complete_source):
     setup_run(tmp_path)

@@ -57,6 +57,24 @@ def test_structure_runtime_source_uses_single_keep_classification(tmp_path):
     assert model.temporal_encoder.mlp[0].norm.num_batches_tracked == 1
 
 
+def test_ltae_only_finetune_freezes_pse_and_head_including_buffers(tmp_path):
+    model, _ = models()
+    selector = SegmentSelector(width=16, heads=2, protocol='inshape_drop_proxy_detached_v1')
+    cfg = config(tmp_path)
+    cfg.__dict__.update(epochs=1, variant='inshape', finetune_ltae_only=True, pelt_penalty=0.)
+    before = {name: value.clone() for name, value in model.state_dict().items()}
+    scorer = selector.scorer[0].weight.detach().clone()
+    train_source_structure_epochs(model, selector, [sample()], cfg)
+    packet = torch.load(tmp_path/'model.pt', weights_only=False)
+    assert packet['finetune_ltae_only'] is True
+    for name, value in packet['state_dict'].items():
+        if name.startswith(('spatial_encoder.', 'decoder.')):
+            torch.testing.assert_close(value, before[name], atol=0, rtol=0)
+    assert not torch.equal(packet['state_dict']['temporal_encoder.attention_heads.key.weight'],
+                           before['temporal_encoder.attention_heads.key.weight'])
+    assert not torch.equal(selector.scorer[0].weight, scorer)
+
+
 def test_uda_structure_trains_both_domains_without_target_labels(tmp_path, monkeypatch):
     import timematch
     model, selector = models()

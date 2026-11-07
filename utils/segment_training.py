@@ -48,13 +48,19 @@ def write_history(path, rows):
 def train_source_structure_epochs(model, selector, loader, config, writer=None):
     if not len(loader):
         raise ValueError('No complete source batches for structure finetuning')
-    optimizer = torch.optim.Adam([{'params': model.parameters()},
+    ltae_only = getattr(config, 'finetune_ltae_only', False)
+    frozen = (model.spatial_encoder, model.decoder) if ltae_only else ()
+    for module in frozen:
+        module.requires_grad_(False)
+    optimizer = torch.optim.Adam([{'params': (p for p in model.parameters() if p.requires_grad)},
         {'params': selector.parameters(), 'lr': config.selector_lr}],
         lr=config.lr, weight_decay=config.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs*len(loader))
     criterion, history = FocalLoss(gamma=config.focal_loss_gamma), []
     for epoch in range(config.epochs):
         model.train()
+        for module in frozen:
+            module.eval()
         selector.train()
         rows = []
         for sample in loader:
@@ -87,6 +93,7 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None):
                     role='source_structure', completed_epochs=config.epochs, variant=config.variant,
                     classification_path='keep_only_unified',
                     selector_protocol=getattr(config, 'selector_protocol', 'legacy'),
+                    finetune_ltae_only=ltae_only,
                     source_init=getattr(config, 'source_init', 'checkpoint'),
                     source=config.source, original_source_checkpoint_sha256=config.original_source_checkpoint_sha256),
                Path(config.fold_dir)/'model.pt')
