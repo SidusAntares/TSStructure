@@ -293,8 +293,9 @@ def test_drop_protocol_projects_only_retained_dates_and_trains_selector(monkeypa
     assert selector.scorer[0].weight.grad.abs().sum() > 0
 
 
-@pytest.mark.parametrize('detached', [False, True])
-def test_drop_proxy_trains_rejected_gates_without_changing_forward(monkeypatch, detached):
+@pytest.mark.parametrize('protocol', ['inshape_drop_proxy_v1', 'inshape_drop_proxy_detached_v1',
+                                      'inshape_drop_proxy_context_v1'])
+def test_drop_proxy_trains_rejected_gates_without_changing_forward(monkeypatch, protocol):
     from models.segment_selector import SegmentSelector
     from utils import segment_structure
 
@@ -302,8 +303,8 @@ def test_drop_proxy_trains_rejected_gates_without_changing_forward(monkeypatch, 
     reference = _model().train()
     model = copy.deepcopy(reference)
     selector = SegmentSelector(feature_dim=8, width=16, heads=4, protocol='inshape_drop_v1')
-    proxy_selector = copy.deepcopy(selector)
-    proxy_selector.protocol = 'inshape_drop_proxy_detached_v1' if detached else 'inshape_drop_proxy_v1'
+    proxy_selector = SegmentSelector(feature_dim=8, width=16, heads=4, protocol=protocol)
+    proxy_selector.load_state_dict(selector.state_dict(), strict=False)
     monkeypatch.setattr(segment_structure, 'segment_pelt', lambda features, *args, **kwargs:
                         torch.arange(18)[None].expand(features.size(0), -1) // 3)
     args = (torch.randn(4, 18, 3, 5), torch.ones(4, 18, 5),
@@ -320,11 +321,37 @@ def test_drop_proxy_trains_rejected_gates_without_changing_forward(monkeypatch, 
     loss = torch.nn.functional.cross_entropy(logits, torch.tensor([0, 1, 2, 0]))
     gate_input_grad, = torch.autograd.grad(info['probabilities'].sum(), info['features'],
                                           allow_unused=True, retain_graph=True)
-    assert (gate_input_grad is None) == detached
-    gate_grad, score_grad, pse_grad = torch.autograd.grad(loss, (info['gate'],
-        proxy_selector.scorer[0].weight, model.spatial_encoder.mlp1[0].linear.weight))
+    assert (gate_input_grad is None) == (protocol != 'inshape_drop_proxy_v1')
+    parameters = [info['gate'], proxy_selector.scorer[0].weight, model.spatial_encoder.mlp1[0].linear.weight]
+    if protocol == 'inshape_drop_proxy_context_v1':
+        parameters.append(proxy_selector.segment_context.out_proj.weight)
+    gate_grad, score_grad, pse_grad, *context_grads = torch.autograd.grad(loss, parameters)
     rejected = info['gate'][:, 0].eq(0) & info['valid_segments']
     assert rejected.any()
     assert gate_grad[:, 0][rejected].abs().sum() > 0
     assert score_grad.abs().sum() > 0
     assert pse_grad.abs().sum() > 0
+    assert all(gradient.abs().sum() > 0 for gradient in context_grads)
+
+
+def test_segment_context_changes_other_segment_scores_and_masks_padding():
+    from models.segment_selector import SegmentSelector
+
+    torch.manual_seed(6)
+    model = SegmentSelector(feature_dim=4, width=8, heads=2, protocol='inshape_drop_proxy_context_v1').eval()
+    context = model.segment_context
+    with torch.no_grad():
+        context.in_proj_weight.zero_()
+        context.in_proj_weight[-8:].copy_(torch.eye(8))
+        context.in_proj_bias.zero_()
+        context.out_proj.weight.copy_(torch.eye(8))
+        features = torch.randn(2, 9, 4)
+        segments = torch.tensor([[0, 0, 0, 1, 1, 1, -1, -1, -1], [0, 0, 0, 1, 1, 1, 2, 2, 2]])
+        def scores(x, labels):
+            return model(x, None, labels, variant='inshape', deterministic=True, head_count=4)['probabilities']
+        baseline = scores(features, segments)
+        changed = features.clone()
+        changed[0, 3:6] = -changed[0, 3:6]
+        assert not torch.allclose(baseline[0, :, 0], scores(changed, segments)[0, :, 0])
+        torch.testing.assert_close(baseline[0, :, :2], scores(features[:1, :6], segments[:1, :6])[0])
+        torch.testing.assert_close(baseline[1], scores(changed, segments)[1])

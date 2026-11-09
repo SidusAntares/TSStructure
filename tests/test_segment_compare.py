@@ -16,6 +16,30 @@ def test_joint_source_and_uda_endpoint_configuration(tmp_path):
     assert uda.epochs == 20 and uda.source_training_epochs == 100 and uda.keep_weight == 1
 
 
+def test_context_launcher_runs_four_matched_finetune_uda_chains(tmp_path):
+    setup_run(tmp_path)
+    script = 'run_segment_compare_8jobs_4gpu.sh'
+    root = Path(__file__).resolve().parents[1]
+    shutil.copyfile(root/'closedset_scripts'/script, tmp_path/'closedset_scripts'/script)
+    subprocess.run([bash_bin(), 'closedset_scripts/'+script], cwd=tmp_path, check=True, timeout=40,
+                   env=dict(os.environ, DATA_ROOT='data', PYTHON_BIN='/bin/echo', EXPERIMENT='context',
+                            SEGMENT_CONTEXT='1', RESUME='0'))
+    logs = tmp_path/'logs/context'
+    for task in ('AT1_DK1', 'FR1_FR2', 'FR2_DK1', 'DK1_AT1'):
+        for log_stage, stage in (('source', 'finetune'), ('uda', 'uda')):
+            line = (logs/f'{task}_finetune_{log_stage}.log').read_text()
+            argv = shlex.split(line)[2:]
+            config = build_config(argv)
+            assert config.stage == stage and config.epochs == 20
+            assert config.selector_protocol == 'inshape_drop_proxy_context_v1'
+            baseline = build_config([arg for arg in argv if arg != '--segment_context'])
+            for key, value in vars(config).items():
+                if key not in {'selector_protocol', 'segment_context', 'structure_protocol'}:
+                    assert value == getattr(baseline, key)
+    assert (logs/'launcher.log').read_text().count('TASK_COMPLETE|') == 4
+    assert not list(logs.glob('*_joint_*.log'))
+
+
 def test_ltae_finetune_hands_off_to_historical_uda_arguments(tmp_path):
     from test_closedset_historical_rerun import arguments
 

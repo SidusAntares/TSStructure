@@ -5,7 +5,10 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
-EXPERIMENT="${EXPERIMENT:-timematch_segments_compare_seed1}"
+SEGMENT_CONTEXT="${SEGMENT_CONTEXT:-0}"
+default_experiment=timematch_segments_compare_seed1
+if [[ "$SEGMENT_CONTEXT" == 1 ]]; then default_experiment=timematch_segments_context_seed1; fi
+EXPERIMENT="${EXPERIMENT:-$default_experiment}"
 RESUME="${RESUME:-0}"
 OUTPUT_ROOT="outputs/$EXPERIMENT"
 LOG_ROOT="logs/$EXPERIMENT"
@@ -21,6 +24,9 @@ exec >> "$LOG_ROOT/launcher.log" 2>&1
 [[ -d "$DATA_ROOT" ]] || { echo "ERROR: missing dataset: $DATA_ROOT"; exit 1; }
 [[ "$RESUME" == 0 || "$RESUME" == 1 ]] || {
     echo 'ERROR: RESUME must be 0 or 1'; exit 1;
+}
+[[ "$SEGMENT_CONTEXT" == 0 || "$SEGMENT_CONTEXT" == 1 ]] || {
+    echo 'ERROR: SEGMENT_CONTEXT must be 0 or 1'; exit 1;
 }
 [[ ! -e "$OUTPUT_ROOT" || "$RESUME" == 1 ]] || {
     echo 'ERROR: experiment output exists; use RESUME=1 to reuse final Source checkpoints'; exit 1;
@@ -46,6 +52,10 @@ done
 # Slow FR1 jobs enter first; each free GPU takes the next pair immediately.
 job_tasks=(FR1_FR2 FR1_FR2 FR2_DK1 DK1_AT1 FR2_DK1 DK1_AT1 AT1_DK1 AT1_DK1)
 job_variants=(joint finetune joint joint finetune finetune joint finetune)
+if [[ "$SEGMENT_CONTEXT" == 1 ]]; then
+    job_tasks=(FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1)
+    job_variants=(finetune finetune finetune finetune)
+fi
 mkdir -p "$OUTPUT_ROOT"
 queue_dir="$(mktemp -d "$LOG_ROOT/queue.XXXXXX")"
 printf '%s\n' 0 > "$queue_dir/next"
@@ -66,6 +76,7 @@ run_job() {
     local common=(--source "$source" --target "$target" --weights "$original"
         --data_root "$DATA_ROOT" --seed 1 --num_workers 8 --variant inshape
         --experiment_name "$task" --progress_bar off)
+    if [[ "$SEGMENT_CONTEXT" == 1 ]]; then common+=(--segment_context); fi
     if [[ "$RESUME" == 1 && -s "$leaf/source/fold_0/model.pt" ]]; then
         # UDA validates the saved role, epoch count, route, protocol and source hash.
         echo "SOURCE_REUSE|gpu=$gpu|task=$task|route=$route|checkpoint=$leaf/source/fold_0/model.pt"

@@ -28,6 +28,8 @@ def build_config(argv=None):
     parser.add_argument('--structure_checkpoint', help='Own variant/task finetune/fold_0/model.pt, required for UDA')
     parser.add_argument('--finetune_ltae_only', action='store_true',
                         help='Train LTAE and Selector while freezing PSE and classifier')
+    parser.add_argument('--segment_context', action='store_true',
+                        help='Apply one self-attention layer across candidate segment embeddings')
     parser.add_argument('--output_dir', required=True, help='Exact new stage leaf; existing directories are refused')
     parser.add_argument('--experiment_name')
     parser.add_argument('--tensorboard_log_dir')
@@ -66,6 +68,9 @@ def build_config(argv=None):
         parser.error('finetune starts from --weights and does not accept --structure_checkpoint')
     if cfg.finetune_ltae_only and cfg.stage != 'finetune':
         parser.error('--finetune_ltae_only requires --stage finetune')
+    if cfg.segment_context and (cfg.variant != 'inshape' or cfg.stage == 'joint_source'
+                                or cfg.source_training_epochs != 20 or cfg.finetune_ltae_only):
+        parser.error('--segment_context requires the matched inshape finetune/UDA route')
     # The approved run is a fixed matched comparison; refuse silent protocol drift.
     fixed = dict(integers, **floats, **booleans)
     for name in ('log_step',):
@@ -80,6 +85,8 @@ def build_config(argv=None):
         parser.error('log_step must be positive')
     cfg.mode = None
     cfg.selector_protocol = 'inshape_drop_proxy_detached_v1' if cfg.variant == 'inshape' else 'legacy'
+    if cfg.segment_context:
+        cfg.selector_protocol = 'inshape_drop_proxy_context_v1'
     if cfg.variant == 'attention_shared':
         cfg.selector_protocol = 'inshape_attention_coverage_v1'
     if cfg.variant in ('inshape', 'attention_shared'):
@@ -122,6 +129,8 @@ def build_config(argv=None):
         cfg.structure_protocol.update(finetune_trainable='LTAE and Selector',
                                       finetune_frozen='PSE and classifier including normalization buffers',
                                       selector_input_gradient='frozen PSE features')
+    if cfg.segment_context:
+        cfg.structure_protocol.update(segment_context='one 1-head residual self-attention over valid segment CLS vectors; zero output initialization')
     cfg.structure_protocol.update(source_init=cfg.source_init, source_training_epochs=cfg.source_training_epochs,
         actual_stage_epochs=cfg.epochs)
     return cfg

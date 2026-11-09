@@ -25,7 +25,9 @@ import torch
 from torch import nn
 
 DETACHED_DROP_PROTOCOL = 'inshape_drop_proxy_detached_v1'
-DROP_PROXY_PROTOCOLS = ('inshape_drop_proxy_v1', DETACHED_DROP_PROTOCOL)
+CONTEXT_DROP_PROTOCOL = 'inshape_drop_proxy_context_v1'
+DETACHED_DROP_PROTOCOLS = (DETACHED_DROP_PROTOCOL, CONTEXT_DROP_PROTOCOL)
+DROP_PROXY_PROTOCOLS = ('inshape_drop_proxy_v1', *DETACHED_DROP_PROTOCOLS)
 DROP_PROTOCOLS = ('inshape_drop_v1', *DROP_PROXY_PROTOCOLS)
 
 
@@ -118,6 +120,12 @@ class SegmentSelector(nn.Module):
                 with torch.random.fork_rng(devices=[]):
                     self.attention_scorer = nn.Linear(32, 2, bias=False)
                 nn.init.zeros_(self.attention_scorer.weight)
+        if protocol == CONTEXT_DROP_PROTOCOL:
+            # Preserve the baseline initialization and start with a zero residual.
+            with torch.random.fork_rng(devices=[]):
+                self.segment_context = nn.MultiheadAttention(width, num_heads=1, batch_first=True)
+            nn.init.zeros_(self.segment_context.out_proj.weight)
+            nn.init.zeros_(self.segment_context.out_proj.bias)
 
     def forward(self, features, attention, segments, variant='attention', deterministic=False,
                 head_count=None):
@@ -157,6 +165,10 @@ class SegmentSelector(nn.Module):
         content = self.encoder(tokens, src_key_padding_mask=pad)[:, 0]
         embeddings = features.new_zeros(batch, maximum, content.size(-1))
         embeddings[valid_segments] = content
+        if self.protocol == CONTEXT_DROP_PROTOCOL:
+            context, _ = self.segment_context(embeddings, embeddings, embeddings,
+                                              key_padding_mask=~valid_segments, need_weights=False)
+            embeddings = embeddings + context.masked_fill(~valid_segments[..., None], 0.)
         if self.protocol in ('legacy', 'inshape_attention_coverage_v1'):
             mass = torch.einsum('bht,bkt->bhk', attention.detach(), membership.to(attention.dtype))
             fraction = lengths.to(features.dtype) / valid.sum(-1, keepdim=True)
