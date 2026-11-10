@@ -146,7 +146,13 @@ done
 if [[ "$status" == 0 && "$SEGMENT_REFINE" == 1 ]]; then
     mkdir -p "$VISUALIZATION_LOG"
     echo 'ANALYSIS_START|mode=refined_plots'
-    if CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" -u -m analysis.segment_cut_transfer +        --mode refined_plots --experiment_root "$OUTPUT_ROOT" --data_root "$DATA_ROOT" +        --output_dir "$VISUALIZATION_ROOT" > "$VISUALIZATION_LOG/analysis.log" 2>&1; then
+    analysis_args=(
+        --mode refined_plots
+        --experiment_root "$OUTPUT_ROOT"
+        --data_root "$DATA_ROOT"
+        --output_dir "$VISUALIZATION_ROOT"
+    )
+    if CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" -u -m analysis.segment_cut_transfer "${analysis_args[@]}" > "$VISUALIZATION_LOG/analysis.log" 2>&1; then
         echo 'ANALYSIS_COMPLETE|mode=refined_plots'
     else
         echo 'ANALYSIS_FAILED|mode=refined_plots'

@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -136,4 +137,9 @@ def test_four_task_launcher_waits_for_final_students_before_plots(tmp_path):
     events = (logs/'launcher.log').read_text()
     assert events.count('TASK_COMPLETE|') == 4
     assert events.rfind('TASK_COMPLETE|') < events.index('ANALYSIS_START|')
-    assert '--mode refined_plots' in (tmp_path/'logs/refine_visualization/analysis.log').read_text()
+    analysis_command = (tmp_path/'logs/refine_visualization/analysis.log').read_text()
+    assert shlex.split(analysis_command) == [
+        '-u', '-m', 'analysis.segment_cut_transfer', '--mode', 'refined_plots',
+        '--experiment_root', 'outputs/refine', '--data_root', 'data',
+        '--output_dir', 'outputs/refine_visualization',
+    ]
