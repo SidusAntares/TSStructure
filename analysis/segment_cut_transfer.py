@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from analysis.segment_structure_visualization import (
-    TASKS, _batch, _date, _sample, fit_projection, ifft_display, load_job, validate_jobs,
+    TASKS, _batch, _date, _sample, checkpoint_digest, fit_projection, ifft_display, load_job, validate_jobs,
 )
 
 
@@ -97,15 +97,32 @@ def plot_class(sources, target, path, title, keep_fraction):
                 if (value := retained_overlap(a, b)) is not None]
     summary = f'mean kept-day IoU {np.mean(overlaps):.2f}' if overlaps else 'kept-day IoU N/A'
     for i, (ax, packet) in enumerate(zip(axes[1:], sources)):
-        trace(ax, packet, 'Source', '#1565c0')
+        original = packet.get('initial')
+        trace(ax, packet, 'Source', '#1565c0', row=int(original is not None))
         candidate_count = int(packet['segments'][-1])+1
         kept_count = int(packet['gate'][:candidate_count].sum())
         label = f"Source {packet['parcel']} | {kept_count}/{candidate_count} segments kept"
+        if original is not None:
+            edges = candidate_edges(packet['dates'], original['segments'])
+            count = len(edges)-1
+            for k, (start, end) in enumerate(zip(edges[:-1], edges[1:])):
+                ax.axvspan(start, end, ymin=.025, ymax=.08, color='#777777',
+                           alpha=.70 if original['gate'][k] else .17)
+            for cut in packet['removed']:
+                ax.axvline(cut, color='#555555', ls=':', lw=1.3)
+            for cut in packet['added']:
+                ax.axvline(cut, color='#1565c0', ls='-.', lw=1.3)
+            label = (f"Source {packet['parcel']} | kept {int(original['gate'][:count].sum())}/{count}"
+                     f" → {kept_count}/{candidate_count} | Split +{len(packet['added'])}, Merge −{len(packet['removed'])}")
         ax.set_title(f'{label} | within-class {summary}' if i == 0 else label, loc='left', fontsize=10)
     for ax in axes:
         ax.grid(axis='y', alpha=.18)
         ax.margins(y=.19)
-    fig.suptitle(title + '\niFFT curves with observed points | dashed: cuts | dark/light bars: kept/rejected')
+    legend = 'iFFT curves with observed points | dashed: cuts | dark/light bars: kept/rejected'
+    if 'initial' in sources[0]:
+        legend = ('iFFT and observed points | source bars: PELT (gray), refined (blue)\n'
+                  'Source cuts: dashed retained, dash-dot added, dotted removed | dark: kept')
+    fig.suptitle(title + '\n' + legend)
     fig.supylabel('Shared Source-train PSE PC1')
     fig.supxlabel('Original calendar day relative to Source start')
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,7 +131,9 @@ def plot_class(sources, target, path, title, keep_fraction):
 
 
 def make_images(job, args):
-    model, selector, checkpoint, train, source, target = load_job(job, args, sample_pixels=False)
+    refinement = getattr(args, 'mode', None) == 'refined_plots'
+    model, selector, checkpoint, train, source, target = load_job(job, args, sample_pixels=refinement)
+    replay = load_refinement(job, model, selector, args) if refinement else None
     rng = np.random.default_rng(args.seed)
     train_ids = rng.permutation(len(train))[:args.pca_parcels]
     if not len(train_ids):
@@ -131,8 +150,12 @@ def make_images(job, args):
         if not len(source_pool) or not len(target_pool):
             print(f'PLOT_SKIP class={name!r} reason=missing_shared_test_class', flush=True)
             continue
-        traces = [collect_observations(model, selector, job, source, i,
-                   checkpoint['source_to_target_shift'], args) for i in source_pool[:args.source_samples]]
+        if refinement:
+            traces = [refined_source_trace(model, selector, job, source, i, args, replay)
+                      for i in source_pool[:args.source_samples]]
+        else:
+            traces = [collect_observations(model, selector, job, source, i,
+                       checkpoint['source_to_target_shift'], args) for i in source_pool[:args.source_samples]]
         target_trace = collect_observations(model, selector, job, target, target_pool[0], 0, args)
         target_trace['dates'] = target_trace['dates'] + target_origin
         for packet in (*traces, target_trace):
@@ -142,6 +165,126 @@ def make_images(job, args):
         plot_class(traces, target_trace, path, f'{job["route"]} / {job["task"]} / {name} / Student epoch20',
                    args.keep_fraction)
         print(f'PLOT_SAVED {path}', flush=True)
+        if refinement:
+            report_class_edits(job['task'], name, traces)
+
+
+def report_class_edits(task, name, traces):
+    before = [dict(dates=t['dates'], **t['initial']) for t in traces]
+
+    def stats(packets):
+        ious, deviations, cuts = [], [], 0
+        for a, b in combinations(packets, 2):
+            if (value := retained_overlap(a, b)) is not None:
+                ious.append(value)
+            left, right = max(a['dates'][0], b['dates'][0]), min(a['dates'][-1], b['dates'][-1])
+            aa, bb = (candidate_edges(t['dates'], t['segments'])[1:-1] for t in (a, b))
+            aa, bb = aa[(aa > left) & (aa < right)], bb[(bb > left) & (bb < right)]
+            cuts += len(aa) + len(bb)
+            pairs = sorted((abs(x-y), i, j) for i, x in enumerate(aa) for j, y in enumerate(bb)
+                           if abs(x-y) <= 14)
+            seen_a, seen_b = set(), set()
+            for distance, i, j in pairs:
+                if i not in seen_a and j not in seen_b:
+                    seen_a.add(i)
+                    seen_b.add(j)
+                    deviations.append(distance)
+        eligible = sum(t['prototype_eligible'] for t in packets)
+        distances = [pair for t in packets for pair in t['prototype_errors']]
+        return dict(kept_day_iou=float(np.mean(ious)) if ious else None,
+                    cut_match_fraction_14d=2*len(deviations)/cuts if cuts else None,
+                    matched_cut_mean_error_days=float(np.mean(deviations)) if deviations else None,
+                    prototype_matches=len(distances), prototype_eligible=eligible,
+                    prototype_match_coverage=len(distances)/eligible if eligible else None,
+                    prototype_left_right_mae_days=np.mean(distances, axis=0).tolist() if distances else None)
+
+    print('REFINED_PLOT_CLASS|' + json.dumps(dict(task=task, category=name,
+        parcels=[t['parcel'] for t in traces], added=sum(len(t['added']) for t in traces),
+        removed=sum(len(t['removed']) for t in traces), initial=stats(before), refined=stats(traces))), flush=True)
+
+
+def load_refinement(job, model, selector, args):
+    from copy import deepcopy
+    import torch
+    from utils.source_segment_refinement import restore_bank
+
+    source_dir = job['checkpoint'].parents[2] / 'source'
+    source_final = source_dir / 'fold_0' / 'model.pt'
+    if checkpoint_digest(source_final) != job['tested_checkpoint'].get('structure_initial_sha256'):
+        raise ValueError(f'Source checkpoint differs from the tested UDA initialization: {source_final}')
+    source = torch.load(source_final, map_location='cpu', weights_only=False)
+    snapshot = source_dir / 'refinement' / 'update_epoch10.pt'
+    if checkpoint_digest(snapshot) != source.get('refinement_snapshot_sha256'):
+        raise ValueError(f'Refinement snapshot differs from the Source checkpoint record: {snapshot}')
+    packet = torch.load(snapshot, map_location=args.device, weights_only=False)
+    source_model, source_selector = deepcopy(model), deepcopy(selector)
+    source_model.load_state_dict(packet['state_dict'])
+    source_selector.load_state_dict(packet['selector_state_dict'])
+    return source_model, source_selector, restore_bank(packet['bank'])
+
+
+def refined_source_trace(model, selector, job, dataset, index, args, replay):
+    import torch
+    from utils.segment_structure import segment_pelt
+    from utils.source_segment_refinement import (
+        calendar_cuts, calendar_labels, match_segment, project, refine_parcel, selector_state,
+    )
+
+    source_model, source_selector, bank = replay
+    sample = _sample(dataset, int(index), args.seed)
+    pixels, mask, positions, extra = _batch(sample, args.device)
+    pixels, mask, extra = pixels.float(), mask.float(), extra.float()
+    dates = positions[0].cpu().numpy()
+    features = source_model.spatial_encoder(pixels, mask, extra)
+    config = job['config']
+    initial = segment_pelt(features, penalty=config['pelt_penalty'],
+                           min_size=config['pelt_min_size'], penalty_mode='absolute')
+    cuts = calendar_cuts(dates, initial[0].cpu().numpy())
+    state = selector_state(source_model, source_selector, features, initial)
+    label = int(sample['label'])
+    updated, added, removed = refine_parcel(source_model, features[0], positions[0],
+        label, cuts, state['gate'][0, 0].bool().cpu().numpy(),
+        state['probabilities'][0, 0].cpu().numpy(), bank, config['pelt_min_size'], config['focal_loss_gamma'])
+    final_features = model.spatial_encoder(pixels, mask, extra)
+    projected = project(features[0].cpu().numpy(), bank)
+    prototypes = {p['id']: p for p in bank['classes'].get(label, [])
+                  if np.count_nonzero((dates >= p['bounds'][0][1]) & (dates <= p['bounds'][1][1])) >= 3}
+
+    def select(labels):
+        state = selector_state(model, selector, final_features, labels)
+        ids = labels[0].cpu().numpy()
+        gate = state['gate'][0, 0].bool().cpu().numpy()
+        errors = {}
+        for k in np.flatnonzero(gate):
+            points = ids == k
+            left, right = float(dates[points][0]), float(dates[points][-1])
+            match = match_segment(projected[points], left, right, prototypes.values())
+            if match is not None:
+                typical = prototypes[match]['bounds']
+                error = [abs(left-typical[0][1]), abs(right-typical[1][1])]
+                if match not in errors or sum(error) < sum(errors[match]):
+                    errors[match] = error
+        return dict(segments=ids, gate=gate, prototype_eligible=len(prototypes),
+                    prototype_errors=list(errors.values()))
+
+    refined = torch.as_tensor(calendar_labels(dates, updated), device=positions.device)[None]
+    return dict(parcel=int(sample['parcel_index']), dates=dates, features=final_features[0].cpu().numpy(),
+                initial=select(initial), added=added, removed=removed, **select(refined))
+
+
+def print_final_target_metrics(job):
+    target = job['config']['target'].replace('/', '_')
+    path = job['checkpoint'].parent / f'test_{target}.json'
+    report = json.loads(path.read_text(encoding='utf-8'))
+    if report.get('completed_epochs') != 20:
+        raise ValueError(f'Expected final epoch20 metrics: {path}')
+    for name in ('full', 'keep'):
+        cm = np.asarray(report[name]['confusion_matrix'], dtype=float)
+        true_positive = np.diag(cm)
+        total = cm.sum(0) + cm.sum(1)
+        f1 = np.divide(2*true_positive, total, out=np.zeros_like(total), where=total > 0).mean()
+        print(f'FINAL_UDA|task={job["task"]}|input={name}|epoch=20|accuracy={report[name]["accuracy"]:.6f}'
+              f'|macro_f1_all_classes={f1:.6f}|class_count={len(cm)}', flush=True)
 
 
 def target_cut_diagnostic(job, args):
@@ -247,7 +390,7 @@ def main(argv=None):
     import torch
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', required=True, choices=('plots', 'diagnostic'))
+    parser.add_argument('--mode', required=True, choices=('plots', 'diagnostic', 'refined_plots'))
     parser.add_argument('--experiment_root', required=True)
     parser.add_argument('--data_root', required=True)
     parser.add_argument('--output_dir', help='PNG output directory for plots mode')
@@ -261,14 +404,21 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.source_samples < 2 or args.pca_parcels < 1 or not 0 < args.keep_fraction <= 1:
         parser.error('Require at least two source samples, positive PCA count and 0 < keep_fraction <= 1')
-    if args.mode == 'plots':
+    if args.mode != 'diagnostic':
         if args.output_dir is None:
             parser.error('plots mode requires --output_dir')
         experiment, output = Path(args.experiment_root).resolve(), Path(args.output_dir).resolve()
         if output == experiment or experiment in output.parents:
             parser.error('Plot directory must be outside the experiment directory')
-    jobs = validate_final_drop_jobs(args.experiment_root, args.joint_task)
-    run_job = make_images if args.mode == 'plots' else target_cut_diagnostic
+    if args.mode == 'refined_plots':
+        jobs = validate_jobs(args.experiment_root, variants=('finetune',), comparison=True)
+        if not all(job['config'].get('segment_refine') for job in jobs):
+            raise ValueError('Refined plots require four class-guided Source runs')
+        for job in jobs:
+            print_final_target_metrics(job)
+    else:
+        jobs = validate_final_drop_jobs(args.experiment_root, args.joint_task)
+    run_job = target_cut_diagnostic if args.mode == 'diagnostic' else make_images
     with torch.no_grad():
         for job in jobs:
             print(f'JOB_START mode={args.mode} route={job["route"]} task={job["task"]} '

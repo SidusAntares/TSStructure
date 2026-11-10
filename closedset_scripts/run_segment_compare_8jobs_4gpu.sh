@@ -6,8 +6,10 @@ cd "$PROJECT_DIR"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 SEGMENT_CONTEXT="${SEGMENT_CONTEXT:-0}"
+SEGMENT_REFINE="${SEGMENT_REFINE:-0}"
 default_experiment=timematch_segments_compare_seed1
 if [[ "$SEGMENT_CONTEXT" == 1 ]]; then default_experiment=timematch_segments_context_seed1; fi
+if [[ "$SEGMENT_REFINE" == 1 ]]; then default_experiment=timematch_segments_refine_seed1; fi
 EXPERIMENT="${EXPERIMENT:-$default_experiment}"
 RESUME="${RESUME:-0}"
 OUTPUT_ROOT="outputs/$EXPERIMENT"
@@ -27,6 +29,9 @@ exec >> "$LOG_ROOT/launcher.log" 2>&1
 }
 [[ "$SEGMENT_CONTEXT" == 0 || "$SEGMENT_CONTEXT" == 1 ]] || {
     echo 'ERROR: SEGMENT_CONTEXT must be 0 or 1'; exit 1;
+}
+[[ "$SEGMENT_REFINE" == 0 || ( "$SEGMENT_REFINE" == 1 && "$SEGMENT_CONTEXT" == 0 ) ]] || {
+    echo 'ERROR: SEGMENT_REFINE must be 0 or 1 and cannot be combined with SEGMENT_CONTEXT'; exit 1;
 }
 [[ ! -e "$OUTPUT_ROOT" || "$RESUME" == 1 ]] || {
     echo 'ERROR: experiment output exists; use RESUME=1 to reuse final Source checkpoints'; exit 1;
@@ -52,7 +57,7 @@ done
 # Slow FR1 jobs enter first; each free GPU takes the next pair immediately.
 job_tasks=(FR1_FR2 FR1_FR2 FR2_DK1 DK1_AT1 FR2_DK1 DK1_AT1 AT1_DK1 AT1_DK1)
 job_variants=(joint finetune joint joint finetune finetune joint finetune)
-if [[ "$SEGMENT_CONTEXT" == 1 ]]; then
+if [[ "$SEGMENT_CONTEXT" == 1 || "$SEGMENT_REFINE" == 1 ]]; then
     job_tasks=(FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1)
     job_variants=(finetune finetune finetune finetune)
 fi
@@ -77,6 +82,7 @@ run_job() {
         --data_root "$DATA_ROOT" --seed 1 --num_workers 8 --variant inshape
         --experiment_name "$task" --progress_bar off)
     if [[ "$SEGMENT_CONTEXT" == 1 ]]; then common+=(--segment_context); fi
+    if [[ "$SEGMENT_REFINE" == 1 ]]; then common+=(--segment_refine); fi
     if [[ "$RESUME" == 1 && -s "$leaf/source/fold_0/model.pt" ]]; then
         # UDA validates the saved role, epoch count, route, protocol and source hash.
         echo "SOURCE_REUSE|gpu=$gpu|task=$task|route=$route|checkpoint=$leaf/source/fold_0/model.pt"
@@ -137,4 +143,14 @@ status=0
 for pid in "${pids[@]}"; do
     if ! wait "$pid"; then status=1; fi
 done
+if [[ "$status" == 0 && "$SEGMENT_REFINE" == 1 ]]; then
+    mkdir -p "$VISUALIZATION_LOG"
+    echo 'ANALYSIS_START|mode=refined_plots'
+    if CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" -u -m analysis.segment_cut_transfer +        --mode refined_plots --experiment_root "$OUTPUT_ROOT" --data_root "$DATA_ROOT" +        --output_dir "$VISUALIZATION_ROOT" > "$VISUALIZATION_LOG/analysis.log" 2>&1; then
+        echo 'ANALYSIS_COMPLETE|mode=refined_plots'
+    else
+        echo 'ANALYSIS_FAILED|mode=refined_plots'
+        status=1
+    fi
+fi
 exit "$status"

@@ -45,13 +45,16 @@ def write_history(path, rows):
         writer.writerows(rows)
 
 
-def train_source_structure_epochs(model, selector, loader, config, writer=None):
+def train_source_structure_epochs(model, selector, loader, config, writer=None, refinement=None):
     if not len(loader):
         raise ValueError('No complete source batches for structure finetuning')
     ltae_only = getattr(config, 'finetune_ltae_only', False)
-    frozen = (model.spatial_encoder, model.decoder) if ltae_only else ()
+    frozen = (model.spatial_encoder, model.decoder) if ltae_only or refinement is not None else ()
     for module in frozen:
         module.requires_grad_(False)
+    if refinement is not None:
+        from utils.source_segment_refinement import SETTINGS
+        refinement.initialize(model)
     optimizer = torch.optim.Adam([{'params': (p for p in model.parameters() if p.requires_grad)},
         {'params': selector.parameters(), 'lr': config.selector_lr}],
         lr=config.lr, weight_decay=config.weight_decay)
@@ -65,9 +68,14 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None):
         rows = []
         for sample in loader:
             pixels, mask, dates, extra = sample_to_device(sample, config.device)
+            options = {}
+            if refinement is not None:
+                labels = refinement.labels(sample['parcel_index'], sample['positions'],
+                                           sample['valid_pixels'].bool().any(-1))
+                options['segments_override'] = labels.to(config.device)
             _, keep, info = structure_forward(model, selector, pixels, mask, dates, extra,
                 variant=config.variant, full_loss=False, unified=True, penalty=config.pelt_penalty,
-                min_size=config.pelt_min_size, penalty_mode=config.pelt_penalty_mode)
+                min_size=config.pelt_min_size, penalty_mode=config.pelt_penalty_mode, **options)
             labels = sample['label'].to(config.device)
             keep_loss = criterion(keep, labels)
             loss = keep_loss+config.sparse_weight*info['sparse_loss']
@@ -89,13 +97,22 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None):
             for key, value in record.items():
                 if isinstance(value, (float, int)):
                     writer.add_scalar('structure_finetune/'+key, value, epoch+1)
+        if refinement is not None and epoch+1 == SETTINGS['update_epoch']:
+            refinement.update(model, selector)
+    refinement_record = {}
+    if refinement is not None:
+        refinement.finish(model, selector)
+        refinement_record['refinement_snapshot_sha256'] = hashlib.sha256(
+            (refinement.folder / 'update_epoch10.pt').read_bytes()).hexdigest()
     torch.save(dict(state_dict=model.state_dict(), selector_state_dict=selector.state_dict(),
                     role='source_structure', completed_epochs=config.epochs, variant=config.variant,
                     classification_path='keep_only_unified',
                     selector_protocol=getattr(config, 'selector_protocol', 'legacy'),
                     finetune_ltae_only=ltae_only,
+                    segment_refine=refinement is not None,
                     source_init=getattr(config, 'source_init', 'checkpoint'),
-                    source=config.source, original_source_checkpoint_sha256=config.original_source_checkpoint_sha256),
+                    source=config.source, original_source_checkpoint_sha256=config.original_source_checkpoint_sha256,
+                    **refinement_record),
                Path(config.fold_dir)/'model.pt')
     return history
 
@@ -207,9 +224,16 @@ def finetune_structure(config):
     dataset = PixelSetData(config.data_root, config.source, config.classes, transform,
         indices=splits[config.source]['train'], closed_set=True, combine_spring_and_winter=False)
     loader = create_train_loader(dataset, config.batch_size, config.num_workers)
+    refinement = None
+    if getattr(config, 'segment_refine', False):
+        from utils.source_segment_refinement import SourceRefinement
+        reference = PixelSetData(config.data_root, config.source, config.classes,
+            Compose([RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()]),
+            indices=splits[config.source]['train'], closed_set=True, combine_spring_and_winter=False)
+        refinement = SourceRefinement(reference, config)
     writer = SummaryWriter(log_dir=config.tensorboard_log_dir)
     try:
-        train_source_structure_epochs(model, selector, loader, config, writer)
+        train_source_structure_epochs(model, selector, loader, config, writer, refinement)
     finally:
         writer.close()
     packet = torch.load(Path(config.fold_dir)/'model.pt', map_location=config.device, weights_only=False)
@@ -234,6 +258,7 @@ def run_structure_uda(config):
         or initial.get('source_init', 'checkpoint') != ('scratch' if required_epochs == 100 else 'checkpoint')
         or initial.get('classification_path') != 'keep_only_unified'
         or initial.get('selector_protocol', 'legacy') != getattr(config, 'selector_protocol', 'legacy')
+        or initial.get('segment_refine', False) != getattr(config, 'segment_refine', False)
         or initial.get('variant') != config.variant or initial.get('source') != config.source
         or initial.get('original_source_checkpoint_sha256') != config.original_source_checkpoint_sha256):
         raise ValueError('UDA requires its own final Source checkpoint with matching route, epochs and protocol')

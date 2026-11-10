@@ -133,7 +133,7 @@ def _classify_retained_observations(model, selector, features, positions, segmen
 
 def structure_forward(model, selector, pixels, mask, positions, extra, variant='attention',
                       deterministic=False, full_loss=True, penalty=.1, min_size=3,
-                      penalty_mode='per_observation', unified=False):
+                      penalty_mode='per_observation', unified=False, segments_override=None):
     """One PSE pass, with an opt-in unified Keep-only training path.
 
     unified=True uses original attention dropout and one normal backend BN/dropout
@@ -162,11 +162,15 @@ def structure_forward(model, selector, pixels, mask, positions, extra, variant='
     if getattr(selector, 'protocol', None) in DROP_PROTOCOLS:
         if variant != 'inshape':
             raise ValueError('Dropping observations before LTAE requires the pure-content variant')
-        segments = segment_pelt(features, valid, penalty=penalty, min_size=min_size, penalty_mode=penalty_mode)
+        segments = segments_override
+        if segments is None:
+            segments = segment_pelt(features, valid, penalty=penalty, min_size=min_size, penalty_mode=penalty_mode)
         keep, info = _classify_retained_observations(model, selector, features, positions, segments, deterministic)
         full = (model.decoder(encoder(features, positions, return_attention_scores=True,
                                       valid_time=attention_mask)[0]) if full_loss else None)
         return full, keep, info
+    if segments_override is not None:
+        raise ValueError('Reference segmentation requires the observation-drop protocol')
     full = None
     if full_loss:
         temporal, attention, values, scores = encoder(features, positions, return_attention_scores=True, valid_time=attention_mask)
