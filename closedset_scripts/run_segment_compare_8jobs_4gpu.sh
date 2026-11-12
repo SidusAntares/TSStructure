@@ -98,7 +98,7 @@ run_job() {
         if [[ "$route" == two_rounds ]]; then rounds=2; fi
         local summary="$leaf/source/fold_0/test_${source//\//_}.json"
         if [[ "$RESUME" == 1 && -s "$summary" && -s "$leaf/source/fold_0/model.pt" &&
-              -s "$leaf/source/refinement/round_history.json" && -s "$leaf/source/refinement/parcels.jsonl" &&
+              -s "$leaf/source/refinement/parcels.jsonl" &&
               -s "$leaf/source/refinement/prototypes.json" ]]; then
             echo "SOURCE_REUSE|gpu=$gpu|task=$task|route=$route|checkpoint=$leaf/source/fold_0/model.pt"
         elif [[ -e "$leaf/source" ]]; then

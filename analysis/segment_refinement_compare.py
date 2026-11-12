@@ -20,7 +20,63 @@ def read_json(path):
     return json.loads(path.read_text(encoding='utf-8'))
 
 
-def load_source(root, task, route):
+def expected_phases(rounds):
+    return [(epoch, phase) for i in range(rounds)
+            for epoch, phase in ((10+10*i, 'split'), (15+10*i, 'merge'))]
+
+
+def complete_history(history, rounds):
+    return (isinstance(history, list)
+            and all(isinstance(record, dict) for record in history)
+            and [(r.get('epoch'), r.get('phase')) for r in history] == expected_phases(rounds))
+
+
+def load_round_history(leaf, rounds, source_log):
+    history_path = leaf / 'refinement' / 'round_history.json'
+    if history_path.is_file():
+        try:
+            history = read_json(history_path)
+        except json.JSONDecodeError:
+            history = None
+        if complete_history(history, rounds):
+            return history, 'round_history.json'
+
+    checkpoint = leaf / 'fold_0' / 'model.pt'
+    if checkpoint.is_file():
+        import torch
+
+        packet = torch.load(checkpoint, map_location='cpu', weights_only=True)
+        if (packet.get('role') != 'source_structure' or packet.get('refinement_rounds') != rounds
+                or packet.get('completed_epochs') != 10 + 10*rounds):
+            raise ValueError(
+                f'{leaf}: checkpoint does not confirm the requested {rounds} refinement round(s). '
+                'Check the Source training log for a legacy run. Sync the training modules and '
+                'rerun this Source leaf in the same experiment if it used the legacy schedule.')
+        history = packet.get('refinement_round_history')
+        if complete_history(history, rounds):
+            return history, 'checkpoint'
+
+    if source_log is not None and source_log.is_file():
+        prefix = 'SEGMENT_REFINE_PHASE|'
+        history = []
+        with source_log.open(encoding='utf-8', errors='replace') as stream:
+            for line in stream:
+                if line.startswith(prefix):
+                    try:
+                        history.append(json.loads(line[len(prefix):]))
+                    except json.JSONDecodeError:
+                        continue
+        if complete_history(history, rounds):
+            return history, 'source_log'
+
+    if checkpoint.is_file():
+        # Older staged checkpoints certify the schedule but did not embed counts.
+        return None, 'unavailable'
+    raise FileNotFoundError(
+        f'{leaf}: no complete round history, final checkpoint or Source phase log to verify this run')
+
+
+def load_source(root, task, route, source_log_dir=None):
     leaf = root / route / task / 'source'
     config = read_json(leaf / 'resolved_config.json')
     rounds = ROUTES.index(route) + 1
@@ -28,6 +84,8 @@ def load_source(root, task, route):
     if config.get('refinement_rounds') != rounds or config.get('epochs') != epochs:
         raise ValueError(f'Unexpected refinement configuration in {leaf}')
     folder = leaf / 'refinement'
+    source_log = None if source_log_dir is None else source_log_dir / f'{task}_{route}_source.log'
+    history, history_source = load_round_history(leaf, rounds, source_log)
     with (folder / 'parcels.jsonl').open(encoding='utf-8') as stream:
         rows = {}
         for line in stream:
@@ -35,16 +93,12 @@ def load_source(root, task, route):
             if row['parcel'] in rows:
                 raise ValueError(f'Duplicate parcel {row["parcel"]} in {leaf}')
             rows[row['parcel']] = row
-    history = read_json(folder / 'round_history.json')
-    phases = [(r['epoch'], r['phase']) for r in history]
-    if phases != [(epoch, phase) for i in range(rounds)
-                  for epoch, phase in ((10+10*i, 'split'), (15+10*i, 'merge'))]:
-        raise ValueError(f'Incomplete refinement schedule in {leaf}: {phases}')
     bank = read_json(folder / 'prototypes.json')['classes']
     test = read_json(leaf / 'fold_0' / f'test_{config["source"].replace("/", "_")}.json')
     if test['completed_epochs'] != epochs:
         raise ValueError(f'Unexpected evaluated epoch in {leaf}')
-    return dict(leaf=leaf, config=config, rows=rows, history=history, bank=bank, test=test)
+    return dict(leaf=leaf, config=config, rows=rows, history=history,
+                history_source=history_source, bank=bank, test=test)
 
 
 def match_cuts(left, right, tolerance=14):
@@ -123,6 +177,7 @@ def summarize_task(one, two, seed, samples_per_class):
                              source_epochs=test['completed_epochs'],
                              prototypes=sum(map(len, run['bank'].values())),
                              rounds=run['history'],
+                             round_history_source=run.get('history_source', 'round_history.json'),
                              heldout_native_pelt={kind: {key: test[kind][key]
                                                         for key in ('accuracy', 'macro_f1')}
                                                   for kind in ('full', 'keep')})
@@ -202,6 +257,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--experiment_root', type=Path, required=True)
     parser.add_argument('--output_dir', type=Path, required=True)
+    parser.add_argument('--source_log_dir', type=Path,
+                        help='Defaults to logs/<experiment name>; recovers missing phase histories')
     parser.add_argument('--data_root', type=Path)
     parser.add_argument('--plot_task', choices=TASKS, default='AT1_DK1')
     parser.add_argument('--samples_per_class', type=int, default=3)
@@ -211,15 +268,17 @@ def main(argv=None):
     if args.samples_per_class < 1:
         parser.error('--samples_per_class must be positive')
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = args.source_log_dir or Path('logs') / args.experiment_root.name
     results, plot_inputs = {}, None
     for task in TASKS:
-        one, two = (load_source(args.experiment_root, task, route) for route in ROUTES)
+        one, two = (load_source(args.experiment_root, task, route, log_dir) for route in ROUTES)
         results[task], plot_ids = summarize_task(one, two, args.seed, args.samples_per_class)
         for route in ROUTES:
             record = results[task][route]
             print('SOURCE_REFINEMENT_COMPARE|' + json.dumps(dict(task=task, route=route,
                   paired_cut_f1=record['paired_cut_f1'], heldout_native_pelt=record['heldout_native_pelt'],
-                  selected_segment_match_fraction=record['selected_segment_match_fraction'])), flush=True)
+                  selected_segment_match_fraction=record['selected_segment_match_fraction'],
+                  round_history_source=record['round_history_source'])), flush=True)
         if args.data_root is not None and task == args.plot_task:
             ids = [parcel for group in plot_ids.values() for parcel in group]
             plot_inputs = (

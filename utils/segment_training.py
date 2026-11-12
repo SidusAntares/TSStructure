@@ -106,9 +106,11 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None, 
                 refinement.update(model, selector)
     refinement_record = {}
     if refinement is not None:
+        if rounds and len(refinement.round_history) != 2 * rounds:
+            raise RuntimeError('Source training did not complete the requested refinement schedule')
         refinement.finish(model, selector)
         if rounds:
-            refinement_record['refinement_rounds'] = rounds
+            refinement_record.update(refinement_rounds=rounds, refinement_round_history=refinement.round_history)
         else:
             refinement_record['refinement_snapshot_sha256'] = hashlib.sha256(
                 (refinement.folder / 'update_epoch10.pt').read_bytes()).hexdigest()

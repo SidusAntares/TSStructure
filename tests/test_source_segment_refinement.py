@@ -137,7 +137,9 @@ def test_merge_recomputes_selector_on_split_cuts_after_training(tmp_path, monkey
     assert len(history) == cfg.epochs and len(phase_weights) == rounds+1
     assert [(row['epoch'], row['phase']) for row in ref.round_history] == [
         phase for i in range(rounds) for phase in ((10+10*i, 'split'), (15+10*i, 'merge'))]
-    assert torch.load(tmp_path/'model.pt', weights_only=False)['refinement_rounds'] == rounds
+    packet = torch.load(tmp_path/'model.pt', weights_only=False)
+    assert packet['refinement_rounds'] == rounds
+    assert packet['refinement_round_history'] == ref.round_history
 
 
 @torch.no_grad()
@@ -239,3 +241,30 @@ def test_refinement_comparison_keeps_the_same_plot_parcels_and_boundary_pairs(tm
     plot_class('AT1_DK1', 'corn', plot_ids[0], one, two,
                {parcel: (dates, np.sin(dates/10)) for parcel in plot_ids[0]}, path)
     assert path.read_bytes()[:8] == b'\x89PNG\r\n\x1a\n'
+
+
+def test_missing_history_uses_source_log_or_completed_checkpoint(tmp_path):
+    from analysis.segment_refinement_compare import load_round_history
+
+    fold = tmp_path/'fold_0'
+    fold.mkdir()
+    log = tmp_path/'source.log'
+    history = [dict(epoch=10, phase='split', cuts_changed=4), dict(epoch=15, phase='merge', cuts_changed=1)]
+    packet = dict(role='source_structure', completed_epochs=20, refinement_rounds=1)
+    torch.save(packet, fold/'model.pt')
+    assert load_round_history(tmp_path, 1, log) == (None, 'unavailable')
+    log.write_text(''.join('SEGMENT_REFINE_PHASE|'+json.dumps(row)+'\n' for row in history), encoding='utf-8')
+    assert load_round_history(tmp_path, 1, log) == (history, 'source_log')
+    torch.save(dict(packet, refinement_round_history=history), fold/'model.pt')
+    assert load_round_history(tmp_path, 1, None) == (history, 'checkpoint')
+
+
+def test_missing_history_does_not_relabel_legacy_checkpoint(tmp_path):
+    from analysis.segment_refinement_compare import load_round_history
+
+    fold = tmp_path/'fold_0'
+    fold.mkdir()
+    torch.save(dict(role='source_structure', completed_epochs=20, segment_refine=True,
+                    refinement_snapshot_sha256='legacy'), fold/'model.pt')
+    with pytest.raises(ValueError, match='checkpoint does not confirm the requested 1 refinement'):
+        load_round_history(tmp_path, 1, None)
