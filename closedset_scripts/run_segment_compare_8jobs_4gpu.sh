@@ -14,6 +14,7 @@ if [[ "$SEGMENT_REFINE" == 1 ]]; then default_experiment=timematch_segments_refi
 if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then default_experiment=timematch_segments_refine_compare_seed1; fi
 EXPERIMENT="${EXPERIMENT:-$default_experiment}"
 RESUME="${RESUME:-0}"
+REPAIR_SOURCE="${REPAIR_SOURCE:-0}"
 OUTPUT_ROOT="outputs/$EXPERIMENT"
 LOG_ROOT="logs/$EXPERIMENT"
 VISUALIZATION_ROOT="outputs/${EXPERIMENT}_visualization"
@@ -39,6 +40,10 @@ exec >> "$LOG_ROOT/launcher.log" 2>&1
    ( "$SEGMENT_REFINE_COMPARE" == 1 && "$SEGMENT_REFINE" == 0 && "$SEGMENT_CONTEXT" == 0 ) ]] || {
     echo 'ERROR: SEGMENT_REFINE_COMPARE must be 0 or 1 and runs independently'; exit 1;
 }
+[[ "$REPAIR_SOURCE" == 0 ||
+   ( "$REPAIR_SOURCE" == 1 && "$RESUME" == 1 && "$SEGMENT_REFINE_COMPARE" == 1 ) ]] || {
+    echo 'ERROR: REPAIR_SOURCE=1 requires RESUME=1 and SEGMENT_REFINE_COMPARE=1'; exit 1;
+}
 [[ ! -e "$OUTPUT_ROOT" || "$RESUME" == 1 ]] || {
     echo 'ERROR: experiment output exists; use RESUME=1 to reuse final Source checkpoints'; exit 1;
 }
@@ -60,6 +65,9 @@ for task in FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1; do
         echo "ERROR: historical Original Source missing for $task"; exit 1;
     }
 done
+if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then
+    "$PYTHON_BIN" -c 'from utils.segment_training import validate_refinement_training; validate_refinement_training()'
+fi
 # Slow FR1 jobs enter first; each free GPU takes the next pair immediately.
 job_tasks=(FR1_FR2 FR1_FR2 FR2_DK1 DK1_AT1 FR2_DK1 DK1_AT1 AT1_DK1 AT1_DK1)
 job_variants=(joint finetune joint joint finetune finetune joint finetune)
@@ -81,6 +89,20 @@ cleanup_queue() {
 }
 trap cleanup_queue EXIT
 
+audit_refinement_checkpoint() {
+    "$PYTHON_BIN" -c '
+from pathlib import Path
+import sys
+from analysis.segment_refinement_compare import SourceScheduleError, verify_source_checkpoint
+
+try:
+    verify_source_checkpoint(Path(sys.argv[1]), int(sys.argv[2]))
+except SourceScheduleError as error:
+    print(error, file=sys.stderr)
+    sys.exit(2)
+' "$1" "$2"
+}
+
 run_job() {
     local gpu="$1" task="$2" route="$3" source target tile
     resolve_task "$task"
@@ -97,19 +119,34 @@ run_job() {
         local rounds=1
         if [[ "$route" == two_rounds ]]; then rounds=2; fi
         local summary="$leaf/source/fold_0/test_${source//\//_}.json"
+        local log="$LOG_ROOT/${task}_${route}_source.log"
         if [[ "$RESUME" == 1 && -s "$summary" && -s "$leaf/source/fold_0/model.pt" &&
               -s "$leaf/source/refinement/parcels.jsonl" &&
               -s "$leaf/source/refinement/prototypes.json" ]]; then
-            echo "SOURCE_REUSE|gpu=$gpu|task=$task|route=$route|checkpoint=$leaf/source/fold_0/model.pt"
-        elif [[ -e "$leaf/source" ]]; then
-            echo "ERROR: incomplete Source output preserved: $leaf/source"
-            return 1
-        else
-            local source_args=(--stage finetune "${common[@]}" --refinement_rounds "$rounds" --output_dir "$leaf/source")
-            CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train_segment_timematch.py "${source_args[@]}" \
-                > "$LOG_ROOT/${task}_${route}_source.log" 2>&1 || return $?
+            if audit_refinement_checkpoint "$leaf/source" "$rounds"; then
+                echo "SOURCE_REUSE|gpu=$gpu|task=$task|route=$route|checkpoint=$leaf/source/fold_0/model.pt"
+                return 0
+            else
+                local audit_status=$?
+                # Leave the files in place if the checkpoint could not be read.
+                [[ "$audit_status" == 2 ]] || return "$audit_status"
+            fi
         fi
-        return 0
+        if [[ -e "$leaf/source" ]]; then
+            if [[ "$REPAIR_SOURCE" != 1 ]]; then
+                echo "ERROR: Source output preserved: $leaf/source. To replace it use RESUME=1 REPAIR_SOURCE=1."
+                return 1
+            fi
+            local backup
+            backup="$(mktemp -d "$leaf/source_before_repair.XXXXXX")" || return $?
+            if [[ -f "$log" ]]; then cp -- "$log" "$backup/source.log" || return $?; fi
+            mv -- "$leaf/source" "$backup/source" || return $?
+            echo "SOURCE_BACKUP|gpu=$gpu|task=$task|route=$route|path=$backup"
+        fi
+        local source_args=(--stage finetune "${common[@]}" --refinement_rounds "$rounds" --output_dir "$leaf/source")
+        CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train_segment_timematch.py "${source_args[@]}" \
+            > "$log" 2>&1
+        return $?
     fi
     if [[ "$RESUME" == 1 && -s "$leaf/source/fold_0/model.pt" ]]; then
         # UDA validates the saved role, epoch count, route, protocol and source hash.

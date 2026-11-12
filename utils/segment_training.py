@@ -45,6 +45,13 @@ def write_history(path, rows):
         writer.writerows(rows)
 
 
+def validate_refinement_training():
+    from utils.source_segment_refinement import SourceRefinement
+
+    if not callable(getattr(SourceRefinement, 'refine_round_step', None)):
+        raise RuntimeError('Sync utils/source_segment_refinement.py before running staged refinement')
+
+
 def train_source_structure_epochs(model, selector, loader, config, writer=None, refinement=None):
     if not len(loader):
         raise ValueError('No complete source batches for structure finetuning')

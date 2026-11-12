@@ -203,6 +203,9 @@ def main(argv=None):
     if cfg.dry_run:
         print(json.dumps(vars(cfg), indent=2))
         return
+    if cfg.refinement_rounds:
+        from utils.segment_training import validate_refinement_training
+        validate_refinement_training()
     validate_source(cfg)
     if cfg.stage == 'uda':
         checkpoint = Path(cfg.structure_checkpoint)

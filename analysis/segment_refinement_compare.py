@@ -31,6 +31,24 @@ def complete_history(history, rounds):
             and [(r.get('epoch'), r.get('phase')) for r in history] == expected_phases(rounds))
 
 
+class SourceScheduleError(ValueError):
+    """The saved checkpoint belongs to a different Source schedule."""
+
+
+def verify_source_checkpoint(leaf, rounds):
+    import torch
+
+    packet = torch.load(leaf / 'fold_0' / 'model.pt', map_location='cpu', weights_only=True)
+    expected = ('source_structure', rounds, 10 + 10*rounds)
+    actual = tuple(packet.get(key) for key in ('role', 'refinement_rounds', 'completed_epochs'))
+    if actual != expected:
+        raise SourceScheduleError(
+            f'{leaf}: checkpoint does not confirm the requested {rounds} refinement round(s). '
+            f'Found role={actual[0]!r}, refinement_rounds={actual[1]!r}, completed_epochs={actual[2]!r}. '
+            'Resume the existing experiment with REPAIR_SOURCE=1 to replace this Source result.')
+    return packet
+
+
 def load_round_history(leaf, rounds, source_log):
     history_path = leaf / 'refinement' / 'round_history.json'
     if history_path.is_file():
@@ -43,15 +61,7 @@ def load_round_history(leaf, rounds, source_log):
 
     checkpoint = leaf / 'fold_0' / 'model.pt'
     if checkpoint.is_file():
-        import torch
-
-        packet = torch.load(checkpoint, map_location='cpu', weights_only=True)
-        if (packet.get('role') != 'source_structure' or packet.get('refinement_rounds') != rounds
-                or packet.get('completed_epochs') != 10 + 10*rounds):
-            raise ValueError(
-                f'{leaf}: checkpoint does not confirm the requested {rounds} refinement round(s). '
-                'Check the Source training log for a legacy run. Sync the training modules and '
-                'rerun this Source leaf in the same experiment if it used the legacy schedule.')
+        packet = verify_source_checkpoint(leaf, rounds)
         history = packet.get('refinement_round_history')
         if complete_history(history, rounds):
             return history, 'checkpoint'

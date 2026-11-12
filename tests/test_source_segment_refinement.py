@@ -268,3 +268,47 @@ def test_missing_history_does_not_relabel_legacy_checkpoint(tmp_path):
                     refinement_snapshot_sha256='legacy'), fold/'model.pt')
     with pytest.raises(ValueError, match='checkpoint does not confirm the requested 1 refinement'):
         load_round_history(tmp_path, 1, None)
+
+
+def test_resume_reuses_valid_sources_and_backs_up_only_the_mismatched_run(tmp_path):
+    setup_run(tmp_path)
+    script = 'run_segment_compare_8jobs_4gpu.sh'
+    shutil.copyfile(Path(__file__).resolve().parents[1]/'closedset_scripts'/script,
+                    tmp_path/'closedset_scripts'/script)
+    results = tmp_path/'outputs/compare'
+    logs = tmp_path/'logs/compare'
+    logs.mkdir(parents=True)
+    bad = results/'one_round/AT1_DK1'
+    domains = dict(AT1_DK1='austria_33UVP_2017', FR1_FR2='france_30TXT_2017',
+                   FR2_DK1='france_31TCJ_2017', DK1_AT1='denmark_32VNH_2017')
+    for task, domain in domains.items():
+        for route in ('one_round', 'two_rounds'):
+            source = results/route/task/'source'
+            for path in (f'fold_0/test_{domain}.json', 'fold_0/model.pt', 'refinement/parcels.jsonl',
+                         'refinement/prototypes.json'):
+                file = source/path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text('original')
+            (logs/f'{task}_{route}_source.log').write_text('original log')
+    mock = tmp_path/'mock-python'
+    mock.write_bytes(b'''#!/usr/bin/env bash
+if [[ "$1" == -c ]]; then
+    [[ "${3:-}" != outputs/compare/one_round/AT1_DK1/source ]] || exit 2
+    exit 0
+fi
+echo "$*"
+''')
+    mock.chmod(0o755)
+    subprocess.run([bash_bin(), 'closedset_scripts/'+script], cwd=tmp_path, check=True, timeout=40,
+                   env=dict(os.environ, DATA_ROOT='data', PYTHON_BIN='./mock-python', EXPERIMENT='compare',
+                            SEGMENT_CONTEXT='0', SEGMENT_REFINE='0', SEGMENT_REFINE_COMPARE='1',
+                            RESUME='1', REPAIR_SOURCE='1'))
+    events = (logs/'launcher.log').read_text()
+    assert events.count('SOURCE_REUSE|') == 7
+    assert events.count('SOURCE_BACKUP|') == 1
+    backup, = bad.glob('source_before_repair.*')
+    assert (backup/'source/fold_0/model.pt').read_text() == 'original'
+    assert (backup/'source.log').read_text() == 'original log'
+    assert '--refinement_rounds 1 --output_dir outputs/compare/one_round/AT1_DK1/source' in (
+        logs/'AT1_DK1_one_round_source.log').read_text()
+    assert [path.name for path in (tmp_path/'outputs').glob('compare*')] == ['compare']
