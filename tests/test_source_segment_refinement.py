@@ -99,15 +99,16 @@ def test_refinement_uses_one_reference_pelt_and_freezes_source_encoders(tmp_path
     assert torch.load(tmp_path/'model.pt', weights_only=False)['segment_refine']
 
 
-@pytest.mark.parametrize('rounds', [1, 2])
-def test_merge_recomputes_selector_on_split_cuts_after_training(tmp_path, monkeypatch, rounds):
+@pytest.mark.parametrize('rounds,adapt', [(1, 5), (2, 5), (3, 3)])
+def test_merge_recomputes_selector_on_split_cuts_after_training(tmp_path, monkeypatch, rounds, adapt):
     from torch.utils.data import default_collate
 
     dataset = FixedParcels()
     batch = default_collate([dataset[i] for i in range(len(dataset))])
     cfg = config(tmp_path)
-    cfg.__dict__.update(epochs=10+10*rounds, variant='inshape', output_dir=tmp_path, num_workers=0,
-                        refinement_rounds=rounds, refinement_adapt_epochs=5, source_schedule_epochs=30,
+    cfg.__dict__.update(epochs=10+2*adapt*rounds, variant='inshape', output_dir=tmp_path, num_workers=0,
+                        refinement_rounds=rounds, refinement_adapt_epochs=adapt,
+                        source_schedule_epochs=28 if adapt == 3 else 30,
                         selector_protocol='inshape_drop_proxy_detached_v1')
     model = PseLTae(num_classes=2, with_extra=False)
     selector = SegmentSelector(width=16, heads=2, protocol=cfg.selector_protocol)
@@ -115,31 +116,46 @@ def test_merge_recomputes_selector_on_split_cuts_after_training(tmp_path, monkey
     monkeypatch.setattr(refinement, 'segment_pelt', lambda features, **_: torch.zeros(
         features.shape[:2], dtype=torch.long))
     phase_weights = []
+    known_cuts = [17.5, 38.5, 59.5]
 
     def fit_bank(model, selector):
         phase_weights.append(selector.scorer[0].weight.detach().clone())
-        ref.bank = dict(mean=np.zeros(128), basis=np.eye(128)[:8], scale=np.ones(8), classes={})
+        prototype = dict(id=0, region=0, bounds=[[21]*3, [35]*3], shape=np.zeros((3, 8)))
+        ref.bank = dict(mean=np.zeros(128), basis=np.eye(128)[:8], scale=np.full(8, 100.),
+                        classes={0: [prototype], 1: [prototype]})
 
     def split(dates, shape, cuts, prototypes, min_size):
-        return [17.5] if not len(cuts) else [59.5]
+        return [known_cuts[len(cuts)]]
 
     def merge(model, features, dates, y, cuts, gates, probabilities, protected, gamma):
-        assert cuts.tolist() == ([17.5] if len(phase_weights) == 1 else [17.5, 59.5])
+        assert cuts.tolist() == known_cuts[:len(phase_weights)]
         assert protected == [cuts[-1]]
         assert len(gates) == len(probabilities) == len(cuts)+1
         assert not torch.equal(selector.scorer[0].weight, phase_weights[-1])
         return []
 
+    if adapt == 3:
+        from utils import refinement_probe
+        ref.probe = refinement_probe.RefinementProbe(dataset, cfg, ref.folder)
+        monkeypatch.setattr(refinement_probe, 'segment_pelt', refinement.segment_pelt)
+        monkeypatch.setattr(refinement_probe, 'split_cuts', split)
+        monkeypatch.setattr(refinement_probe, 'merge_cuts', merge)
     monkeypatch.setattr(ref, 'fit_bank', fit_bank)
     monkeypatch.setattr(refinement, 'split_cuts', split)
     monkeypatch.setattr(refinement, 'merge_cuts', merge)
     history = train_source_structure_epochs(model, selector, [batch], cfg, refinement=ref)
     assert len(history) == cfg.epochs and len(phase_weights) == rounds+1
     assert [(row['epoch'], row['phase']) for row in ref.round_history] == [
-        phase for i in range(rounds) for phase in ((10+10*i, 'split'), (15+10*i, 'merge'))]
+        (10+adapt*i, 'merge' if i % 2 else 'split') for i in range(2*rounds)]
     packet = torch.load(tmp_path/'model.pt', weights_only=False)
     assert packet['refinement_rounds'] == rounds
     assert packet['refinement_round_history'] == ref.round_history
+    if adapt == 3:
+        rows = json.loads((ref.folder/'validation_probe.json').read_text())
+        assert len(rows) == 25 and all(row['targets'] == 6 and row['target_pairs'] == 6 for row in rows)
+        assert rows[0]['complete_fraction'] == 0
+        assert rows[-1]['epoch'] == 28 and rows[-1]['epochs_since_edit'] == 3
+        assert len({row['reference_sha256'] for row in rows}) == 1
 
 
 @torch.no_grad()
@@ -189,7 +205,8 @@ def test_four_task_launcher_waits_for_final_students_before_plots(tmp_path):
     ]
 
 
-def test_refinement_comparison_launcher_runs_two_source_budgets_for_each_task(tmp_path):
+@pytest.mark.parametrize('adapt,budgets', [(5, (20, 30)), (3, (16, 22, 28))])
+def test_refinement_comparison_launcher_runs_each_source_budget(tmp_path, adapt, budgets):
     from train_segment_timematch import build_config
 
     setup_run(tmp_path)
@@ -198,21 +215,26 @@ def test_refinement_comparison_launcher_runs_two_source_budgets_for_each_task(tm
                     tmp_path/'closedset_scripts'/script)
     subprocess.run([bash_bin(), 'closedset_scripts/'+script], cwd=tmp_path, check=True, timeout=40,
                    env=dict(os.environ, DATA_ROOT='data', PYTHON_BIN='/bin/echo', EXPERIMENT='compare',
-                            SEGMENT_CONTEXT='0', SEGMENT_REFINE='0', SEGMENT_REFINE_COMPARE='1', RESUME='0'))
+                            SEGMENT_CONTEXT='0', SEGMENT_REFINE='0', SEGMENT_REFINE_COMPARE='1', RESUME='0',
+                            REFINEMENT_ADAPT_EPOCHS=str(adapt)))
     logs = tmp_path/'logs/compare'
     for task in ('AT1_DK1', 'FR1_FR2', 'FR2_DK1', 'DK1_AT1'):
-        for route, epochs in (('one_round', 20), ('two_rounds', 30)):
+        for route, epochs in zip(('one_round', 'two_rounds', 'three_rounds'), budgets):
             command = shlex.split((logs/f'{task}_{route}_source.log').read_text())
             cfg = build_config(command[2:])
-            assert cfg.stage == 'finetune' and cfg.epochs == epochs and cfg.source_schedule_epochs == 30
+            assert cfg.stage == 'finetune' and cfg.epochs == epochs
+            assert cfg.source_schedule_epochs == budgets[-1]
             assert cfg.output_dir == f'outputs/compare/{route}/{task}/source'
     assert not list(logs.glob('*_uda.log'))
     events = (logs/'launcher.log').read_text()
-    assert events.count('TASK_COMPLETE|') == 8
+    assert events.count('TASK_COMPLETE|') == 4*len(budgets)
     assert events.rfind('TASK_COMPLETE|') < events.index('ANALYSIS_START|')
-    assert shlex.split((tmp_path/'logs/compare_visualization/analysis.log').read_text()) == [
+    analysis = [
         '-u', '-m', 'analysis.segment_refinement_compare', '--experiment_root', 'outputs/compare',
         '--data_root', 'data', '--output_dir', 'outputs/compare_visualization', '--plot_task', 'AT1_DK1']
+    if adapt == 3:
+        analysis += ['--refinement_adapt_epochs', '3']
+    assert shlex.split((tmp_path/'logs/compare_visualization/analysis.log').read_text()) == analysis
 
 
 def test_refinement_comparison_keeps_the_same_plot_parcels_and_boundary_pairs(tmp_path):
@@ -241,6 +263,20 @@ def test_refinement_comparison_keeps_the_same_plot_parcels_and_boundary_pairs(tm
     plot_class('AT1_DK1', 'corn', plot_ids[0], one, two,
                {parcel: (dates, np.sin(dates/10)) for parcel in plot_ids[0]}, path)
     assert path.read_bytes()[:8] == b'\x89PNG\r\n\x1a\n'
+    third = run(28, [[26], [30]])
+    stats, plot_ids = summarize_task(one, two, seed=1, samples_per_class=2, three=third)
+    assert stats['three_rounds']['mean_matched_error_days'] == 4
+    plot_class('AT1_DK1', 'corn', plot_ids[0], one, two,
+               {parcel: (dates, np.sin(dates/10)) for parcel in plot_ids[0]}, path, three=third)
+    assert path.read_bytes()[:8] == b'\x89PNG\r\n\x1a\n'
+
+
+def test_complete_structure_requires_one_well_bounded_selected_segment():
+    from utils.refinement_probe import complete_window
+
+    assert complete_window((5, 15), [(6, 15)])
+    assert not complete_window((5, 15), [(5, 10), (10, 15)])
+    assert not complete_window((5, 15), [(0, 30)])
 
 
 def test_missing_history_uses_source_log_or_completed_checkpoint(tmp_path):

@@ -32,8 +32,10 @@ def build_config(argv=None):
                         help='Apply one self-attention layer across candidate segment embeddings')
     parser.add_argument('--segment_refine', action='store_true',
                         help='Use class-guided calendar boundaries during source finetuning')
-    parser.add_argument('--refinement_rounds', type=int, choices=(1, 2), default=0,
-                        help='Run one or two alternating Split and Merge rounds in Source finetuning')
+    parser.add_argument('--refinement_rounds', type=int, choices=(1, 2, 3), default=0,
+                        help='Number of alternating Split and Merge rounds in Source finetuning')
+    parser.add_argument('--refinement_adapt_epochs', type=int, choices=(3, 5), default=5,
+                        help='Epochs of Source training after each Split and after each Merge')
     parser.add_argument('--output_dir', required=True, help='Exact new stage leaf; existing directories are refused')
     parser.add_argument('--experiment_name')
     parser.add_argument('--tensorboard_log_dir')
@@ -67,7 +69,11 @@ def build_config(argv=None):
     if cfg.refinement_rounds:
         if cfg.stage != 'finetune':
             parser.error('--refinement_rounds requires --stage finetune')
+        if cfg.refinement_rounds == 3 and cfg.refinement_adapt_epochs != 3:
+            parser.error('Three refinement rounds require --refinement_adapt_epochs 3')
         cfg.segment_refine = True
+    elif cfg.refinement_adapt_epochs != 5:
+        parser.error('--refinement_adapt_epochs requires --refinement_rounds')
     if cfg.source == cfg.target:
         parser.error('specify the downstream source/target pair; finetuning uses source only internally')
     if cfg.stage == 'uda' and not cfg.structure_checkpoint:
@@ -96,9 +102,8 @@ def build_config(argv=None):
     if cfg.log_step <= 0:
         parser.error('log_step must be positive')
     if cfg.refinement_rounds:
-        cfg.refinement_adapt_epochs = 5
         cfg.epochs = cfg.source_training_epochs = 10 + 2 * cfg.refinement_adapt_epochs * cfg.refinement_rounds
-        cfg.source_schedule_epochs = 30
+        cfg.source_schedule_epochs = 28 if cfg.refinement_adapt_epochs == 3 else 30
     cfg.mode = None
     cfg.selector_protocol = 'inshape_drop_proxy_detached_v1' if cfg.variant == 'inshape' else 'legacy'
     if cfg.segment_context:
@@ -156,7 +161,7 @@ def build_config(argv=None):
     if cfg.refinement_rounds:
         cfg.structure_protocol.update(
             source_reference='full dates with frozen PSE; Split and Merge separated by Selector/LTAE training',
-            finetune=f'{cfg.epochs} source epochs; 10 warmup, then 5 after each Split and each Merge',
+            finetune=f'{cfg.epochs} source epochs; 10 warmup, then {cfg.refinement_adapt_epochs} after each edit',
             refinement_rounds=cfg.refinement_rounds,
             source_schedule_epochs=cfg.source_schedule_epochs)
     cfg.structure_protocol.update(source_init=cfg.source_init, source_training_epochs=cfg.source_training_epochs,
@@ -205,7 +210,7 @@ def main(argv=None):
         return
     if cfg.refinement_rounds:
         from utils.segment_training import validate_refinement_training
-        validate_refinement_training()
+        validate_refinement_training(cfg.refinement_adapt_epochs)
     validate_source(cfg)
     if cfg.stage == 'uda':
         checkpoint = Path(cfg.structure_checkpoint)

@@ -45,11 +45,14 @@ def write_history(path, rows):
         writer.writerows(rows)
 
 
-def validate_refinement_training():
+def validate_refinement_training(adapt=5):
     from utils.source_segment_refinement import SourceRefinement
 
     if not callable(getattr(SourceRefinement, 'refine_round_step', None)):
         raise RuntimeError('Sync utils/source_segment_refinement.py before running staged refinement')
+    if adapt == 3:
+        from utils.refinement_probe import RefinementProbe
+        return RefinementProbe
 
 
 def train_source_structure_epochs(model, selector, loader, config, writer=None, refinement=None):
@@ -117,7 +120,8 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None, 
             raise RuntimeError('Source training did not complete the requested refinement schedule')
         refinement.finish(model, selector)
         if rounds:
-            refinement_record.update(refinement_rounds=rounds, refinement_round_history=refinement.round_history)
+            refinement_record.update(refinement_rounds=rounds, refinement_round_history=refinement.round_history,
+                                     refinement_adapt_epochs=config.refinement_adapt_epochs)
         else:
             refinement_record['refinement_snapshot_sha256'] = hashlib.sha256(
                 (refinement.folder / 'update_epoch10.pt').read_bytes()).hexdigest()
@@ -248,6 +252,11 @@ def finetune_structure(config):
             Compose([RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()]),
             indices=splits[config.source]['train'], closed_set=True, combine_spring_and_winter=False)
         refinement = SourceRefinement(reference, config)
+        if getattr(config, 'refinement_rounds', 0) and config.refinement_adapt_epochs == 3:
+            RefinementProbe = validate_refinement_training(3)
+            validation = PixelSetData(config.data_root, config.source, config.classes, reference.transform,
+                indices=splits[config.source]['val'], closed_set=True, combine_spring_and_winter=False)
+            refinement.probe = RefinementProbe(validation, config, refinement.folder)
     writer = SummaryWriter(log_dir=config.tensorboard_log_dir)
     try:
         train_source_structure_epochs(model, selector, loader, config, writer, refinement)

@@ -12,58 +12,58 @@ import numpy as np
 from analysis.segment_structure_visualization import TASKS, _batch, _sample, fit_projection, ifft_display
 
 
-ROUTES = ('one_round', 'two_rounds')
-LABELS = ('Initial INSHAPE PELT', 'One round / 20 epochs', 'Two rounds / 30 epochs')
+ROUTES = ('one_round', 'two_rounds', 'three_rounds')
 
 
 def read_json(path):
     return json.loads(path.read_text(encoding='utf-8'))
 
 
-def expected_phases(rounds):
-    return [(epoch, phase) for i in range(rounds)
-            for epoch, phase in ((10+10*i, 'split'), (15+10*i, 'merge'))]
+def expected_phases(rounds, adapt=5):
+    return [(10+adapt*i, 'merge' if i % 2 else 'split') for i in range(2*rounds)]
 
 
-def complete_history(history, rounds):
+def complete_history(history, rounds, adapt=5):
     return (isinstance(history, list)
             and all(isinstance(record, dict) for record in history)
-            and [(r.get('epoch'), r.get('phase')) for r in history] == expected_phases(rounds))
+            and [(r.get('epoch'), r.get('phase')) for r in history] == expected_phases(rounds, adapt))
 
 
 class SourceScheduleError(ValueError):
     """The saved checkpoint belongs to a different Source schedule."""
 
 
-def verify_source_checkpoint(leaf, rounds):
+def verify_source_checkpoint(leaf, rounds, adapt=5):
     import torch
 
     packet = torch.load(leaf / 'fold_0' / 'model.pt', map_location='cpu', weights_only=True)
-    expected = ('source_structure', rounds, 10 + 10*rounds)
-    actual = tuple(packet.get(key) for key in ('role', 'refinement_rounds', 'completed_epochs'))
+    expected = ('source_structure', rounds, 10 + 2*adapt*rounds, adapt)
+    actual = (packet.get('role'), packet.get('refinement_rounds'), packet.get('completed_epochs'),
+              packet.get('refinement_adapt_epochs', 5))
     if actual != expected:
         raise SourceScheduleError(
             f'{leaf}: checkpoint does not confirm the requested {rounds} refinement round(s). '
-            f'Found role={actual[0]!r}, refinement_rounds={actual[1]!r}, completed_epochs={actual[2]!r}. '
+            f'Found role={actual[0]!r}, refinement_rounds={actual[1]!r}, completed_epochs={actual[2]!r}, '
+            f'refinement_adapt_epochs={actual[3]!r}. '
             'Resume the existing experiment with REPAIR_SOURCE=1 to replace this Source result.')
     return packet
 
 
-def load_round_history(leaf, rounds, source_log):
+def load_round_history(leaf, rounds, source_log, adapt=5):
     history_path = leaf / 'refinement' / 'round_history.json'
     if history_path.is_file():
         try:
             history = read_json(history_path)
         except json.JSONDecodeError:
             history = None
-        if complete_history(history, rounds):
+        if complete_history(history, rounds, adapt):
             return history, 'round_history.json'
 
     checkpoint = leaf / 'fold_0' / 'model.pt'
     if checkpoint.is_file():
-        packet = verify_source_checkpoint(leaf, rounds)
+        packet = verify_source_checkpoint(leaf, rounds, adapt)
         history = packet.get('refinement_round_history')
-        if complete_history(history, rounds):
+        if complete_history(history, rounds, adapt):
             return history, 'checkpoint'
 
     if source_log is not None and source_log.is_file():
@@ -76,7 +76,7 @@ def load_round_history(leaf, rounds, source_log):
                         history.append(json.loads(line[len(prefix):]))
                     except json.JSONDecodeError:
                         continue
-        if complete_history(history, rounds):
+        if complete_history(history, rounds, adapt):
             return history, 'source_log'
 
     if checkpoint.is_file():
@@ -86,16 +86,26 @@ def load_round_history(leaf, rounds, source_log):
         f'{leaf}: no complete round history, final checkpoint or Source phase log to verify this run')
 
 
-def load_source(root, task, route, source_log_dir=None):
+def load_source(root, task, route, source_log_dir=None, adapt=5):
     leaf = root / route / task / 'source'
     config = read_json(leaf / 'resolved_config.json')
     rounds = ROUTES.index(route) + 1
-    epochs = 10 + 10 * rounds
-    if config.get('refinement_rounds') != rounds or config.get('epochs') != epochs:
+    epochs = 10 + 2*adapt*rounds
+    if (config.get('refinement_rounds') != rounds or config.get('epochs') != epochs
+            or config.get('refinement_adapt_epochs', 5) != adapt):
         raise ValueError(f'Unexpected refinement configuration in {leaf}')
     folder = leaf / 'refinement'
     source_log = None if source_log_dir is None else source_log_dir / f'{task}_{route}_source.log'
-    history, history_source = load_round_history(leaf, rounds, source_log)
+    history, history_source = load_round_history(leaf, rounds, source_log, adapt)
+    probe = None
+    if adapt == 3:
+        probe = read_json(folder / 'validation_probe.json')
+        expected = [(10, 0, 'initial', 0)]
+        for i, (epoch, phase) in enumerate(expected_phases(rounds, adapt)):
+            expected.extend((epoch+age, i//2+1, phase, age) for age in range(adapt+1))
+        observed = [(r['epoch'], r['round'], r['phase'], r['epochs_since_edit']) for r in probe]
+        if observed != expected or len({r['reference_sha256'] for r in probe}) != 1:
+            raise ValueError(f'Incomplete or inconsistent validation probe in {leaf}')
     with (folder / 'parcels.jsonl').open(encoding='utf-8') as stream:
         rows = {}
         for line in stream:
@@ -107,7 +117,7 @@ def load_source(root, task, route, source_log_dir=None):
     test = read_json(leaf / 'fold_0' / f'test_{config["source"].replace("/", "_")}.json')
     if test['completed_epochs'] != epochs:
         raise ValueError(f'Unexpected evaluated epoch in {leaf}')
-    return dict(leaf=leaf, config=config, rows=rows, history=history,
+    return dict(leaf=leaf, config=config, rows=rows, history=history, probe=probe,
                 history_source=history_source, bank=bank, test=test)
 
 
@@ -146,21 +156,29 @@ def parcel_metrics(rows):
                 parcel_match_fraction=totals['parcels_with_hits']/n)
 
 
-def summarize_task(one, two, seed, samples_per_class):
+def summarize_task(one, two, seed, samples_per_class, three=None):
+    runs = (one, two) if three is None else (one, two, three)
+    routes = ROUTES[:len(runs)]
     classes = one['config']['classes']
-    if (classes != two['config']['classes'] or one['config']['source'] != two['config']['source']
-            or one['config']['original_source_checkpoint_sha256']
-            != two['config']['original_source_checkpoint_sha256']):
-        raise ValueError('Paired runs require the same Source and class order')
-    left, right = one['rows'], two['rows']
-    if not left or left.keys() != right.keys():
-        raise ValueError('Paired runs require identical training parcel IDs')
+    left = one['rows']
+    for run in runs[1:]:
+        if any(one['config'][key] != run['config'][key]
+               for key in ('classes', 'source', 'original_source_checkpoint_sha256')):
+            raise ValueError('Paired runs require the same Source and class order')
+        if not left or left.keys() != run['rows'].keys():
+            raise ValueError('Paired runs require identical training parcel IDs')
+    probes = [run['probe'] for run in runs if run.get('probe') is not None]
+    if probes and (len(probes) != len(runs) or any(
+            rows[0]['reference_sha256'] != probes[0][0]['reference_sha256'] for rows in probes)):
+        raise ValueError('Paired runs require identical fixed validation reference windows')
     by_class = defaultdict(list)
     for parcel in sorted(left):
-        if left[parcel]['label'] != right[parcel]['label'] or left[parcel]['initial'] != right[parcel]['initial']:
+        if any(left[parcel][key] != run['rows'][parcel][key]
+               for run in runs[1:] for key in ('label', 'initial')):
             raise ValueError(f'Initial reference differs on parcel {parcel}')
         by_class[left[parcel]['label']].append(parcel)
-    aggregate = np.zeros((3, 3))
+    aggregate = np.zeros((len(runs)+1, 3))
+    cut_sources = [(left, 'initial'), *((run['rows'], 'final') for run in runs)]
     class_stats, plot_ids = {}, {}
     for label, ids in by_class.items():
         rng = np.random.default_rng(seed+label)
@@ -171,17 +189,16 @@ def summarize_task(one, two, seed, samples_per_class):
         totals = np.zeros_like(aggregate)
         for index in selected:
             a, b = pairs[index]
-            for i, (rows, key) in enumerate(((left, 'initial'), (left, 'final'), (right, 'final'))):
+            for i, (rows, key) in enumerate(cut_sources):
                 totals[i] += match_cuts(rows[a][key], rows[b][key])
         aggregate += totals
-        class_stats[classes[label]] = dict(
-            pairs=len(selected), initial=cut_metrics(totals[0]),
-            one_round=dict(**cut_metrics(totals[1]), **parcel_metrics(left[p] for p in ids),
-                           prototypes=len(one['bank'].get(str(label), []))),
-            two_rounds=dict(**cut_metrics(totals[2]), **parcel_metrics(right[p] for p in ids),
-                            prototypes=len(two['bank'].get(str(label), []))))
+        class_stats[classes[label]] = dict(pairs=len(selected), initial=cut_metrics(totals[0]))
+        for i, (route, run) in enumerate(zip(routes, runs), 1):
+            class_stats[classes[label]][route] = dict(
+                **cut_metrics(totals[i]), **parcel_metrics(run['rows'][p] for p in ids),
+                prototypes=len(run['bank'].get(str(label), [])))
     result = dict(initial=cut_metrics(aggregate[0]), classes=class_stats)
-    for i, (route, run) in enumerate(zip(ROUTES, (one, two)), 1):
+    for i, (route, run) in enumerate(zip(routes, runs), 1):
         test = run['test']
         result[route] = dict(**cut_metrics(aggregate[i]), **parcel_metrics(run['rows'].values()),
                              source_epochs=test['completed_epochs'],
@@ -191,6 +208,11 @@ def summarize_task(one, two, seed, samples_per_class):
                              heldout_native_pelt={kind: {key: test[kind][key]
                                                         for key in ('accuracy', 'macro_f1')}
                                                   for kind in ('full', 'keep')})
+        if run.get('probe'):
+            result[route]['validation_probe'] = run['probe']
+            result[route]['validation_structure'] = run['probe'][-1]
+    if probes:
+        result['initial']['validation_structure'] = probes[0][0]
     return result, plot_ids
 
 
@@ -226,19 +248,23 @@ def load_plot_features(run, parcel_ids, data_root, device):
     return {parcel: (dates, (values-mean) @ component) for parcel, (dates, values) in views.items()}
 
 
-def plot_class(task, name, ids, one, two, curves, path):
+def plot_class(task, name, ids, one, two, curves, path, three=None):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    figure, axes = plt.subplots(3, len(ids), squeeze=False, sharex=True, sharey=True,
-                                figsize=(4.8*len(ids), 7), layout='constrained')
+    runs = (one, two) if three is None else (one, two, three)
+    labels = ['Initial INSHAPE PELT'] + [
+        f'{i} round(s) / {run["test"]["completed_epochs"]} epochs' for i, run in enumerate(runs, 1)]
+    rows = len(labels)
+    figure, axes = plt.subplots(rows, len(ids), squeeze=False, sharex=True, sharey=True,
+                                figsize=(4.8*len(ids), 2.3*rows), constrained_layout=True)
     for column, parcel in enumerate(ids):
         dates, values = curves[parcel]
         grid, smooth = ifft_display(dates, values)
-        first, second = one['rows'][parcel], two['rows'][parcel]
-        panels = ((first['initial'], None), (first['final'], first['segments']),
-                  (second['final'], second['segments']))
+        first = one['rows'][parcel]
+        parcels = [run['rows'][parcel] for run in runs]
+        panels = [(first['initial'], None)] + [(r['final'], r['segments']) for r in parcels]
         for row, (cuts, segments) in enumerate(panels):
             ax = axes[row, column]
             ax.plot(grid, smooth, color='#263b56', lw=1.25)
@@ -252,7 +278,7 @@ def plot_class(task, name, ids, one, two, curves, path):
                     ax.axvspan(edges[i], edges[i+1], ymin=.025, ymax=.08, color='#277c77',
                                alpha=.85 if segment['selected'] else .15)
             kept = '' if segments is None else f' / {sum(s["selected"] for s in segments)} kept'
-            ax.set_title(f'{LABELS[row]} · {len(cuts)+1} segments{kept}', fontsize=9)
+            ax.set_title(f'{labels[row]} · {len(cuts)+1} segments{kept}', fontsize=9)
             ax.grid(axis='y', alpha=.18)
         axes[0, column].text(.02, .96, f'Parcel {parcel}', transform=axes[0, column].transAxes,
                              va='top', fontsize=9)
@@ -269,6 +295,7 @@ def main(argv=None):
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument('--source_log_dir', type=Path,
                         help='Defaults to logs/<experiment name>; recovers missing phase histories')
+    parser.add_argument('--refinement_adapt_epochs', type=int, choices=(3, 5), default=5)
     parser.add_argument('--data_root', type=Path)
     parser.add_argument('--plot_task', choices=TASKS, default='AT1_DK1')
     parser.add_argument('--samples_per_class', type=int, default=3)
@@ -279,28 +306,35 @@ def main(argv=None):
         parser.error('--samples_per_class must be positive')
     args.output_dir.mkdir(parents=True, exist_ok=True)
     log_dir = args.source_log_dir or Path('logs') / args.experiment_root.name
+    adapt = args.refinement_adapt_epochs
+    routes = ROUTES if adapt == 3 else ROUTES[:2]
     results, plot_inputs = {}, None
     for task in TASKS:
-        one, two = (load_source(args.experiment_root, task, route, log_dir) for route in ROUTES)
-        results[task], plot_ids = summarize_task(one, two, args.seed, args.samples_per_class)
-        for route in ROUTES:
+        runs = [load_source(args.experiment_root, task, route, log_dir, adapt) for route in routes]
+        results[task], plot_ids = summarize_task(*runs[:2], args.seed, args.samples_per_class,
+                                                 three=runs[2] if len(runs) == 3 else None)
+        for route in routes:
             record = results[task][route]
             print('SOURCE_REFINEMENT_COMPARE|' + json.dumps(dict(task=task, route=route,
                   paired_cut_f1=record['paired_cut_f1'], heldout_native_pelt=record['heldout_native_pelt'],
                   selected_segment_match_fraction=record['selected_segment_match_fraction'],
+                  validation_structure=record.get('validation_structure'),
                   round_history_source=record['round_history_source'])), flush=True)
         if args.data_root is not None and task == args.plot_task:
             ids = [parcel for group in plot_ids.values() for parcel in group]
-            plot_inputs = (
-                dict(leaf=one['leaf'], config=one['config'], rows={p: one['rows'][p] for p in ids}),
-                dict(rows={p: two['rows'][p] for p in ids}),
-                plot_ids,
-            )
+            plot_inputs = [dict(leaf=run['leaf'], config=run['config'], test=run['test'],
+                                rows={p: run['rows'][p] for p in ids}) for run in runs], plot_ids
     report = dict(pairing=dict(seed=args.seed, max_parcels_per_class=128, max_pairs_per_class=500,
                                tolerance_days=14), tasks=results)
+    if adapt == 3:
+        report['validation_probe_protocol'] = dict(
+            reference_bank='fixed epoch-10 training shapelets', label_guided=True,
+            max_validation_parcels_per_class=24, min_reference_observation_recall=.9,
+            min_observation_iou=.5, complete_pair='both parcels retain the same prototype in one segment each')
     (args.output_dir / 'summary.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     if plot_inputs is not None:
-        one, two, plot_ids = plot_inputs
+        runs, plot_ids = plot_inputs
+        one, two = runs[:2]
         curves = load_plot_features(one, [p for ids in plot_ids.values() for p in ids],
                                     args.data_root, args.device)
         folder = args.output_dir / args.plot_task
@@ -308,7 +342,8 @@ def main(argv=None):
         for label, ids in plot_ids.items():
             name = one['config']['classes'][label]
             filename = f'{label:02d}_{re.sub(r"[^A-Za-z0-9_-]", "_", name)}.png'
-            plot_class(args.plot_task, name, ids, one, two, curves, folder / filename)
+            plot_class(args.plot_task, name, ids, one, two, curves, folder / filename,
+                       three=runs[2] if len(runs) == 3 else None)
         (folder / 'paired_parcels.json').write_text(json.dumps(
             {one['config']['classes'][y]: ids for y, ids in plot_ids.items()}, indent=2), encoding='utf-8')
 

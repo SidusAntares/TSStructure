@@ -128,35 +128,39 @@ def cluster_selected(records, eligible_dates, previous):
             for p in sorted(group, key=lambda p: (-p['frequency'], p['id']))[:SETTINGS['top_k']]]
 
 
+def prototype_windows(dates, start, stop, prototype):
+    (ll, lm, lh), (rl, rm, rh) = prototype['bounds']
+    slack = SETTINGS['boundary_slack']
+    left = [i for i in range(start, stop) if ll-slack <= dates[i] <= lh+slack
+            and (i == start or dates[i] > dates[i-1])]
+    right = [i for i in range(start+1, stop+1) if rl-slack <= dates[i-1] <= rh+slack
+             and (i == stop or dates[i] > dates[i-1])]
+    left = sorted(left, key=lambda i: abs(dates[i]-lm))[:3]
+    right = sorted(right, key=lambda i: abs(dates[i-1]-rm))[:3]
+    return [(a, b) for a in left for b in right]
+
+
 def split_cuts(dates, shape, cuts, prototypes, min_size):
     candidates = []
     for p in prototypes:
-        (ll, lm, lh), (rl, rm, rh) = p['bounds']
+        lh, rl = p['bounds'][0][2], p['bounds'][1][0]
         existing = match_segment_for_prototype(dates, shape, cuts, p)
         if existing:
             continue
         for start, stop in ranges_for(dates, cuts):
             if stop - start < 2 * min_size or dates[start] > lh or dates[stop-1] < rl:
                 continue
-            slack = SETTINGS['boundary_slack']
-            left = [i for i in range(start, stop) if ll - slack <= dates[i] <= lh + slack
-                    and (i == start or dates[i] > dates[i-1])]
-            right = [i for i in range(start + 1, stop + 1) if rl - slack <= dates[i-1] <= rh + slack
-                     and (i == stop or dates[i] > dates[i-1])]
-            left = sorted(left, key=lambda i: abs(dates[i] - lm))[:3]
-            right = sorted(right, key=lambda i: abs(dates[i-1] - rm))[:3]
-            for a in left:
-                for b in right:
-                    if b - a < min_size or (a > start and a-start < min_size) or (b < stop and stop-b < min_size):
-                        continue
-                    if not .5 * len(p['shape']) <= b-a <= 2 * len(p['shape']):
-                        continue
-                    additions = [cut_gap(dates, i) for i in (a, b) if start < i < stop]
-                    if not additions or any(np.any(np.abs(cuts - c) <= SETTINGS['boundary_slack']) for c in additions):
-                        continue
-                    distance = dtw(shape[a:b], p['shape'])
-                    if distance <= SETTINGS['dtw_limit']:
-                        candidates.append((-p['frequency'], distance, additions))
+            for a, b in prototype_windows(dates, start, stop, p):
+                if b-a < min_size or (a > start and a-start < min_size) or (b < stop and stop-b < min_size):
+                    continue
+                if not .5 * len(p['shape']) <= b-a <= 2 * len(p['shape']):
+                    continue
+                additions = [cut_gap(dates, i) for i in (a, b) if start < i < stop]
+                if not additions or any(np.any(np.abs(cuts-c) <= SETTINGS['boundary_slack']) for c in additions):
+                    continue
+                distance = dtw(shape[a:b], p['shape'])
+                if distance <= SETTINGS['dtw_limit']:
+                    candidates.append((-p['frequency'], distance, additions))
     inserted = []
     for _, _, additions in sorted(candidates):
         if len(inserted) + len(additions) > SETTINGS['split_budget']:
@@ -262,14 +266,16 @@ class SourceRefinement:
         self.initial, self.cuts, self.edits = {}, {}, {}
         self.round_history, self.protected = [], {}
         self.bank = None
+        self.probe = None
         labels = dataset.get_labels()
         rng = np.random.default_rng(config.seed)
         self.panel = [i for y in np.unique(labels) for i in
                       rng.permutation(np.flatnonzero(labels == y))[:SETTINGS['reference_per_class']]]
 
-    def views(self, model, indices):
+    def views(self, model, indices, dataset=None):
         cfg = self.config
-        loader = DataLoader(FixedViews(self.dataset, indices, cfg.seed), batch_size=48,
+        dataset = self.dataset if dataset is None else dataset
+        loader = DataLoader(FixedViews(dataset, indices, cfg.seed), batch_size=48,
                             num_workers=cfg.num_workers, generator=torch.Generator().manual_seed(cfg.seed))
         for sample in loader:
             x, mask, extra = (sample[key].to(cfg.device) for key in ('pixels', 'valid_pixels', 'extra'))
@@ -356,6 +362,8 @@ class SourceRefinement:
     @torch.no_grad()
     def refine_round_step(self, model, selector, epoch):
         """Apply a scheduled edit after the model has trained on the preceding cuts."""
+        if self.probe is not None and self.probe.history:
+            self.probe.record(model, selector, epoch)
         offset = epoch - SETTINGS['update_epoch']
         adapt = self.config.refinement_adapt_epochs
         if offset < 0 or offset % adapt or epoch >= self.config.epochs:
@@ -369,6 +377,9 @@ class SourceRefinement:
         changes = defaultdict(lambda: dict(parcels=0, cuts=0))
         if phase == 'split':
             self.fit_bank(model, selector)
+            if self.probe is not None and not self.probe.history:
+                self.probe.initialize(self.views(model, self.probe.indices, self.probe.dataset), self.bank)
+                self.probe.record(model, selector, epoch)
             self.protected = {}
             for parcels, labels, dates, features in self.views(model, range(len(self.dataset))):
                 projected = project(features.cpu().numpy(), self.bank)
@@ -400,6 +411,8 @@ class SourceRefinement:
         self.round_history.append(record)
         (self.folder / 'round_history.json').write_text(json.dumps(self.round_history, indent=2), encoding='utf-8')
         print('SEGMENT_REFINE_PHASE|' + json.dumps(record), flush=True)
+        if self.probe is not None:
+            self.probe.edit(model, selector, self.bank, phase, round_index, epoch)
 
     @torch.no_grad()
     def finish(self, model, selector):

@@ -8,10 +8,14 @@ DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 SEGMENT_CONTEXT="${SEGMENT_CONTEXT:-0}"
 SEGMENT_REFINE="${SEGMENT_REFINE:-0}"
 SEGMENT_REFINE_COMPARE="${SEGMENT_REFINE_COMPARE:-0}"
+REFINEMENT_ADAPT_EPOCHS="${REFINEMENT_ADAPT_EPOCHS:-5}"
 default_experiment=timematch_segments_compare_seed1
 if [[ "$SEGMENT_CONTEXT" == 1 ]]; then default_experiment=timematch_segments_context_seed1; fi
 if [[ "$SEGMENT_REFINE" == 1 ]]; then default_experiment=timematch_segments_refine_seed1; fi
 if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then default_experiment=timematch_segments_refine_compare_seed1; fi
+if [[ "$SEGMENT_REFINE_COMPARE" == 1 && "$REFINEMENT_ADAPT_EPOCHS" == 3 ]]; then
+    default_experiment=timematch_segments_refine_3epoch_seed1
+fi
 EXPERIMENT="${EXPERIMENT:-$default_experiment}"
 RESUME="${RESUME:-0}"
 REPAIR_SOURCE="${REPAIR_SOURCE:-0}"
@@ -40,6 +44,10 @@ exec >> "$LOG_ROOT/launcher.log" 2>&1
    ( "$SEGMENT_REFINE_COMPARE" == 1 && "$SEGMENT_REFINE" == 0 && "$SEGMENT_CONTEXT" == 0 ) ]] || {
     echo 'ERROR: SEGMENT_REFINE_COMPARE must be 0 or 1 and runs independently'; exit 1;
 }
+[[ "$REFINEMENT_ADAPT_EPOCHS" == 5 ||
+   ( "$REFINEMENT_ADAPT_EPOCHS" == 3 && "$SEGMENT_REFINE_COMPARE" == 1 ) ]] || {
+    echo 'ERROR: REFINEMENT_ADAPT_EPOCHS=3 requires SEGMENT_REFINE_COMPARE=1'; exit 1;
+}
 [[ "$REPAIR_SOURCE" == 0 ||
    ( "$REPAIR_SOURCE" == 1 && "$RESUME" == 1 && "$SEGMENT_REFINE_COMPARE" == 1 ) ]] || {
     echo 'ERROR: REPAIR_SOURCE=1 requires RESUME=1 and SEGMENT_REFINE_COMPARE=1'; exit 1;
@@ -66,7 +74,18 @@ for task in FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1; do
     }
 done
 if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then
-    "$PYTHON_BIN" -c 'from utils.segment_training import validate_refinement_training; validate_refinement_training()'
+    "$PYTHON_BIN" -c '
+import sys
+from utils.segment_training import validate_refinement_training
+
+adapt = int(sys.argv[1])
+if adapt == 3:
+    from analysis.segment_refinement_compare import expected_phases
+    expected_phases(3, adapt)
+    validate_refinement_training(adapt)
+else:
+    validate_refinement_training()
+' "$REFINEMENT_ADAPT_EPOCHS"
 fi
 # Slow FR1 jobs enter first; each free GPU takes the next pair immediately.
 job_tasks=(FR1_FR2 FR1_FR2 FR2_DK1 DK1_AT1 FR2_DK1 DK1_AT1 AT1_DK1 AT1_DK1)
@@ -78,6 +97,10 @@ fi
 if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then
     job_tasks=(FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1 FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1)
     job_variants=(two_rounds two_rounds two_rounds two_rounds one_round one_round one_round one_round)
+    if [[ "$REFINEMENT_ADAPT_EPOCHS" == 3 ]]; then
+        job_tasks=(FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1 FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1 FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1)
+        job_variants=(three_rounds three_rounds three_rounds three_rounds two_rounds two_rounds two_rounds two_rounds one_round one_round one_round one_round)
+    fi
 fi
 mkdir -p "$OUTPUT_ROOT"
 queue_dir="$(mktemp -d "$LOG_ROOT/queue.XXXXXX")"
@@ -96,11 +119,14 @@ import sys
 from analysis.segment_refinement_compare import SourceScheduleError, verify_source_checkpoint
 
 try:
-    verify_source_checkpoint(Path(sys.argv[1]), int(sys.argv[2]))
+    if sys.argv[3] == "3":
+        verify_source_checkpoint(Path(sys.argv[1]), int(sys.argv[2]), 3)
+    else:
+        verify_source_checkpoint(Path(sys.argv[1]), int(sys.argv[2]))
 except SourceScheduleError as error:
     print(error, file=sys.stderr)
     sys.exit(2)
-' "$1" "$2"
+' "$1" "$2" "$REFINEMENT_ADAPT_EPOCHS"
 }
 
 run_job() {
@@ -118,9 +144,14 @@ run_job() {
     if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then
         local rounds=1
         if [[ "$route" == two_rounds ]]; then rounds=2; fi
+        if [[ "$route" == three_rounds ]]; then rounds=3; fi
+        local probe_ready=1
+        if [[ "$REFINEMENT_ADAPT_EPOCHS" == 3 && ! -s "$leaf/source/refinement/validation_probe.json" ]]; then
+            probe_ready=0
+        fi
         local summary="$leaf/source/fold_0/test_${source//\//_}.json"
         local log="$LOG_ROOT/${task}_${route}_source.log"
-        if [[ "$RESUME" == 1 && -s "$summary" && -s "$leaf/source/fold_0/model.pt" &&
+        if [[ "$RESUME" == 1 && "$probe_ready" == 1 && -s "$summary" && -s "$leaf/source/fold_0/model.pt" &&
               -s "$leaf/source/refinement/parcels.jsonl" &&
               -s "$leaf/source/refinement/prototypes.json" ]]; then
             if audit_refinement_checkpoint "$leaf/source" "$rounds"; then
@@ -144,6 +175,7 @@ run_job() {
             echo "SOURCE_BACKUP|gpu=$gpu|task=$task|route=$route|path=$backup"
         fi
         local source_args=(--stage finetune "${common[@]}" --refinement_rounds "$rounds" --output_dir "$leaf/source")
+        if [[ "$REFINEMENT_ADAPT_EPOCHS" == 3 ]]; then source_args+=(--refinement_adapt_epochs 3); fi
         CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train_segment_timematch.py "${source_args[@]}" \
             > "$log" 2>&1
         return $?
@@ -225,6 +257,7 @@ if [[ "$status" == 0 && ( "$SEGMENT_REFINE" == 1 || "$SEGMENT_REFINE_COMPARE" ==
         analysis_module=analysis.segment_refinement_compare
         analysis_mode=source_refinement_compare
         analysis_args+=(--plot_task "${PLOT_TASK:-AT1_DK1}")
+        if [[ "$REFINEMENT_ADAPT_EPOCHS" == 3 ]]; then analysis_args+=(--refinement_adapt_epochs 3); fi
     else
         analysis_args=(--mode refined_plots "${analysis_args[@]}")
     fi
