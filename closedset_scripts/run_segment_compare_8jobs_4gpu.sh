@@ -7,9 +7,11 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 SEGMENT_CONTEXT="${SEGMENT_CONTEXT:-0}"
 SEGMENT_REFINE="${SEGMENT_REFINE:-0}"
+SEGMENT_REFINE_COMPARE="${SEGMENT_REFINE_COMPARE:-0}"
 default_experiment=timematch_segments_compare_seed1
 if [[ "$SEGMENT_CONTEXT" == 1 ]]; then default_experiment=timematch_segments_context_seed1; fi
 if [[ "$SEGMENT_REFINE" == 1 ]]; then default_experiment=timematch_segments_refine_seed1; fi
+if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then default_experiment=timematch_segments_refine_compare_seed1; fi
 EXPERIMENT="${EXPERIMENT:-$default_experiment}"
 RESUME="${RESUME:-0}"
 OUTPUT_ROOT="outputs/$EXPERIMENT"
@@ -32,6 +34,10 @@ exec >> "$LOG_ROOT/launcher.log" 2>&1
 }
 [[ "$SEGMENT_REFINE" == 0 || ( "$SEGMENT_REFINE" == 1 && "$SEGMENT_CONTEXT" == 0 ) ]] || {
     echo 'ERROR: SEGMENT_REFINE must be 0 or 1 and cannot be combined with SEGMENT_CONTEXT'; exit 1;
+}
+[[ "$SEGMENT_REFINE_COMPARE" == 0 ||
+   ( "$SEGMENT_REFINE_COMPARE" == 1 && "$SEGMENT_REFINE" == 0 && "$SEGMENT_CONTEXT" == 0 ) ]] || {
+    echo 'ERROR: SEGMENT_REFINE_COMPARE must be 0 or 1 and runs independently'; exit 1;
 }
 [[ ! -e "$OUTPUT_ROOT" || "$RESUME" == 1 ]] || {
     echo 'ERROR: experiment output exists; use RESUME=1 to reuse final Source checkpoints'; exit 1;
@@ -61,6 +67,10 @@ if [[ "$SEGMENT_CONTEXT" == 1 || "$SEGMENT_REFINE" == 1 ]]; then
     job_tasks=(FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1)
     job_variants=(finetune finetune finetune finetune)
 fi
+if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then
+    job_tasks=(FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1 FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1)
+    job_variants=(two_rounds two_rounds two_rounds two_rounds one_round one_round one_round one_round)
+fi
 mkdir -p "$OUTPUT_ROOT"
 queue_dir="$(mktemp -d "$LOG_ROOT/queue.XXXXXX")"
 printf '%s\n' 0 > "$queue_dir/next"
@@ -83,6 +93,24 @@ run_job() {
         --experiment_name "$task" --progress_bar off)
     if [[ "$SEGMENT_CONTEXT" == 1 ]]; then common+=(--segment_context); fi
     if [[ "$SEGMENT_REFINE" == 1 ]]; then common+=(--segment_refine); fi
+    if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then
+        local rounds=1
+        if [[ "$route" == two_rounds ]]; then rounds=2; fi
+        local summary="$leaf/source/fold_0/test_${source//\//_}.json"
+        if [[ "$RESUME" == 1 && -s "$summary" && -s "$leaf/source/fold_0/model.pt" &&
+              -s "$leaf/source/refinement/round_history.json" && -s "$leaf/source/refinement/parcels.jsonl" &&
+              -s "$leaf/source/refinement/prototypes.json" ]]; then
+            echo "SOURCE_REUSE|gpu=$gpu|task=$task|route=$route|checkpoint=$leaf/source/fold_0/model.pt"
+        elif [[ -e "$leaf/source" ]]; then
+            echo "ERROR: incomplete Source output preserved: $leaf/source"
+            return 1
+        else
+            local source_args=(--stage finetune "${common[@]}" --refinement_rounds "$rounds" --output_dir "$leaf/source")
+            CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train_segment_timematch.py "${source_args[@]}" \
+                > "$LOG_ROOT/${task}_${route}_source.log" 2>&1 || return $?
+        fi
+        return 0
+    fi
     if [[ "$RESUME" == 1 && -s "$leaf/source/fold_0/model.pt" ]]; then
         # UDA validates the saved role, epoch count, route, protocol and source hash.
         echo "SOURCE_REUSE|gpu=$gpu|task=$task|route=$route|checkpoint=$leaf/source/fold_0/model.pt"
@@ -125,7 +153,11 @@ worker() {
         echo "TASK_START|gpu=$gpu|task=$task|route=$variant|queue_index=$index"
         rmdir "$queue_dir/lock"
         if run_job "$gpu" "$task" "$variant"; then
-            echo "TASK_COMPLETE|gpu=$gpu|task=$task|route=$variant|uda_epochs=20"
+            if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then
+                echo "TASK_COMPLETE|gpu=$gpu|task=$task|route=$variant|stage=source"
+            else
+                echo "TASK_COMPLETE|gpu=$gpu|task=$task|route=$variant|uda_epochs=20"
+            fi
         else
             echo "TASK_FAILED|gpu=$gpu|task=$task|route=$variant|status=$?"
             status=1
@@ -143,19 +175,27 @@ status=0
 for pid in "${pids[@]}"; do
     if ! wait "$pid"; then status=1; fi
 done
-if [[ "$status" == 0 && "$SEGMENT_REFINE" == 1 ]]; then
+if [[ "$status" == 0 && ( "$SEGMENT_REFINE" == 1 || "$SEGMENT_REFINE_COMPARE" == 1 ) ]]; then
     mkdir -p "$VISUALIZATION_LOG"
-    echo 'ANALYSIS_START|mode=refined_plots'
     analysis_args=(
-        --mode refined_plots
         --experiment_root "$OUTPUT_ROOT"
         --data_root "$DATA_ROOT"
         --output_dir "$VISUALIZATION_ROOT"
     )
-    if CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" -u -m analysis.segment_cut_transfer "${analysis_args[@]}" > "$VISUALIZATION_LOG/analysis.log" 2>&1; then
-        echo 'ANALYSIS_COMPLETE|mode=refined_plots'
+    analysis_module=analysis.segment_cut_transfer
+    analysis_mode=refined_plots
+    if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then
+        analysis_module=analysis.segment_refinement_compare
+        analysis_mode=source_refinement_compare
+        analysis_args+=(--plot_task "${PLOT_TASK:-AT1_DK1}")
     else
-        echo 'ANALYSIS_FAILED|mode=refined_plots'
+        analysis_args=(--mode refined_plots "${analysis_args[@]}")
+    fi
+    echo "ANALYSIS_START|mode=$analysis_mode"
+    if CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" -u -m "$analysis_module" "${analysis_args[@]}" > "$VISUALIZATION_LOG/analysis.log" 2>&1; then
+        echo "ANALYSIS_COMPLETE|mode=$analysis_mode"
+    else
+        echo "ANALYSIS_FAILED|mode=$analysis_mode"
         status=1
     fi
 fi

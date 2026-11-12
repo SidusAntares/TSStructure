@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from models.segment_selector import SegmentSelector
@@ -98,6 +99,47 @@ def test_refinement_uses_one_reference_pelt_and_freezes_source_encoders(tmp_path
     assert torch.load(tmp_path/'model.pt', weights_only=False)['segment_refine']
 
 
+@pytest.mark.parametrize('rounds', [1, 2])
+def test_merge_recomputes_selector_on_split_cuts_after_training(tmp_path, monkeypatch, rounds):
+    from torch.utils.data import default_collate
+
+    dataset = FixedParcels()
+    batch = default_collate([dataset[i] for i in range(len(dataset))])
+    cfg = config(tmp_path)
+    cfg.__dict__.update(epochs=10+10*rounds, variant='inshape', output_dir=tmp_path, num_workers=0,
+                        refinement_rounds=rounds, refinement_adapt_epochs=5, source_schedule_epochs=30,
+                        selector_protocol='inshape_drop_proxy_detached_v1')
+    model = PseLTae(num_classes=2, with_extra=False)
+    selector = SegmentSelector(width=16, heads=2, protocol=cfg.selector_protocol)
+    ref = refinement.SourceRefinement(dataset, cfg)
+    monkeypatch.setattr(refinement, 'segment_pelt', lambda features, **_: torch.zeros(
+        features.shape[:2], dtype=torch.long))
+    phase_weights = []
+
+    def fit_bank(model, selector):
+        phase_weights.append(selector.scorer[0].weight.detach().clone())
+        ref.bank = dict(mean=np.zeros(128), basis=np.eye(128)[:8], scale=np.ones(8), classes={})
+
+    def split(dates, shape, cuts, prototypes, min_size):
+        return [17.5] if not len(cuts) else [59.5]
+
+    def merge(model, features, dates, y, cuts, gates, probabilities, protected, gamma):
+        assert cuts.tolist() == ([17.5] if len(phase_weights) == 1 else [17.5, 59.5])
+        assert protected == [cuts[-1]]
+        assert len(gates) == len(probabilities) == len(cuts)+1
+        assert not torch.equal(selector.scorer[0].weight, phase_weights[-1])
+        return []
+
+    monkeypatch.setattr(ref, 'fit_bank', fit_bank)
+    monkeypatch.setattr(refinement, 'split_cuts', split)
+    monkeypatch.setattr(refinement, 'merge_cuts', merge)
+    history = train_source_structure_epochs(model, selector, [batch], cfg, refinement=ref)
+    assert len(history) == cfg.epochs and len(phase_weights) == rounds+1
+    assert [(row['epoch'], row['phase']) for row in ref.round_history] == [
+        phase for i in range(rounds) for phase in ((10+10*i, 'split'), (15+10*i, 'merge'))]
+    assert torch.load(tmp_path/'model.pt', weights_only=False)['refinement_rounds'] == rounds
+
+
 @torch.no_grad()
 def test_refined_source_trace_renders_png_and_reports_pair_metrics(tmp_path, capsys):
     from analysis.segment_cut_transfer import plot_class, refined_source_trace, report_class_edits
@@ -143,3 +185,57 @@ def test_four_task_launcher_waits_for_final_students_before_plots(tmp_path):
         '--experiment_root', 'outputs/refine', '--data_root', 'data',
         '--output_dir', 'outputs/refine_visualization',
     ]
+
+
+def test_refinement_comparison_launcher_runs_two_source_budgets_for_each_task(tmp_path):
+    from train_segment_timematch import build_config
+
+    setup_run(tmp_path)
+    script = 'run_segment_compare_8jobs_4gpu.sh'
+    shutil.copyfile(Path(__file__).resolve().parents[1]/'closedset_scripts'/script,
+                    tmp_path/'closedset_scripts'/script)
+    subprocess.run([bash_bin(), 'closedset_scripts/'+script], cwd=tmp_path, check=True, timeout=40,
+                   env=dict(os.environ, DATA_ROOT='data', PYTHON_BIN='/bin/echo', EXPERIMENT='compare',
+                            SEGMENT_CONTEXT='0', SEGMENT_REFINE='0', SEGMENT_REFINE_COMPARE='1', RESUME='0'))
+    logs = tmp_path/'logs/compare'
+    for task in ('AT1_DK1', 'FR1_FR2', 'FR2_DK1', 'DK1_AT1'):
+        for route, epochs in (('one_round', 20), ('two_rounds', 30)):
+            command = shlex.split((logs/f'{task}_{route}_source.log').read_text())
+            cfg = build_config(command[2:])
+            assert cfg.stage == 'finetune' and cfg.epochs == epochs and cfg.source_schedule_epochs == 30
+            assert cfg.output_dir == f'outputs/compare/{route}/{task}/source'
+    assert not list(logs.glob('*_uda.log'))
+    events = (logs/'launcher.log').read_text()
+    assert events.count('TASK_COMPLETE|') == 8
+    assert events.rfind('TASK_COMPLETE|') < events.index('ANALYSIS_START|')
+    assert shlex.split((tmp_path/'logs/compare_visualization/analysis.log').read_text()) == [
+        '-u', '-m', 'analysis.segment_refinement_compare', '--experiment_root', 'outputs/compare',
+        '--data_root', 'data', '--output_dir', 'outputs/compare_visualization', '--plot_task', 'AT1_DK1']
+
+
+def test_refinement_comparison_keeps_the_same_plot_parcels_and_boundary_pairs(tmp_path):
+    from analysis.segment_refinement_compare import plot_class, summarize_task
+
+    def run(epoch, cuts):
+        rows = {}
+        for parcel, final in enumerate(cuts, 10):
+            segments = [dict(selected=i == 0, cluster=1) for i in range(len(final)+1)]
+            rows[parcel] = dict(label=0, initial=[20 if parcel == 10 else 40],
+                                final=final, segments=segments)
+        test = dict(completed_epochs=epoch, full=dict(accuracy=.8, macro_f1=.75),
+                    keep=dict(accuracy=.7, macro_f1=.65))
+        return dict(config=dict(classes=['corn'], source='AT1', original_source_checkpoint_sha256='same'),
+                    rows=rows, bank={'0': [{}]}, history=[], test=test)
+
+    one, two = run(20, [[22], [36]]), run(30, [[25], [31]])
+    stats, plot_ids = summarize_task(one, two, seed=1, samples_per_class=2)
+    assert set(plot_ids[0]) == {10, 11}
+    assert stats['initial']['paired_cut_f1'] == 0
+    assert stats['one_round']['mean_matched_error_days'] == 14
+    assert stats['two_rounds']['mean_matched_error_days'] == 6
+    assert stats['two_rounds']['heldout_native_pelt']['keep']['macro_f1'] == .65
+    dates = np.arange(0, 81, 10)
+    path = tmp_path / 'paired.png'
+    plot_class('AT1_DK1', 'corn', plot_ids[0], one, two,
+               {parcel: (dates, np.sin(dates/10)) for parcel in plot_ids[0]}, path)
+    assert path.read_bytes()[:8] == b'\x89PNG\r\n\x1a\n'

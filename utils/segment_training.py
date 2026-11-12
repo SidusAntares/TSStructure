@@ -49,6 +49,7 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None, 
     if not len(loader):
         raise ValueError('No complete source batches for structure finetuning')
     ltae_only = getattr(config, 'finetune_ltae_only', False)
+    rounds = getattr(config, 'refinement_rounds', 0)
     frozen = (model.spatial_encoder, model.decoder) if ltae_only or refinement is not None else ()
     for module in frozen:
         module.requires_grad_(False)
@@ -58,7 +59,8 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None, 
     optimizer = torch.optim.Adam([{'params': (p for p in model.parameters() if p.requires_grad)},
         {'params': selector.parameters(), 'lr': config.selector_lr}],
         lr=config.lr, weight_decay=config.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs*len(loader))
+    schedule_epochs = getattr(config, 'source_schedule_epochs', config.epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, schedule_epochs*len(loader))
     criterion, history = FocalLoss(gamma=config.focal_loss_gamma), []
     for epoch in range(config.epochs):
         model.train()
@@ -97,13 +99,19 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None, 
             for key, value in record.items():
                 if isinstance(value, (float, int)):
                     writer.add_scalar('structure_finetune/'+key, value, epoch+1)
-        if refinement is not None and epoch+1 == SETTINGS['update_epoch']:
-            refinement.update(model, selector)
+        if refinement is not None:
+            if rounds:
+                refinement.refine_round_step(model, selector, epoch+1)
+            elif epoch+1 == SETTINGS['update_epoch']:
+                refinement.update(model, selector)
     refinement_record = {}
     if refinement is not None:
         refinement.finish(model, selector)
-        refinement_record['refinement_snapshot_sha256'] = hashlib.sha256(
-            (refinement.folder / 'update_epoch10.pt').read_bytes()).hexdigest()
+        if rounds:
+            refinement_record['refinement_rounds'] = rounds
+        else:
+            refinement_record['refinement_snapshot_sha256'] = hashlib.sha256(
+                (refinement.folder / 'update_epoch10.pt').read_bytes()).hexdigest()
     torch.save(dict(state_dict=model.state_dict(), selector_state_dict=selector.state_dict(),
                     role='source_structure', completed_epochs=config.epochs, variant=config.variant,
                     classification_path='keep_only_unified',

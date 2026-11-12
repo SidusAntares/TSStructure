@@ -197,6 +197,12 @@ def refine_parcel(model, features, positions, y, cuts, gates, probabilities, ban
     dates = positions.cpu().numpy()
     shape = project(features.cpu().numpy(), bank)
     added = split_cuts(dates, shape, cuts, bank['classes'].get(y, []), min_size)
+    removed = merge_cuts(model, features, positions, y, cuts, gates, probabilities, added, gamma)
+    return np.sort(np.r_[cuts[~np.isin(cuts, removed)], added]), added, removed
+
+
+def merge_cuts(model, features, positions, y, cuts, gates, probabilities, protected, gamma):
+    dates = positions.cpu().numpy()
     ranges = ranges_for(dates, cuts)
     labels = calendar_labels(dates, cuts)
     points = torch.as_tensor(labels, device=features.device)
@@ -207,7 +213,7 @@ def refine_parcel(model, features, positions, y, cuts, gates, probabilities, ban
             continue
         if (b-a > SETTINGS['merge_max_points'] or dates[b-1]-dates[a] > SETTINGS['merge_max_span']
                 or dates[split]-dates[split-1] > SETTINGS['merge_max_gap']
-                or any(dates[a] < cut < dates[b-1] for cut in added)):
+                or any(dates[a] < cut < dates[b-1] for cut in protected)):
             continue
         pairs.append(k)
         masks.extend((kept & (points != k+1), kept & (points != k), kept))
@@ -218,7 +224,7 @@ def refine_parcel(model, features, positions, y, cuts, gates, probabilities, ban
         for j in np.argsort(regret, kind='stable')[:SETTINGS['merge_budget']]:
             if regret[j] <= SETTINGS['merge_tolerance']:
                 removed.append(float(cuts[pairs[j]]))
-    return np.sort(np.r_[cuts[~np.isin(cuts, removed)], added]), added, removed
+    return removed
 
 
 def project(x, bank):
@@ -254,6 +260,7 @@ class SourceRefinement:
         self.folder = Path(config.output_dir) / 'refinement'
         self.folder.mkdir()
         self.initial, self.cuts, self.edits = {}, {}, {}
+        self.round_history, self.protected = [], {}
         self.bank = None
         labels = dataset.get_labels()
         rng = np.random.default_rng(config.seed)
@@ -347,6 +354,54 @@ class SourceRefinement:
         print('SEGMENT_REFINE|' + json.dumps(counts), flush=True)
 
     @torch.no_grad()
+    def refine_round_step(self, model, selector, epoch):
+        """Apply a scheduled edit after the model has trained on the preceding cuts."""
+        offset = epoch - SETTINGS['update_epoch']
+        adapt = self.config.refinement_adapt_epochs
+        if offset < 0 or offset % adapt or epoch >= self.config.epochs:
+            return
+        round_index = offset // (2 * adapt) + 1
+        phase = 'merge' if offset % (2 * adapt) else 'split'
+        model.eval()
+        selector.eval()
+        start = time.monotonic()
+        print(f'SEGMENT_REFINE_PHASE_START|round={round_index}|phase={phase}|epoch={epoch}', flush=True)
+        changes = defaultdict(lambda: dict(parcels=0, cuts=0))
+        if phase == 'split':
+            self.fit_bank(model, selector)
+            self.protected = {}
+            for parcels, labels, dates, features in self.views(model, range(len(self.dataset))):
+                projected = project(features.cpu().numpy(), self.bank)
+                for parcel, y, day, shape in zip(parcels, labels, dates.cpu().numpy(), projected):
+                    cuts = self.cuts[parcel]
+                    added = split_cuts(day, shape, cuts, self.bank['classes'].get(y, []),
+                                       self.config.pelt_min_size)
+                    if added:
+                        self.cuts[parcel] = np.sort(np.r_[cuts, added])
+                        self.protected[parcel] = added
+                        changes[y]['parcels'] += 1
+                        changes[y]['cuts'] += len(added)
+        else:
+            # Selections are computed on the current post-Split cuts with the updated Selector.
+            for parcel, y, dates, features, cuts, gates, probs in self.selections(
+                    model, selector, range(len(self.dataset))):
+                removed = merge_cuts(model, features, dates, y, cuts, gates, probs,
+                                     self.protected.get(parcel, ()), self.config.focal_loss_gamma)
+                if removed:
+                    self.cuts[parcel] = cuts[~np.isin(cuts, removed)]
+                    changes[y]['parcels'] += 1
+                    changes[y]['cuts'] += len(removed)
+        record = dict(round=round_index, phase=phase, epoch=epoch,
+                      parcels_changed=sum(item['parcels'] for item in changes.values()),
+                      cuts_changed=sum(item['cuts'] for item in changes.values()),
+                      mean_segments=float(np.mean([len(cuts)+1 for cuts in self.cuts.values()])),
+                      prototype_counts={y: len(p) for y, p in self.bank['classes'].items()},
+                      by_class=dict(changes), seconds=round(time.monotonic()-start, 2))
+        self.round_history.append(record)
+        (self.folder / 'round_history.json').write_text(json.dumps(self.round_history, indent=2), encoding='utf-8')
+        print('SEGMENT_REFINE_PHASE|' + json.dumps(record), flush=True)
+
+    @torch.no_grad()
     def finish(self, model, selector):
         model.eval()
         selector.eval()
@@ -362,8 +417,13 @@ class SourceRefinement:
                                  cluster=match_segment(shape[a:b], float(dates[a]), float(dates[b-1]),
                                                        self.bank['classes'].get(y, [])))
                             for k, (a, b) in enumerate(ranges_for(dates, cuts))]
-                out.write(json.dumps(dict(parcel=parcel, label=y, initial=self.initial[parcel].tolist(),
-                                          final=cuts.tolist(), edits=self.edits.get(parcel, {}),
+                initial = self.initial[parcel]
+                edits = self.edits.get(parcel, {})
+                if self.round_history:
+                    edits = dict(split=np.setdiff1d(cuts, initial).tolist(),
+                                 merge=np.setdiff1d(initial, cuts).tolist())
+                out.write(json.dumps(dict(parcel=parcel, label=y, initial=initial.tolist(),
+                                          final=cuts.tolist(), edits=edits,
                                           segments=segments)) + '\n')
 
 

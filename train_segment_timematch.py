@@ -32,6 +32,8 @@ def build_config(argv=None):
                         help='Apply one self-attention layer across candidate segment embeddings')
     parser.add_argument('--segment_refine', action='store_true',
                         help='Use class-guided calendar boundaries during source finetuning')
+    parser.add_argument('--refinement_rounds', type=int, choices=(1, 2), default=0,
+                        help='Run one or two alternating Split and Merge rounds in Source finetuning')
     parser.add_argument('--output_dir', required=True, help='Exact new stage leaf; existing directories are refused')
     parser.add_argument('--experiment_name')
     parser.add_argument('--tensorboard_log_dir')
@@ -62,6 +64,10 @@ def build_config(argv=None):
     parser.add_argument('--pelt_penalty_mode', choices=('absolute',), default='absolute')
     parser.add_argument('--dry_run', action='store_true')
     cfg = parser.parse_args(argv)
+    if cfg.refinement_rounds:
+        if cfg.stage != 'finetune':
+            parser.error('--refinement_rounds requires --stage finetune')
+        cfg.segment_refine = True
     if cfg.source == cfg.target:
         parser.error('specify the downstream source/target pair; finetuning uses source only internally')
     if cfg.stage == 'uda' and not cfg.structure_checkpoint:
@@ -89,6 +95,10 @@ def build_config(argv=None):
             parser.error(f'matched segment experiment requires {name}={expected}')
     if cfg.log_step <= 0:
         parser.error('log_step must be positive')
+    if cfg.refinement_rounds:
+        cfg.refinement_adapt_epochs = 5
+        cfg.epochs = cfg.source_training_epochs = 10 + 2 * cfg.refinement_adapt_epochs * cfg.refinement_rounds
+        cfg.source_schedule_epochs = 30
     cfg.mode = None
     cfg.selector_protocol = 'inshape_drop_proxy_detached_v1' if cfg.variant == 'inshape' else 'legacy'
     if cfg.segment_context:
@@ -143,6 +153,12 @@ def build_config(argv=None):
             finetune_trainable='LTAE and Selector',
             finetune_frozen='PSE and classifier including normalization buffers',
             uda_reference='native per-view PELT; uses the refined Source checkpoint only')
+    if cfg.refinement_rounds:
+        cfg.structure_protocol.update(
+            source_reference='full dates with frozen PSE; Split and Merge separated by Selector/LTAE training',
+            finetune=f'{cfg.epochs} source epochs; 10 warmup, then 5 after each Split and each Merge',
+            refinement_rounds=cfg.refinement_rounds,
+            source_schedule_epochs=cfg.source_schedule_epochs)
     cfg.structure_protocol.update(source_init=cfg.source_init, source_training_epochs=cfg.source_training_epochs,
         actual_stage_epochs=cfg.epochs)
     return cfg
