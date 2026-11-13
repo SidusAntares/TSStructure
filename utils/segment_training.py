@@ -45,12 +45,12 @@ def write_history(path, rows):
         writer.writerows(rows)
 
 
-def validate_refinement_training(adapt=5):
+def validate_refinement_training(adapt=5, guided=False):
     from utils.source_segment_refinement import SourceRefinement
 
     if not callable(getattr(SourceRefinement, 'refine_round_step', None)):
         raise RuntimeError('Sync utils/source_segment_refinement.py before running staged refinement')
-    if adapt == 3:
+    if adapt == 3 or guided:
         from utils.refinement_probe import RefinementProbe
         return RefinementProbe
 
@@ -122,6 +122,9 @@ def train_source_structure_epochs(model, selector, loader, config, writer=None, 
         if rounds:
             refinement_record.update(refinement_rounds=rounds, refinement_round_history=refinement.round_history,
                                      refinement_adapt_epochs=config.refinement_adapt_epochs)
+            if getattr(config, 'shapelet_guided_merge', False):
+                refinement_record.update(shapelet_guided_merge=True, refinement_options=config.refinement_options,
+                                         refinement_epoch_plan=config.refinement_epoch_plan)
         else:
             refinement_record['refinement_snapshot_sha256'] = hashlib.sha256(
                 (refinement.folder / 'update_epoch10.pt').read_bytes()).hexdigest()
@@ -252,8 +255,9 @@ def finetune_structure(config):
             Compose([RandomSamplePixels(config.num_pixels), Normalize(), ToTensor()]),
             indices=splits[config.source]['train'], closed_set=True, combine_spring_and_winter=False)
         refinement = SourceRefinement(reference, config)
-        if getattr(config, 'refinement_rounds', 0) and config.refinement_adapt_epochs == 3:
-            RefinementProbe = validate_refinement_training(3)
+        guided = getattr(config, 'shapelet_guided_merge', False)
+        if getattr(config, 'refinement_rounds', 0) and (config.refinement_adapt_epochs == 3 or guided):
+            RefinementProbe = validate_refinement_training(config.refinement_adapt_epochs, guided)
             validation = PixelSetData(config.data_root, config.source, config.classes, reference.transform,
                 indices=splits[config.source]['val'], closed_set=True, combine_spring_and_winter=False)
             refinement.probe = RefinementProbe(validation, config, refinement.folder)

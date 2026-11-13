@@ -12,58 +12,61 @@ import numpy as np
 from analysis.segment_structure_visualization import TASKS, _batch, _sample, fit_projection, ifft_display
 
 
-ROUTES = ('one_round', 'two_rounds', 'three_rounds')
+ROUTES = ('one_round', 'two_rounds', 'three_rounds', 'four_rounds')
 
 
 def read_json(path):
     return json.loads(path.read_text(encoding='utf-8'))
 
 
-def expected_phases(rounds, adapt=5):
-    return [(10+adapt*i, 'merge' if i % 2 else 'split') for i in range(2*rounds)]
+def expected_phases(rounds, adapt=5, plan=None):
+    warmup, split, merge = plan or (10, adapt, adapt)
+    return [(warmup + (split+merge)*i + offset, phase)
+            for i in range(rounds) for offset, phase in ((0, 'split'), (split, 'merge'))]
 
 
-def complete_history(history, rounds, adapt=5):
+def complete_history(history, rounds, adapt=5, plan=None):
     return (isinstance(history, list)
             and all(isinstance(record, dict) for record in history)
-            and [(r.get('epoch'), r.get('phase')) for r in history] == expected_phases(rounds, adapt))
+            and [(r.get('epoch'), r.get('phase')) for r in history] == expected_phases(rounds, adapt, plan))
 
 
 class SourceScheduleError(ValueError):
     """The saved checkpoint belongs to a different Source schedule."""
 
 
-def verify_source_checkpoint(leaf, rounds, adapt=5):
+def verify_source_checkpoint(leaf, rounds, adapt=5, guided=False, plan=None):
     import torch
 
     packet = torch.load(leaf / 'fold_0' / 'model.pt', map_location='cpu', weights_only=True)
-    expected = ('source_structure', rounds, 10 + 2*adapt*rounds, adapt)
+    warmup, split, merge = plan or (10, adapt, adapt)
+    expected = ('source_structure', rounds, warmup + (split+merge)*rounds, adapt, guided)
     actual = (packet.get('role'), packet.get('refinement_rounds'), packet.get('completed_epochs'),
-              packet.get('refinement_adapt_epochs', 5))
-    if actual != expected:
+              packet.get('refinement_adapt_epochs', 5), packet.get('shapelet_guided_merge', False))
+    if actual != expected or (guided and packet.get('refinement_epoch_plan') != [warmup, split, merge]):
         raise SourceScheduleError(
             f'{leaf}: checkpoint does not confirm the requested {rounds} refinement round(s). '
             f'Found role={actual[0]!r}, refinement_rounds={actual[1]!r}, completed_epochs={actual[2]!r}, '
-            f'refinement_adapt_epochs={actual[3]!r}. '
+            f'refinement_adapt_epochs={actual[3]!r}, shapelet_guided_merge={actual[4]!r}. '
             'Resume the existing experiment with REPAIR_SOURCE=1 to replace this Source result.')
     return packet
 
 
-def load_round_history(leaf, rounds, source_log, adapt=5):
+def load_round_history(leaf, rounds, source_log, adapt=5, guided=False, plan=None):
     history_path = leaf / 'refinement' / 'round_history.json'
     if history_path.is_file():
         try:
             history = read_json(history_path)
         except json.JSONDecodeError:
             history = None
-        if complete_history(history, rounds, adapt):
+        if complete_history(history, rounds, adapt, plan):
             return history, 'round_history.json'
 
     checkpoint = leaf / 'fold_0' / 'model.pt'
     if checkpoint.is_file():
-        packet = verify_source_checkpoint(leaf, rounds, adapt)
+        packet = verify_source_checkpoint(leaf, rounds, adapt, guided, plan)
         history = packet.get('refinement_round_history')
-        if complete_history(history, rounds, adapt):
+        if complete_history(history, rounds, adapt, plan):
             return history, 'checkpoint'
 
     if source_log is not None and source_log.is_file():
@@ -76,7 +79,7 @@ def load_round_history(leaf, rounds, source_log, adapt=5):
                         history.append(json.loads(line[len(prefix):]))
                     except json.JSONDecodeError:
                         continue
-        if complete_history(history, rounds, adapt):
+        if complete_history(history, rounds, adapt, plan):
             return history, 'source_log'
 
     if checkpoint.is_file():
@@ -86,23 +89,27 @@ def load_round_history(leaf, rounds, source_log, adapt=5):
         f'{leaf}: no complete round history, final checkpoint or Source phase log to verify this run')
 
 
-def load_source(root, task, route, source_log_dir=None, adapt=5):
+def load_source(root, task, route, source_log_dir=None, adapt=5, guided=False):
     leaf = root / route / task / 'source'
     config = read_json(leaf / 'resolved_config.json')
     rounds = ROUTES.index(route) + 1
-    epochs = 10 + 2*adapt*rounds
+    plan = config.get('refinement_epoch_plan', [10, adapt, adapt])
+    warmup, split, merge = plan
+    epochs = warmup + (split+merge)*rounds
     if (config.get('refinement_rounds') != rounds or config.get('epochs') != epochs
-            or config.get('refinement_adapt_epochs', 5) != adapt):
+            or config.get('refinement_adapt_epochs', 5) != adapt
+            or config.get('shapelet_guided_merge', False) != guided):
         raise ValueError(f'Unexpected refinement configuration in {leaf}')
     folder = leaf / 'refinement'
     source_log = None if source_log_dir is None else source_log_dir / f'{task}_{route}_source.log'
-    history, history_source = load_round_history(leaf, rounds, source_log, adapt)
+    history, history_source = load_round_history(leaf, rounds, source_log, adapt, guided, plan)
     probe = None
-    if adapt == 3:
+    if adapt == 3 or guided:
         probe = read_json(folder / 'validation_probe.json')
-        expected = [(10, 0, 'initial', 0)]
-        for i, (epoch, phase) in enumerate(expected_phases(rounds, adapt)):
-            expected.extend((epoch+age, i//2+1, phase, age) for age in range(adapt+1))
+        expected = [(warmup, 0, 'initial', 0)]
+        for i, (epoch, phase) in enumerate(expected_phases(rounds, adapt, plan)):
+            length = split if phase == 'split' else merge
+            expected.extend((epoch+age, i//2+1, phase, age) for age in range(length+1))
         observed = [(r['epoch'], r['round'], r['phase'], r['epochs_since_edit']) for r in probe]
         if observed != expected or len({r['reference_sha256'] for r in probe}) != 1:
             raise ValueError(f'Incomplete or inconsistent validation probe in {leaf}')
@@ -156,14 +163,16 @@ def parcel_metrics(rows):
                 parcel_match_fraction=totals['parcels_with_hits']/n)
 
 
-def summarize_task(one, two, seed, samples_per_class, three=None):
+def summarize_task(one, two, seed, samples_per_class, three=None, routes=None):
     runs = (one, two) if three is None else (one, two, three)
-    routes = ROUTES[:len(runs)]
+    routes = ROUTES[:len(runs)] if routes is None else routes
     classes = one['config']['classes']
     left = one['rows']
     for run in runs[1:]:
         if any(one['config'][key] != run['config'][key]
-               for key in ('classes', 'source', 'original_source_checkpoint_sha256')):
+               for key in ('classes', 'source', 'original_source_checkpoint_sha256')) or any(
+                   one['config'].get(key) != run['config'].get(key)
+                   for key in ('refinement_options', 'refinement_epoch_plan', 'source_schedule_epochs')):
             raise ValueError('Paired runs require the same Source and class order')
         if not left or left.keys() != run['rows'].keys():
             raise ValueError('Paired runs require identical training parcel IDs')
@@ -231,8 +240,10 @@ def load_plot_features(run, parcel_ids, data_root, device):
                            closed_set=cfg.closed_set, combine_spring_and_winter=cfg.combine_spring_and_winter)
     model, _ = new_models(cfg)
     packet = torch.load(run['leaf'] / 'fold_0' / 'model.pt', map_location=device, weights_only=False)
-    if packet.get('role') != 'source_structure' or packet.get('refinement_rounds') != 1:
-        raise ValueError('Expected the one-round Source checkpoint for display features')
+    if (packet.get('role') != 'source_structure'
+            or packet.get('refinement_rounds') != cfg.refinement_rounds
+            or packet.get('completed_epochs') != cfg.epochs):
+        raise ValueError('Unexpected Source checkpoint for display features')
     model.load_state_dict(packet['state_dict'])
     model.eval()
     views = {}
@@ -248,14 +259,14 @@ def load_plot_features(run, parcel_ids, data_root, device):
     return {parcel: (dates, (values-mean) @ component) for parcel, (dates, values) in views.items()}
 
 
-def plot_class(task, name, ids, one, two, curves, path, three=None):
+def plot_class(task, name, ids, one, two, curves, path, three=None, first_round=1):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
     runs = (one, two) if three is None else (one, two, three)
     labels = ['Initial INSHAPE PELT'] + [
-        f'{i} round(s) / {run["test"]["completed_epochs"]} epochs' for i, run in enumerate(runs, 1)]
+        f'{i} round(s) / {run["test"]["completed_epochs"]} epochs' for i, run in enumerate(runs, first_round)]
     rows = len(labels)
     figure, axes = plt.subplots(rows, len(ids), squeeze=False, sharex=True, sharey=True,
                                 figsize=(4.8*len(ids), 2.3*rows), constrained_layout=True)
@@ -295,24 +306,26 @@ def main(argv=None):
     parser.add_argument('--output_dir', type=Path, required=True)
     parser.add_argument('--source_log_dir', type=Path,
                         help='Defaults to logs/<experiment name>; recovers missing phase histories')
-    parser.add_argument('--refinement_adapt_epochs', type=int, choices=(3, 5), default=5)
+    parser.add_argument('--refinement_adapt_epochs', type=int, default=5)
+    parser.add_argument('--shapelet_guided_merge', action='store_true')
     parser.add_argument('--data_root', type=Path)
     parser.add_argument('--plot_task', choices=TASKS, default='AT1_DK1')
     parser.add_argument('--samples_per_class', type=int, default=3)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--device', default='cuda')
     args = parser.parse_args(argv)
-    if args.samples_per_class < 1:
-        parser.error('--samples_per_class must be positive')
+    if args.samples_per_class < 1 or args.refinement_adapt_epochs < 1:
+        parser.error('Sample count and adaptation epochs must be positive')
     args.output_dir.mkdir(parents=True, exist_ok=True)
     log_dir = args.source_log_dir or Path('logs') / args.experiment_root.name
     adapt = args.refinement_adapt_epochs
-    routes = ROUTES if adapt == 3 else ROUTES[:2]
+    guided = args.shapelet_guided_merge
+    routes = ROUTES[1:] if guided else ROUTES[:3] if adapt == 3 else ROUTES[:2]
     results, plot_inputs = {}, None
     for task in TASKS:
-        runs = [load_source(args.experiment_root, task, route, log_dir, adapt) for route in routes]
+        runs = [load_source(args.experiment_root, task, route, log_dir, adapt, guided) for route in routes]
         results[task], plot_ids = summarize_task(*runs[:2], args.seed, args.samples_per_class,
-                                                 three=runs[2] if len(runs) == 3 else None)
+                                                 three=runs[2] if len(runs) == 3 else None, routes=routes)
         for route in routes:
             record = results[task][route]
             print('SOURCE_REFINEMENT_COMPARE|' + json.dumps(dict(task=task, route=route,
@@ -326,9 +339,12 @@ def main(argv=None):
                                 rows={p: run['rows'][p] for p in ids}) for run in runs], plot_ids
     report = dict(pairing=dict(seed=args.seed, max_parcels_per_class=128, max_pairs_per_class=500,
                                tolerance_days=14), tasks=results)
-    if adapt == 3:
+    if guided:
+        report.update(shapelet_guided_merge=True, refinement_options=runs[0]['config']['refinement_options'],
+                      refinement_epoch_plan=runs[0]['config']['refinement_epoch_plan'])
+    if adapt == 3 or guided:
         report['validation_probe_protocol'] = dict(
-            reference_bank='fixed epoch-10 training shapelets', label_guided=True,
+            reference_bank='fixed training shapelets from the end of warmup', label_guided=True,
             max_validation_parcels_per_class=24, min_reference_observation_recall=.9,
             min_observation_iou=.5, complete_pair='both parcels retain the same prototype in one segment each')
     (args.output_dir / 'summary.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
@@ -343,7 +359,7 @@ def main(argv=None):
             name = one['config']['classes'][label]
             filename = f'{label:02d}_{re.sub(r"[^A-Za-z0-9_-]", "_", name)}.png'
             plot_class(args.plot_task, name, ids, one, two, curves, folder / filename,
-                       three=runs[2] if len(runs) == 3 else None)
+                       three=runs[2] if len(runs) == 3 else None, first_round=2 if guided else 1)
         (folder / 'paired_parcels.json').write_text(json.dumps(
             {one['config']['classes'][y]: ids for y, ids in plot_ids.items()}, indent=2), encoding='utf-8')
 

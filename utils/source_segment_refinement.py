@@ -67,7 +67,7 @@ def region(left, right):
     return int((left + right) / 2 // SETTINGS['region_days'])
 
 
-def match_segment(shape, left, right, prototypes):
+def match_segment(shape, left, right, prototypes, settings=SETTINGS):
     matches = []
     for p in prototypes:
         if abs(region(left, right) - p['region']) > 1:
@@ -78,21 +78,21 @@ def match_segment(shape, left, right, prototypes):
         if max(len(shape), len(p['shape'])) > 2 * min(len(shape), len(p['shape'])):
             continue
         distance = dtw(shape, p['shape'])
-        if distance <= SETTINGS['dtw_limit']:
+        if distance <= settings['dtw_limit']:
             matches.append((distance, p['id']))
     return min(matches)[1] if matches else None
 
 
-def cluster_selected(records, eligible_dates, previous):
+def cluster_selected(records, eligible_dates, previous, settings=SETTINGS):
     """Assign to bounded nearby medoids and recount parcel-level support each round."""
     clusters = {p['id']: dict(p, members=[]) for p in previous}
     next_id = max(clusters, default=-1) + 1
     for record in records:
         left, right = record['bounds']
         area = region(left, right)
-        match = match_segment(record['shape'], left, right, clusters.values())
+        match = match_segment(record['shape'], left, right, clusters.values(), settings)
         if match is None:
-            if sum(p['region'] == area for p in clusters.values()) >= 2 * SETTINGS['top_k']:
+            if sum(p['region'] == area for p in clusters.values()) >= 2 * settings['top_k']:
                 continue
             match = next_id
             next_id += 1
@@ -110,7 +110,7 @@ def cluster_selected(records, eligible_dates, previous):
                     if np.count_nonzero((dates >= left) & (dates <= right)) >= 3}
         supporting = sorted(eligible.intersection(m['parcel'] for m in members))
         frequency = len(supporting) / max(1, len(eligible))
-        if len(supporting) < SETTINGS['min_support_count'] or frequency < SETTINGS['min_support']:
+        if len(supporting) < settings['min_support_count'] or frequency < settings['min_support']:
             continue
         # Approximate the medoid within a bounded pool of actual cluster members.
         panel = [members[i] for i in np.linspace(0, len(members)-1, min(12, len(members)), dtype=int)]
@@ -125,12 +125,12 @@ def cluster_selected(records, eligible_dates, previous):
                        frequency=frequency, eligible=len(eligible), supporting=supporting)
         ranked[cluster['region']].append(cluster)
     return [p for group in ranked.values()
-            for p in sorted(group, key=lambda p: (-p['frequency'], p['id']))[:SETTINGS['top_k']]]
+            for p in sorted(group, key=lambda p: (-p['frequency'], p['id']))[:settings['top_k']]]
 
 
-def prototype_windows(dates, start, stop, prototype):
+def prototype_windows(dates, start, stop, prototype, settings=SETTINGS):
     (ll, lm, lh), (rl, rm, rh) = prototype['bounds']
-    slack = SETTINGS['boundary_slack']
+    slack = settings['boundary_slack']
     left = [i for i in range(start, stop) if ll-slack <= dates[i] <= lh+slack
             and (i == start or dates[i] > dates[i-1])]
     right = [i for i in range(start+1, stop+1) if rl-slack <= dates[i-1] <= rh+slack
@@ -185,7 +185,8 @@ def match_segment_for_prototype(dates, shape, cuts, prototype):
 
 
 @torch.no_grad()
-def merge_costs(model, features, dates, y, masks, gamma):
+def merge_costs(model, features, dates, y, masks, gamma, states=3,
+                coverage_cost=SETTINGS['merge_coverage_cost']):
     sequences = torch.nn.utils.rnn.pad_sequence([features[mask] for mask in masks], batch_first=True)
     positions = torch.nn.utils.rnn.pad_sequence([dates[mask] for mask in masks], batch_first=True)
     count = masks.sum(1)
@@ -193,7 +194,7 @@ def merge_costs(model, features, dates, y, masks, gamma):
     embedded = model.temporal_encoder(sequences, positions, return_attention_scores=True, valid_time=valid)[0]
     logp = model.decoder(embedded).log_softmax(-1)[:, y]
     focal = -(1-logp.exp()).pow(gamma) * logp
-    return (focal + SETTINGS['merge_coverage_cost'] * count / len(dates)).view(-1, 3).cpu().numpy()
+    return (focal + coverage_cost * count / len(dates)).view(-1, states).cpu().numpy()
 
 
 @torch.no_grad()
@@ -265,12 +266,15 @@ class SourceRefinement:
         self.folder.mkdir()
         self.initial, self.cuts, self.edits = {}, {}, {}
         self.round_history, self.protected = [], {}
+        self.guided = getattr(config, 'shapelet_guided_merge', False)
+        self.settings = dict(SETTINGS, **getattr(config, 'refinement_options', {}))
+        self.matches = {}
         self.bank = None
         self.probe = None
         labels = dataset.get_labels()
         rng = np.random.default_rng(config.seed)
         self.panel = [i for y in np.unique(labels) for i in
-                      rng.permutation(np.flatnonzero(labels == y))[:SETTINGS['reference_per_class']]]
+                      rng.permutation(np.flatnonzero(labels == y))[:self.settings['reference_per_class']]]
 
     def views(self, model, indices, dataset=None):
         cfg = self.config
@@ -325,11 +329,11 @@ class SourceRefinement:
             eligible[y][parcel] = dates
             projected = project(features, self.bank)
             for k, (a, b) in enumerate(ranges_for(dates, cuts)):
-                if gates[k] and probs[k] >= .5:
+                if gates[k] and (self.guided or probs[k] >= .5):
                     records[y].append(dict(parcel=parcel, shape=projected[a:b],
                                            bounds=[float(dates[a]), float(dates[b-1])]))
         previous = self.bank['classes']
-        self.bank['classes'] = {y: cluster_selected(records[y], dates, previous.get(y, []))
+        self.bank['classes'] = {y: cluster_selected(records[y], dates, previous.get(y, []), self.settings)
                                 for y, dates in eligible.items()}
 
     @torch.no_grad()
@@ -364,29 +368,45 @@ class SourceRefinement:
         """Apply a scheduled edit after the model has trained on the preceding cuts."""
         if self.probe is not None and self.probe.history:
             self.probe.record(model, selector, epoch)
-        offset = epoch - SETTINGS['update_epoch']
         adapt = self.config.refinement_adapt_epochs
-        if offset < 0 or offset % adapt or epoch >= self.config.epochs:
+        warmup, split_epochs, merge_epochs = getattr(
+            self.config, 'refinement_epoch_plan', (self.settings['update_epoch'], adapt, adapt))
+        offset = epoch-warmup
+        cycle = split_epochs+merge_epochs
+        round_offset = offset % cycle
+        if offset < 0 or round_offset not in (0, split_epochs) or epoch >= self.config.epochs:
             return
-        round_index = offset // (2 * adapt) + 1
-        phase = 'merge' if offset % (2 * adapt) else 'split'
+        round_index = offset // cycle + 1
+        phase = 'merge' if round_offset else 'split'
         model.eval()
         selector.eval()
         start = time.monotonic()
         print(f'SEGMENT_REFINE_PHASE_START|round={round_index}|phase={phase}|epoch={epoch}', flush=True)
         changes = defaultdict(lambda: dict(parcels=0, cuts=0))
+        match_count = 0
+        merge_counts = dict(guided=0, ordinary=0)
+        if self.guided:
+            from utils.guided_segment_refinement import guided_merge, match_shapelets, split_matches
         if phase == 'split':
             self.fit_bank(model, selector)
             if self.probe is not None and not self.probe.history:
                 self.probe.initialize(self.views(model, self.probe.indices, self.probe.dataset), self.bank)
                 self.probe.record(model, selector, epoch)
             self.protected = {}
+            self.matches.clear()
             for parcels, labels, dates, features in self.views(model, range(len(self.dataset))):
                 projected = project(features.cpu().numpy(), self.bank)
                 for parcel, y, day, shape in zip(parcels, labels, dates.cpu().numpy(), projected):
                     cuts = self.cuts[parcel]
-                    added = split_cuts(day, shape, cuts, self.bank['classes'].get(y, []),
-                                       self.config.pelt_min_size)
+                    prototypes = self.bank['classes'].get(y, [])
+                    if self.guided:
+                        matches = match_shapelets(day, shape, prototypes, self.config.pelt_min_size, self.settings)
+                        if matches:
+                            self.matches[parcel] = matches
+                            match_count += len(matches)
+                        added = split_matches(day, cuts, matches, self.config.pelt_min_size, self.settings)
+                    else:
+                        added = split_cuts(day, shape, cuts, prototypes, self.config.pelt_min_size)
                     if added:
                         self.cuts[parcel] = np.sort(np.r_[cuts, added])
                         self.protected[parcel] = added
@@ -396,8 +416,17 @@ class SourceRefinement:
             # Selections are computed on the current post-Split cuts with the updated Selector.
             for parcel, y, dates, features, cuts, gates, probs in self.selections(
                     model, selector, range(len(self.dataset))):
-                removed = merge_cuts(model, features, dates, y, cuts, gates, probs,
-                                     self.protected.get(parcel, ()), self.config.focal_loss_gamma)
+                protected = self.protected.get(parcel, ())
+                if self.guided:
+                    removed, kind = guided_merge(model, features, dates, y, cuts, gates, protected,
+                                                 self.matches.get(parcel, ()), self.config.focal_loss_gamma,
+                                                 self.settings)
+                    if kind is not None:
+                        merge_counts[kind] += 1
+                        changes[y][kind] = changes[y].get(kind, 0) + 1
+                else:
+                    removed = merge_cuts(model, features, dates, y, cuts, gates, probs,
+                                         protected, self.config.focal_loss_gamma)
                 if removed:
                     self.cuts[parcel] = cuts[~np.isin(cuts, removed)]
                     changes[y]['parcels'] += 1
@@ -408,6 +437,12 @@ class SourceRefinement:
                       mean_segments=float(np.mean([len(cuts)+1 for cuts in self.cuts.values()])),
                       prototype_counts={y: len(p) for y, p in self.bank['classes'].items()},
                       by_class=dict(changes), seconds=round(time.monotonic()-start, 2))
+        if self.guided:
+            if phase == 'split':
+                record.update(matched_parcels=len(self.matches), shapelet_matches=match_count)
+            else:
+                record['merge_types'] = merge_counts
+                self.matches.clear()
         self.round_history.append(record)
         (self.folder / 'round_history.json').write_text(json.dumps(self.round_history, indent=2), encoding='utf-8')
         print('SEGMENT_REFINE_PHASE|' + json.dumps(record), flush=True)
@@ -420,7 +455,7 @@ class SourceRefinement:
         selector.eval()
         self.fit_bank(model, selector)
         (self.folder / 'prototypes.json').write_text(
-            json.dumps(dict(settings=SETTINGS, **serializable(self.bank))), encoding='utf-8')
+            json.dumps(dict(settings=self.settings, **serializable(self.bank))), encoding='utf-8')
         with (self.folder / 'parcels.jsonl').open('w', encoding='utf-8') as out:
             for parcel, y, dates, features, cuts, gates, probs in self.selections(model, selector, range(len(self.dataset))):
                 dates = dates.cpu().numpy()
@@ -428,7 +463,7 @@ class SourceRefinement:
                 segments = [dict(id=k, first_day=int(dates[a]), last_day=int(dates[b-1]),
                                  probability=float(probs[k]), selected=bool(gates[k]),
                                  cluster=match_segment(shape[a:b], float(dates[a]), float(dates[b-1]),
-                                                       self.bank['classes'].get(y, [])))
+                                                       self.bank['classes'].get(y, []), self.settings))
                             for k, (a, b) in enumerate(ranges_for(dates, cuts))]
                 initial = self.initial[parcel]
                 edits = self.edits.get(parcel, {})

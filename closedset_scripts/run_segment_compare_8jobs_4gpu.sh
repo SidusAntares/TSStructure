@@ -8,13 +8,19 @@ DATA_ROOT="${DATA_ROOT:-/data/user/dataset/timematch_data}"
 SEGMENT_CONTEXT="${SEGMENT_CONTEXT:-0}"
 SEGMENT_REFINE="${SEGMENT_REFINE:-0}"
 SEGMENT_REFINE_COMPARE="${SEGMENT_REFINE_COMPARE:-0}"
-REFINEMENT_ADAPT_EPOCHS="${REFINEMENT_ADAPT_EPOCHS:-5}"
+SHAPELET_GUIDED_MERGE="${SHAPELET_GUIDED_MERGE:-0}"
+default_adapt=5
+if [[ "$SHAPELET_GUIDED_MERGE" == 1 ]]; then default_adapt=3; fi
+REFINEMENT_ADAPT_EPOCHS="${REFINEMENT_ADAPT_EPOCHS:-$default_adapt}"
 default_experiment=timematch_segments_compare_seed1
 if [[ "$SEGMENT_CONTEXT" == 1 ]]; then default_experiment=timematch_segments_context_seed1; fi
 if [[ "$SEGMENT_REFINE" == 1 ]]; then default_experiment=timematch_segments_refine_seed1; fi
 if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then default_experiment=timematch_segments_refine_compare_seed1; fi
 if [[ "$SEGMENT_REFINE_COMPARE" == 1 && "$REFINEMENT_ADAPT_EPOCHS" == 3 ]]; then
     default_experiment=timematch_segments_refine_3epoch_seed1
+fi
+if [[ "$SHAPELET_GUIDED_MERGE" == 1 ]]; then
+    default_experiment="timematch_segments_shapelet_guided_${REFINEMENT_ADAPT_EPOCHS}epoch_seed1"
 fi
 EXPERIMENT="${EXPERIMENT:-$default_experiment}"
 RESUME="${RESUME:-0}"
@@ -44,9 +50,14 @@ exec >> "$LOG_ROOT/launcher.log" 2>&1
    ( "$SEGMENT_REFINE_COMPARE" == 1 && "$SEGMENT_REFINE" == 0 && "$SEGMENT_CONTEXT" == 0 ) ]] || {
     echo 'ERROR: SEGMENT_REFINE_COMPARE must be 0 or 1 and runs independently'; exit 1;
 }
+[[ "$SHAPELET_GUIDED_MERGE" == 0 ||
+   ( "$SHAPELET_GUIDED_MERGE" == 1 && "$SEGMENT_REFINE_COMPARE" == 1 ) ]] || {
+    echo 'ERROR: SHAPELET_GUIDED_MERGE=1 requires SEGMENT_REFINE_COMPARE=1'; exit 1;
+}
 [[ "$REFINEMENT_ADAPT_EPOCHS" == 5 ||
-   ( "$REFINEMENT_ADAPT_EPOCHS" == 3 && "$SEGMENT_REFINE_COMPARE" == 1 ) ]] || {
-    echo 'ERROR: REFINEMENT_ADAPT_EPOCHS=3 requires SEGMENT_REFINE_COMPARE=1'; exit 1;
+   ( "$REFINEMENT_ADAPT_EPOCHS" == 3 && "$SEGMENT_REFINE_COMPARE" == 1 ) ||
+   ( "$SHAPELET_GUIDED_MERGE" == 1 && "$REFINEMENT_ADAPT_EPOCHS" =~ ^[1-9][0-9]*$ ) ]] || {
+    echo 'ERROR: invalid REFINEMENT_ADAPT_EPOCHS'; exit 1;
 }
 [[ "$REPAIR_SOURCE" == 0 ||
    ( "$REPAIR_SOURCE" == 1 && "$RESUME" == 1 && "$SEGMENT_REFINE_COMPARE" == 1 ) ]] || {
@@ -79,13 +90,14 @@ import sys
 from utils.segment_training import validate_refinement_training
 
 adapt = int(sys.argv[1])
-if adapt == 3:
+guided = sys.argv[2] == "1"
+if adapt == 3 or guided:
     from analysis.segment_refinement_compare import expected_phases
-    expected_phases(3, adapt)
-    validate_refinement_training(adapt)
+    expected_phases(4 if guided else 3, adapt)
+    validate_refinement_training(adapt, guided)
 else:
     validate_refinement_training()
-' "$REFINEMENT_ADAPT_EPOCHS"
+' "$REFINEMENT_ADAPT_EPOCHS" "$SHAPELET_GUIDED_MERGE"
 fi
 # Slow FR1 jobs enter first; each free GPU takes the next pair immediately.
 job_tasks=(FR1_FR2 FR1_FR2 FR2_DK1 DK1_AT1 FR2_DK1 DK1_AT1 AT1_DK1 AT1_DK1)
@@ -100,6 +112,10 @@ if [[ "$SEGMENT_REFINE_COMPARE" == 1 ]]; then
     if [[ "$REFINEMENT_ADAPT_EPOCHS" == 3 ]]; then
         job_tasks=(FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1 FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1 FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1)
         job_variants=(three_rounds three_rounds three_rounds three_rounds two_rounds two_rounds two_rounds two_rounds one_round one_round one_round one_round)
+    fi
+    if [[ "$SHAPELET_GUIDED_MERGE" == 1 ]]; then
+        job_tasks=(FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1 FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1 FR1_FR2 FR2_DK1 DK1_AT1 AT1_DK1)
+        job_variants=(four_rounds four_rounds four_rounds four_rounds three_rounds three_rounds three_rounds three_rounds two_rounds two_rounds two_rounds two_rounds)
     fi
 fi
 mkdir -p "$OUTPUT_ROOT"
@@ -119,14 +135,11 @@ import sys
 from analysis.segment_refinement_compare import SourceScheduleError, verify_source_checkpoint
 
 try:
-    if sys.argv[3] == "3":
-        verify_source_checkpoint(Path(sys.argv[1]), int(sys.argv[2]), 3)
-    else:
-        verify_source_checkpoint(Path(sys.argv[1]), int(sys.argv[2]))
+    verify_source_checkpoint(Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4] == "1")
 except SourceScheduleError as error:
     print(error, file=sys.stderr)
     sys.exit(2)
-' "$1" "$2" "$REFINEMENT_ADAPT_EPOCHS"
+' "$1" "$2" "$REFINEMENT_ADAPT_EPOCHS" "$SHAPELET_GUIDED_MERGE"
 }
 
 run_job() {
@@ -145,8 +158,10 @@ run_job() {
         local rounds=1
         if [[ "$route" == two_rounds ]]; then rounds=2; fi
         if [[ "$route" == three_rounds ]]; then rounds=3; fi
+        if [[ "$route" == four_rounds ]]; then rounds=4; fi
         local probe_ready=1
-        if [[ "$REFINEMENT_ADAPT_EPOCHS" == 3 && ! -s "$leaf/source/refinement/validation_probe.json" ]]; then
+        if [[ ( "$REFINEMENT_ADAPT_EPOCHS" == 3 || "$SHAPELET_GUIDED_MERGE" == 1 ) &&
+              ! -s "$leaf/source/refinement/validation_probe.json" ]]; then
             probe_ready=0
         fi
         local summary="$leaf/source/fold_0/test_${source//\//_}.json"
@@ -175,7 +190,10 @@ run_job() {
             echo "SOURCE_BACKUP|gpu=$gpu|task=$task|route=$route|path=$backup"
         fi
         local source_args=(--stage finetune "${common[@]}" --refinement_rounds "$rounds" --output_dir "$leaf/source")
-        if [[ "$REFINEMENT_ADAPT_EPOCHS" == 3 ]]; then source_args+=(--refinement_adapt_epochs 3); fi
+        if [[ "$REFINEMENT_ADAPT_EPOCHS" != 5 || "$SHAPELET_GUIDED_MERGE" == 1 ]]; then
+            source_args+=(--refinement_adapt_epochs "$REFINEMENT_ADAPT_EPOCHS")
+        fi
+        if [[ "$SHAPELET_GUIDED_MERGE" == 1 ]]; then source_args+=(--shapelet_guided_merge); fi
         CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u train_segment_timematch.py "${source_args[@]}" \
             > "$log" 2>&1
         return $?
@@ -257,7 +275,8 @@ if [[ "$status" == 0 && ( "$SEGMENT_REFINE" == 1 || "$SEGMENT_REFINE_COMPARE" ==
         analysis_module=analysis.segment_refinement_compare
         analysis_mode=source_refinement_compare
         analysis_args+=(--plot_task "${PLOT_TASK:-AT1_DK1}")
-        if [[ "$REFINEMENT_ADAPT_EPOCHS" == 3 ]]; then analysis_args+=(--refinement_adapt_epochs 3); fi
+        if [[ "$REFINEMENT_ADAPT_EPOCHS" != 5 ]]; then analysis_args+=(--refinement_adapt_epochs "$REFINEMENT_ADAPT_EPOCHS"); fi
+        if [[ "$SHAPELET_GUIDED_MERGE" == 1 ]]; then analysis_args+=(--shapelet_guided_merge); fi
     else
         analysis_args=(--mode refined_plots "${analysis_args[@]}")
     fi

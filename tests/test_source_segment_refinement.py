@@ -181,6 +181,48 @@ def test_refined_source_trace_renders_png_and_reports_pair_metrics(tmp_path, cap
     assert record['initial'] == record['refined']
 
 
+def test_guided_round_refreshes_matches_and_keeps_split_protection_until_merge(tmp_path, monkeypatch):
+    from utils import guided_segment_refinement as guided
+
+    dataset = FixedParcels()
+    cfg = config(tmp_path)
+    cfg.__dict__.update(epochs=13, output_dir=tmp_path, shapelet_guided_merge=True,
+                        refinement_adapt_epochs=3, refinement_epoch_plan=[1, 3, 3])
+    ref = refinement.SourceRefinement(dataset, cfg)
+    ref.cuts[100] = np.array([17.5, 59.5])
+    dates = torch.arange(12)*7
+    features = torch.zeros(12, 128)
+    match = guided.ShapeletMatch(2, 3, 9, .1)
+    next_match = guided.ShapeletMatch(3, 3, 6, .2)
+    batches = [([100], [0], dates[None], features[None])]
+    matching = []
+    received = []
+    module = torch.nn.Identity()
+
+    def fit_bank(*args):
+        ref.bank = dict(classes={}, mean=np.zeros(128), basis=np.eye(128)[:8], scale=np.ones(8))
+
+    def match_shapes(*args):
+        matching.append(len(matching)+1)
+        return [match if matching[-1] == 1 else next_match]
+
+    def merge(model, features, positions, y, cuts, gates, protected, matches, gamma, settings):
+        received.append((protected, matches))
+        return [], None
+
+    monkeypatch.setattr(ref, 'fit_bank', fit_bank)
+    monkeypatch.setattr(ref, 'views', lambda *args: iter(batches))
+    monkeypatch.setattr(ref, 'selections', lambda *args: iter([
+        (100, 0, dates, features, ref.cuts[100], np.ones(3, dtype=bool), np.ones(3))]))
+    monkeypatch.setattr(guided, 'match_shapelets', match_shapes)
+    monkeypatch.setattr(guided, 'guided_merge', merge)
+    for epoch in (1, 4, 7, 10):
+        ref.refine_round_step(module, module, epoch)
+    assert matching == [1, 2]
+    assert received == [((), [match]), ([38.5], [next_match])]
+    assert [r['shapelet_matches'] for r in ref.round_history if r['phase'] == 'split'] == [1, 1]
+
+
 def test_four_task_launcher_waits_for_final_students_before_plots(tmp_path):
     setup_run(tmp_path)
     script = 'run_segment_compare_8jobs_4gpu.sh'
@@ -205,8 +247,9 @@ def test_four_task_launcher_waits_for_final_students_before_plots(tmp_path):
     ]
 
 
-@pytest.mark.parametrize('adapt,budgets', [(5, (20, 30)), (3, (16, 22, 28))])
-def test_refinement_comparison_launcher_runs_each_source_budget(tmp_path, adapt, budgets):
+@pytest.mark.parametrize('adapt,budgets,guided', [(5, (20, 30), False), (3, (16, 22, 28), False),
+                                                (3, (22, 28, 34), True)])
+def test_refinement_comparison_launcher_runs_each_source_budget(tmp_path, adapt, budgets, guided):
     from train_segment_timematch import build_config
 
     setup_run(tmp_path)
@@ -216,14 +259,17 @@ def test_refinement_comparison_launcher_runs_each_source_budget(tmp_path, adapt,
     subprocess.run([bash_bin(), 'closedset_scripts/'+script], cwd=tmp_path, check=True, timeout=40,
                    env=dict(os.environ, DATA_ROOT='data', PYTHON_BIN='/bin/echo', EXPERIMENT='compare',
                             SEGMENT_CONTEXT='0', SEGMENT_REFINE='0', SEGMENT_REFINE_COMPARE='1', RESUME='0',
-                            REFINEMENT_ADAPT_EPOCHS=str(adapt)))
+                            REFINEMENT_ADAPT_EPOCHS=str(adapt), SHAPELET_GUIDED_MERGE=str(int(guided))))
     logs = tmp_path/'logs/compare'
     for task in ('AT1_DK1', 'FR1_FR2', 'FR2_DK1', 'DK1_AT1'):
-        for route, epochs in zip(('one_round', 'two_rounds', 'three_rounds'), budgets):
+        routes = ('two_rounds', 'three_rounds', 'four_rounds') if guided else (
+            'one_round', 'two_rounds', 'three_rounds')
+        for route, epochs in zip(routes, budgets):
             command = shlex.split((logs/f'{task}_{route}_source.log').read_text())
             cfg = build_config(command[2:])
             assert cfg.stage == 'finetune' and cfg.epochs == epochs
             assert cfg.source_schedule_epochs == budgets[-1]
+            assert cfg.shapelet_guided_merge is guided
             assert cfg.output_dir == f'outputs/compare/{route}/{task}/source'
     assert not list(logs.glob('*_uda.log'))
     events = (logs/'launcher.log').read_text()
@@ -234,6 +280,8 @@ def test_refinement_comparison_launcher_runs_each_source_budget(tmp_path, adapt,
         '--data_root', 'data', '--output_dir', 'outputs/compare_visualization', '--plot_task', 'AT1_DK1']
     if adapt == 3:
         analysis += ['--refinement_adapt_epochs', '3']
+    if guided:
+        analysis += ['--shapelet_guided_merge']
     assert shlex.split((tmp_path/'logs/compare_visualization/analysis.log').read_text()) == analysis
 
 

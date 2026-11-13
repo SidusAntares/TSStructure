@@ -32,10 +32,19 @@ def build_config(argv=None):
                         help='Apply one self-attention layer across candidate segment embeddings')
     parser.add_argument('--segment_refine', action='store_true',
                         help='Use class-guided calendar boundaries during source finetuning')
-    parser.add_argument('--refinement_rounds', type=int, choices=(1, 2, 3), default=0,
+    parser.add_argument('--refinement_rounds', type=int, default=0,
                         help='Number of alternating Split and Merge rounds in Source finetuning')
-    parser.add_argument('--refinement_adapt_epochs', type=int, choices=(3, 5), default=5,
+    parser.add_argument('--refinement_adapt_epochs', type=int, default=None,
                         help='Epochs of Source training after each Split and after each Merge')
+    parser.add_argument('--shapelet_guided_merge', action='store_true')
+    parser.add_argument('--refinement_warmup_epochs', type=int)
+    parser.add_argument('--refinement_split_epochs', type=int)
+    parser.add_argument('--refinement_merge_epochs', type=int)
+    options = dict(top_k=2, dtw_limit=1., min_support=.20, reference_per_class=128, split_budget=2,
+                   boundary_slack=7, merge_max_points=24, merge_max_span=90, merge_max_gap=24,
+                   merge_coverage_cost=.10, merge_tolerance=.01)
+    for name, value in options.items():
+        parser.add_argument('--refinement_'+name, type=type(value), default=None)
     parser.add_argument('--output_dir', required=True, help='Exact new stage leaf; existing directories are refused')
     parser.add_argument('--experiment_name')
     parser.add_argument('--tensorboard_log_dir')
@@ -66,11 +75,37 @@ def build_config(argv=None):
     parser.add_argument('--pelt_penalty_mode', choices=('absolute',), default='absolute')
     parser.add_argument('--dry_run', action='store_true')
     cfg = parser.parse_args(argv)
+    overrides = {}
+    for name, default in options.items():
+        value = vars(cfg).pop('refinement_'+name)
+        if value is not None:
+            overrides[name] = value
+    if cfg.refinement_adapt_epochs is None:
+        cfg.refinement_adapt_epochs = 3 if cfg.shapelet_guided_merge else 5
+    epoch_overrides = [vars(cfg).pop('refinement_'+phase+'_epochs')
+                       for phase in ('warmup', 'split', 'merge')]
+    if cfg.refinement_rounds < 0 or cfg.refinement_adapt_epochs < 1:
+        parser.error('Refinement rounds must be nonnegative and adaptation epochs positive')
+    if ((cfg.shapelet_guided_merge and not cfg.refinement_rounds)
+            or (not cfg.shapelet_guided_merge and (overrides or any(v is not None for v in epoch_overrides)))):
+        parser.error('Guided refinement options require --shapelet_guided_merge and --refinement_rounds')
+    if cfg.shapelet_guided_merge:
+        epoch_defaults = (10, cfg.refinement_adapt_epochs, cfg.refinement_adapt_epochs)
+        cfg.refinement_epoch_plan = [default if value is None else value
+                                     for default, value in zip(epoch_defaults, epoch_overrides)]
+        if min(cfg.refinement_epoch_plan) < 1:
+            parser.error('All refinement phase lengths must be positive')
+        cfg.refinement_options = dict(options, **overrides)
+        for key, value in cfg.refinement_options.items():
+            minimum = 1 if key in ('top_k', 'reference_per_class', 'merge_max_points') else 0
+            if not math.isfinite(value) or value < minimum or (key == 'min_support' and value > 1):
+                parser.error(f'Invalid --refinement_{key}: {value}')
+    elif (cfg.refinement_rounds > 3 or cfg.refinement_adapt_epochs not in (3, 5)
+          or (cfg.refinement_rounds == 3 and cfg.refinement_adapt_epochs != 3)):
+        parser.error('Historical refinement supports up to 3 rounds with 3 or 5 adaptation epochs')
     if cfg.refinement_rounds:
         if cfg.stage != 'finetune':
             parser.error('--refinement_rounds requires --stage finetune')
-        if cfg.refinement_rounds == 3 and cfg.refinement_adapt_epochs != 3:
-            parser.error('Three refinement rounds require --refinement_adapt_epochs 3')
         cfg.segment_refine = True
     elif cfg.refinement_adapt_epochs != 5:
         parser.error('--refinement_adapt_epochs requires --refinement_rounds')
@@ -103,7 +138,13 @@ def build_config(argv=None):
         parser.error('log_step must be positive')
     if cfg.refinement_rounds:
         cfg.epochs = cfg.source_training_epochs = 10 + 2 * cfg.refinement_adapt_epochs * cfg.refinement_rounds
-        cfg.source_schedule_epochs = 28 if cfg.refinement_adapt_epochs == 3 else 30
+        if cfg.shapelet_guided_merge:
+            warmup, split_epochs, merge_epochs = cfg.refinement_epoch_plan
+            round_epochs = split_epochs + merge_epochs
+            cfg.epochs = cfg.source_training_epochs = warmup + round_epochs * cfg.refinement_rounds
+            cfg.source_schedule_epochs = warmup + round_epochs * max(4, cfg.refinement_rounds)
+        else:
+            cfg.source_schedule_epochs = 28 if cfg.refinement_adapt_epochs == 3 else 30
     cfg.mode = None
     cfg.selector_protocol = 'inshape_drop_proxy_detached_v1' if cfg.variant == 'inshape' else 'legacy'
     if cfg.segment_context:
@@ -164,6 +205,11 @@ def build_config(argv=None):
             finetune=f'{cfg.epochs} source epochs; 10 warmup, then {cfg.refinement_adapt_epochs} after each edit',
             refinement_rounds=cfg.refinement_rounds,
             source_schedule_epochs=cfg.source_schedule_epochs)
+    if cfg.shapelet_guided_merge:
+        cfg.structure_protocol.update(
+            refinement_algorithm='cached full-sequence Shapelet matches; guided triples before adjacent pairs',
+            finetune=f'{cfg.epochs} source epochs; phase lengths {cfg.refinement_epoch_plan}',
+            refinement_options=cfg.refinement_options, refinement_epoch_plan=cfg.refinement_epoch_plan)
     cfg.structure_protocol.update(source_init=cfg.source_init, source_training_epochs=cfg.source_training_epochs,
         actual_stage_epochs=cfg.epochs)
     return cfg
@@ -210,7 +256,7 @@ def main(argv=None):
         return
     if cfg.refinement_rounds:
         from utils.segment_training import validate_refinement_training
-        validate_refinement_training(cfg.refinement_adapt_epochs)
+        validate_refinement_training(cfg.refinement_adapt_epochs, cfg.shapelet_guided_merge)
     validate_source(cfg)
     if cfg.stage == 'uda':
         checkpoint = Path(cfg.structure_checkpoint)

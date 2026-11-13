@@ -12,6 +12,7 @@ from utils.source_segment_refinement import (
     prototype_windows, ranges_for, selector_state, split_cuts,
 )
 from utils.segment_structure import segment_pelt
+from utils.guided_segment_refinement import guided_merge, match_shapelets, split_matches
 
 
 def reference_window(dates, shape, prototype, min_size):
@@ -49,8 +50,12 @@ class RefinementProbe:
         self.indices = [i for y in np.unique(labels)
                         for i in rng.permutation(np.flatnonzero(labels == y))[:24]]
         self.batches, self.cuts, self.targets, self.protected = [], {}, {}, {}
+        self.guided = getattr(config, 'shapelet_guided_merge', False)
+        self.settings = dict(SETTINGS, **getattr(config, 'refinement_options', {}))
+        self.matches = {}
         self.history, self.previous = [], {}
-        self.phase, self.round_index, self.edit_epoch = 'initial', 0, 10
+        warmup = getattr(config, 'refinement_epoch_plan', (10,))[0]
+        self.phase, self.round_index, self.edit_epoch = 'initial', 0, warmup
 
     @torch.no_grad()
     def initialize(self, batches, bank):
@@ -63,10 +68,16 @@ class RefinementProbe:
             for parcel, y, day, shape, seg in zip(ids, ys, dates.cpu().numpy(), projected, labels):
                 self.cuts[parcel] = calendar_cuts(day, seg)
                 targets = {}
-                for p in bank['classes'].get(y, []):
-                    window = reference_window(day, shape, p, self.config.pelt_min_size)
-                    if window is not None:
-                        targets[p['id']] = window
+                prototypes = bank['classes'].get(y, [])
+                if self.guided:
+                    matches = match_shapelets(day, shape, prototypes, self.config.pelt_min_size, self.settings)
+                    self.matches[parcel] = matches
+                    targets = {m.prototype: (m.start, m.stop) for m in matches}
+                else:
+                    for p in prototypes:
+                        window = reference_window(day, shape, p, self.config.pelt_min_size)
+                        if window is not None:
+                            targets[p['id']] = window
                 self.targets[parcel] = targets
                 manifest.append((parcel, y, sorted(targets.items())))
         self.reference_sha256 = hashlib.sha256(json.dumps(sorted(manifest)).encode()).hexdigest()
@@ -90,14 +101,25 @@ class RefinementProbe:
                 projected = project(features.cpu().numpy(), bank)
                 for parcel, y, day, shape in zip(ids, ys, dates.cpu().numpy(), projected):
                     cuts = self.cuts[parcel]
-                    added = split_cuts(day, shape, cuts, bank['classes'].get(y, []),
-                                       self.config.pelt_min_size)
+                    prototypes = bank['classes'].get(y, [])
+                    if self.guided:
+                        if round_index > 1:
+                            self.matches[parcel] = match_shapelets(
+                                day, shape, prototypes, self.config.pelt_min_size, self.settings)
+                        added = split_matches(day, cuts, self.matches[parcel],
+                                              self.config.pelt_min_size, self.settings)
+                    else:
+                        added = split_cuts(day, shape, cuts, prototypes, self.config.pelt_min_size)
                     self.cuts[parcel] = np.sort(np.r_[cuts, added])
                     self.protected[parcel] = added
         else:
             for parcel, y, dates, features, cuts, gates, probs in self.selections(model, selector):
-                removed = merge_cuts(model, features, dates, y, cuts, gates, probs,
-                                     self.protected[parcel], self.config.focal_loss_gamma)
+                if self.guided:
+                    removed, _ = guided_merge(model, features, dates, y, cuts, gates, self.protected[parcel],
+                                              self.matches[parcel], self.config.focal_loss_gamma, self.settings)
+                else:
+                    removed = merge_cuts(model, features, dates, y, cuts, gates, probs,
+                                         self.protected[parcel], self.config.focal_loss_gamma)
                 self.cuts[parcel] = cuts[~np.isin(cuts, removed)]
         self.phase, self.round_index, self.edit_epoch = phase, round_index, epoch
         self.previous.clear()
